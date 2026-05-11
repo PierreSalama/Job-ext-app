@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Job Tracker v5 — Desktop</title>
+<link rel="stylesheet" href="app/app.css" />
+<style>
+  /* Desktop chrome: thin banner + body offset so the sidebar/main grid
+     defined in app.css stays visually identical to the extension. */
+  :root { --jat-banner-h: 28px; }
+  body { padding-top: var(--jat-banner-h); box-sizing: border-box; }
+  #jat-banner {
+    position: fixed; top: 0; left: 0; right: 0; height: var(--jat-banner-h);
+    display: flex; align-items: center; justify-content: center;
+    font: 12px/1 -apple-system, system-ui, sans-serif;
+    background: var(--bg-elev, #0e1116); color: var(--muted, #8b95a7);
+    border-bottom: 1px solid var(--border, #1f242c); z-index: 9999;
+    -webkit-app-region: drag; user-select: none;
+  }
+  #jat-banner b { color: var(--text, #e6e9ef); margin-right: 6px; }
+</style>
+</head>
+<body>
+  <div id="jat-banner"><b>🖥️ Desktop app</b> sync server running on :7733</div>
+  <aside class="sidebar">
+    <div class="brand"><span class="logo">JAT</span><div><strong>Job Tracker</strong><small>v5</small></div></div>
+    <nav id="nav">
+      <a href="#/" data-route="/">📊 Dashboard</a>
+      <a href="#/jobs" data-route="/jobs">📋 Applications</a>
+      <a href="#/profile" data-route="/profile">👤 Profile</a>
+      <a href="#/ai" data-route="/ai">✨ AI Assistant</a>
+      <a href="#/documents" data-route="/documents">📁 Documents</a>
+      <a href="#/settings" data-route="/settings">⚙️ Settings</a>
+      <a href="#/sources" data-route="/sources">🌐 Sources</a>
+    </nav>
+    <div class="ai-status" id="ai-pill"></div>
+  </aside>
+  <main id="main">Loading…</main>
+  <div id="toast"></div>
+  <script type="module" src="app/app.js"></script>
+</body>
+</html>

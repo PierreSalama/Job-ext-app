@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Job Tracker v5</title>
+<link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><span class="logo">JAT</span><div><strong>Job Tracker</strong><small>v5</small></div></div>
+    <nav id="nav">
+      <a href="#/" data-route="/">📊 Dashboard</a>
+      <a href="#/jobs" data-route="/jobs">📋 Applications</a>
+      <a href="#/profile" data-route="/profile">👤 Profile</a>
+      <a href="#/ai" data-route="/ai">✨ AI Assistant</a>
+      <a href="#/documents" data-route="/documents">📁 Documents</a>
+      <a href="#/settings" data-route="/settings">⚙️ Settings</a>
+      <a href="#/sources" data-route="/sources">🌐 Sources</a>
+    </nav>
+    <div class="ai-status" id="ai-pill"></div>
+  </aside>
+  <main id="main">Loading…</main>
+  <div id="toast"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

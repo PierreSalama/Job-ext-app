@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output
+app/dist/
+app/build/output/
+extension/setup/JAT-v8-setup.exe
+extension/setup/JAT-v8.dmg
+extension/setup/JAT-v8.AppImage
+extension/setup/JAT-v8.pkg
+extension/setup/JAT-v8.deb
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+npm-debug.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local secrets / overrides
+.env
+.env.local

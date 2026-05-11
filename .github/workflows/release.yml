@@ -1,0 +1,101 @@
+name: Build & Release JAT v8 installers
+
+# Triggers:
+#   • Push a tag like `v8.0.1` → automatic build + release
+#   • Manual run via "Run workflow" button on the Actions tab
+on:
+  push:
+    tags:
+      - 'v8.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write  # required so the action can create a Release + upload assets
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: '*Setup*.exe'
+            label: Windows
+          - os: macos-latest
+            artifact: '*.dmg'
+            label: macOS
+          - os: ubuntu-latest
+            artifact: '*.AppImage'
+            label: Linux
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm install --no-audit --no-fund
+
+      - name: Build (${{ matrix.label }})
+        working-directory: app
+        run: npm run build
+        env:
+          # Avoid the auto-publish flow; we attach files explicitly below.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: List build output
+        working-directory: app
+        shell: bash
+        run: ls -la dist/ || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jat-v8-${{ matrix.label }}
+          path: app/dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Rename for predictable URLs
+        shell: bash
+        run: |
+          mkdir -p release
+          # Windows
+          if compgen -G "artifacts/jat-v8-Windows/*.exe" > /dev/null; then
+            cp artifacts/jat-v8-Windows/*.exe release/JAT-v8-setup.exe
+          fi
+          # macOS
+          if compgen -G "artifacts/jat-v8-macOS/*.dmg" > /dev/null; then
+            cp artifacts/jat-v8-macOS/*.dmg release/JAT-v8.dmg
+          fi
+          # Linux
+          if compgen -G "artifacts/jat-v8-Linux/*.AppImage" > /dev/null; then
+            cp artifacts/jat-v8-Linux/*.AppImage release/JAT-v8.AppImage
+          fi
+          ls -la release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false
