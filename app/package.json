@@ -5,7 +5,6 @@
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "postinstall": "electron-rebuild -f -w better-sqlite3",
     "rebuild": "electron-rebuild -f -w better-sqlite3",
     "build": "electron-builder",
     "build:win": "electron-builder --win",
@@ -37,8 +36,13 @@
     "linux": {
       "target": "AppImage",
       "category": "Office"
-    }
+    },
+    "publish": null
   },
   "author": "Pierre",
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PierreSalama/Job-ext-app.git"
+  }
 }
