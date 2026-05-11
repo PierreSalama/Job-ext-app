@@ -79,17 +79,23 @@ const RELEASE_FILES = {
 };
 
 // Probe GitHub Releases for the OS-specific installer. Returns { url, label, hint } or null.
+// CORS blocks direct fetch from the extension page, so we ask the background
+// service worker (which can call api.github.com freely) to check the release.
 async function probeRelease(os, releasesBaseUrl) {
   if (!releasesBaseUrl) return null;
   const f = RELEASE_FILES[os];
   if (!f) return null;
   const url = `${releasesBaseUrl.replace(/\/+$/, '')}/${f.name}`;
   try {
-    // HEAD might be redirected (302 → S3) but follow is enabled by default in fetch.
-    const r = await fetch(url, { method: 'HEAD', redirect: 'follow' });
-    if (r.ok) return { ...f, url };
+    const r = await new Promise((res) => chrome.runtime.sendMessage(
+      { type: 'probe-release-asset', data: { releasesBaseUrl, fileName: f.name } },
+      res
+    ));
+    if (r?.ok && r.exists) return { ...f, url };
   } catch {}
-  return null;
+  // If the probe fails for any reason, fall back to optimistic: assume the
+  // URL exists. chrome.downloads.download will surface a clear error if not.
+  return { ...f, url };
 }
 
 // Per-render cache of which bundled installers actually exist (HEAD-checked).

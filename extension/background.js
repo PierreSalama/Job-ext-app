@@ -857,6 +857,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // ============ v8 NEW HANDLERS ============
         case 'ping': sendResponse({ ok: true, ts: Date.now() }); break;
 
+        case 'probe-release-asset': {
+          // Page can't probe Release URLs directly (CORS). Background calls
+          // api.github.com (which sends proper CORS) — same info, no block.
+          // releasesBaseUrl shape: https://github.com/OWNER/REPO/releases/latest/download
+          const { releasesBaseUrl, fileName } = data || {};
+          try {
+            const m = String(releasesBaseUrl || '').match(/github\.com\/([^\/]+)\/([^\/]+)\/releases/);
+            if (!m) { sendResponse({ ok: false, error: 'Invalid releases URL' }); break; }
+            const apiUrl = `https://api.github.com/repos/${m[1]}/${m[2]}/releases/latest`;
+            const r = await fetch(apiUrl, { headers: { Accept: 'application/vnd.github+json' } });
+            if (!r.ok) { sendResponse({ ok: false, error: `HTTP ${r.status}` }); break; }
+            const rel = await r.json();
+            const exists = (rel.assets || []).some((a) => a.name === fileName);
+            sendResponse({ ok: true, exists, tag: rel.tag_name, assets: (rel.assets || []).map((a) => a.name) });
+          } catch (e) {
+            sendResponse({ ok: false, error: String(e?.message || e) });
+          }
+          break;
+        }
+
         case 'db-stats': {
           const stores = ['jobs','documents','messages','contacts','companies','events','notes','reminders','todos','audit','tags','savedViews','fitScores','autopsies'];
           let total = 0;
