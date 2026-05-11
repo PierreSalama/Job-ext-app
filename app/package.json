@@ -45,7 +45,7 @@
     },
     "linux": {
       "target": "AppImage",
-      "icon": "src/icons/icon128.png",
+      "icon": "src/icons/icon512.png",
       "category": "Office"
     },
     "publish": null
