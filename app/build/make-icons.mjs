@@ -1,6 +1,6 @@
-// Pure-Node icon builder. Reads the source PNGs (16/32/48/128) and writes
-// a multi-resolution Windows .ico and a macOS .icns file alongside them.
-// No external deps — implements the ICO + ICNS binary formats directly.
+// Build proper multi-resolution icon.ico, icon.icns, and per-size PNGs from
+// the source SVG. Requires `sharp` (auto-installed at build time via the
+// devDependency; ships prebuilt binaries for every OS so no compile needed).
 //
 // Run: node build/make-icons.mjs
 
@@ -10,63 +10,100 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ICONS_DIR = path.resolve(__dirname, '..', 'src', 'icons');
+const SVG_PATH = path.join(ICONS_DIR, 'icon.svg');
 
-// ---------- ICO ----------
-// Format: ICONDIR (6 bytes) + n × ICONDIRENTRY (16 bytes each) + n × image data.
-// Image data is raw PNG bytes (Vista+ supports embedded PNG inside ICO).
-function buildIco(pngFiles) {
-  const images = pngFiles.map(({ size, file }) => {
-    const data = fs.readFileSync(file);
-    return { size, data };
-  });
+// All sizes a Windows ICO + macOS ICNS together need.
+const SIZES = [16, 32, 48, 64, 128, 256, 512, 1024];
+
+async function main() {
+  let sharp;
+  try {
+    sharp = (await import('sharp')).default;
+  } catch (e) {
+    console.error('sharp not installed. Run `npm install sharp --no-save` first.');
+    console.error('Falling back to bundling only the existing PNGs (build may fail if 256x256 is required).');
+    sharp = null;
+  }
+
+  const pngs = {};
+
+  if (sharp) {
+    if (!fs.existsSync(SVG_PATH)) {
+      console.error('Source SVG missing at', SVG_PATH);
+      process.exit(1);
+    }
+    const svg = fs.readFileSync(SVG_PATH);
+    for (const size of SIZES) {
+      const out = path.join(ICONS_DIR, `icon${size}.png`);
+      await sharp(svg, { density: 384 })
+        .resize(size, size, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+        .png({ compressionLevel: 9 })
+        .toFile(out);
+      pngs[size] = fs.readFileSync(out);
+      console.log(`  ${size}x${size} -> ${out} (${pngs[size].length} bytes)`);
+    }
+  } else {
+    // Fallback: use only what's already on disk.
+    for (const size of SIZES) {
+      const p = path.join(ICONS_DIR, `icon${size}.png`);
+      if (fs.existsSync(p)) pngs[size] = fs.readFileSync(p);
+    }
+  }
+
+  // ---- ICO ----
+  const icoSizes = [16, 32, 48, 64, 128, 256].filter((s) => pngs[s]);
+  const ico = buildIco(icoSizes.map((s) => ({ size: s, data: pngs[s] })));
+  fs.writeFileSync(path.join(ICONS_DIR, 'icon.ico'), ico);
+  console.log(`Wrote icon.ico (${ico.length} bytes, sizes: ${icoSizes.join(',')})`);
+
+  // ---- ICNS ----
+  const icns = buildIcns(pngs);
+  fs.writeFileSync(path.join(ICONS_DIR, 'icon.icns'), icns);
+  console.log(`Wrote icon.icns (${icns.length} bytes)`);
+}
+
+// ICO format: ICONDIR + n × ICONDIRENTRY + image bytes (raw PNG works on Vista+).
+function buildIco(images) {
   const n = images.length;
   const headerSize = 6 + 16 * n;
   let offset = headerSize;
   const dir = Buffer.alloc(headerSize);
-  // ICONDIR
-  dir.writeUInt16LE(0, 0);   // reserved
-  dir.writeUInt16LE(1, 2);   // type=1 (icon)
-  dir.writeUInt16LE(n, 4);   // count
-  // ICONDIRENTRYs
+  dir.writeUInt16LE(0, 0);
+  dir.writeUInt16LE(1, 2);
+  dir.writeUInt16LE(n, 4);
   for (let i = 0; i < n; i++) {
     const e = 6 + i * 16;
-    const sz = images[i].size === 256 ? 0 : images[i].size; // 256 encoded as 0
-    dir.writeUInt8(sz, e);              // width
-    dir.writeUInt8(sz, e + 1);          // height
-    dir.writeUInt8(0, e + 2);           // palette
-    dir.writeUInt8(0, e + 3);           // reserved
-    dir.writeUInt16LE(1, e + 4);        // planes
-    dir.writeUInt16LE(32, e + 6);       // bits per pixel
-    dir.writeUInt32LE(images[i].data.length, e + 8);  // bytes
-    dir.writeUInt32LE(offset, e + 12);  // offset
+    const sz = images[i].size >= 256 ? 0 : images[i].size; // 256+ encoded as 0
+    dir.writeUInt8(sz, e);
+    dir.writeUInt8(sz, e + 1);
+    dir.writeUInt8(0, e + 2);
+    dir.writeUInt8(0, e + 3);
+    dir.writeUInt16LE(1, e + 4);
+    dir.writeUInt16LE(32, e + 6);
+    dir.writeUInt32LE(images[i].data.length, e + 8);
+    dir.writeUInt32LE(offset, e + 12);
     offset += images[i].data.length;
   }
   return Buffer.concat([dir, ...images.map((i) => i.data)]);
 }
 
-// ---------- ICNS ----------
-// Format: header "icns" + total length, then a series of typed chunks.
-// We use the PNG-embedded chunk types which all modern macOS versions read:
-//   ic07 = 128×128, ic08 = 256×256 (not used here), ic09 = 512×512 (not used),
-//   ic11 = 32×32@2x (=64), ic12 = 16×16@2x (=32), ic13 = 128×128@2x (=256).
-// For our 16/32/48/128 sources we just embed the matching closest sizes.
-function buildIcns(pngFiles) {
-  // Map size → ICNS chunk OSType (4 ASCII bytes)
-  const SIZE_TO_TYPE = {
-    16:  'icp4',  // 16x16
-    32:  'icp5',  // 32x32
-    64:  'icp6',  // 64x64 (not present in our sources)
-    128: 'ic07',  // 128x128
-    256: 'ic08',  // 256x256
-    512: 'ic09'
+// ICNS — embed PNG chunks for the standard Retina sizes.
+function buildIcns(pngs) {
+  const TYPE_BY_SIZE = {
+    16:   'icp4',
+    32:   'icp5',
+    64:   'icp6',
+    128:  'ic07',
+    256:  'ic08',
+    512:  'ic09',
+    1024: 'ic10'
   };
   const chunks = [];
-  for (const { size, file } of pngFiles) {
-    const type = SIZE_TO_TYPE[size];
-    if (!type) continue;
-    const data = fs.readFileSync(file);
+  for (const sz of Object.keys(TYPE_BY_SIZE).map(Number).sort((a, b) => a - b)) {
+    const data = pngs[sz];
+    if (!data) continue;
     const chunk = Buffer.alloc(8 + data.length);
-    chunk.write(type, 0, 'ascii');
+    chunk.write(TYPE_BY_SIZE[sz], 0, 'ascii');
     chunk.writeUInt32BE(8 + data.length, 4);
     data.copy(chunk, 8);
     chunks.push(chunk);
@@ -78,24 +115,4 @@ function buildIcns(pngFiles) {
   return Buffer.concat([header, body]);
 }
 
-// ---------- Main ----------
-const sources = [16, 32, 48, 128]
-  .map((size) => ({ size, file: path.join(ICONS_DIR, `icon${size}.png`) }))
-  .filter((s) => fs.existsSync(s.file));
-
-if (sources.length === 0) {
-  console.error('No source PNGs found in', ICONS_DIR);
-  process.exit(1);
-}
-
-const ico = buildIco(sources);
-fs.writeFileSync(path.join(ICONS_DIR, 'icon.ico'), ico);
-console.log(`Wrote icon.ico (${ico.length} bytes, ${sources.length} resolutions)`);
-
-const icns = buildIcns(sources);
-fs.writeFileSync(path.join(ICONS_DIR, 'icon.icns'), icns);
-console.log(`Wrote icon.icns (${icns.length} bytes, ${sources.length} resolutions)`);
-
-// Linux electron-builder wants either a single 512x512 PNG or a directory
-// with multiple sizes. We already have the directory.
-console.log('Linux: src/icons/ contains the multi-res PNGs.');
+main().catch((e) => { console.error(e); process.exit(1); });

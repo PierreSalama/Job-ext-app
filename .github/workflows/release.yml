@@ -41,6 +41,13 @@ jobs:
         working-directory: app
         run: npm install --no-audit --no-fund
 
+      - name: Generate proper multi-resolution icons from SVG
+        working-directory: app
+        shell: bash
+        run: |
+          npm install sharp --no-save --no-audit --no-fund
+          node build/make-icons.mjs
+
       - name: Pre-build env dump
         working-directory: app
         shell: bash
