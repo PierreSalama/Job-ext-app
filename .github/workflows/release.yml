@@ -41,6 +41,18 @@ jobs:
         working-directory: app
         run: npm install --no-audit --no-fund
 
+      - name: Pre-build env dump
+        working-directory: app
+        shell: bash
+        run: |
+          echo "::group::Environment"
+          node --version
+          npm --version
+          echo "::endgroup::"
+          echo "::group::package.json"
+          cat package.json
+          echo "::endgroup::"
+
       - name: Build (${{ matrix.label }})
         working-directory: app
         run: npm run build
@@ -48,11 +60,42 @@ jobs:
           # Avoid the auto-publish flow; we attach files explicitly below.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_IDENTITY_AUTO_DISCOVERY: false
+          # Helpful diagnostics if the build fails — surfaced in the run log,
+          # which Actions exposes on the Summary page even without auth.
+          DEBUG: electron-builder
 
       - name: List build output
+        if: always()
         working-directory: app
         shell: bash
-        run: ls -la dist/ || true
+        run: |
+          echo "::group::dist/ contents"
+          ls -la dist/ 2>/dev/null || echo "(no dist/)"
+          echo "::endgroup::"
+          echo "::group::dist/ recursive (top 50)"
+          find dist -maxdepth 3 -print 2>/dev/null | head -50 || true
+          echo "::endgroup::"
+
+      - name: Collect logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          mkdir -p /tmp/jat-logs
+          # npm debug logs (any platform)
+          if [ -d "$HOME/.npm/_logs" ]; then cp -r "$HOME/.npm/_logs" /tmp/jat-logs/npm-logs 2>/dev/null || true; fi
+          # electron-builder debug output (sometimes written into the app dir)
+          cp -r app/dist /tmp/jat-logs/dist 2>/dev/null || true
+          # Recent stdout — node_modules listing for sanity
+          ls -la app 2>/dev/null > /tmp/jat-logs/app-ls.txt || true
+          ls -la app/node_modules 2>/dev/null | head -40 > /tmp/jat-logs/app-node_modules-ls.txt || true
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-logs-${{ matrix.label }}
+          path: /tmp/jat-logs
+          if-no-files-found: ignore
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
