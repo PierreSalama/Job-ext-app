@@ -301,11 +301,12 @@ async function load() {
     if (ss?.ok) state.syncStatus = ss.status || state.syncStatus;
   } catch {}
   // Also load Q&A and recommendations
-  const [qa, recs, docs, np] = await Promise.all([send('list-answers'), send('list-recommendations'), send('list-documents'), send('list-named-profiles')]);
+  const [qa, recs, docs, np, uinfo] = await Promise.all([send('list-answers'), send('list-recommendations'), send('list-documents'), send('list-named-profiles'), send('get-extension-update-info')]);
   if (np?.ok) state.namedProfiles = np.items || [];
   if (qa?.ok) state.answers = qa.items || [];
   if (recs?.ok) state.recommendations = recs.items || [];
   if (docs?.ok) state.documents = docs.items || [];
+  if (uinfo?.ok) state.updateInfo = uinfo.info || null;
   // v8 stores
   const v6Loads = await Promise.all([
     send('list-events'), send('list-reminders'), send('list-todos'),
@@ -429,6 +430,9 @@ chrome.runtime.onMessage.addListener((msg) => {
   } else if (name === 'sync.status') {
     state.syncStatus = data || state.syncStatus;
     updateSyncPill(); // pill only — no full render
+  } else if (name === 'extension.update.checked') {
+    state.updateInfo = { ...data, checkedAt: Date.now() };
+    scheduleRender();
   } else if (name === 'namedProfiles.updated') {
     send('list-named-profiles').then((r) => { if (r?.ok) { state.namedProfiles = r.items || []; scheduleRender(); } });
   } else {
@@ -1588,8 +1592,34 @@ function pageProfile() {
 function pageSettings() {
   const s = state.settings;
   const currentTheme = s.theme || 'midnight';
+  const u = state.updateInfo || {};
+  const checkedAt = u.checkedAt ? new Date(u.checkedAt).toLocaleString() : 'never';
   return `
     <div class="page-h"><div><h1>Settings</h1><div class="sub">Themes, AI providers, follow-ups, notifications.</div></div></div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h3 style="margin-top:0;font-size:14px">⬆️ Updates</h3>
+      <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+        <div style="flex:1;min-width:200px">
+          <div style="font-size:13px">
+            <strong>Extension</strong>:
+            v${escape(chrome.runtime.getManifest().version)}
+            ${u.hasUpdate ? `<span class="pill" style="background:#ef4444;color:#fff;margin-left:6px">Update available → v${escape(u.latest)}</span>` : (u.latest ? `<span class="pill" style="background:rgba(16,185,129,0.18);color:#10b981;margin-left:6px">Up to date</span>` : '')}
+          </div>
+          <div class="s" style="font-size:11px;color:var(--muted);margin-top:2px">Last checked: ${escape(checkedAt)}</div>
+        </div>
+        <div style="display:flex;gap:6px">
+          <button class="btn" id="check-update-btn">Check now</button>
+          ${u.hasUpdate ? `<a class="btn primary" href="${escape(u.url || '#')}" target="_blank" rel="noreferrer">Download v${escape(u.latest)}</a>` : ''}
+        </div>
+      </div>
+      ${u.hasUpdate ? `
+        <div style="margin-top:10px;font-size:12px;color:var(--muted);line-height:1.6">
+          To update: download the latest release, unzip, and replace your loaded extension's folder. Then click <em>Reload</em> on the extension at <code>chrome://extensions</code>.
+          The desktop app updates itself automatically — no action needed.
+        </div>
+      ` : ''}
+    </div>
 
     <div class="card">
       <h3 style="margin-top:0;font-size:14px">🎨 Theme <span style="font-weight:400;color:var(--muted);font-size:12px">${THEMES.length} built-in</span></h3>
@@ -2161,6 +2191,21 @@ function attach() {
     toast(`Theme: ${THEMES.find((t) => t.id === id)?.name}`, 'success');
     render();
   }));
+  // v8.0.2: Manual "Check for updates" button
+  $('#check-update-btn')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; const orig = btn.textContent; btn.textContent = 'Checking…';
+    try {
+      const r = await send('check-extension-update');
+      if (r?.ok) {
+        state.updateInfo = { current: r.current, latest: r.latest, hasUpdate: r.hasUpdate, checkedAt: Date.now(), url: r.url };
+        toast(r.hasUpdate ? `New version available: v${r.latest}` : `Up to date (v${r.current})`, r.hasUpdate ? 'success' : 'success');
+        render();
+      } else {
+        toast(`Check failed: ${r?.error || 'unknown'}`, 'danger');
+      }
+    } finally { btn.disabled = false; btn.textContent = orig; }
+  });
   // Settings — sidebar customization
   $('#settings-sidebar-reset')?.addEventListener('click', async () => {
     await patchAppSettings({ sidebarOrder: [], sidebarHidden: [], sidebarPinned: [], sectionOverrides: {} });

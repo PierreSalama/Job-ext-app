@@ -1,6 +1,6 @@
 {
   "name": "jat8-app",
-  "version": "8.0.0",
+  "version": "8.0.2",
   "description": "Desktop companion for the Job Application Tracker v8 Chrome extension. System tray, native notifications, global hotkey, real-time sync on :7733.",
   "main": "src/main.js",
   "scripts": {
@@ -12,7 +12,8 @@
     "build:linux": "electron-builder --linux"
   },
   "dependencies": {
-    "better-sqlite3": "^11.3.0"
+    "better-sqlite3": "^11.3.0",
+    "electron-updater": "^6.3.9"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.7.2",
@@ -48,7 +49,12 @@
       "icon": "src/icons/icon512.png",
       "category": "Office"
     },
-    "publish": null
+    "publish": [{
+      "provider": "github",
+      "owner": "PierreSalama",
+      "repo": "Job-ext-app",
+      "releaseType": "release"
+    }]
   },
   "author": "Pierre",
   "license": "MIT",

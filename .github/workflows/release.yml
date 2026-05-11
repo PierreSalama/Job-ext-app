@@ -62,7 +62,11 @@ jobs:
 
       - name: Build (${{ matrix.label }})
         working-directory: app
-        run: npm run build
+        # --publish never: the workflow uploads artifacts separately via
+        # softprops/action-gh-release. We just want electron-builder to
+        # produce the files locally, and electron-updater needs the publish
+        # provider config in package.json to know where to check for updates.
+        run: npx electron-builder --publish never
         env:
           # Avoid the auto-publish flow; we attach files explicitly below.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -108,7 +112,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: jat-v8-${{ matrix.label }}
-          path: app/dist/${{ matrix.artifact }}
+          # Include the installer AND the *.yml + *.blockmap metadata files
+          # that electron-updater needs to discover new versions.
+          path: |
+            app/dist/${{ matrix.artifact }}
+            app/dist/latest*.yml
+            app/dist/*.blockmap
           if-no-files-found: error
 
   release:
@@ -127,17 +136,32 @@ jobs:
         shell: bash
         run: |
           mkdir -p release
-          # Windows
+          # Windows installer + auto-updater metadata
           if compgen -G "artifacts/jat-v8-Windows/*.exe" > /dev/null; then
             cp artifacts/jat-v8-Windows/*.exe release/JAT-v8-setup.exe
           fi
-          # macOS
+          if compgen -G "artifacts/jat-v8-Windows/latest.yml" > /dev/null; then
+            cp artifacts/jat-v8-Windows/latest.yml release/latest.yml
+          fi
+          if compgen -G "artifacts/jat-v8-Windows/*.blockmap" > /dev/null; then
+            cp artifacts/jat-v8-Windows/*.blockmap release/ 2>/dev/null || true
+          fi
+          # macOS installer + auto-updater metadata
           if compgen -G "artifacts/jat-v8-macOS/*.dmg" > /dev/null; then
             cp artifacts/jat-v8-macOS/*.dmg release/JAT-v8.dmg
           fi
-          # Linux
+          if compgen -G "artifacts/jat-v8-macOS/latest-mac.yml" > /dev/null; then
+            cp artifacts/jat-v8-macOS/latest-mac.yml release/latest-mac.yml
+          fi
+          if compgen -G "artifacts/jat-v8-macOS/*.blockmap" > /dev/null; then
+            cp artifacts/jat-v8-macOS/*.blockmap release/ 2>/dev/null || true
+          fi
+          # Linux installer + auto-updater metadata
           if compgen -G "artifacts/jat-v8-Linux/*.AppImage" > /dev/null; then
             cp artifacts/jat-v8-Linux/*.AppImage release/JAT-v8.AppImage
+          fi
+          if compgen -G "artifacts/jat-v8-Linux/latest-linux.yml" > /dev/null; then
+            cp artifacts/jat-v8-Linux/latest-linux.yml release/latest-linux.yml
           fi
           ls -la release/
 

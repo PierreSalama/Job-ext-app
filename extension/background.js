@@ -212,6 +212,7 @@ function scheduleAlarms() {
   try { chrome.alarms.create('jat-daily-summary', { periodInMinutes: 60 }); } catch {} // checks hourly, runs once at 9am
   try { chrome.alarms.create('jat-stale-refresh', { periodInMinutes: 24 * 60 }); } catch {}
   try { chrome.alarms.create('jat-health-check',  { periodInMinutes: 5 }); } catch {}
+  try { chrome.alarms.create('jat-update-check',  { periodInMinutes: 6 * 60 }); } catch {} // v8.0.2: check for updates every 6h
 }
 
 // ============ v8.5 auto-* alarm handlers ============
@@ -319,7 +320,41 @@ chrome.alarms?.onAlarm?.addListener(async (a) => {
   else if (a.name === 'jat-daily-summary') await maybeRunDailySummary();
   else if (a.name === 'jat-stale-refresh') await refreshStaleJobs();
   else if (a.name === 'jat-health-check')  await autoHealthCheck();
+  else if (a.name === 'jat-update-check')  await silentUpdateCheck();
 });
+
+// v8.0.2: semver comparison + silent update check
+function _semverGt(a, b) {
+  const pa = String(a || '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b || '').split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) > (pb[i] || 0)) return true;
+    if ((pa[i] || 0) < (pb[i] || 0)) return false;
+  }
+  return false;
+}
+async function silentUpdateCheck() {
+  try {
+    const settings = await getSettings();
+    const base = settings.releasesBaseUrl || '';
+    const m = String(base).match(/github\.com\/([^\/]+)\/([^\/]+)\/releases/);
+    if (!m) return;
+    const r = await fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/releases/latest`, { headers: { Accept: 'application/vnd.github+json' } });
+    if (!r.ok) return;
+    const rel = await r.json();
+    const current = chrome.runtime.getManifest().version;
+    const latest = String(rel.tag_name || '').replace(/^v/, '');
+    const hasUpdate = _semverGt(latest, current);
+    await chrome.storage.local.set({ 'jat8.updateInfo': { current, latest, hasUpdate, checkedAt: Date.now(), url: rel.html_url } });
+    if (hasUpdate) {
+      try {
+        chrome.action.setBadgeText({ text: '!' });
+        chrome.action.setBadgeBackgroundColor({ color: '#ef4444' });
+      } catch {}
+      try { await broadcast('extension.update.checked', { hasUpdate, current, latest, url: rel.html_url }); } catch {}
+    }
+  } catch {}
+}
 
 // ============ v8: Smart-tag rules + sandbox + webhooks ============
 async function applySmartTagRules(job) {
@@ -856,6 +891,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
         // ============ v8 NEW HANDLERS ============
         case 'ping': sendResponse({ ok: true, ts: Date.now() }); break;
+
+        case 'check-extension-update': {
+          // Compares running extension manifest version to the latest GitHub
+          // release tag. Returns { hasUpdate, current, latest, url, body }.
+          try {
+            const settings = await getSettings();
+            const base = settings.releasesBaseUrl || '';
+            const m = String(base).match(/github\.com\/([^\/]+)\/([^\/]+)\/releases/);
+            if (!m) { sendResponse({ ok: false, error: 'releasesBaseUrl not set' }); break; }
+            const apiUrl = `https://api.github.com/repos/${m[1]}/${m[2]}/releases/latest`;
+            const r = await fetch(apiUrl, { headers: { Accept: 'application/vnd.github+json' } });
+            if (!r.ok) { sendResponse({ ok: false, error: `HTTP ${r.status}` }); break; }
+            const rel = await r.json();
+            const current = chrome.runtime.getManifest().version;
+            const latest = String(rel.tag_name || '').replace(/^v/, '');
+            const hasUpdate = _semverGt(latest, current);
+            await chrome.storage.local.set({ 'jat8.updateInfo': { current, latest, hasUpdate, checkedAt: Date.now(), url: rel.html_url } });
+            await broadcast('extension.update.checked', { hasUpdate, current, latest, url: rel.html_url });
+            // Badge so the user sees a dot when an update exists
+            try {
+              if (hasUpdate) {
+                chrome.action.setBadgeText({ text: '!' });
+                chrome.action.setBadgeBackgroundColor({ color: '#ef4444' });
+              }
+            } catch {}
+            sendResponse({ ok: true, hasUpdate, current, latest, url: rel.html_url, body: (rel.body || '').slice(0, 1000) });
+          } catch (e) { sendResponse({ ok: false, error: String(e?.message || e) }); }
+          break;
+        }
+
+        case 'get-extension-update-info': {
+          const v = await chrome.storage.local.get('jat8.updateInfo');
+          sendResponse({ ok: true, info: v['jat8.updateInfo'] || null });
+          break;
+        }
 
         case 'probe-release-asset': {
           // Page can't probe Release URLs directly (CORS). Background calls

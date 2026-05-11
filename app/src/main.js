@@ -14,6 +14,11 @@ const path = require('path');
 const { JatDb } = require('./db.js');
 const { startServer, PORT, setLocalBroadcast } = require('./server.js');
 
+// v8.0.2: Auto-update via electron-updater (GitHub Releases backend).
+// Reads provider config from package.json build.publish at build time.
+let autoUpdater = null;
+try { autoUpdater = require('electron-updater').autoUpdater; } catch {}
+
 let mainWindow = null;
 let tray = null;
 let db = null;
@@ -238,6 +243,60 @@ ipcMain.handle('jat:reset-icon', async () => {
   } catch (e) { return { ok: false, error: String(e?.message || e) }; }
 });
 
+// v8.0.2: Auto-updater plumbing
+function setupAutoUpdater() {
+  if (!autoUpdater) {
+    console.warn('[v8] electron-updater not installed; skipping auto-update');
+    return;
+  }
+  autoUpdater.autoDownload = true;          // download in background once a new version is detected
+  autoUpdater.autoInstallOnAppQuit = true;  // apply on next quit/restart
+  autoUpdater.on('checking-for-update', () => sendUpdateEvent('checking'));
+  autoUpdater.on('update-available', (info) => sendUpdateEvent('available', { version: info.version }));
+  autoUpdater.on('update-not-available', (info) => sendUpdateEvent('current', { version: info?.version }));
+  autoUpdater.on('error', (err) => sendUpdateEvent('error', { error: String(err?.message || err) }));
+  autoUpdater.on('download-progress', (p) => sendUpdateEvent('progress', { percent: Math.round(p.percent), bps: p.bytesPerSecond }));
+  autoUpdater.on('update-downloaded', (info) => {
+    sendUpdateEvent('downloaded', { version: info.version });
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      dialog.showMessageBox(mainWindow, {
+        type: 'info',
+        title: 'Update ready',
+        message: `Version ${info.version} is downloaded and ready to install.`,
+        detail: 'The app will restart and apply the update.',
+        buttons: ['Restart now', 'Later'],
+        defaultId: 0,
+        cancelId: 1
+      }).then((r) => { if (r.response === 0) autoUpdater.quitAndInstall(); });
+    }
+  });
+  // Background check on startup (silent) + every 6 hours
+  setTimeout(() => { autoUpdater.checkForUpdatesAndNotify().catch(() => {}); }, 5000);
+  setInterval(() => { autoUpdater.checkForUpdatesAndNotify().catch(() => {}); }, 6 * 60 * 60 * 1000);
+}
+
+function sendUpdateEvent(name, data) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('update-event', { name, data: data || {} });
+  }
+}
+
+ipcMain.handle('jat:check-updates', async () => {
+  if (!autoUpdater) return { ok: false, error: 'electron-updater not available' };
+  try {
+    const r = await autoUpdater.checkForUpdates();
+    return { ok: true, version: r?.updateInfo?.version, available: r?.updateInfo && r.updateInfo.version !== app.getVersion() };
+  } catch (e) { return { ok: false, error: String(e?.message || e) }; }
+});
+
+ipcMain.handle('jat:install-update', () => {
+  if (!autoUpdater) return false;
+  autoUpdater.quitAndInstall();
+  return true;
+});
+
+ipcMain.handle('jat:app-version', () => app.getVersion());
+
 // v8: Native notification helper exposed to renderer
 ipcMain.handle('notify', (_e, { title, body, urgent }) => {
   try {
@@ -261,6 +320,7 @@ app.whenReady().then(() => {
   createWindow();
   setupTray();
   setupGlobalShortcuts();
+  setupAutoUpdater();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
