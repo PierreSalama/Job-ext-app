@@ -22,7 +22,7 @@ That's it. You can now visit LinkedIn, Indeed, Glassdoor, Greenhouse, Lever, Wor
 ### Optional: enable AI features (Ollama, local + free)
 
 1. Install [Ollama](https://ollama.com/download) for your OS.
-2. Pull the model: `ollama pull gemma3:4b`
+2. Pull the model: `ollama pull gemma4:e4b`
 3. The extension already strips the browser `Origin` header so Ollama accepts requests — no further setup needed.
 
 If you see a 403 from Ollama anyway, set the env var: `OLLAMA_ORIGINS=chrome-extension://*` and restart Ollama. The AI Setup Wizard inside the extension (`#/ai`) walks you through it and provides bundled scripts (`setup/install-ollama-{windows,mac,linux}.{ps1,sh}`).

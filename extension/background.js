@@ -1142,7 +1142,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           try {
             const result = await Promise.race([
               dispatch(),
-              new Promise((_, rej) => setTimeout(() => rej(new Error('AI call timeout — check Ollama is running at ' + (settings.ollamaUrl || 'localhost:11434') + ' and the model "' + (settings.ollamaModel || 'gemma3:4b') + '" is pulled.')), timeoutMs))
+              new Promise((_, rej) => setTimeout(() => rej(new Error('AI call timeout — check Ollama is running at ' + (settings.ollamaUrl || 'localhost:11434') + ' and the model "' + (settings.ollamaModel || 'gemma4:e4b') + '" is pulled.')), timeoutMs))
             ]);
             sendResponse({ ok: true, result });
           } catch (e) {
@@ -1209,7 +1209,7 @@ chrome.runtime.onConnect.addListener((port) => {
       const result = await Promise.race([
         dispatch(),
         new Promise((_, rej) => setTimeout(
-          () => rej(new Error(`AI timeout (180s). Check Ollama at ${settings.ollamaUrl || 'localhost:11434'} and that "${settings.ollamaModel || 'gemma3:4b'}" is pulled.`)),
+          () => rej(new Error(`AI timeout (180s). Check Ollama at ${settings.ollamaUrl || 'localhost:11434'} and that "${settings.ollamaModel || 'gemma4:e4b'}" is pulled.`)),
           180000
         ))
       ]);

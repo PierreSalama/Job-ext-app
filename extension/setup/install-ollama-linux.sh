@@ -52,11 +52,11 @@ fi
 
 # 3. Pull the recommended model
 echo ""
-echo "[ .. ] Pulling gemma3:4b (this can take a few minutes)..."
-if ollama pull gemma3:4b; then
-    echo "[ OK ] gemma3:4b downloaded."
+echo "[ .. ] Pulling gemma4:e4b (this can take a few minutes)..."
+if ollama pull gemma4:e4b; then
+    echo "[ OK ] gemma4:e4b downloaded."
 else
-    echo "[FAIL] Failed to pull gemma3:4b."
+    echo "[FAIL] Failed to pull gemma4:e4b."
     exit 1
 fi
 

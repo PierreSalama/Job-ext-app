@@ -100,8 +100,25 @@ function handleProtocolUrl(url) {
   }
 }
 
+// v8: resolve the icon path with user-override support. The user can drop a
+// PNG/ICO at <userData>/custom-icon.png to replace the bundled one at runtime.
+// (The compiled binary's icon is baked in by the installer, but the window +
+// tray + taskbar icon are runtime-controllable.)
+function resolveAppIcon() {
+  try {
+    const custom = path.join(app.getPath('userData'), 'custom-icon.png');
+    if (require('fs').existsSync(custom)) return custom;
+  } catch {}
+  // Platform-preferred bundled icon
+  if (process.platform === 'win32') {
+    const ico = path.join(__dirname, 'icons', 'icon.ico');
+    if (require('fs').existsSync(ico)) return ico;
+  }
+  return path.join(__dirname, 'icons', 'icon128.png');
+}
+
 function createWindow() {
-  const iconPath = path.join(__dirname, 'icons', 'icon128.png');
+  const iconPath = resolveAppIcon();
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -151,11 +168,10 @@ ipcMain.handle('jat:pick-folder', async () => {
   return r.filePaths[0];
 });
 
-// v8: System tray
+// v8: System tray — uses the same icon resolver as the window so user overrides apply.
 function setupTray() {
   try {
-    const iconPath = path.join(__dirname, 'icons', 'icon.png');
-    const img = nativeImage.createFromPath(iconPath);
+    const img = nativeImage.createFromPath(resolveAppIcon());
     tray = new Tray(img.isEmpty() ? nativeImage.createEmpty() : img.resize({ width: 16, height: 16 }));
     const menu = Menu.buildFromTemplate([
       { label: 'Open Job Tracker', click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } else createWindow(); } },
@@ -187,6 +203,40 @@ function setupGlobalShortcuts() {
     console.log('[v8] global hotkey Ctrl+Shift+J registered');
   } catch (e) { console.warn('[v8] global shortcut failed:', e.message); }
 }
+
+// v8: User-customizable app icon. Renderer calls 'jat:pick-icon' to open a file
+// picker, then we copy the chosen PNG into <userData>/custom-icon.png and
+// hot-update the window + tray icons. Survives restarts.
+ipcMain.handle('jat:pick-icon', async () => {
+  if (!mainWindow) return { ok: false, error: 'No window' };
+  const r = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openFile'],
+    filters: [{ name: 'Image (PNG/ICO/JPEG)', extensions: ['png', 'ico', 'jpg', 'jpeg'] }]
+  });
+  if (r.canceled || !r.filePaths?.length) return { ok: false, canceled: true };
+  const src = r.filePaths[0];
+  const dst = path.join(app.getPath('userData'), 'custom-icon.png');
+  try {
+    require('fs').copyFileSync(src, dst);
+    const img = nativeImage.createFromPath(dst);
+    if (mainWindow && !img.isEmpty()) mainWindow.setIcon(img);
+    if (tray && !img.isEmpty()) tray.setImage(img.resize({ width: 16, height: 16 }));
+    return { ok: true, path: dst };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
+ipcMain.handle('jat:reset-icon', async () => {
+  try {
+    const dst = path.join(app.getPath('userData'), 'custom-icon.png');
+    if (require('fs').existsSync(dst)) require('fs').unlinkSync(dst);
+    const img = nativeImage.createFromPath(resolveAppIcon());
+    if (mainWindow) mainWindow.setIcon(img);
+    if (tray) tray.setImage(img.resize({ width: 16, height: 16 }));
+    return { ok: true };
+  } catch (e) { return { ok: false, error: String(e?.message || e) }; }
+});
 
 // v8: Native notification helper exposed to renderer
 ipcMain.handle('notify', (_e, { title, body, urgent }) => {

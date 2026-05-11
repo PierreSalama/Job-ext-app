@@ -28,7 +28,7 @@ const DEFAULT_SETTINGS = {
   onboardingDone: false,
   aiProvider: 'ollama',
   ollamaUrl: 'http://localhost:11434',
-  ollamaModel: 'gemma3:4b',
+  ollamaModel: 'gemma4:e4b',
   openaiBaseUrl: 'https://api.openai.com/v1',
   openaiKey: '',
   openaiModel: 'gpt-4o-mini',

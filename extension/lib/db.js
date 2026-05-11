@@ -418,7 +418,7 @@ const DEFAULT_SETTINGS = {
   // AI — Ollama (local) is the default. Gemma 3 4B if pulled, else falls back to any available model.
   aiProvider: 'ollama', // 'auto' | 'chrome' | 'ollama' | 'openai' | 'none'
   ollamaUrl: 'http://localhost:11434',
-  ollamaModel: 'gemma3:4b',
+  ollamaModel: 'gemma4:e4b',
   openaiBaseUrl: 'https://api.openai.com/v1',
   openaiKey: '',
   openaiModel: 'gpt-4o-mini',

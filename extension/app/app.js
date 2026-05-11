@@ -895,7 +895,7 @@ function welcomeOverlay() {
         <h1 style="margin:0 0 6px;font-size:24px">Welcome to Job Tracker v8</h1>
         <p style="color:var(--muted);font-size:14px;margin:0 0 20px;line-height:1.6">You're set up with the Chrome extension. Here's what to do next:</p>
         <ol style="margin:0 0 20px 20px;font-size:14px;line-height:1.8;color:var(--text)">
-          <li><strong>Connect AI</strong> (optional but powerful). Open <a href="#/ai" style="color:var(--primary)">AI Setup Wizard</a> — defaults to local Ollama with gemma3:4b.</li>
+          <li><strong>Connect AI</strong> (optional but powerful). Open <a href="#/ai" style="color:var(--primary)">AI Setup Wizard</a> — defaults to local Ollama with gemma4:e4b.</li>
           <li><strong>Start applying.</strong> Visit a job on LinkedIn, Indeed, Glassdoor, etc. The extension captures it automatically.</li>
           <li><strong>Take the interactive tour.</strong> 60+ steps walk you through every page with animated spotlights.</li>
           <li><strong>Optional: install the desktop app</strong> for durable storage, background scraping, and uninterruptible AI.</li>
@@ -1654,7 +1654,7 @@ function pageSettings() {
 
     <div class="card" style="margin-top:14px">
       <h3 style="margin-top:0;font-size:14px">✨ AI provider</h3>
-      <p style="color:var(--muted);font-size:13px;margin:0 0 10px">Default is Ollama with <strong>gemma3:4b</strong> (local, free, private). To use it: install <a href="https://ollama.com" target="_blank" rel="noreferrer" style="color:var(--primary)">Ollama</a>, then run <code style="background:var(--bg);padding:2px 6px;border-radius:4px">ollama pull gemma3:4b</code>. The extension will auto-detect when Ollama is running.</p>
+      <p style="color:var(--muted);font-size:13px;margin:0 0 10px">Default is Ollama with <strong>gemma4:e4b</strong> (local, free, private). To use it: install <a href="https://ollama.com" target="_blank" rel="noreferrer" style="color:var(--primary)">Ollama</a>, then run <code style="background:var(--bg);padding:2px 6px;border-radius:4px">ollama pull gemma4:e4b</code>. The extension will auto-detect when Ollama is running.</p>
       <div class="field"><label>Provider</label>
         <select id="s-aiProvider">
           ${['ollama', 'auto', 'chrome', 'openai', 'none'].map((v) => `<option value="${v}"${s.aiProvider === v ? ' selected' : ''}>${v}${v === 'ollama' ? ' (recommended — local)' : ''}</option>`).join('')}
@@ -1662,7 +1662,7 @@ function pageSettings() {
       </div>
       <div class="grid-2">
         <div><label>Ollama URL</label><input type="url" id="s-ollamaUrl" value="${escape(s.ollamaUrl)}" placeholder="http://localhost:11434" /></div>
-        <div><label>Ollama model</label><input type="text" id="s-ollamaModel" value="${escape(s.ollamaModel)}" placeholder="gemma3:4b" /></div>
+        <div><label>Ollama model</label><input type="text" id="s-ollamaModel" value="${escape(s.ollamaModel)}" placeholder="gemma4:e4b" /></div>
         <div><label>OpenAI base URL</label><input type="url" id="s-openaiBaseUrl" value="${escape(s.openaiBaseUrl)}" /></div>
         <div><label>OpenAI model</label><input type="text" id="s-openaiModel" value="${escape(s.openaiModel)}" /></div>
         <div style="grid-column:1/-1"><label>OpenAI API key</label><input type="text" id="s-openaiKey" value="${escape(s.openaiKey)}" placeholder="sk-…" /></div>
@@ -1745,10 +1745,10 @@ function pageAi() {
             <li>Install Ollama from <a href="https://ollama.com/download" target="_blank" rel="noreferrer" style="color:var(--primary)">ollama.com/download</a>.</li>
             <li>Pull the recommended model:</li>
           </ol>
-          ${codeBlock('ollama pull gemma3:4b')}
+          ${codeBlock('ollama pull gemma4:e4b')}
           <div style="margin-top:12px;padding:10px;border:1px dashed var(--border);border-radius:8px">
             <strong style="font-size:13px">Or run our bundled setup script</strong>
-            <p style="color:var(--muted);font-size:12px;margin:4px 0 8px">It sets <code>OLLAMA_ORIGINS=chrome-extension://*</code> and pulls <code>gemma3:4b</code> in one go.</p>
+            <p style="color:var(--muted);font-size:12px;margin:4px 0 8px">It sets <code>OLLAMA_ORIGINS=chrome-extension://*</code> and pulls <code>gemma4:e4b</code> in one go.</p>
             <div style="display:flex;gap:6px;flex-wrap:wrap">
               <a class="btn small" id="wiz-download-setup-win" href="${chrome.runtime.getURL('setup/install-ollama-windows.ps1')}" download="install-ollama-windows.ps1">⬇ Windows (.ps1)</a>
               <a class="btn small" id="wiz-download-setup-mac" href="${chrome.runtime.getURL('setup/install-ollama-mac.sh')}" download="install-ollama-mac.sh">⬇ macOS (.sh)</a>
@@ -1758,7 +1758,7 @@ function pageAi() {
           <p style="color:var(--muted);font-size:12px;margin-top:12px">Once installed, no extra setup is needed — the extension already strips the browser Origin header so Ollama accepts requests.</p>
           <div class="grid-2" style="margin-top:14px">
             <div><label>Ollama URL</label><input type="url" id="wiz-ollamaUrl" value="${escape(state.settings.ollamaUrl || 'http://localhost:11434')}" /></div>
-            <div><label>Ollama model</label><input type="text" id="wiz-ollamaModel" value="${escape(state.settings.ollamaModel || 'gemma3:4b')}" /></div>
+            <div><label>Ollama model</label><input type="text" id="wiz-ollamaModel" value="${escape(state.settings.ollamaModel || 'gemma4:e4b')}" /></div>
           </div>
           <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
             <button class="btn primary" id="wiz-save-test">Save & test connection</button>

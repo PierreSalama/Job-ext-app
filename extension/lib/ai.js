@@ -1,6 +1,6 @@
 // AI provider abstraction. Supports three providers:
 //   1. Chrome built-in Prompt API (Gemini Nano, ~3B params, on-device, free)
-//   2. Ollama local server (gemma3:4b, gemma2:2b, llama3.2, mistral, etc.)
+//   2. Ollama local server (gemma4:e4b, gemma2:2b, llama3.2, mistral, etc.)
 //   3. OpenAI-compatible HTTP endpoint (OpenAI, Together, Groq, etc.)
 //
 // All three return text (or stream chunks). The caller passes a prompt and gets
@@ -49,7 +49,7 @@ export async function detectOllama(baseUrl = 'http://localhost:11434') {
     if (!r.ok) return { available: false, reason: `Ollama HTTP ${r.status}` };
     const data = await r.json();
     const models = (data.models || []).map((m) => m.name);
-    if (models.length === 0) return { available: false, reason: 'Ollama is running but no models are pulled. Run: ollama pull gemma3:4b' };
+    if (models.length === 0) return { available: false, reason: 'Ollama is running but no models are pulled. Run: ollama pull gemma4:e4b' };
     return { available: true, status: 'ready', models, baseUrl };
   } catch (e) {
     return { available: false, reason: `Ollama not reachable at ${baseUrl} — start the Ollama app. (${e.message || e})` };
@@ -91,7 +91,7 @@ async function callChromeAI(prompt, opts = {}) {
 
 async function callOllama(prompt, opts = {}) {
   const baseUrl = opts.baseUrl || 'http://localhost:11434';
-  let model = opts.model || 'gemma3:4b';
+  let model = opts.model || 'gemma4:e4b';
   // If chosen model isn't pulled, pick first available (so user gets *something*)
   try {
     const tagsRes = await fetch(`${baseUrl}/api/tags`, { signal: AbortSignal.timeout(2000) });
@@ -176,7 +176,7 @@ export async function aiStatus(settings) {
   };
   const tryOllama = async () => {
     const r = await detectOllama(settings?.ollamaUrl);
-    return { provider: 'ollama', ...r, defaultModel: settings?.ollamaModel || 'gemma3:4b' };
+    return { provider: 'ollama', ...r, defaultModel: settings?.ollamaModel || 'gemma4:e4b' };
   };
   const tryOpenAI = async () => {
     const r = await detectOpenAI(settings?.openaiBaseUrl, settings?.openaiKey);
@@ -215,7 +215,7 @@ async function _aiPromptInner(prompt, settings = {}, opts = {}) {
     if (status.provider === 'chrome') {
       result = await callChromeAI(prompt, callOpts);
     } else if (status.provider === 'ollama') {
-      result = await callOllama(prompt, { ...callOpts, baseUrl: settings.ollamaUrl, model: opts.model || settings.ollamaModel || 'gemma3:4b' });
+      result = await callOllama(prompt, { ...callOpts, baseUrl: settings.ollamaUrl, model: opts.model || settings.ollamaModel || 'gemma4:e4b' });
     } else if (status.provider === 'openai') {
       result = await callOpenAI(prompt, { ...callOpts, baseUrl: settings.openaiBaseUrl, apiKey: settings.openaiKey, model: opts.model || settings.openaiModel || 'gpt-4o-mini' });
     } else {
@@ -717,7 +717,7 @@ export async function aiRawPrompt(prompt, opts = {}, settings = {}) {
     if (provider === 'chrome') {
       result = await callChromeAI(prompt, callOpts);
     } else if (provider === 'ollama') {
-      result = await callOllama(prompt, { ...callOpts, baseUrl: settings.ollamaUrl, model: opts.model || settings.ollamaModel || 'gemma3:4b' });
+      result = await callOllama(prompt, { ...callOpts, baseUrl: settings.ollamaUrl, model: opts.model || settings.ollamaModel || 'gemma4:e4b' });
     } else if (provider === 'openai') {
       result = await callOpenAI(prompt, { ...callOpts, baseUrl: settings.openaiBaseUrl, apiKey: settings.openaiKey, model: opts.model || settings.openaiModel || 'gpt-4o-mini' });
     } else {

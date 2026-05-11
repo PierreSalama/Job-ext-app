@@ -34,13 +34,13 @@ try {
 
 # 3. Pull the recommended model
 Write-Host ""
-Write-Host "[ .. ] Pulling gemma3:4b (this can take a few minutes)..." -ForegroundColor Cyan
+Write-Host "[ .. ] Pulling gemma4:e4b (this can take a few minutes)..." -ForegroundColor Cyan
 try {
-    & ollama pull gemma3:4b
+    & ollama pull gemma4:e4b
     if ($LASTEXITCODE -ne 0) { throw "ollama pull exited with code $LASTEXITCODE" }
-    Write-Host "[ OK ] gemma3:4b downloaded." -ForegroundColor Green
+    Write-Host "[ OK ] gemma4:e4b downloaded." -ForegroundColor Green
 } catch {
-    Write-Host "[FAIL] Failed to pull gemma3:4b: $_" -ForegroundColor Red
+    Write-Host "[FAIL] Failed to pull gemma4:e4b: $_" -ForegroundColor Red
     exit 1
 }
 

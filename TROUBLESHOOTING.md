@@ -12,8 +12,8 @@
 - Or run the bundled setup script: `extension/setup/install-ollama-windows.ps1`.
 
 **"AI timeout (180s)"**
-- The chosen model may not be pulled. Run `ollama pull gemma3:4b` (or whichever model you set in Settings).
-- Check the model size matches your hardware. `gemma3:4b` needs ~3 GB free RAM; on slower machines try `gemma3:1b`.
+- The chosen model may not be pulled. Run `ollama pull gemma4:e4b` (or whichever model you set in Settings).
+- Check the model size matches your hardware. `gemma4:e4b` needs ~3 GB free RAM; on slower machines try `gemma3:1b`.
 
 **Cover Letter / Summary button hangs forever**
 - v5 had this bug from MV3 service-worker termination. v6 uses a port-based AI channel that keeps the SW alive. If you still see hangs, reload the extension at `chrome://extensions/`.

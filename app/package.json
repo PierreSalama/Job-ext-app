@@ -27,14 +27,25 @@
       "package.json"
     ],
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "icon": "src/icons/icon.ico"
+    },
+    "nsis": {
+      "installerIcon": "src/icons/icon.ico",
+      "uninstallerIcon": "src/icons/icon.ico",
+      "installerHeaderIcon": "src/icons/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Job Application Tracker"
     },
     "mac": {
       "target": "dmg",
+      "icon": "src/icons/icon.icns",
       "category": "public.app-category.productivity"
     },
     "linux": {
       "target": "AppImage",
+      "icon": "src/icons/icon128.png",
       "category": "Office"
     },
     "publish": null

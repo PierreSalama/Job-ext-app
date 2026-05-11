@@ -193,7 +193,7 @@ async function aiStatus(settings) {
     if (!r.ok) return { provider: 'none', available: false, reason: `Ollama HTTP ${r.status}` };
     const data = await r.json();
     const models = (data.models || []).map((m) => m.name);
-    const want = settings.ollamaModel || 'gemma3:4b';
+    const want = settings.ollamaModel || 'gemma4:e4b';
     const has = models.includes(want);
     return {
       provider: 'ollama',
@@ -209,7 +209,7 @@ async function aiStatus(settings) {
 
 async function ollamaChat(settings, prompt, { format } = {}) {
   const baseUrl = settings.ollamaUrl || 'http://localhost:11434';
-  const model = settings.ollamaModel || 'gemma3:4b';
+  const model = settings.ollamaModel || 'gemma4:e4b';
   const body = {
     model, prompt, stream: false,
     options: { temperature: 0.4 }
