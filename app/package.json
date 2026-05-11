@@ -28,16 +28,15 @@
       "package.json"
     ],
     "win": {
-      "target": "nsis",
-      "icon": "src/icons/icon.ico"
+      "target": "nsis"
     },
     "mac": {
       "target": "dmg",
-      "icon": "src/icons/icon.icns"
+      "category": "public.app-category.productivity"
     },
     "linux": {
       "target": "AppImage",
-      "icon": "src/icons"
+      "category": "Office"
     }
   },
   "author": "Pierre",

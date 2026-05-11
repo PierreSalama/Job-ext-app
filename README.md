@@ -1,141 +1,63 @@
-# Job Application Tracker v7 — Lucky 7
+# Job Application Tracker v8
 
-The most ambitious version yet. **36 sidebar pages** across 7 sections. **40+ AI features.** Bundled native installers shipped inside the extension. Customizable everything. Real-time sync.
+Chrome extension + Electron desktop app that captures every job application across LinkedIn, Indeed, Glassdoor, Greenhouse, Lever, Workday, Ashby, Workable, BambooHR, and SmartRecruiters — with AI-augmented analysis, a unified pipeline, and real-time desktop sync.
 
-```
-v7/
-├── extension/      ← Chrome MV3 extension (mandatory)
-│   ├── manifest.json
-│   ├── background.js
-│   ├── content/        site adapters + autofill
-│   ├── lib/            db, ai, themes, pages, tour, sync-client
-│   ├── app/            single-page app (the dashboard)
-│   │   ├── pages/      36 page modules
-│   │   ├── motion.css  animations + density + reduced-motion
-│   │   ├── cmd-palette.js   global Cmd+K
-│   │   ├── keyboard.js      shortcuts
-│   │   ├── undo.js          undo/redo manager
-│   │   ├── csv.js           bulk import/export
-│   │   └── sidebar.js       customizable sidebar
-│   ├── popup/          rich toolbar popup
-│   ├── icons/          50 preset icons + 4 packaged sizes
-│   └── setup/          BUNDLED INSTALLERS (run from extension folder)
-│       ├── JAT-v7-setup.exe          ← Built by build-windows-installer.ps1
-│       ├── JAT-v7.pkg                ← Built by build-mac.sh
-│       ├── JAT-v7.AppImage           ← Built by build-linux.sh
-│       ├── install-ollama-*.{ps1,sh}
-│       └── install-jat-app-*.{ps1,sh}
-├── app/            ← Electron desktop companion (optional)
-│   ├── src/        same UI, chrome.* swapped for window.jat7.*
-│   ├── build/      Inno Setup .iss + native build scripts
-│   └── package.json
-├── README.md       ← you're here
-├── SETUP.md        ← step-by-step setup
-└── TROUBLESHOOTING.md
+## For end users
+
+1. Install the extension from `extension/` (Load unpacked in `chrome://extensions`).
+2. Open the extension, click **Install desktop app**.
+3. Click **⚡ Install with one click**. The native installer for your OS downloads automatically.
+4. Double-click to install. The app launches and the extension auto-pairs.
+
+No Node.js. No source code. No terminal.
+
+## For developers
+
+This repo is set up to release cross-platform installers via GitHub Actions.
+
+### Cutting a release
+
+```bash
+git tag v8.0.X
+git push origin v8.0.X
 ```
 
----
+GitHub Actions (`.github/workflows/release.yml`) automatically:
 
-## What's new in v7
+- Spins up Windows, macOS, and Linux runners in parallel
+- Builds the Electron desktop app on each platform (`npm run build`)
+- Renames artifacts to `JAT-v8-setup.exe`, `JAT-v8.dmg`, `JAT-v8.AppImage`
+- Attaches them to a GitHub Release named after the tag
 
-### Bundled native installers
-The extension folder ships `setup/JAT-v7-setup.exe` (Inno Setup), `JAT-v7.pkg` (macOS), and `JAT-v7.AppImage` (Linux). The "Install desktop app" page detects the right one for your OS and lets you run it with one click via `chrome.downloads.download`. The Inno Setup script registers a `jat7://` URL handler so the extension can launch the app directly with `chrome.tabs.create({ url: 'jat7://open' })`.
+The extension always fetches from `releases/latest/download/<file>`, so new tags instantly update the installer for every existing extension install — no extension re-deploy needed.
 
-### Customizable sidebar
-- Drag-and-drop reorder
-- Right-click for **Pin / Hide / Move up / Move down**
-- Inline section rename (double-click)
-- Live filter at the top of the sidebar
-- **Compact / Comfortable / Spacious** density toggle
-- Reset-to-defaults button
-- Saved across surfaces via WebSocket sync
+See `RELEASING.md` for the full pipeline + rationale.
 
-### Modern animations & dynamic UI
-- Page transitions (fade-in + slide-up)
-- Smooth nav active indicator that slides between items
-- Toast progress bars + slide-in/out
-- Card hover lifts
-- Skeleton loading screens
-- Theme fade transitions
-- Status pill pulses on change
-- Confetti for milestones (offer received, achievements unlocked)
-- Drop-zone overlays for files
-- Ghost-text AI completion in textareas (Tab to accept)
-- All respect `prefers-reduced-motion` and the per-user `reducedMotion` setting
+### Local development
 
-### 20 NEW AI features (in `lib/ai.js`)
-`aiMockInterview` (multi-turn) · `aiResumeScore` · `aiCoverLetterScore` · `aiRedFlagsInJob` · `aiLinkedInMessage` · `aiOptimalFollowUpTime` · `aiStarFormat` · `aiAnalyzeRejection` · `aiOfferEvaluator` · `aiCompareOffers` · `aiThankYouEmail` · `aiAnalyzeAnswerHistory` · `aiStyleConsistency` · `aiTLDRJob` · `aiCommuteImpact` · `aiWLBEstimate` · `aiCultureFit` · `aiCareerPath` · `aiInlineComplete` · `aiTagIndustry` · `aiPickResume` — plus the 14 carried over from v6.
+```bash
+# Extension — load extension/ as unpacked in chrome://extensions
+# Desktop app
+cd app
+npm install
+npm start
+```
 
-### 11 NEW pages
-`/mock-interview` Mock Interview Studio · `/offer-compare` Offer Compare · `/company-hub` Company Research Hub · `/ai-coach` AI Coach · `/negotiation` Negotiation Workshop · `/references` Reference Tracker · `/roadmap` Career Roadmap · `/daily-digest` Daily Digest · `/install-app` Install Wizard · `/bulk-tools` Bulk Tools · `/pomodoro` Pomodoro.
+### Tests
 
-### Quality-of-life (30+)
-- **Cmd+K** palette with fuzzy search across pages, jobs, contacts, commands
-- `?` keyboard-shortcut help overlay
-- `g d/j/p/s` go-to navigation
-- `n` quick-add overlay
-- `/` global search
-- `[` `]` prev/next page
-- `1–9` switch nav
-- Sortable columns on Applications
-- Multi-select with batch toolbar (delete / archive / status / export)
-- Saved views as chips
-- Pinned items at top of every list
-- Breadcrumbs on detail pages
-- Sticky page headers with scroll shadow
-- **Undo** on every destructive action (8s toast, Cmd+Z)
-- Activity heatmap on the Dashboard (365-day GitHub-style)
-- Per-page emoji favicon
-- Profile templates dropdown
-- Drag jobs onto Calendar to schedule follow-ups
-- Drag-drop file drop overlay on Documents
-- Column reorder on Kanban
+```bash
+cd extension
+node test/runner.mjs
+```
 
-### Smart automations
-- Auto-archive jobs with 90-day idle
-- Auto-create reminders from interview emails
-- Auto-detect offers and prompt status update
-- Auto-tag jobs by industry (`aiTagIndustry`)
-- Auto-pick best resume per JD (`aiPickResume`)
-- Auto-research companies on save (`aiCompanyResearch`)
-- Daily AI summary at 9am (`aiInsightsSummary`)
-- Stale-data refresh nightly
-- 5-minute health check
+161 tests cover schema, sanitization, themes, sidebar logic, page registry, and audit chain integrity.
 
-### Real-time sync
-WebSocket between extension and desktop app. Theme changes, settings, jobs, profile, documents — all flow instantly across surfaces. No refresh button.
+## Architecture
 
-### Production polish
-- Tamper-evident audit log with cryptographic signatures
-- Encrypted backup/export
-- Interactive tour
-- Onboarding tooltips on first page visit
-- Dark/light toggle next to theme picker
-- 22 themes
-- 50 icon presets + custom upload
-- 6 ATS adapters + generic JSON-LD fallback
-- Multilingual autofill (EN/FR/ES/DE/IT/PT)
+- `extension/` — Chrome MV3 extension. 48 page modules under `app/pages/`, IndexedDB v4, AI provider abstraction (`lib/ai.js`) supporting Ollama, OpenAI, and Chrome built-in AI.
+- `app/` — Electron desktop companion. SQLite via `better-sqlite3`, WebSocket sync server on `localhost:7733`, system tray, global hotkey `Ctrl+Shift+J`.
+- `.github/workflows/release.yml` — automated cross-platform installer builds.
 
----
+## License
 
-## Get started
-
-See [SETUP.md](SETUP.md) for the full walkthrough.
-
-**Short version:**
-1. `chrome://extensions` → Developer mode → Load unpacked → `v7/extension`.
-2. Click the toolbar icon → **Open dashboard** → `#/install-app` → **Run bundled installer**. Done.
-3. (Optional) Install [Ollama](https://ollama.com/download) and run `ollama pull gemma3:4b` for free local AI. The bundled scripts in `setup/install-ollama-*.{ps1,sh}` automate this for you.
-
----
-
-## Stats
-
-- **36** sidebar pages
-- **40+** AI features
-- **22** themes
-- **50** icon presets
-- **6** dedicated ATS adapters + universal generic adapter
-- **161** automated tests, all passing
-- **30+** keyboard shortcuts
-- **3** native installer targets (Windows / macOS / Linux)
+MIT — see `LICENSE.txt`.
