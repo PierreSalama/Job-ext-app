@@ -2849,6 +2849,17 @@ state.__rerender = render;
 
 // ---------- Sidebar interactions (search / add / reset / palette) ----------
 function bootSidebarChrome() {
+  // v8.0.3: show real manifest version in the sidebar brand, and route clicks
+  // to the Settings → Updates section so users have a 1-click update check.
+  try {
+    const ver = chrome.runtime.getManifest().version;
+    const bv = $('#brand-version');
+    if (bv) {
+      bv.textContent = 'v' + ver;
+      bv.style.cursor = 'pointer';
+      bv.addEventListener('click', () => { location.hash = '#/settings'; });
+    }
+  } catch {}
   const search = $('#sidebar-search');
   if (search) {
     search.addEventListener('input', () => {
