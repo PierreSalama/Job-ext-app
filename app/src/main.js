@@ -12,7 +12,7 @@ const { app, BrowserWindow, ipcMain, dialog, shell, nativeImage, Tray, Menu, glo
 const path = require('path');
 
 const { JatDb } = require('./db.js');
-const { startServer, PORT, setLocalBroadcast } = require('./server.js');
+const { startServer, PORT, setLocalBroadcast, setUpdateBridge } = require('./server.js');
 
 // v8.0.2: Auto-update via electron-updater (GitHub Releases backend).
 // Reads provider config from package.json build.publish at build time.
@@ -243,20 +243,41 @@ ipcMain.handle('jat:reset-icon', async () => {
   } catch (e) { return { ok: false, error: String(e?.message || e) }; }
 });
 
+// v8.0.5: Track the latest available update so the extension's HTTP probe
+// can report it instantly without re-asking GitHub.
+let _latestUpdate = { current: app.getVersion(), available: false, version: null, downloaded: false, downloadProgress: 0 };
+
 // v8.0.2: Auto-updater plumbing
 function setupAutoUpdater() {
   if (!autoUpdater) {
     console.warn('[v8] electron-updater not installed; skipping auto-update');
+    // Still register a stub bridge so the extension gets a clean answer.
+    setUpdateBridge({
+      status: async () => ({ current: app.getVersion(), available: false, reason: 'electron-updater not bundled' }),
+      check: async () => ({ ok: false, error: 'electron-updater not bundled' }),
+      install: () => {}
+    });
     return;
   }
   autoUpdater.autoDownload = true;          // download in background once a new version is detected
   autoUpdater.autoInstallOnAppQuit = true;  // apply on next quit/restart
   autoUpdater.on('checking-for-update', () => sendUpdateEvent('checking'));
-  autoUpdater.on('update-available', (info) => sendUpdateEvent('available', { version: info.version }));
-  autoUpdater.on('update-not-available', (info) => sendUpdateEvent('current', { version: info?.version }));
+  autoUpdater.on('update-available', (info) => {
+    _latestUpdate = { current: app.getVersion(), available: true, version: info.version, downloaded: false, downloadProgress: 0 };
+    sendUpdateEvent('available', { version: info.version });
+  });
+  autoUpdater.on('update-not-available', (info) => {
+    _latestUpdate = { current: app.getVersion(), available: false, version: info?.version || null, downloaded: false, downloadProgress: 0 };
+    sendUpdateEvent('current', { version: info?.version });
+  });
   autoUpdater.on('error', (err) => sendUpdateEvent('error', { error: String(err?.message || err) }));
-  autoUpdater.on('download-progress', (p) => sendUpdateEvent('progress', { percent: Math.round(p.percent), bps: p.bytesPerSecond }));
+  autoUpdater.on('download-progress', (p) => {
+    _latestUpdate.downloadProgress = Math.round(p.percent);
+    sendUpdateEvent('progress', { percent: Math.round(p.percent), bps: p.bytesPerSecond });
+  });
   autoUpdater.on('update-downloaded', (info) => {
+    _latestUpdate.downloaded = true;
+    _latestUpdate.version = info.version;
     sendUpdateEvent('downloaded', { version: info.version });
     if (mainWindow && !mainWindow.isDestroyed()) {
       dialog.showMessageBox(mainWindow, {
@@ -273,6 +294,22 @@ function setupAutoUpdater() {
   // Background check on startup (silent) + every 6 hours
   setTimeout(() => { autoUpdater.checkForUpdatesAndNotify().catch(() => {}); }, 5000);
   setInterval(() => { autoUpdater.checkForUpdatesAndNotify().catch(() => {}); }, 6 * 60 * 60 * 1000);
+
+  // v8.0.5: expose update controls to the HTTP server so the extension can
+  // probe and trigger updates over localhost:7733.
+  setUpdateBridge({
+    status: async () => ({ ..._latestUpdate, current: app.getVersion() }),
+    check: async () => {
+      try {
+        const r = await autoUpdater.checkForUpdates();
+        const latestVersion = r?.updateInfo?.version;
+        const available = !!latestVersion && latestVersion !== app.getVersion();
+        _latestUpdate = { ..._latestUpdate, available, version: latestVersion || _latestUpdate.version };
+        return { available, version: latestVersion, current: app.getVersion() };
+      } catch (e) { return { available: false, error: String(e?.message || e), current: app.getVersion() }; }
+    },
+    install: () => { try { autoUpdater.quitAndInstall(); } catch (e) { console.warn(e); } }
+  });
 }
 
 function sendUpdateEvent(name, data) {

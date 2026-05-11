@@ -301,12 +301,13 @@ async function load() {
     if (ss?.ok) state.syncStatus = ss.status || state.syncStatus;
   } catch {}
   // Also load Q&A and recommendations
-  const [qa, recs, docs, np, uinfo] = await Promise.all([send('list-answers'), send('list-recommendations'), send('list-documents'), send('list-named-profiles'), send('get-extension-update-info')]);
+  const [qa, recs, docs, np, uinfo, ainfo] = await Promise.all([send('list-answers'), send('list-recommendations'), send('list-documents'), send('list-named-profiles'), send('get-extension-update-info'), send('get-app-update-info')]);
   if (np?.ok) state.namedProfiles = np.items || [];
   if (qa?.ok) state.answers = qa.items || [];
   if (recs?.ok) state.recommendations = recs.items || [];
   if (docs?.ok) state.documents = docs.items || [];
   if (uinfo?.ok) state.updateInfo = uinfo.info || null;
+  if (ainfo?.ok) state.appUpdateInfo = ainfo.info || null;
   // v8 stores
   const v6Loads = await Promise.all([
     send('list-events'), send('list-reminders'), send('list-todos'),
@@ -432,6 +433,9 @@ chrome.runtime.onMessage.addListener((msg) => {
     updateSyncPill(); // pill only — no full render
   } else if (name === 'extension.update.checked') {
     state.updateInfo = { ...data, checkedAt: Date.now() };
+    scheduleRender();
+  } else if (name === 'app.update.checked') {
+    state.appUpdateInfo = { ...data, checkedAt: Date.now() };
     scheduleRender();
   } else if (name === 'namedProfiles.updated') {
     send('list-named-profiles').then((r) => { if (r?.ok) { state.namedProfiles = r.items || []; scheduleRender(); } });
@@ -1593,16 +1597,20 @@ function pageSettings() {
   const s = state.settings;
   const currentTheme = s.theme || 'midnight';
   const u = state.updateInfo || {};
+  const a = state.appUpdateInfo || {};
   const checkedAt = u.checkedAt ? new Date(u.checkedAt).toLocaleString() : 'never';
+  const aCheckedAt = a.checkedAt ? new Date(a.checkedAt).toLocaleString() : 'never';
+  const appReachable = state.appHealth?.ok || a.current;
   return `
     <div class="page-h"><div><h1>Settings</h1><div class="sub">Themes, AI providers, follow-ups, notifications.</div></div></div>
 
     <div class="card" style="margin-bottom:14px">
       <h3 style="margin-top:0;font-size:14px">⬆️ Updates</h3>
-      <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+
+      <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding-bottom:12px;border-bottom:1px solid var(--border)">
         <div style="flex:1;min-width:200px">
           <div style="font-size:13px">
-            <strong>Extension</strong>:
+            <strong>🧩 Extension</strong>:
             v${escape(chrome.runtime.getManifest().version)}
             ${u.hasUpdate ? `<span class="pill" style="background:#ef4444;color:#fff;margin-left:6px">Update available → v${escape(u.latest)}</span>` : (u.latest ? `<span class="pill" style="background:rgba(16,185,129,0.18);color:#10b981;margin-left:6px">Up to date</span>` : '')}
           </div>
@@ -1613,12 +1621,24 @@ function pageSettings() {
           ${u.hasUpdate ? `<a class="btn primary" href="${escape(u.url || '#')}" target="_blank" rel="noreferrer">Download v${escape(u.latest)}</a>` : ''}
         </div>
       </div>
-      ${u.hasUpdate ? `
-        <div style="margin-top:10px;font-size:12px;color:var(--muted);line-height:1.6">
-          To update: download the latest release, unzip, and replace your loaded extension's folder. Then click <em>Reload</em> on the extension at <code>chrome://extensions</code>.
-          The desktop app updates itself automatically — no action needed.
+
+      <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding-top:12px">
+        <div style="flex:1;min-width:200px">
+          <div style="font-size:13px">
+            <strong>🖥️ Desktop app</strong>:
+            ${appReachable ? `v${escape(a.current || '?')}` : `<span style="color:var(--muted)">not running</span>`}
+            ${a.hasUpdate ? `<span class="pill" style="background:#ef4444;color:#fff;margin-left:6px">Update available → v${escape(a.latest)}</span>` : (a.current && a.latest ? `<span class="pill" style="background:rgba(16,185,129,0.18);color:#10b981;margin-left:6px">Up to date</span>` : '')}
+            ${a.downloaded ? `<span class="pill" style="background:rgba(99,102,241,0.18);color:#6366f1;margin-left:6px">Downloaded — ready to install</span>` : (a.hasUpdate && a.downloadProgress > 0 ? `<span class="s" style="margin-left:6px;font-size:11px;color:var(--muted)">${a.downloadProgress}% downloaded…</span>` : '')}
+          </div>
+          <div class="s" style="font-size:11px;color:var(--muted);margin-top:2px">Last checked: ${escape(aCheckedAt)}</div>
         </div>
-      ` : ''}
+        <div style="display:flex;gap:6px">
+          <button class="btn" id="check-app-update-btn" ${appReachable ? '' : 'disabled'}>Check now</button>
+          ${a.hasUpdate && !a.downloaded ? `<button class="btn primary" id="trigger-app-update-btn">⬇ Download update</button>` : ''}
+          ${a.downloaded ? `<button class="btn primary" id="install-app-update-btn">🚀 Install &amp; restart</button>` : ''}
+        </div>
+      </div>
+      ${!appReachable ? `<div class="s" style="font-size:11px;color:var(--muted);margin-top:8px">Launch the desktop app to enable update controls (or <a href="#/install-app" style="color:var(--primary)">install it</a>).</div>` : ''}
     </div>
 
     <div class="card">
@@ -2191,7 +2211,7 @@ function attach() {
     toast(`Theme: ${THEMES.find((t) => t.id === id)?.name}`, 'success');
     render();
   }));
-  // v8.0.2: Manual "Check for updates" button
+  // v8.0.2: Manual "Check for updates" button (extension)
   $('#check-update-btn')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget;
     btn.disabled = true; const orig = btn.textContent; btn.textContent = 'Checking…';
@@ -2199,12 +2219,55 @@ function attach() {
       const r = await send('check-extension-update');
       if (r?.ok) {
         state.updateInfo = { current: r.current, latest: r.latest, hasUpdate: r.hasUpdate, checkedAt: Date.now(), url: r.url };
-        toast(r.hasUpdate ? `New version available: v${r.latest}` : `Up to date (v${r.current})`, r.hasUpdate ? 'success' : 'success');
+        toast(r.hasUpdate ? `New version available: v${r.latest}` : `Up to date (v${r.current})`, 'success');
         render();
       } else {
         toast(`Check failed: ${r?.error || 'unknown'}`, 'danger');
       }
     } finally { btn.disabled = false; btn.textContent = orig; }
+  });
+  // v8.0.5: Desktop app update controls
+  $('#check-app-update-btn')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; const orig = btn.textContent; btn.textContent = 'Checking…';
+    try {
+      const r = await send('check-app-update');
+      if (r?.ok) {
+        state.appUpdateInfo = { current: r.current, latest: r.latest, hasUpdate: r.hasUpdate, downloaded: r.downloaded, downloadProgress: r.downloadProgress, checkedAt: Date.now() };
+        toast(r.hasUpdate ? `Desktop app update available: v${r.latest}` : `Desktop app up to date (v${r.current})`, 'success');
+        render();
+      } else {
+        toast(`Check failed: ${r?.error || 'unknown'}`, 'danger');
+      }
+    } finally { btn.disabled = false; btn.textContent = orig; }
+  });
+  $('#trigger-app-update-btn')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; const orig = btn.textContent; btn.textContent = 'Starting download…';
+    try {
+      const r = await send('trigger-app-update-check');
+      if (r?.ok) {
+        toast(r.available ? `Downloading v${r.version}… The app will show a Restart prompt when ready.` : 'No update available.', 'success', 6000);
+        // Re-check status in a moment
+        setTimeout(() => send('check-app-update').then(() => { /* broadcast triggers render */ }), 2000);
+      } else {
+        toast(`Failed: ${r?.error || 'unknown'}`, 'danger');
+      }
+    } finally { btn.disabled = false; btn.textContent = orig; }
+  });
+  $('#install-app-update-btn')?.addEventListener('click', async (e) => {
+    if (!confirm('The desktop app will quit and re-launch with the new version. Continue?')) return;
+    const btn = e.currentTarget;
+    btn.disabled = true; const orig = btn.textContent; btn.textContent = 'Restarting…';
+    try {
+      const r = await send('install-app-update');
+      if (r?.ok) {
+        toast('Desktop app is restarting with the new version. ✨', 'success', 6000);
+      } else {
+        toast(`Install failed: ${r?.error || 'unknown'}`, 'danger');
+        btn.disabled = false; btn.textContent = orig;
+      }
+    } catch (err) { btn.disabled = false; btn.textContent = orig; }
   });
   // Settings — sidebar customization
   $('#settings-sidebar-reset')?.addEventListener('click', async () => {

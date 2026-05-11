@@ -375,17 +375,41 @@ async function silentUpdateCheck() {
     const r = await fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/releases/latest`, { headers: { Accept: 'application/vnd.github+json' } });
     if (!r.ok) return;
     const rel = await r.json();
-    const current = chrome.runtime.getManifest().version;
-    const latest = String(rel.tag_name || '').replace(/^v/, '');
-    const hasUpdate = _semverGt(latest, current);
-    await chrome.storage.local.set({ 'jat8.updateInfo': { current, latest, hasUpdate, checkedAt: Date.now(), url: rel.html_url } });
-    if (hasUpdate) {
-      try {
+    const latestTag = String(rel.tag_name || '').replace(/^v/, '');
+
+    // ----- Extension self-check -----
+    const extCurrent = chrome.runtime.getManifest().version;
+    const extHasUpdate = _semverGt(latestTag, extCurrent);
+    await chrome.storage.local.set({ 'jat8.updateInfo': { current: extCurrent, latest: latestTag, hasUpdate: extHasUpdate, checkedAt: Date.now(), url: rel.html_url } });
+
+    // ----- Desktop app check -----
+    let appCurrent = null, appHasUpdate = false, appDownloaded = false;
+    try {
+      const appBase = (settings.desktopAppUrl || 'http://localhost:7733').replace(/\/+$/, '');
+      const sr = await fetch(`${appBase}/app-update/status`, { signal: AbortSignal.timeout(1500) }).then((r) => r.json()).catch(() => null);
+      if (sr?.current) {
+        appCurrent = sr.current;
+        appHasUpdate = _semverGt(latestTag, appCurrent);
+        appDownloaded = !!sr.downloaded;
+        await chrome.storage.local.set({ 'jat8.appUpdateInfo': {
+          current: appCurrent, latest: latestTag, hasUpdate: appHasUpdate,
+          downloaded: appDownloaded, downloadProgress: sr.downloadProgress || 0, checkedAt: Date.now()
+        }});
+      }
+    } catch {}
+
+    // ----- Badge: red ! if EITHER extension or app has an update -----
+    const anyUpdate = extHasUpdate || appHasUpdate;
+    try {
+      if (anyUpdate) {
         chrome.action.setBadgeText({ text: '!' });
         chrome.action.setBadgeBackgroundColor({ color: '#ef4444' });
-      } catch {}
-      try { await broadcast('extension.update.checked', { hasUpdate, current, latest, url: rel.html_url }); } catch {}
-    }
+      } else {
+        chrome.action.setBadgeText({ text: '' });
+      }
+    } catch {}
+    try { await broadcast('extension.update.checked', { hasUpdate: extHasUpdate, current: extCurrent, latest: latestTag, url: rel.html_url }); } catch {}
+    if (appCurrent) try { await broadcast('app.update.checked', { current: appCurrent, latest: latestTag, hasUpdate: appHasUpdate, downloaded: appDownloaded }); } catch {}
   } catch {}
 }
 
@@ -957,6 +981,74 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case 'get-extension-update-info': {
           const v = await chrome.storage.local.get('jat8.updateInfo');
           sendResponse({ ok: true, info: v['jat8.updateInfo'] || null });
+          break;
+        }
+
+        // v8.0.5: Desktop-app update commands routed through the local sync
+        // server on :7733. The app's electron-updater handles the heavy lifting.
+        case 'check-app-update': {
+          try {
+            const settings = await getSettings();
+            const base = (settings.desktopAppUrl || 'http://localhost:7733').replace(/\/+$/, '');
+            // 1. Ask the app what version it has + what it knows about updates
+            const sr = await fetch(`${base}/app-update/status`).then((r) => r.json()).catch(() => null);
+            if (!sr) { sendResponse({ ok: false, error: 'Desktop app not reachable. Is it running?' }); break; }
+            // 2. Cross-check against GitHub releases (in case the app hasn't checked yet)
+            const baseUrl = settings.releasesBaseUrl || '';
+            const m = String(baseUrl).match(/github\.com\/([^\/]+)\/([^\/]+)\/releases/);
+            let ghLatest = null;
+            if (m) {
+              try {
+                const gr = await fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/releases/latest`, { headers: { Accept: 'application/vnd.github+json' } });
+                if (gr.ok) {
+                  const rel = await gr.json();
+                  ghLatest = String(rel.tag_name || '').replace(/^v/, '');
+                }
+              } catch {}
+            }
+            const current = sr.current || '0.0.0';
+            const latest = ghLatest || sr.version || current;
+            const hasUpdate = _semverGt(latest, current);
+            const info = {
+              current, latest, hasUpdate,
+              downloaded: !!sr.downloaded,
+              downloadProgress: sr.downloadProgress || 0,
+              checkedAt: Date.now()
+            };
+            await chrome.storage.local.set({ 'jat8.appUpdateInfo': info });
+            await broadcast('app.update.checked', info);
+            sendResponse({ ok: true, ...info });
+          } catch (e) { sendResponse({ ok: false, error: String(e?.message || e) }); }
+          break;
+        }
+
+        case 'get-app-update-info': {
+          const v = await chrome.storage.local.get('jat8.appUpdateInfo');
+          sendResponse({ ok: true, info: v['jat8.appUpdateInfo'] || null });
+          break;
+        }
+
+        case 'trigger-app-update-check': {
+          // Tell the running app to actively check + start downloading.
+          try {
+            const settings = await getSettings();
+            const base = (settings.desktopAppUrl || 'http://localhost:7733').replace(/\/+$/, '');
+            const r = await fetch(`${base}/app-update/check`, { method: 'POST' });
+            const j = await r.json();
+            sendResponse(j);
+          } catch (e) { sendResponse({ ok: false, error: String(e?.message || e) }); }
+          break;
+        }
+
+        case 'install-app-update': {
+          // Tell the running app to quit + apply the downloaded update.
+          try {
+            const settings = await getSettings();
+            const base = (settings.desktopAppUrl || 'http://localhost:7733').replace(/\/+$/, '');
+            const r = await fetch(`${base}/app-update/install`, { method: 'POST' });
+            const j = await r.json();
+            sendResponse(j);
+          } catch (e) { sendResponse({ ok: false, error: String(e?.message || e) }); }
           break;
         }
 

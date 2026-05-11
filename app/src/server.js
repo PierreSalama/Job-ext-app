@@ -15,7 +15,10 @@ const url = require('url');
 const crypto = require('crypto');
 
 const PORT = 7733;
-const VERSION = '5.0.0';
+// Read the actual app version from package.json so /health and /version
+// always report what the user actually has installed.
+let VERSION = '8.0.0';
+try { VERSION = require('../package.json').version; } catch {}
 
 // ---------- Minimal WebSocket implementation ----------
 // We only need short text frames (<= 65535 bytes — covers JSON event payloads).
@@ -300,6 +303,10 @@ async function aiCall(data, settings) {
 // Broadcasts an event to all WebSocket clients AND the local Electron renderer.
 let _localBroadcast = null;
 function setLocalBroadcast(fn) { _localBroadcast = fn; }
+// v8.0.5: bridge from server.js (HTTP) into main.js (electron-updater). main.js
+// installs the actual handlers when it boots so this stays decoupled.
+let _updateBridge = null;
+function setUpdateBridge(fns) { _updateBridge = fns || null; }
 function broadcastSync(name, data) {
   const msg = { type: 'event', name, data };
   wsBroadcast(msg);
@@ -404,6 +411,31 @@ function startServer(db) {
     try {
       // Health
       if (p === '/health' && req.method === 'GET') return send(res, 200, { ok: true, version: VERSION, ws: true });
+
+      // v8.0.5: explicit version endpoint for the extension's update probe
+      if (p === '/version' && req.method === 'GET') {
+        return send(res, 200, { ok: true, version: VERSION });
+      }
+
+      // v8.0.5: extension-triggered desktop-app update.
+      // GET  /app-update/status      -> { current, latest?, available? }
+      // POST /app-update/check       -> kicks off electron-updater check
+      // POST /app-update/install     -> quits and installs the staged update
+      if (p === '/app-update/status' && req.method === 'GET') {
+        if (!_updateBridge?.status) return send(res, 200, { ok: true, current: VERSION, available: false });
+        try { return send(res, 200, { ok: true, ...(await _updateBridge.status()) }); }
+        catch (e) { return send(res, 500, { ok: false, error: String(e?.message || e) }); }
+      }
+      if (p === '/app-update/check' && req.method === 'POST') {
+        if (!_updateBridge?.check) return send(res, 503, { ok: false, error: 'updater not available' });
+        try { return send(res, 200, { ok: true, ...(await _updateBridge.check()) }); }
+        catch (e) { return send(res, 500, { ok: false, error: String(e?.message || e) }); }
+      }
+      if (p === '/app-update/install' && req.method === 'POST') {
+        if (!_updateBridge?.install) return send(res, 503, { ok: false, error: 'updater not available' });
+        try { _updateBridge.install(); return send(res, 200, { ok: true, quitting: true }); }
+        catch (e) { return send(res, 500, { ok: false, error: String(e?.message || e) }); }
+      }
 
       // Pairing endpoint — extension POSTs a token to authorize itself.
       // Token is stored in app's settings store; subsequent requests include it.
@@ -593,4 +625,4 @@ function applySyncEvent(db, ev) {
   }
 }
 
-module.exports = { startServer, PORT, VERSION, setLocalBroadcast };
+module.exports = { startServer, PORT, VERSION, setLocalBroadcast, setUpdateBridge };
