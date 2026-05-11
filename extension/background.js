@@ -197,7 +197,40 @@ chrome.runtime.onInstalled.addListener(() => {
   scheduleAlarms();
   applyIconFromSettings();
   ensureSyncClient();
+  migrateSidebarDefaults();
 });
+
+// v8.0.4: when the bundled DEFAULT_SETTINGS.sidebarHidden changes, replay the
+// new default on existing installs. Compares stored sidebarDefaultsVersion vs
+// the constant in DEFAULT_SETTINGS. Also resets sidebarOrder so newly-visible
+// pages slot in. Skips pages the user has explicitly pinned.
+async function migrateSidebarDefaults() {
+  try {
+    const settings = await getSettings();
+    const TARGET = 2; // bump in lockstep with DEFAULT_SETTINGS.sidebarDefaultsVersion
+    if ((settings.sidebarDefaultsVersion || 1) >= TARGET) return;
+    // Pull the fresh default list from the same source as DEFAULT_SETTINGS by
+    // re-reading via getSettings on a wiped key (cheap shortcut: hard-code here)
+    const newHidden = [
+      'todos','threads','templates','contacts','companies','network','sources',
+      'resume-builder','cover-studio','interview-prep','salary','notes',
+      'mock-interview','company-hub','references','analytics','goals',
+      'achievements','skills','recommendations','offer-compare','negotiation',
+      'roadmap','ai','ai-lab','integrations','tour','bulk-tools','pomodoro',
+      'ai-coach','daily-digest','audit','backup','logs','fit-scores','red-flags',
+      'autopsy','tags','saved-views','health','sandbox','permissions','recipes',
+      'webhooks','voice','timeline'
+    ];
+    await patchSettings({
+      sidebarHidden: newHidden,
+      sidebarOrder: null,         // recompute from registry
+      sidebarPinned: [],          // clear pins so the new minimal set is clean
+      sidebarDefaultsVersion: TARGET
+    });
+    log.info('migrate', 'Applied v2 sidebar defaults (minimal job-tracker set)');
+    await broadcast('settings.updated', { settings: await getSettings() });
+  } catch (e) { log.warn('migrate', `sidebar defaults: ${e.message || e}`); }
+}
 // Also boot the sync client at module load — covers SW wakeups that don't
 // trigger 'activate' (e.g. cold start to handle a message).
 ensureSyncClient();

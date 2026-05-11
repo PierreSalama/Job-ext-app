@@ -1,6 +1,6 @@
 {
   "name": "jat8-app",
-  "version": "8.0.3",
+  "version": "8.0.4",
   "description": "Desktop companion for the Job Application Tracker v8 Chrome extension. System tray, native notifications, global hotkey, real-time sync on :7733.",
   "main": "src/main.js",
   "scripts": {

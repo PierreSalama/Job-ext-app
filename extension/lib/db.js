@@ -439,31 +439,35 @@ const DEFAULT_SETTINGS = {
   // Sidebar / page customization. User-editable. The default value is computed
   // from the page registry (lib/pages.js). null = "use registry default".
   sidebarOrder: null,           // null OR array of page IDs in user's chosen order
-  // v8: Aggressive default hiding. Only the core job-tracker pages are
-  // visible out of the box — every other page is one click away under
-  // "+ Add a page". Visible by default: dashboard, jobs, pipeline, calendar,
-  // reminders, todos, inbox, contacts, companies, sources, profile,
-  // documents, ai, install-app, settings.
+  // v8.0.4: Strictest possible default. Only job-application essentials are
+  // visible out of the box: Dashboard, Applications, Pipeline, Calendar,
+  // Reminders, Inbox, Profile, Documents, Install desktop app, Settings.
+  // Everything else (40+ pages) is one click away under "+ Add a page".
   sidebarHidden: [
-    // Inbox cluster (other than core inbox)
+    // Pipeline cluster — leave dashboard/jobs/pipeline/calendar/reminders only
+    'todos',
+    // Inbox cluster — leave inbox only
     'threads', 'templates',
-    // Network cluster (other than contacts/companies/sources)
-    'network',
-    // Knowledge cluster — all except profile + documents
+    // Network cluster — hide all
+    'contacts', 'companies', 'network', 'sources',
+    // Knowledge cluster — leave profile + documents only
     'resume-builder', 'cover-studio', 'interview-prep', 'salary', 'notes',
     'mock-interview', 'company-hub', 'references',
-    // Growth cluster — entirely advanced
+    // Growth cluster — hide all
     'analytics', 'goals', 'achievements', 'skills', 'recommendations',
     'offer-compare', 'negotiation', 'roadmap',
-    // Workspace cluster — except ai + install-app
-    'ai-lab', 'integrations', 'tour', 'bulk-tools', 'pomodoro',
+    // Workspace cluster — leave only install-app
+    'ai', 'ai-lab', 'integrations', 'tour', 'bulk-tools', 'pomodoro',
     'ai-coach', 'daily-digest',
-    // System cluster (other than settings)
+    // System cluster — leave settings only
     'audit', 'backup', 'logs',
-    // v8 NEW power-user pages
+    // v8 NEW power-user pages — all hidden
     'fit-scores', 'red-flags', 'autopsy', 'tags', 'saved-views', 'health',
     'sandbox', 'permissions', 'recipes', 'webhooks', 'voice', 'timeline'
   ],
+  // Migration marker — bump when defaults change. Background applies the
+  // newer hidden list when the stored value here is lower than the constant.
+  sidebarDefaultsVersion: 2,
   sidebarPinned: [],            // array of page IDs pinned to top
   sidebarSections: null,        // optional grouping {label, pageIds[]}[]
   // Tour
