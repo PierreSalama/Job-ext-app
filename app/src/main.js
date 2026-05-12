@@ -347,21 +347,91 @@ ipcMain.handle('notify', (_e, { title, body, urgent }) => {
   return false;
 });
 
+// v8.0.6: hardened boot. Every subsystem is wrapped so that a single failure
+// (port already in use, native-module ABI mismatch, corrupt db, etc.) is
+// surfaced as a friendly dialog instead of a silent process crash. The window
+// is created FIRST so users can see what failed; sub-failures degrade
+// gracefully rather than aborting the whole startup.
+function fatalDialog(title, detail, allowReinstall = true) {
+  try {
+    const buttons = allowReinstall ? ['Quit', 'Open log folder'] : ['Quit'];
+    dialog.showMessageBoxSync({
+      type: 'error',
+      title,
+      message: title,
+      detail: detail + '\n\nIf this keeps happening, run the clean-uninstall script from the Chrome extension\'s setup folder and reinstall from a fresh release.',
+      buttons,
+      defaultId: 0
+    });
+  } catch {}
+}
+
 app.whenReady().then(() => {
-  const dbPath = path.join(app.getPath('userData'), 'jat5.sqlite3');
-  db = new JatDb(dbPath);
-  server = startServer(db);
-  setLocalBroadcast(broadcastEvent);
+  // 1. Create the window FIRST (so the user has something on screen even if
+  //    sub-systems fail) — but in a try because GPU init can throw.
+  try { createWindow(); } catch (e) {
+    console.error('[v8] createWindow failed:', e);
+    fatalDialog('Window failed to open', String(e?.message || e));
+    return app.exit(1);
+  }
+
+  // 2. Open the database. If this fails it's almost always a corrupt sqlite
+  //    file or a native-module ABI mismatch from an old install. Tell the
+  //    user how to recover instead of silently crashing.
+  try {
+    const dbPath = path.join(app.getPath('userData'), 'jat5.sqlite3');
+    db = new JatDb(dbPath);
+    console.log(`[jat8] db at ${dbPath}`);
+  } catch (e) {
+    console.error('[v8] db init failed:', e);
+    fatalDialog(
+      'Could not open the local database',
+      `${String(e?.message || e)}\n\nLikely causes:\n  • Native module ABI mismatch from an old install\n  • Corrupt database file from a previous crash`
+    );
+    // Don't quit — let the user see the window and the dialog, then quit themselves.
+  }
+
+  // 3. Start the local HTTP/WS server. If port 7733 is already taken (usually
+  //    a zombie instance), this throws EADDRINUSE — catch it cleanly.
+  try {
+    if (db) {
+      server = startServer(db);
+      setLocalBroadcast(broadcastEvent);
+      console.log(`[jat8] sync server listening on :${PORT}`);
+    }
+  } catch (e) {
+    console.error('[v8] server start failed:', e);
+    const portInUse = /EADDRINUSE|address already in use/i.test(String(e?.message || e));
+    fatalDialog(
+      portInUse ? 'Port 7733 is already in use' : 'Sync server failed to start',
+      portInUse
+        ? 'Another instance of Job Application Tracker (or another app) is using port 7733.\nClose the other instance and relaunch.'
+        : String(e?.message || e)
+    );
+  }
+
   global.__jat = { db, server, broadcastEvent };
-  console.log(`[jat8] sync server listening on :${PORT} — db at ${dbPath}`);
-  createWindow();
-  setupTray();
-  setupGlobalShortcuts();
-  setupAutoUpdater();
+
+  // 4. Each optional subsystem isolated — failures degrade gracefully.
+  try { setupTray(); } catch (e) { console.warn('[v8] tray failed:', e.message); }
+  try { setupGlobalShortcuts(); } catch (e) { console.warn('[v8] hotkey failed:', e.message); }
+  try { setupAutoUpdater(); } catch (e) { console.warn('[v8] updater failed:', e.message); }
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (BrowserWindow.getAllWindows().length === 0) {
+      try { createWindow(); } catch (e) { console.error('[v8] activate createWindow failed:', e); }
+    }
   });
+}).catch((e) => {
+  console.error('[v8] whenReady failed:', e);
+  fatalDialog('App failed to initialize', String(e?.message || e), false);
+  app.exit(1);
+});
+
+// v8.0.6: catch any unhandled rejection late in startup
+process.on('uncaughtException', (e) => {
+  console.error('[v8] uncaughtException:', e);
+  try { fatalDialog('Unexpected error', String(e?.message || e), false); } catch {}
 });
 
 app.on('window-all-closed', () => {

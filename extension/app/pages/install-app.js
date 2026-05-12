@@ -168,6 +168,31 @@ export function render(state) {
           </div>
         `}
       </div>
+
+      <!-- v8.0.6: clean-slate reinstall path for users with a broken old install -->
+      <div class="card" style="margin-top:14px;border:1px solid var(--border);background:transparent">
+        <details>
+          <summary style="cursor:pointer;font-size:13px;font-weight:600">🧹 App won't open? Reset to a clean state</summary>
+          <p style="margin:8px 0 4px;font-size:12px;color:var(--muted);line-height:1.6">
+            If an older version of the desktop app is installed and crashes on launch, download the clean-uninstall script
+            for your OS, run it once, then click the install button above. It will:
+          </p>
+          <ul style="margin:4px 0 8px 18px;font-size:12px;color:var(--muted);line-height:1.6">
+            <li>Stop any running JAT processes</li>
+            <li>Run the NSIS uninstaller (Windows) or remove the app bundle (Mac/Linux)</li>
+            <li>Wipe leftover settings + database from <code>userData</code></li>
+            <li>Free port <code>7733</code></li>
+            <li>Remove desktop / Start menu shortcuts</li>
+          </ul>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <a class="btn small" href="${escape(chrome.runtime.getURL('setup/clean-uninstall-jat.ps1'))}" download="clean-uninstall-jat.ps1">⬇ Windows (.ps1)</a>
+            <a class="btn small" href="${escape(chrome.runtime.getURL('setup/clean-uninstall-jat-mac.sh'))}" download="clean-uninstall-jat-mac.sh">⬇ macOS (.sh)</a>
+            <a class="btn small" href="${escape(chrome.runtime.getURL('setup/clean-uninstall-jat-linux.sh'))}" download="clean-uninstall-jat-linux.sh">⬇ Linux (.sh)</a>
+            <button class="btn small" id="copy-uninstall-cmd">Copy run command</button>
+          </div>
+          <p style="margin:8px 0 0;font-size:11px;color:var(--muted)">Then run <code>powershell -ExecutionPolicy Bypass -File clean-uninstall-jat.ps1</code> from your Downloads folder.</p>
+        </details>
+      </div>
     ` : ''}
 
     <div class="card" style="margin-bottom:14px">
@@ -530,6 +555,17 @@ export function attach($main, ctx) {
     } finally {
       btn.disabled = false; btn.textContent = '⚡ Install with one click';
     }
+  });
+
+  // v8.0.6: copy the clean-uninstall run command
+  $main.querySelector('#copy-uninstall-cmd')?.addEventListener('click', async (e) => {
+    const os3 = state.installAppOS || detectOS();
+    const cmd = os3 === 'windows'
+      ? 'powershell -ExecutionPolicy Bypass -File clean-uninstall-jat.ps1'
+      : os3 === 'mac' ? 'bash clean-uninstall-jat-mac.sh'
+      : 'bash clean-uninstall-jat-linux.sh';
+    try { await navigator.clipboard.writeText(cmd); e.currentTarget.textContent = '✓ Copied'; setTimeout(() => { e.currentTarget.textContent = 'Copy run command'; }, 2000); }
+    catch { toast('Copy failed.', 'danger'); }
   });
 
   $main.querySelector('#launch-app')?.addEventListener('click', () => {
