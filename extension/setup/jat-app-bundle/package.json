@@ -1,7 +1,7 @@
 {
-  "name": "jat8-app",
-  "version": "8.0.0",
-  "description": "Desktop companion for the Job Application Tracker v8 Chrome extension. System tray, native notifications, global hotkey, real-time sync on :7733.",
+  "name": "jat9-app",
+  "version": "9.0.0",
+  "description": "Desktop companion for the Job Application Tracker v9 Chrome extension. System tray, native notifications, global hotkey, real-time sync on :7733.",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
@@ -21,7 +21,7 @@
     "electron-builder": "^24.13.3"
   },
   "build": {
-    "appId": "com.pierre.jat8",
+    "appId": "com.pierre.jat9",
     "productName": "Job Application Tracker",
     "files": [
       "src/**/*",

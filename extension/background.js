@@ -15,8 +15,8 @@ import { SyncClient } from './lib/sync-client.js';
 // Tamper-evident hash chain. Each entry's hash incorporates the previous
 // entry's hash so any tampering is detectable. Optionally signed with a
 // per-install ECDSA P-256 key (private key never leaves chrome.storage).
-const AUDIT_KEY_STORAGE = 'jat8.auditKeyJwk';
-const AUDIT_PUB_STORAGE = 'jat8.auditPubJwk';
+const AUDIT_KEY_STORAGE = 'jat9.auditKeyJwk';
+const AUDIT_PUB_STORAGE = 'jat9.auditPubJwk';
 let _auditKeyPromise = null;
 
 async function getOrCreateAuditKey() {
@@ -200,20 +200,20 @@ chrome.runtime.onInstalled.addListener(() => {
   migrateSidebarDefaults();
 });
 
-// v8.0.7: also run migration on every SW startup as a safety net — onInstalled
+// v9.0.0: also run migration on every SW startup as a safety net — onInstalled
 // can be missed if the extension wasn't reloaded properly. migrateSidebarDefaults
 // is idempotent (early-returns when marker already matches TARGET) so this is safe.
 migrateSidebarDefaults();
 
-// v8.0.8: fire one update check immediately on SW boot so users with an old
+// v9.0.0: fire one update check immediately on SW boot so users with an old
 // install see the prompt within seconds, not after the 6h alarm tick.
 setTimeout(() => { try { silentUpdateCheck(); } catch {} }, 3000);
 
-// v8.0.4: when the bundled DEFAULT_SETTINGS.sidebarHidden changes, replay the
+// v9.0.0: when the bundled DEFAULT_SETTINGS.sidebarHidden changes, replay the
 // new default on existing installs. Compares stored sidebarDefaultsVersion vs
 // the constant in DEFAULT_SETTINGS. Also resets sidebarOrder so newly-visible
 // pages slot in. Skips pages the user has explicitly pinned.
-// v8.0.11: OS detection in the SW context (used for picking the right
+// v9.0.0: OS detection in the SW context (used for picking the right
 // installer artifact from GitHub Releases). chrome.runtime.getPlatformInfo
 // is the canonical API in MV3.
 async function detectPlatform() {
@@ -226,7 +226,7 @@ async function detectPlatform() {
   return 'windows';
 }
 
-// v8.0.10: TARGET bumped to 4 — ultra-minimal. Hides pipeline, calendar,
+// v9.0.0: TARGET bumped to 4 — ultra-minimal. Hides pipeline, calendar,
 // reminders, inbox too. Only 6 daily essentials visible by default.
 const SIDEBAR_HIDDEN_STRICT = [
   'pipeline','calendar','reminders','todos',
@@ -245,7 +245,7 @@ const SIDEBAR_HIDDEN_STRICT = [
 async function migrateSidebarDefaults() {
   try {
     const settings = await getSettings();
-    const TARGET = 4;
+    const TARGET = 5;
     if ((settings.sidebarDefaultsVersion || 1) >= TARGET) return;
     await patchSettings({
       sidebarHidden: SIDEBAR_HIDDEN_STRICT,
@@ -262,7 +262,7 @@ async function migrateSidebarDefaults() {
   } catch (e) { log.warn('migrate', `sidebar defaults: ${e.message || e}`); }
 }
 
-// v8.0.7: manual reset handler — user can hit a button in Settings to force
+// v9.0.0: manual reset handler — user can hit a button in Settings to force
 // the sidebar back to the strict default at any time.
 async function resetSidebarToDefaults() {
   await patchSettings({
@@ -270,7 +270,7 @@ async function resetSidebarToDefaults() {
     sidebarOrder: null,
     sidebarPinned: [],
     sidebarSections: null,
-    sidebarDefaultsVersion: 4
+    sidebarDefaultsVersion: 5
   });
   await broadcast('settings.updated', { settings: await getSettings() });
   await broadcast('sidebar.reset', { sidebarHidden: SIDEBAR_HIDDEN_STRICT });
@@ -290,7 +290,7 @@ function scheduleAlarms() {
   try { chrome.alarms.create('jat-daily-summary', { periodInMinutes: 60 }); } catch {} // checks hourly, runs once at 9am
   try { chrome.alarms.create('jat-stale-refresh', { periodInMinutes: 24 * 60 }); } catch {}
   try { chrome.alarms.create('jat-health-check',  { periodInMinutes: 5 }); } catch {}
-  try { chrome.alarms.create('jat-update-check',  { periodInMinutes: 6 * 60 }); } catch {} // v8.0.2: check for updates every 6h
+  try { chrome.alarms.create('jat-update-check',  { periodInMinutes: 6 * 60 }); } catch {} // v9.0.0: check for updates every 6h
 }
 
 // ============ v8.5 auto-* alarm handlers ============
@@ -401,7 +401,7 @@ chrome.alarms?.onAlarm?.addListener(async (a) => {
   else if (a.name === 'jat-update-check')  await silentUpdateCheck();
 });
 
-// v8.0.2: semver comparison + silent update check
+// v9.0.0: semver comparison + silent update check
 function _semverGt(a, b) {
   const pa = String(a || '').split('.').map((n) => parseInt(n, 10) || 0);
   const pb = String(b || '').split('.').map((n) => parseInt(n, 10) || 0);
@@ -425,7 +425,7 @@ async function silentUpdateCheck() {
     // ----- Extension self-check -----
     const extCurrent = chrome.runtime.getManifest().version;
     const extHasUpdate = _semverGt(latestTag, extCurrent);
-    await chrome.storage.local.set({ 'jat8.updateInfo': { current: extCurrent, latest: latestTag, hasUpdate: extHasUpdate, checkedAt: Date.now(), url: rel.html_url } });
+    await chrome.storage.local.set({ 'jat9.updateInfo': { current: extCurrent, latest: latestTag, hasUpdate: extHasUpdate, checkedAt: Date.now(), url: rel.html_url } });
 
     // ----- Desktop app check -----
     let appCurrent = null, appHasUpdate = false, appDownloaded = false;
@@ -436,7 +436,7 @@ async function silentUpdateCheck() {
         appCurrent = sr.current;
         appHasUpdate = _semverGt(latestTag, appCurrent);
         appDownloaded = !!sr.downloaded;
-        await chrome.storage.local.set({ 'jat8.appUpdateInfo': {
+        await chrome.storage.local.set({ 'jat9.appUpdateInfo': {
           current: appCurrent, latest: latestTag, hasUpdate: appHasUpdate,
           downloaded: appDownloaded, downloadProgress: sr.downloadProgress || 0, checkedAt: Date.now()
         }});
@@ -879,7 +879,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case 'list-logs': sendResponse({ ok: true, items: await listLogs(data?.limit || 200) }); break;
 
-        // ============ v8 generic CRUD for new stores ============
+        // ============ v9 generic CRUD for new stores ============
         case 'list-notes':
         case 'list-salaryEntries':
         case 'list-goals':
@@ -895,7 +895,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case 'list-pomodoroSessions':
         case 'list-mockInterviews':
         case 'list-references':
-        // v8 NEW
+        // v9 NEW
         case 'list-tags':
         case 'list-savedViews':
         case 'list-fitScores':
@@ -991,7 +991,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
         }
 
-        // ============ v8 NEW HANDLERS ============
+        // ============ v9 NEW HANDLERS ============
         case 'ping': sendResponse({ ok: true, ts: Date.now() }); break;
 
         case 'reset-sidebar': {
@@ -1015,7 +1015,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             const current = chrome.runtime.getManifest().version;
             const latest = String(rel.tag_name || '').replace(/^v/, '');
             const hasUpdate = _semverGt(latest, current);
-            await chrome.storage.local.set({ 'jat8.updateInfo': { current, latest, hasUpdate, checkedAt: Date.now(), url: rel.html_url } });
+            await chrome.storage.local.set({ 'jat9.updateInfo': { current, latest, hasUpdate, checkedAt: Date.now(), url: rel.html_url } });
             await broadcast('extension.update.checked', { hasUpdate, current, latest, url: rel.html_url });
             // Badge so the user sees a dot when an update exists
             try {
@@ -1030,12 +1030,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
 
         case 'get-extension-update-info': {
-          const v = await chrome.storage.local.get('jat8.updateInfo');
-          sendResponse({ ok: true, info: v['jat8.updateInfo'] || null });
+          const v = await chrome.storage.local.get('jat9.updateInfo');
+          sendResponse({ ok: true, info: v['jat9.updateInfo'] || null });
           break;
         }
 
-        // v8.0.5: Desktop-app update commands routed through the local sync
+        // v9.0.0: Desktop-app update commands routed through the local sync
         // server on :7733. The app's electron-updater handles the heavy lifting.
         case 'check-app-update': {
           try {
@@ -1066,7 +1066,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               downloadProgress: sr.downloadProgress || 0,
               checkedAt: Date.now()
             };
-            await chrome.storage.local.set({ 'jat8.appUpdateInfo': info });
+            await chrome.storage.local.set({ 'jat9.appUpdateInfo': info });
             await broadcast('app.update.checked', info);
             sendResponse({ ok: true, ...info });
           } catch (e) { sendResponse({ ok: false, error: String(e?.message || e) }); }
@@ -1074,8 +1074,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
 
         case 'get-app-update-info': {
-          const v = await chrome.storage.local.get('jat8.appUpdateInfo');
-          sendResponse({ ok: true, info: v['jat8.appUpdateInfo'] || null });
+          const v = await chrome.storage.local.get('jat9.appUpdateInfo');
+          sendResponse({ ok: true, info: v['jat9.appUpdateInfo'] || null });
           break;
         }
 
@@ -1104,7 +1104,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
 
         case 'download-and-install-app-update': {
-          // v8.0.11: bypass electron-updater entirely. Download the installer
+          // v9.0.0: bypass electron-updater entirely. Download the installer
           // from GitHub Releases via chrome.downloads, then auto-launch it.
           // Works even if the installed app is broken/crashed.
           try {
@@ -1115,7 +1115,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
             // Pick the right asset for the user's OS
             const os = await detectPlatform();
-            const fileNames = { windows: 'JAT-v8-setup.exe', mac: 'JAT-v8.dmg', linux: 'JAT-v8.AppImage' };
+            const fileNames = { windows: 'JAT-v9-setup.exe', mac: 'JAT-v9.dmg', linux: 'JAT-v9.AppImage' };
             const fileName = fileNames[os] || fileNames.windows;
             const downloadUrl = `${base}/${fileName}`;
 
@@ -1126,7 +1126,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               version = String(rel.tag_name || '').replace(/^v/, '');
             } catch {}
 
-            // v8.0.11: try to gracefully quit the running app first if requested
+            // v9.0.0: try to gracefully quit the running app first if requested
             if (data?.quitFirst) {
               try {
                 const appBase = (settings.desktopAppUrl || 'http://localhost:7733').replace(/\/+$/, '');
@@ -1173,7 +1173,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
 
         case 'launch-downloaded-installer': {
-          // v8.0.11: page-context user-gesture wrapper for chrome.downloads.open.
+          // v9.0.0: page-context user-gesture wrapper for chrome.downloads.open.
           // The download itself runs in the background; once complete the
           // background broadcasts app.installer.ready with the downloadId,
           // and the page surfaces a "Launch installer" button that calls
@@ -1193,7 +1193,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
 
         case 'get-release-notes': {
-          // v8.0.11: fetch the latest release's markdown body so the UI can
+          // v9.0.0: fetch the latest release's markdown body so the UI can
           // surface patch notes alongside the update prompt.
           try {
             const settings = await getSettings();
@@ -1415,12 +1415,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
 
         case 'launch-app': {
-          // Launches the desktop companion via the jat8:// URL handler that
+          // Launches the desktop companion via the jat9:// URL handler that
           // the Inno Setup installer registers. Optional `data.path` lets
-          // callers deep-link (e.g. 'job/<id>' → 'jat8://job/<id>'). The
+          // callers deep-link (e.g. 'job/<id>' → 'jat9://job/<id>'). The
           // desktop app intercepts the protocol in main.js.
           const sub = (data?.path || 'open').replace(/^\/+/, '');
-          const url = `jat8://${sub}`;
+          const url = `jat9://${sub}`;
           try {
             chrome.tabs.create({ url });
             sendResponse({ ok: true, url });
@@ -1692,7 +1692,7 @@ function buildSearchUrls({ keywords, location, rationale }) {
   ];
 }
 
-// ============ Generic CRUD for v8 stores ============
+// ============ Generic CRUD for v9 stores ============
 // Handles list-X / add-X / patch-X / delete-X for a known set of stores.
 // Each mutation broadcasts X.updated to keep all extension contexts in sync.
 const V6_STORES = ['events', 'reminders', 'todos', 'messages', 'emailTemplates', 'contacts', 'companies'];

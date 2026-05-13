@@ -24,7 +24,7 @@ for p in '/Applications/Job Application Tracker.app' "$HOME/Applications/Job App
 done
 
 say 'Wiping userData...'
-for d in "$HOME/Library/Application Support/Job Application Tracker" "$HOME/Library/Application Support/jat8-app" "$HOME/Library/Preferences/com.pierre.jat8.plist" "$HOME/Library/Caches/com.pierre.jat8"; do
+for d in "$HOME/Library/Application Support/Job Application Tracker" "$HOME/Library/Application Support/jat9-app" "$HOME/Library/Preferences/com.pierre.jat9.plist" "$HOME/Library/Caches/com.pierre.jat9"; do
   [ -e "$d" ] && rm -rf "$d" && ok "deleted $d"
 done
 

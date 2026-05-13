@@ -3,7 +3,7 @@
 // app page, popup) share this same DB.
 import { sanitizeApplication, STATUS_FLOW, STATUSES, isHigherStatus } from './schema.js';
 
-const DB_NAME = 'jat8';
+const DB_NAME = 'jat9';
 const DB_VERSION = 4;
 
 const STORES = {
@@ -21,7 +21,7 @@ const STORES = {
   // The legacy single profile in chrome.storage continues to act as the "Default" mirror for back-compat.
   namedProfiles: { keyPath: 'id', indexes: [['updatedAt', 'updatedAt']] },
 
-  // ============ v8 NEW STORES ============
+  // ============ v9 NEW STORES ============
   messages: { keyPath: 'id', indexes: [['source', 'source'], ['threadId', 'threadId'], ['contactId', 'contactId'], ['receivedAt', 'receivedAt']] },
   contacts: { keyPath: 'id', indexes: [['name', 'name'], ['company', 'company'], ['source', 'source'], ['updatedAt', 'updatedAt']] },
   companies: { keyPath: 'id', indexes: [['name', 'name'], ['updatedAt', 'updatedAt']] },
@@ -54,11 +54,11 @@ const STORES = {
   savedSearches: { keyPath: 'id', indexes: [['updatedAt', 'updatedAt']] }, // Saved search chips
   pomodoroSessions: { keyPath: 'id', indexes: [['startedAt', 'startedAt'], ['day', 'day']] },
 
-  // ============ v8 stores ============
+  // ============ v9 stores ============
   mockInterviews: { keyPath: 'id', indexes: [['createdAt', 'createdAt'], ['jobId', 'jobId']] },
   references: { keyPath: 'id', indexes: [['name', 'name'], ['updatedAt', 'updatedAt']] },
 
-  // ============ v8 NEW STORES (DB v4) ============
+  // ============ v9 NEW STORES (DB v4) ============
   tags: { keyPath: 'id', indexes: [['name', 'name'], ['updatedAt', 'updatedAt']] },
   savedViews: { keyPath: 'id', indexes: [['updatedAt', 'updatedAt']] }, // saved filter combos for jobs page
   fitScores: { keyPath: 'jobId', indexes: [['score', 'score'], ['computedAt', 'computedAt']] },
@@ -400,8 +400,8 @@ export async function pushNotification({ title, body, kind = 'info', jobId = '' 
 export async function listNotifications() { return db.getAll('notifications'); }
 
 // ---------- Settings + Profile (chrome.storage.local) ----------
-const SETTINGS_KEY = 'jat8.settings';
-const PROFILE_KEY = 'jat8.profile';
+const SETTINGS_KEY = 'jat9.settings';
+const PROFILE_KEY = 'jat9.profile';
 
 const DEFAULT_SETTINGS = {
   theme: 'system', // 'light' | 'dark' | 'system'
@@ -435,16 +435,16 @@ const DEFAULT_SETTINGS = {
     { id: 'sh2', label: 'Indeed', url: 'https://www.indeed.com/' },
     { id: 'sh3', label: 'Glassdoor', url: 'https://www.glassdoor.com/Job/index.htm' }
   ],
-  // ============ v8 SETTINGS ============
+  // ============ v9 SETTINGS ============
   // Sidebar / page customization. User-editable. The default value is computed
   // from the page registry (lib/pages.js). null = "use registry default".
   sidebarOrder: null,           // null OR array of page IDs in user's chosen order
-  // v8.0.4: Strictest possible default. Only job-application essentials are
+  // v9.0.0: Strictest possible default. Only job-application essentials are
   // visible out of the box: Dashboard, Applications, Pipeline, Calendar,
   // Reminders, Inbox, Profile, Documents, Install desktop app, Settings.
   // Everything else (40+ pages) is one click away under "+ Add a page".
   sidebarHidden: [
-    // v8.0.10: ULTRA-MINIMAL default. Only the daily core remains visible.
+    // v9.0.0: ULTRA-MINIMAL default. Only the daily core remains visible.
     // Visible: dashboard, jobs, profile, documents, install-app, settings.
     // Everything else is one click away under "+ Add a page".
     'pipeline', 'calendar', 'reminders', 'todos',
@@ -467,7 +467,8 @@ const DEFAULT_SETTINGS = {
   // state in open tabs / etc.). Same hidden list, different marker = re-runs.
   // v4 (2026-05-13): tightened to ULTRA-MINIMAL — hides pipeline, calendar,
   // reminders, inbox too. Only 6 daily-essential pages visible by default.
-  sidebarDefaultsVersion: 4,
+  // v5 (v9.0.0): bump on major release so v9 re-applies for v8 upgraders.
+  sidebarDefaultsVersion: 5,
   sidebarPinned: [],            // array of page IDs pinned to top
   sidebarSections: null,        // optional grouping {label, pageIds[]}[]
   // Tour
@@ -490,7 +491,7 @@ const DEFAULT_SETTINGS = {
   density: 'comfortable', // 'compact' | 'comfortable' | 'spacious'
   fontScale: 1.0,
   shareAnonymousMetrics: false,
-  // ============ v8 NEW SETTINGS ============
+  // ============ v9 NEW SETTINGS ============
   // Auto-status inference: when emails/events are detected, auto-advance status
   autoStatusInference: true,
   // Job-fit scoring: compute and surface score on every job card

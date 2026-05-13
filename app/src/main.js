@@ -2,9 +2,9 @@
 // at src/index.html. Closing the window exits the app (no tray) — keeping
 // it minimal per the spec.
 //
-// Protocol handler: registers jat8:// at startup so the Chrome extension can
-// launch / focus / deep-link the app via chrome.tabs.create({ url: 'jat8://...' }).
-// We also enforce single-instance — a second launch (e.g. from a jat8:// click
+// Protocol handler: registers jat9:// at startup so the Chrome extension can
+// launch / focus / deep-link the app via chrome.tabs.create({ url: 'jat9://...' }).
+// We also enforce single-instance — a second launch (e.g. from a jat9:// click
 // while the app is already running) just focuses the existing window and
 // routes the URL into the renderer.
 
@@ -14,7 +14,7 @@ const path = require('path');
 const { JatDb } = require('./db.js');
 const { startServer, PORT, setLocalBroadcast, setUpdateBridge, destroyAllWs } = require('./server.js');
 
-// v8.0.2: Auto-update via electron-updater (GitHub Releases backend).
+// v9.0.0: Auto-update via electron-updater (GitHub Releases backend).
 // Reads provider config from package.json build.publish at build time.
 let autoUpdater = null;
 try { autoUpdater = require('electron-updater').autoUpdater; } catch {}
@@ -23,11 +23,11 @@ let mainWindow = null;
 let tray = null;
 let db = null;
 let server = null;
-// Stash any jat8:// URL captured before the window exists so we can route it
+// Stash any jat9:// URL captured before the window exists so we can route it
 // once the renderer is ready.
 let pendingProtocolUrl = null;
 
-// ---- Single-instance + jat8:// protocol registration ----
+// ---- Single-instance + jat9:// protocol registration ----
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
@@ -35,7 +35,7 @@ if (!gotLock) {
   app.on('second-instance', (_e, argv) => {
     // Windows / Linux: the protocol URL is somewhere in argv on the second
     // launch. Mac uses the 'open-url' event instead.
-    const url = (argv || []).find((a) => typeof a === 'string' && a.startsWith('jat8://'));
+    const url = (argv || []).find((a) => typeof a === 'string' && a.startsWith('jat9://'));
     if (url) handleProtocolUrl(url);
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
@@ -45,16 +45,16 @@ if (!gotLock) {
   });
 }
 
-// Register as default handler for jat8://. On Windows the installer also
+// Register as default handler for jat9://. On Windows the installer also
 // writes the registry key (so launching from Chrome works even when the app
 // isn't running), but doing it here keeps dev runs working too.
 try {
   if (process.defaultApp) {
     if (process.argv.length >= 2) {
-      app.setAsDefaultProtocolClient('jat8', process.execPath, [path.resolve(process.argv[1])]);
+      app.setAsDefaultProtocolClient('jat9', process.execPath, [path.resolve(process.argv[1])]);
     }
   } else {
-    app.setAsDefaultProtocolClient('jat8');
+    app.setAsDefaultProtocolClient('jat9');
   }
 } catch (e) {
   console.warn('[jat5] setAsDefaultProtocolClient failed:', e?.message || e);
@@ -71,16 +71,16 @@ app.on('open-url', (event, url) => {
 });
 
 // First-launch protocol delivery on Windows: the URL shows up in process.argv
-const initialProtocolUrl = process.argv.find((a) => typeof a === 'string' && a.startsWith('jat8://'));
+const initialProtocolUrl = process.argv.find((a) => typeof a === 'string' && a.startsWith('jat9://'));
 if (initialProtocolUrl) pendingProtocolUrl = initialProtocolUrl;
 
 function handleProtocolUrl(url) {
   // Routes:
-  //   jat8://open              → focus the window (default)
-  //   jat8://job/<id>          → focus + tell renderer to open the job detail
-  //   jat8://<other>           → focus + forward verbatim for future routes
+  //   jat9://open              → focus the window (default)
+  //   jat9://job/<id>          → focus + tell renderer to open the job detail
+  //   jat9://<other>           → focus + forward verbatim for future routes
   if (!url || typeof url !== 'string') return;
-  const stripped = url.replace(/^jat8:\/\//i, '').replace(/\/+$/, '');
+  const stripped = url.replace(/^jat9:\/\//i, '').replace(/\/+$/, '');
   console.log(`[jat5] protocol: ${url} (route="${stripped}")`);
 
   const dispatch = () => {
@@ -187,7 +187,7 @@ function setupTray() {
       { type: 'separator' },
       { label: 'Quit', click: () => app.quit() }
     ]);
-    tray.setToolTip('Job Application Tracker v8');
+    tray.setToolTip('Job Application Tracker v9');
     tray.setContextMenu(menu);
     tray.on('click', () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } else createWindow(); });
   } catch (e) { console.warn('[v8] tray setup failed:', e.message); }
@@ -243,11 +243,11 @@ ipcMain.handle('jat:reset-icon', async () => {
   } catch (e) { return { ok: false, error: String(e?.message || e) }; }
 });
 
-// v8.0.5: Track the latest available update so the extension's HTTP probe
+// v9.0.0: Track the latest available update so the extension's HTTP probe
 // can report it instantly without re-asking GitHub.
 let _latestUpdate = { current: app.getVersion(), available: false, version: null, downloaded: false, downloadProgress: 0 };
 
-// v8.0.2: Auto-updater plumbing
+// v9.0.0: Auto-updater plumbing
 function setupAutoUpdater() {
   if (!autoUpdater) {
     console.warn('[v8] electron-updater not installed; skipping auto-update');
@@ -295,7 +295,7 @@ function setupAutoUpdater() {
   setTimeout(() => { autoUpdater.checkForUpdatesAndNotify().catch(() => {}); }, 5000);
   setInterval(() => { autoUpdater.checkForUpdatesAndNotify().catch(() => {}); }, 6 * 60 * 60 * 1000);
 
-  // v8.0.5: expose update controls to the HTTP server so the extension can
+  // v9.0.0: expose update controls to the HTTP server so the extension can
   // probe and trigger updates over localhost:7733.
   setUpdateBridge({
     status: async () => ({ ..._latestUpdate, current: app.getVersion() }),
@@ -347,12 +347,12 @@ ipcMain.handle('notify', (_e, { title, body, urgent }) => {
   return false;
 });
 
-// v8.0.6: hardened boot. Every subsystem is wrapped so that a single failure
+// v9.0.0: hardened boot. Every subsystem is wrapped so that a single failure
 // (port already in use, native-module ABI mismatch, corrupt db, etc.) is
 // surfaced as a friendly dialog instead of a silent process crash. The window
 // is created FIRST so users can see what failed; sub-failures degrade
 // gracefully rather than aborting the whole startup.
-// v8.0.8: try to kill whatever process is holding the given TCP port. Used
+// v9.0.0: try to kill whatever process is holding the given TCP port. Used
 // on relaunch when a previous instance left a zombie binding port 7733.
 function tryKillPortHolder(port) {
   try {
@@ -402,7 +402,7 @@ app.whenReady().then(async () => {
   //    than just showing a fatal dialog.
   const dbPath = path.join(app.getPath('userData'), 'jat5.sqlite3');
   const tryOpenDb = () => {
-    try { db = new JatDb(dbPath); console.log(`[jat8] db at ${dbPath}`); return true; }
+    try { db = new JatDb(dbPath); console.log(`[jat9] db at ${dbPath}`); return true; }
     catch (e) { console.error('[v8] db init failed:', e); return e; }
   };
   let dbResult = tryOpenDb();
@@ -437,14 +437,14 @@ app.whenReady().then(async () => {
   //    sockets already open keep the port bound for several seconds.
   if (db) {
     const startWithRetry = async () => {
-      // v8.0.9: silent retry — no dialog flashes, no user-visible noise.
+      // v9.0.0: silent retry — no dialog flashes, no user-visible noise.
       // Try aggressively to clear the zombie port and start cleanly.
       // Only show a dialog if all attempts fail.
       for (let attempt = 1; attempt <= 8; attempt++) {
         try {
           server = startServer(db);
           setLocalBroadcast(broadcastEvent);
-          console.log(`[jat8] sync server listening on :${PORT} (attempt ${attempt})`);
+          console.log(`[jat9] sync server listening on :${PORT} (attempt ${attempt})`);
           return true;
         } catch (e) {
           const portInUse = /EADDRINUSE|address already in use/i.test(String(e?.message || e));
@@ -498,14 +498,14 @@ app.whenReady().then(async () => {
   app.exit(1);
 });
 
-// v8.0.6: catch any unhandled rejection late in startup
+// v9.0.0: catch any unhandled rejection late in startup
 process.on('uncaughtException', (e) => {
   console.error('[v8] uncaughtException:', e);
   try { fatalDialog('Unexpected error', String(e?.message || e), false); } catch {}
 });
 
 app.on('window-all-closed', () => {
-  // v8.0.9: close = quit. Previous behavior (stay in tray) confused users
+  // v9.0.0: close = quit. Previous behavior (stay in tray) confused users
   // — they thought the app was closed but it kept port 7733 bound, so the
   // next "launch" hit the single-instance lock and looked broken. macOS
   // gets the standard dock-stays-running idiom.
@@ -517,7 +517,7 @@ app.on('will-quit', () => {
 });
 
 app.on('before-quit', () => {
-  // v8.0.8: actively destroy keep-alive sockets + WS connections so port 7733
+  // v9.0.0: actively destroy keep-alive sockets + WS connections so port 7733
   // releases immediately. Without this, the WS keeps the port bound for
   // 30-60s, causing EADDRINUSE on quick relaunch (= "app breaks, reinstall").
   try {

@@ -1,4 +1,4 @@
-# Releasing JAT v8 — one-click installers for end users
+# Releasing JAT v9 — one-click installers for end users
 
 The Chrome extension is small (~1 MB), but the desktop installer is ~100 MB. We **don't** bundle the installer inside the extension. Instead, the extension downloads it from a GitHub Release on demand. End users click one button → installer downloads → they double-click. No Node.js, no source code, no terminal.
 
@@ -7,14 +7,14 @@ The Chrome extension is small (~1 MB), but the desktop installer is ~100 MB. We 
 1. **Push this repo to GitHub** (private or public — doesn't matter).
 2. **Tag a release**:
    ```bash
-   git tag v8.0.0
-   git push origin v8.0.0
+   git tag v9.0.0
+   git push origin v9.0.0
    ```
 3. GitHub Actions (`.github/workflows/release.yml`) automatically:
    - Spins up Windows + macOS + Linux runners
    - `npm install`s the desktop app dependencies on each OS
    - Runs `electron-builder` to produce native installers
-   - Renames artifacts to predictable filenames (`JAT-v8-setup.exe`, `JAT-v8.dmg`, `JAT-v8.AppImage`)
+   - Renames artifacts to predictable filenames (`JAT-v9-setup.exe`, `JAT-v9.dmg`, `JAT-v9.AppImage`)
    - Attaches them to a Release named after your tag
 4. **Set the releases URL** in the extension. Either:
    - Edit `extension/lib/db.js` and change `releasesBaseUrl` in `DEFAULT_SETTINGS`, or
@@ -40,8 +40,8 @@ The Chrome extension is small (~1 MB), but the desktop installer is ~100 MB. We 
 
 ```bash
 # Bump version in app/package.json and extension/manifest.json
-git tag v8.0.1
-git push origin v8.0.1
+git tag v9.0.0
+git push origin v9.0.0
 ```
 
 Actions rebuilds installers for all 3 OSes and attaches them to `Releases/latest`. The extension always points at `/releases/latest/download/<file>` so existing installs of the extension auto-pick up the new installer with no extension update needed.

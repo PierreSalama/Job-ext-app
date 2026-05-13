@@ -81,7 +81,7 @@ export function applyTheme(id) {
 // Subscribe to theme changes from any extension surface. Cross-surface
 // propagation works by reading chrome.storage.onChanged for the synced
 // settings blob (lib/db.js mirrors settings to chrome.storage.local under
-// 'jat8.settings' / 'jat5.settings'). The callback is invoked with the new
+// 'jat9.settings' / 'jat5.settings'). The callback is invoked with the new
 // theme id whenever it changes — call applyTheme(id) inside it.
 //
 // Returns an unsubscribe function. Safe to call from the popup, app, or
@@ -93,7 +93,7 @@ export function subscribeThemeChanges(cb) {
     if (area !== 'local') return;
     // Mirror keys used by db.js (be lenient — both v5 and v8 keys exist in the
     // wild during the migration period)
-    for (const k of ['jat8.settings', 'jat5.settings']) {
+    for (const k of ['jat9.settings', 'jat5.settings']) {
       const c = changes[k];
       if (!c) continue;
       const newTheme = c.newValue?.theme;

@@ -29,7 +29,7 @@ function Section($msg) {
     Write-Host ('=' * 60) -ForegroundColor Cyan
 }
 
-Section 'Job Application Tracker v8 — Windows installer build'
+Section 'Job Application Tracker v9 — Windows installer build'
 Write-Host "App dir       : $AppDir"
 Write-Host "Extension out : $ExtSetup"
 Write-Host "Inno script   : $IssFile"
@@ -91,7 +91,7 @@ if (-not $iscc) {
 & $iscc.Source $IssFile
 if ($LASTEXITCODE -ne 0) { throw "iscc failed (exit $LASTEXITCODE)" }
 
-$Output = Join-Path $ExtSetup 'JAT-v8-setup.exe'
+$Output = Join-Path $ExtSetup 'JAT-v9-setup.exe'
 if (Test-Path $Output) {
     $size = (Get-Item $Output).Length / 1MB
     Write-Host ''

@@ -11,7 +11,7 @@ EXT_SETUP="$REPO_DIR/extension/setup"
 
 section() { printf '\n%s\n  %s\n%s\n' "============================================================" "$1" "============================================================"; }
 
-section "Job Application Tracker v8 — Linux installer build"
+section "Job Application Tracker v9 — Linux installer build"
 echo "App dir       : $APP_DIR"
 echo "Extension out : $EXT_SETUP"
 
@@ -36,13 +36,13 @@ if [ -z "$APPIMAGE" ] && [ -z "$DEB" ]; then
 fi
 
 if [ -n "$APPIMAGE" ]; then
-  cp -f "$APPIMAGE" "$EXT_SETUP/JAT-v8.AppImage"
-  chmod +x "$EXT_SETUP/JAT-v8.AppImage" || true
-  echo "Copied $APPIMAGE -> $EXT_SETUP/JAT-v8.AppImage"
+  cp -f "$APPIMAGE" "$EXT_SETUP/JAT-v9.AppImage"
+  chmod +x "$EXT_SETUP/JAT-v9.AppImage" || true
+  echo "Copied $APPIMAGE -> $EXT_SETUP/JAT-v9.AppImage"
 fi
 if [ -n "$DEB" ]; then
-  cp -f "$DEB" "$EXT_SETUP/JAT-v8.deb"
-  echo "Copied $DEB -> $EXT_SETUP/JAT-v8.deb"
+  cp -f "$DEB" "$EXT_SETUP/JAT-v9.deb"
+  echo "Copied $DEB -> $EXT_SETUP/JAT-v9.deb"
 fi
 
 echo ""

@@ -1,4 +1,4 @@
-// Reminders — v8.0.10 rich UX: quick-pick chips, custom date+time picker,
+// Reminders — v9.0.0 rich UX: quick-pick chips, custom date+time picker,
 // optional recurrence (daily/weekly/monthly), priority, notes field. Tab-based
 // upcoming/overdue/done view with snooze + bulk actions.
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]); }

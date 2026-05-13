@@ -1,12 +1,12 @@
-name: Build & Release JAT v8 installers
+name: Build & Release JAT v9 installers
 
 # Triggers:
-#   • Push a tag like `v8.0.1` → automatic build + release
+#   • Push a tag like `v9.0.0` → automatic build + release
 #   • Manual run via "Run workflow" button on the Actions tab
 on:
   push:
     tags:
-      - 'v8.*'
+      - 'v9.*'
   workflow_dispatch:
 
 permissions:
@@ -111,7 +111,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: jat-v8-${{ matrix.label }}
+          name: jat-v9-${{ matrix.label }}
           # Include the installer AND the *.yml + *.blockmap metadata files
           # that electron-updater needs to discover new versions.
           path: |
@@ -137,31 +137,31 @@ jobs:
         run: |
           mkdir -p release
           # Windows installer + auto-updater metadata
-          if compgen -G "artifacts/jat-v8-Windows/*.exe" > /dev/null; then
-            cp artifacts/jat-v8-Windows/*.exe release/JAT-v8-setup.exe
+          if compgen -G "artifacts/jat-v9-Windows/*.exe" > /dev/null; then
+            cp artifacts/jat-v9-Windows/*.exe release/JAT-v9-setup.exe
           fi
-          if compgen -G "artifacts/jat-v8-Windows/latest.yml" > /dev/null; then
-            cp artifacts/jat-v8-Windows/latest.yml release/latest.yml
+          if compgen -G "artifacts/jat-v9-Windows/latest.yml" > /dev/null; then
+            cp artifacts/jat-v9-Windows/latest.yml release/latest.yml
           fi
-          if compgen -G "artifacts/jat-v8-Windows/*.blockmap" > /dev/null; then
-            cp artifacts/jat-v8-Windows/*.blockmap release/ 2>/dev/null || true
+          if compgen -G "artifacts/jat-v9-Windows/*.blockmap" > /dev/null; then
+            cp artifacts/jat-v9-Windows/*.blockmap release/ 2>/dev/null || true
           fi
           # macOS installer + auto-updater metadata
-          if compgen -G "artifacts/jat-v8-macOS/*.dmg" > /dev/null; then
-            cp artifacts/jat-v8-macOS/*.dmg release/JAT-v8.dmg
+          if compgen -G "artifacts/jat-v9-macOS/*.dmg" > /dev/null; then
+            cp artifacts/jat-v9-macOS/*.dmg release/JAT-v9.dmg
           fi
-          if compgen -G "artifacts/jat-v8-macOS/latest-mac.yml" > /dev/null; then
-            cp artifacts/jat-v8-macOS/latest-mac.yml release/latest-mac.yml
+          if compgen -G "artifacts/jat-v9-macOS/latest-mac.yml" > /dev/null; then
+            cp artifacts/jat-v9-macOS/latest-mac.yml release/latest-mac.yml
           fi
-          if compgen -G "artifacts/jat-v8-macOS/*.blockmap" > /dev/null; then
-            cp artifacts/jat-v8-macOS/*.blockmap release/ 2>/dev/null || true
+          if compgen -G "artifacts/jat-v9-macOS/*.blockmap" > /dev/null; then
+            cp artifacts/jat-v9-macOS/*.blockmap release/ 2>/dev/null || true
           fi
           # Linux installer + auto-updater metadata
-          if compgen -G "artifacts/jat-v8-Linux/*.AppImage" > /dev/null; then
-            cp artifacts/jat-v8-Linux/*.AppImage release/JAT-v8.AppImage
+          if compgen -G "artifacts/jat-v9-Linux/*.AppImage" > /dev/null; then
+            cp artifacts/jat-v9-Linux/*.AppImage release/JAT-v9.AppImage
           fi
-          if compgen -G "artifacts/jat-v8-Linux/latest-linux.yml" > /dev/null; then
-            cp artifacts/jat-v8-Linux/latest-linux.yml release/latest-linux.yml
+          if compgen -G "artifacts/jat-v9-Linux/latest-linux.yml" > /dev/null; then
+            cp artifacts/jat-v9-Linux/latest-linux.yml release/latest-linux.yml
           fi
           ls -la release/
 

@@ -1,4 +1,4 @@
-# Job Application Tracker v8
+# Job Application Tracker v9
 
 Chrome extension + Electron desktop app that captures every job application across LinkedIn, Indeed, Glassdoor, Greenhouse, Lever, Workday, Ashby, Workable, BambooHR, and SmartRecruiters — with AI-augmented analysis, a unified pipeline, and real-time desktop sync.
 
@@ -26,7 +26,7 @@ GitHub Actions (`.github/workflows/release.yml`) automatically:
 
 - Spins up Windows, macOS, and Linux runners in parallel
 - Builds the Electron desktop app on each platform (`npm run build`)
-- Renames artifacts to `JAT-v8-setup.exe`, `JAT-v8.dmg`, `JAT-v8.AppImage`
+- Renames artifacts to `JAT-v9-setup.exe`, `JAT-v9.dmg`, `JAT-v9.AppImage`
 - Attaches them to a GitHub Release named after the tag
 
 The extension always fetches from `releases/latest/download/<file>`, so new tags instantly update the installer for every existing extension install — no extension re-deploy needed.

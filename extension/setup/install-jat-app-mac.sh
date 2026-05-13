@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Job Application Tracker v8 — Desktop app installer (macOS)
+# Job Application Tracker v9 — Desktop app installer (macOS)
 # Checks Node, finds the app folder, runs npm install + start.
 
 set -e
@@ -7,7 +7,7 @@ cyan='\033[0;36m'; green='\033[0;32m'; yellow='\033[0;33m'; red='\033[0;31m'; re
 
 echo ""
 echo "  ┌─────────────────────────────────────────────────────┐"
-echo "  │   Job Application Tracker v8 — Desktop installer    │"
+echo "  │   Job Application Tracker v9 — Desktop installer    │"
 echo "  └─────────────────────────────────────────────────────┘"
 echo ""
 
@@ -39,7 +39,7 @@ echo -e "${green}  ✓ Xcode CLT present${reset}"
 
 # ---- Step 3: Find app folder ----
 echo ""
-echo -e "${cyan}→ Locating v8/app…${reset}"
+echo -e "${cyan}→ Locating v9/app…${reset}"
 script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 candidates=(
   "$script_dir/jat-app-bundle"
@@ -47,20 +47,20 @@ candidates=(
   "$HOME/Downloads/jat-app-bundle"
   "$script_dir/../../app"
   "$script_dir/../../../app"
-  "$(pwd)/v8/app"
+  "$(pwd)/v9/app"
   "$(pwd)/../app"
   "$(pwd)/app"
-  "$HOME/jat8/app"
-  "$HOME/Documents/jat8/app"
-  "$HOME/Desktop/jat8/app"
-  "$HOME/Downloads/jat8/app"
+  "$HOME/jat9/app"
+  "$HOME/Documents/jat9/app"
+  "$HOME/Desktop/jat9/app"
+  "$HOME/Downloads/jat9/app"
 )
 app_path=""
 for c in "${candidates[@]}"; do
   if [ -f "$c/package.json" ]; then app_path="$(cd "$c" && pwd)"; break; fi
 done
 if [ -z "$app_path" ]; then
-  read -p "  Enter the full path to v8/app: " app_path
+  read -p "  Enter the full path to v9/app: " app_path
   if [ ! -f "$app_path/package.json" ]; then
     echo -e "${red}  ✗ No package.json there. Aborting.${reset}"
     exit 1

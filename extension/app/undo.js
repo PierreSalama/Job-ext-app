@@ -7,7 +7,7 @@
 // In-memory stack is the source of truth. We mirror the most recent N entries
 // to chrome.storage.local so they survive page reloads.
 
-const STORAGE_KEY = 'jat8.undoStack';
+const STORAGE_KEY = 'jat9.undoStack';
 const MAX_STACK = 25;
 
 let stack = [];

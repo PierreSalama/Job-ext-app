@@ -11,7 +11,7 @@ EXT_SETUP="$REPO_DIR/extension/setup"
 
 section() { printf '\n%s\n  %s\n%s\n' "============================================================" "$1" "============================================================"; }
 
-section "Job Application Tracker v8 — macOS installer build"
+section "Job Application Tracker v9 — macOS installer build"
 echo "App dir       : $APP_DIR"
 echo "Extension out : $EXT_SETUP"
 
@@ -33,7 +33,7 @@ if [ -z "$PKG" ]; then
   exit 1
 fi
 
-DEST="$EXT_SETUP/JAT-v8.pkg"
+DEST="$EXT_SETUP/JAT-v9.pkg"
 cp -f "$PKG" "$DEST"
 echo "Copied $PKG"
 echo "    -> $DEST"

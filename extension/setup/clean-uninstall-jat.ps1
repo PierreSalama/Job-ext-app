@@ -31,7 +31,7 @@ if ($confirm -notmatch '^[yY]') { Write-Host 'Aborted.'; exit 0 }
 
 # ---- Step 1: Stop running processes ----
 Write-Step 'Stopping running JAT processes...'
-$names = @('Job Application Tracker', 'jat8-app', 'JAT-v8', 'electron')
+$names = @('Job Application Tracker', 'jat9-app', 'JAT-v9', 'electron')
 $killed = 0
 foreach ($n in $names) {
   Get-Process -Name $n -ErrorAction SilentlyContinue | ForEach-Object {
@@ -56,7 +56,7 @@ Start-Sleep -Seconds 1
 Write-Step 'Looking for installed app...'
 $installCandidates = @(
   "$env:LOCALAPPDATA\Programs\Job Application Tracker",
-  "$env:LOCALAPPDATA\Programs\jat8-app",
+  "$env:LOCALAPPDATA\Programs\jat9-app",
   "${env:ProgramFiles}\Job Application Tracker",
   "${env:ProgramFiles(x86)}\Job Application Tracker"
 )
@@ -99,9 +99,9 @@ foreach ($c in $installCandidates) {
 Write-Step 'Cleaning user data...'
 $userDataDirs = @(
   "$env:APPDATA\Job Application Tracker",
-  "$env:APPDATA\jat8-app",
+  "$env:APPDATA\jat9-app",
   "$env:LOCALAPPDATA\Job Application Tracker",
-  "$env:LOCALAPPDATA\jat8-app"
+  "$env:LOCALAPPDATA\jat9-app"
 )
 foreach ($d in $userDataDirs) {
   if (Test-Path $d) {
@@ -143,9 +143,9 @@ try {
   } else { Write-Info 'port 7733 already free' }
 } catch { Write-Info '(Get-NetTCPConnection unavailable; skipping)' }
 
-# ---- Step 7: Clear the protocol handler registration (jat8://) ----
+# ---- Step 7: Clear the protocol handler registration (jat9://) ----
 Write-Step 'Cleaning protocol handler...'
-$protoKeys = @('HKCU:\Software\Classes\jat8', 'HKLM:\Software\Classes\jat8')
+$protoKeys = @('HKCU:\Software\Classes\jat9', 'HKLM:\Software\Classes\jat9')
 foreach ($k in $protoKeys) {
   if (Test-Path $k) {
     try { Remove-Item -Path $k -Recurse -Force -ErrorAction Stop; Write-Ok "removed $k" }
@@ -162,7 +162,7 @@ Write-Host 'Next steps:' -ForegroundColor White
 Write-Host '  1. Open the Chrome extension'
 Write-Host '  2. Go to "Install desktop app"'
 Write-Host '  3. Click "Install with one click"'
-Write-Host '  4. The latest installer (v8.0.5+) will download'
+Write-Host '  4. The latest installer (v9.0.0+) will download'
 Write-Host '  5. Double-click it; the wizard will install fresh'
 Write-Host ''
 Read-Host 'Press Enter to exit'

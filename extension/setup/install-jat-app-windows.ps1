@@ -1,4 +1,4 @@
-# Job Application Tracker v8 - Desktop app installer (Windows)
+# Job Application Tracker v9 - Desktop app installer (Windows)
 # ASCII-only, no Unicode chars, no box-drawing - works in every PowerShell console.
 # Run from anywhere via:
 #   powershell -ExecutionPolicy Bypass -File install-jat-app-windows.ps1
@@ -14,7 +14,7 @@ function Write-Fail($msg) { Write-Host "  FAIL $msg" -ForegroundColor Red }
 
 Write-Host ""
 Write-Host "===================================================="
-Write-Host "  Job Application Tracker v8 - Desktop installer"
+Write-Host "  Job Application Tracker v9 - Desktop installer"
 Write-Host "===================================================="
 Write-Host ""
 
@@ -39,10 +39,10 @@ if ($major -lt 18) {
 }
 Write-Ok "Node.js v$nodeVer"
 
-# ---- Step 2: Locate the v8/app folder ----
+# ---- Step 2: Locate the v9/app folder ----
 Write-Host ""
-Write-Step "Locating the v8/app folder..."
-# When this script lives in v8/extension/setup/, the app is at ../../app
+Write-Step "Locating the v9/app folder..."
+# When this script lives in v9/extension/setup/, the app is at ../../app
 $candidates = @(
   # Bundled with the extension (one-click install path)
   (Join-Path $PSScriptRoot "jat-app-bundle"),
@@ -53,9 +53,9 @@ $candidates = @(
   (Join-Path (Get-Location) "v8\app"),
   (Join-Path (Get-Location) "..\app"),
   (Join-Path (Get-Location) "app"),
-  "$env:USERPROFILE\Documents\jat8\app",
-  "$env:USERPROFILE\Desktop\jat8\app",
-  "$env:USERPROFILE\Downloads\jat8\app",
+  "$env:USERPROFILE\Documents\jat9\app",
+  "$env:USERPROFILE\Desktop\jat9\app",
+  "$env:USERPROFILE\Downloads\jat9\app",
   "$env:USERPROFILE\Downloads\jat-app-bundle"
 )
 $appPath = $null
@@ -68,14 +68,14 @@ foreach ($c in $candidates) {
   }
 }
 if (-not $appPath) {
-  Write-Warn2 "Could not find the v8/app folder automatically."
+  Write-Warn2 "Could not find the v9/app folder automatically."
   Write-Host "  Tried these locations:" -ForegroundColor DarkGray
   foreach ($c in $candidates) { Write-Host "    $c" -ForegroundColor DarkGray }
   Write-Host ""
   Write-Host "  This script lives in:  $PSScriptRoot" -ForegroundColor DarkGray
   Write-Host "  Working directory:     $(Get-Location)" -ForegroundColor DarkGray
   Write-Host ""
-  $appPath = Read-Host "Enter the full path to v8/app (the folder containing package.json)"
+  $appPath = Read-Host "Enter the full path to v9/app (the folder containing package.json)"
   if (-not (Test-Path (Join-Path $appPath "package.json"))) {
     Write-Fail "No package.json found at that path. Aborting."
     Read-Host "Press Enter to exit"

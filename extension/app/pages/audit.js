@@ -118,7 +118,7 @@ export function attach($main, state) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `jat8-audit-${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `jat9-audit-${new Date().toISOString().slice(0, 10)}.json`;
     document.body.appendChild(a);
     a.click();
     a.remove();

@@ -101,7 +101,7 @@ export function render(state) {
     <div class="grid-2">
       <div class="card">
         <h3 style="margin-top:0;font-size:14px">Export</h3>
-        <p style="font-size:12px;color:var(--muted);margin:6px 0 12px">Downloads <code>jat8-backup-YYYY-MM-DD.json</code> with every IDB store and the contents of <code>chrome.storage.local</code>.</p>
+        <p style="font-size:12px;color:var(--muted);margin:6px 0 12px">Downloads <code>jat9-backup-YYYY-MM-DD.json</code> with every IDB store and the contents of <code>chrome.storage.local</code>.</p>
         <label style="display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:8px">
           <input type="checkbox" id="b-encrypt" /> Encrypt with passphrase (AES-GCM, PBKDF2 200k)
         </label>
@@ -162,7 +162,7 @@ export function attach($main, state) {
         payload = JSON.stringify(env, null, 2);
       }
       const stamp = new Date().toISOString().slice(0, 10);
-      downloadBlob(payload, `jat8-backup-${stamp}.json`);
+      downloadBlob(payload, `jat9-backup-${stamp}.json`);
       local.lastResult = `Exported ${Object.keys(snap.indexedDB).length} stores${wantEncrypt ? ' (encrypted)' : ''}.`;
     } catch (e) {
       local.lastResult = `Export failed: ${e.message || e}`;

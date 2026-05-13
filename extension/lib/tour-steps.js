@@ -15,7 +15,7 @@ export function buildDefaultTour() {
   steps.push({
     pageRoute: '/',
     selector: '.brand',
-    title: 'Welcome to Job Tracker v8',
+    title: 'Welcome to Job Tracker v9',
     body: 'This quick tour shows every page in the app. Use Next/Prev to move around — Skip exits at any time.',
     position: 'right'
   });

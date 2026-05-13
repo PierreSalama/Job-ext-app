@@ -2,9 +2,9 @@
 // at src/index.html. Closing the window exits the app (no tray) — keeping
 // it minimal per the spec.
 //
-// Protocol handler: registers jat8:// at startup so the Chrome extension can
-// launch / focus / deep-link the app via chrome.tabs.create({ url: 'jat8://...' }).
-// We also enforce single-instance — a second launch (e.g. from a jat8:// click
+// Protocol handler: registers jat9:// at startup so the Chrome extension can
+// launch / focus / deep-link the app via chrome.tabs.create({ url: 'jat9://...' }).
+// We also enforce single-instance — a second launch (e.g. from a jat9:// click
 // while the app is already running) just focuses the existing window and
 // routes the URL into the renderer.
 
@@ -18,11 +18,11 @@ let mainWindow = null;
 let tray = null;
 let db = null;
 let server = null;
-// Stash any jat8:// URL captured before the window exists so we can route it
+// Stash any jat9:// URL captured before the window exists so we can route it
 // once the renderer is ready.
 let pendingProtocolUrl = null;
 
-// ---- Single-instance + jat8:// protocol registration ----
+// ---- Single-instance + jat9:// protocol registration ----
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
@@ -30,7 +30,7 @@ if (!gotLock) {
   app.on('second-instance', (_e, argv) => {
     // Windows / Linux: the protocol URL is somewhere in argv on the second
     // launch. Mac uses the 'open-url' event instead.
-    const url = (argv || []).find((a) => typeof a === 'string' && a.startsWith('jat8://'));
+    const url = (argv || []).find((a) => typeof a === 'string' && a.startsWith('jat9://'));
     if (url) handleProtocolUrl(url);
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
@@ -40,16 +40,16 @@ if (!gotLock) {
   });
 }
 
-// Register as default handler for jat8://. On Windows the installer also
+// Register as default handler for jat9://. On Windows the installer also
 // writes the registry key (so launching from Chrome works even when the app
 // isn't running), but doing it here keeps dev runs working too.
 try {
   if (process.defaultApp) {
     if (process.argv.length >= 2) {
-      app.setAsDefaultProtocolClient('jat8', process.execPath, [path.resolve(process.argv[1])]);
+      app.setAsDefaultProtocolClient('jat9', process.execPath, [path.resolve(process.argv[1])]);
     }
   } else {
-    app.setAsDefaultProtocolClient('jat8');
+    app.setAsDefaultProtocolClient('jat9');
   }
 } catch (e) {
   console.warn('[jat5] setAsDefaultProtocolClient failed:', e?.message || e);
@@ -66,16 +66,16 @@ app.on('open-url', (event, url) => {
 });
 
 // First-launch protocol delivery on Windows: the URL shows up in process.argv
-const initialProtocolUrl = process.argv.find((a) => typeof a === 'string' && a.startsWith('jat8://'));
+const initialProtocolUrl = process.argv.find((a) => typeof a === 'string' && a.startsWith('jat9://'));
 if (initialProtocolUrl) pendingProtocolUrl = initialProtocolUrl;
 
 function handleProtocolUrl(url) {
   // Routes:
-  //   jat8://open              → focus the window (default)
-  //   jat8://job/<id>          → focus + tell renderer to open the job detail
-  //   jat8://<other>           → focus + forward verbatim for future routes
+  //   jat9://open              → focus the window (default)
+  //   jat9://job/<id>          → focus + tell renderer to open the job detail
+  //   jat9://<other>           → focus + forward verbatim for future routes
   if (!url || typeof url !== 'string') return;
-  const stripped = url.replace(/^jat8:\/\//i, '').replace(/\/+$/, '');
+  const stripped = url.replace(/^jat9:\/\//i, '').replace(/\/+$/, '');
   console.log(`[jat5] protocol: ${url} (route="${stripped}")`);
 
   const dispatch = () => {
@@ -166,7 +166,7 @@ function setupTray() {
       { type: 'separator' },
       { label: 'Quit', click: () => app.quit() }
     ]);
-    tray.setToolTip('Job Application Tracker v8');
+    tray.setToolTip('Job Application Tracker v9');
     tray.setContextMenu(menu);
     tray.on('click', () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } else createWindow(); });
   } catch (e) { console.warn('[v8] tray setup failed:', e.message); }
@@ -207,7 +207,7 @@ app.whenReady().then(() => {
   server = startServer(db);
   setLocalBroadcast(broadcastEvent);
   global.__jat = { db, server, broadcastEvent };
-  console.log(`[jat8] sync server listening on :${PORT} — db at ${dbPath}`);
+  console.log(`[jat9] sync server listening on :${PORT} — db at ${dbPath}`);
   createWindow();
   setupTray();
   setupGlobalShortcuts();

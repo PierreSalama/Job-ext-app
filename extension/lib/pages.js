@@ -130,7 +130,7 @@ export const PAGES = [
   { id: 'pomodoro',      route: '/pomodoro',      label: 'Pomodoro',      icon: '🍅', section: 'workspace', v6New: true,
     description: 'Focus timer with daily session tracking.' },
 
-  // ===== v8 NEW PAGES =====
+  // ===== v9 NEW PAGES =====
   { id: 'fit-scores',  route: '/fit-scores',  label: 'Fit Scores',     icon: '🎯', section: 'growth', v8New: true,
     description: 'Per-job AI-computed match score with explanation and skill gap.' },
   { id: 'red-flags',   route: '/red-flags',   label: 'JD Red Flags',   icon: '🚩', section: 'pipeline', v8New: true,

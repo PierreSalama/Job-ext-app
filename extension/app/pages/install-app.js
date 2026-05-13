@@ -4,9 +4,9 @@
 // scripts as a manual route. Polls the local sync server every 2s to detect
 // when the app comes online, then walks the user through pairing.
 //
-// Bundled installers live at chrome-extension://<id>/setup/JAT-v8-setup.exe
-// (Windows), JAT-v8.pkg (macOS), JAT-v8.AppImage / JAT-v8.deb (Linux).
-// Built by v8/app/build/build-*.{ps1,sh}.
+// Bundled installers live at chrome-extension://<id>/setup/JAT-v9-setup.exe
+// (Windows), JAT-v9.pkg (macOS), JAT-v9.AppImage / JAT-v9.deb (Linux).
+// Built by v9/app/build/build-*.{ps1,sh}.
 
 // Note: no markdown import — pure HTML page, no rendered markdown.
 
@@ -62,20 +62,20 @@ const RUN_COMMANDS = {
 // Map an OS to the prebuilt-installer artifact(s) we ship in setup/.
 // Linux has two — we prefer AppImage but expose both if present.
 const BUNDLED_INSTALLERS = {
-  windows: [{ file: 'setup/JAT-v8-setup.exe', label: 'Windows installer (.exe)', hint: 'Double-click after the download finishes.' }],
-  mac:     [{ file: 'setup/JAT-v8.pkg',       label: 'macOS installer (.pkg)',   hint: 'Double-click after the download finishes.' }],
+  windows: [{ file: 'setup/JAT-v9-setup.exe', label: 'Windows installer (.exe)', hint: 'Double-click after the download finishes.' }],
+  mac:     [{ file: 'setup/JAT-v9.pkg',       label: 'macOS installer (.pkg)',   hint: 'Double-click after the download finishes.' }],
   linux:   [
-    { file: 'setup/JAT-v8.AppImage', label: 'Linux AppImage', hint: 'After download: chmod +x JAT-v8.AppImage && ./JAT-v8.AppImage' },
-    { file: 'setup/JAT-v8.deb',      label: 'Debian/Ubuntu .deb',  hint: 'After download: sudo dpkg -i JAT-v8.deb' }
+    { file: 'setup/JAT-v9.AppImage', label: 'Linux AppImage', hint: 'After download: chmod +x JAT-v9.AppImage && ./JAT-v9.AppImage' },
+    { file: 'setup/JAT-v9.deb',      label: 'Debian/Ubuntu .deb',  hint: 'After download: sudo dpkg -i JAT-v9.deb' }
   ]
 };
 
 // v8: GitHub Releases artifacts — looked up via settings.releasesBaseUrl.
 // File naming matches what .github/workflows/release.yml produces.
 const RELEASE_FILES = {
-  windows: { name: 'JAT-v8-setup.exe', label: 'Windows installer (.exe)', hint: 'Double-click after the download finishes.' },
-  mac:     { name: 'JAT-v8.dmg',       label: 'macOS disk image (.dmg)',  hint: 'Open the DMG and drag the app to Applications.' },
-  linux:   { name: 'JAT-v8.AppImage',  label: 'Linux AppImage',           hint: 'chmod +x then ./JAT-v8.AppImage' }
+  windows: { name: 'JAT-v9-setup.exe', label: 'Windows installer (.exe)', hint: 'Double-click after the download finishes.' },
+  mac:     { name: 'JAT-v9.dmg',       label: 'macOS disk image (.dmg)',  hint: 'Open the DMG and drag the app to Applications.' },
+  linux:   { name: 'JAT-v9.AppImage',  label: 'Linux AppImage',           hint: 'chmod +x then ./JAT-v9.AppImage' }
 };
 
 // Probe GitHub Releases for the OS-specific installer. Returns { url, label, hint } or null.
@@ -134,7 +134,7 @@ export function render(state) {
       </div>
       <div style="display:flex;gap:6px;align-items:center">
         <span class="pill ${status.ok ? 'offer' : 'rejected'}">${status.ok ? '✓ App detected' : '⚠ App not running'}</span>
-        ${paired ? `<button class="btn primary" id="launch-app" title="Open the desktop app via the jat8:// URL handler">🚀 Launch app</button>` : ''}
+        ${paired ? `<button class="btn primary" id="launch-app" title="Open the desktop app via the jat9:// URL handler">🚀 Launch app</button>` : ''}
         <button class="btn" id="reinstall-app-btn" title="Downloads the latest installer to re-install over the existing app">🔁 Reinstall app</button>
       </div>
     </div>
@@ -170,7 +170,7 @@ export function render(state) {
         `}
       </div>
 
-      <!-- v8.0.6: clean-slate reinstall path for users with a broken old install -->
+      <!-- v9.0.0: clean-slate reinstall path for users with a broken old install -->
       <div class="card" style="margin-top:14px;border:1px solid var(--border);background:transparent">
         <details>
           <summary style="cursor:pointer;font-size:13px;font-weight:600">🧹 App won't open? Reset to a clean state</summary>
@@ -265,7 +265,7 @@ export function render(state) {
               <div style="display:flex;align-items:center;gap:10px;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg)">
                 <div style="flex:1">
                   <strong style="display:block;font-size:13px">${escape(SCRIPT_PATHS[os].split('/').pop())}</strong>
-                  <small style="color:var(--muted);font-size:11px">Auto-detects your <code>v8/app</code> folder, runs npm install, starts the app.</small>
+                  <small style="color:var(--muted);font-size:11px">Auto-detects your <code>v9/app</code> folder, runs npm install, starts the app.</small>
                 </div>
                 <a class="btn primary" href="${escape(scriptUrl)}" download="${escape(SCRIPT_PATHS[os].split('/').pop())}">⬇ Download script</a>
               </div>
@@ -306,8 +306,8 @@ export function render(state) {
         <details style="margin-top:10px">
           <summary style="cursor:pointer;color:var(--primary);font-size:13px">Manual install (clone & npm)</summary>
           <div style="padding:10px;font-size:13px;color:var(--muted)">
-            <p>Clone or copy the <code>v8/app/</code> directory anywhere, then:</p>
-            <pre style="background:var(--bg);padding:10px;border-radius:6px;font-size:12px">cd v8/app
+            <p>Clone or copy the <code>v9/app/</code> directory anywhere, then:</p>
+            <pre style="background:var(--bg);padding:10px;border-radius:6px;font-size:12px">cd v9/app
 npm install
 npm start</pre>
             <p>The <code>postinstall</code> hook runs <code>electron-rebuild</code> automatically to compile <code>better-sqlite3</code> against Electron's Node version.</p>
@@ -377,7 +377,7 @@ export function attach($main, ctx) {
         if (r.health.ok && (state.installAppStep || 1) < 4) {
           state.installAppStep = 4; stepChanged = true;
         }
-        // v8.0.7: rerender ONLY when ok flips or step changes. The 'reason'
+        // v9.0.0: rerender ONLY when ok flips or step changes. The 'reason'
         // text flaps between transient strings (ECONNREFUSED / timeout etc.)
         // when the app is offline; rerendering on every flap was the
         // user-visible "page refreshes itself" bug.
@@ -496,7 +496,7 @@ export function attach($main, ctx) {
         rerender();
         return;
       }
-      // Path 2: bundled installer (setup/JAT-v8-setup.exe etc.)
+      // Path 2: bundled installer (setup/JAT-v9-setup.exe etc.)
       btn.textContent = '⬇ Checking bundle…';
       const installers = await probeBundled(os2);
       if (installers.length > 0) {
@@ -560,7 +560,7 @@ export function attach($main, ctx) {
     }
   });
 
-  // v8.0.6: copy the clean-uninstall run command
+  // v9.0.0: copy the clean-uninstall run command
   $main.querySelector('#copy-uninstall-cmd')?.addEventListener('click', async (e) => {
     const os3 = state.installAppOS || detectOS();
     const cmd = os3 === 'windows'
@@ -571,7 +571,7 @@ export function attach($main, ctx) {
     catch { toast('Copy failed.', 'danger'); }
   });
 
-  // v8.0.9: one-click reinstall — downloads latest installer over the existing one.
+  // v9.0.0: one-click reinstall — downloads latest installer over the existing one.
   $main.querySelector('#reinstall-app-btn')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget;
     const os2 = state.installAppOS || detectOS();

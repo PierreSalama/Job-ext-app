@@ -774,20 +774,20 @@ describe('v5 · profile-hint coverage (LinkedIn / Indeed labels)', (it) => {
   }
 });
 
-// ============ v8 NEW SURFACE TESTS ============
+// ============ v9 NEW SURFACE TESTS ============
 import { readFileSync as _rfs7 } from 'node:fs';
-const _v8manifest = JSON.parse(_rfs7(new URL('../manifest.json', import.meta.url)));
+const _v9manifest = JSON.parse(_rfs7(new URL('../manifest.json', import.meta.url)));
 
-describe('v8 · manifest', (it) => {
-  it('declares the v8 name + version', () => {
-    assert.match(_v8manifest.name, /v8/);
-    assert.match(_v8manifest.version, /^8\./);
+describe('v9 · manifest', (it) => {
+  it('declares the v9 name + version', () => {
+    assert.match(_v9manifest.name, /v9/);
+    assert.match(_v9manifest.version, /^9\./);
   });
   it('has the downloads permission for bundled installers', () => {
-    assert.ok((_v8manifest.permissions || []).includes('downloads'));
+    assert.ok((_v9manifest.permissions || []).includes('downloads'));
   });
   it('exposes setup/* in web_accessible_resources', () => {
-    const resources = (_v8manifest.web_accessible_resources || []).flatMap((r) => r.resources || []);
+    const resources = (_v9manifest.web_accessible_resources || []).flatMap((r) => r.resources || []);
     assert.ok(resources.some((r) => r.startsWith('setup/')));
   });
 });
@@ -815,7 +815,7 @@ describe('v8 · page registry', (it) => {
     assert.ok(sb.find((p) => p.id === 'analytics'));
     assert.ok(!sb.find((p) => p.id === 'logs'));
   });
-  it('install-app + new v8 pages are registered', () => {
+  it('install-app + new v9 pages are registered', () => {
     for (const id of ['install-app', 'mock-interview', 'offer-compare', 'company-hub', 'ai-coach', 'negotiation', 'references', 'roadmap', 'daily-digest']) {
       assert.ok(pageByIdV7(id), `Missing page: ${id}`);
     }

@@ -16,20 +16,20 @@ read -p 'Wipe app + all settings/database? (y/N) ' confirm
 [[ ! $confirm =~ ^[yY]$ ]] && { echo Aborted.; exit 0; }
 
 say 'Stopping running processes...'
-pkill -f 'JAT-v8\|jat8-app\|Job Application Tracker' 2>/dev/null && ok 'killed' || warn 'none running'
+pkill -f 'JAT-v9\|jat9-app\|Job Application Tracker' 2>/dev/null && ok 'killed' || warn 'none running'
 
 say 'Removing AppImage(s)...'
-for p in "$HOME/Applications/JAT-v8.AppImage" "$HOME/Downloads/JAT-v8.AppImage" "/opt/JAT-v8.AppImage"; do
+for p in "$HOME/Applications/JAT-v9.AppImage" "$HOME/Downloads/JAT-v9.AppImage" "/opt/JAT-v9.AppImage"; do
   [ -f "$p" ] && rm -f "$p" && ok "deleted $p"
 done
 
 say 'Wiping userData...'
-for d in "$HOME/.config/Job Application Tracker" "$HOME/.config/jat8-app" "$HOME/.cache/Job Application Tracker"; do
+for d in "$HOME/.config/Job Application Tracker" "$HOME/.config/jat9-app" "$HOME/.cache/Job Application Tracker"; do
   [ -e "$d" ] && rm -rf "$d" && ok "deleted $d"
 done
 
 say 'Removing desktop shortcut...'
-for f in "$HOME/.local/share/applications/jat8-app.desktop" "$HOME/.local/share/applications/job-application-tracker.desktop"; do
+for f in "$HOME/.local/share/applications/jat9-app.desktop" "$HOME/.local/share/applications/job-application-tracker.desktop"; do
   [ -f "$f" ] && rm -f "$f" && ok "deleted $f"
 done
 

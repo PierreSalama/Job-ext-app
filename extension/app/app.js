@@ -35,7 +35,7 @@ import * as pTour from './pages/tour.js';
 import * as pInstallApp from './pages/install-app.js';
 import * as pBulkTools from './pages/bulk-tools.js';
 import * as pPomodoro from './pages/pomodoro.js';
-// v8 pages
+// v9 pages
 import * as pMockInterview from './pages/mock-interview.js';
 import * as pOfferCompare from './pages/offer-compare.js';
 import * as pCompanyHub from './pages/company-hub.js';
@@ -44,7 +44,7 @@ import * as pNegotiation from './pages/negotiation.js';
 import * as pReferences from './pages/references.js';
 import * as pRoadmap from './pages/roadmap.js';
 import * as pDailyDigest from './pages/daily-digest.js';
-// v8 NEW pages
+// v9 NEW pages
 import * as pFitScores from './pages/fit-scores.js';
 import * as pRedFlags from './pages/red-flags.js';
 import * as pAutopsy from './pages/autopsy.js';
@@ -89,7 +89,7 @@ const PAGE_RENDERERS = {
   '/install-app':      pInstallApp,
   '/bulk-tools':       pBulkTools,
   '/pomodoro':         pPomodoro,
-  // v8 pages
+  // v9 pages
   '/mock-interview':   pMockInterview,
   '/offer-compare':    pOfferCompare,
   '/company-hub':      pCompanyHub,
@@ -98,7 +98,7 @@ const PAGE_RENDERERS = {
   '/references':       pReferences,
   '/roadmap':          pRoadmap,
   '/daily-digest':     pDailyDigest,
-  // v8 NEW pages
+  // v9 NEW pages
   '/fit-scores':       pFitScores,
   '/red-flags':        pRedFlags,
   '/autopsy':          pAutopsy,
@@ -220,7 +220,7 @@ const state = {
   namedProfiles: [],
   aiErrors: {},
   syncStatus: { healthy: false, connected: false },
-  // v8 stores
+  // v9 stores
   events: [],
   reminders: [],
   todos: [],
@@ -308,7 +308,7 @@ async function load() {
   if (docs?.ok) state.documents = docs.items || [];
   if (uinfo?.ok) state.updateInfo = uinfo.info || null;
   if (ainfo?.ok) state.appUpdateInfo = ainfo.info || null;
-  // v8 stores
+  // v9 stores
   const v6Loads = await Promise.all([
     send('list-events'), send('list-reminders'), send('list-todos'),
     send('list-messages'), send('list-emailTemplates'),
@@ -351,14 +351,14 @@ async function load() {
     if (ps?.ok) state.pomodoroSessions = ps.items || [];
     if (ds?.ok) state.dailySummaries = ds.items || [];
   } catch {}
-  // v8 stores
+  // v9 stores
   try {
     const v8Loads = await Promise.all([send('list-mockInterviews'), send('list-references')]);
     const [mi, rf] = v8Loads;
     if (mi?.ok) state.mockInterviews = mi.items || [];
     if (rf?.ok) state.references = rf.items || [];
   } catch {}
-  // ===== v8 NEW STORES =====
+  // ===== v9 NEW STORES =====
   try {
     const v8Loads2 = await Promise.all([
       send('list-tags'), send('list-savedViews'), send('list-fitScores'),
@@ -375,7 +375,7 @@ async function load() {
   } catch {}
   render();
 
-  // v8.0.8: kick off an immediate update check on every app load so users with
+  // v9.0.0: kick off an immediate update check on every app load so users with
   // an outdated extension OR an outdated desktop app see the prompt within
   // seconds. Runs in parallel, doesn't block the initial render. Each call
   // broadcasts (extension|app).update.checked which the listener picks up and
@@ -383,7 +383,7 @@ async function load() {
   (async () => {
     try { await send('check-extension-update'); } catch {}
     try { await send('check-app-update'); } catch {}
-    // v8.0.11: also fetch the release notes once so the "What's new" expander
+    // v9.0.0: also fetch the release notes once so the "What's new" expander
     // works without a separate user action.
     try {
       const rn = await send('get-release-notes');
@@ -411,9 +411,9 @@ window.addEventListener('hashchange', setRoute);
 // apply + webhook fire) coalesces into one re-render, not 4. Also: only render
 // if the active route actually shows this store's data.
 let _renderTimer = null;
-let _lastRenderedRoute = null; // v8.0.10: only animate on route changes
+let _lastRenderedRoute = null; // v9.0.0: only animate on route changes
 
-// v8.0.10: which settings keys matter for the visible page. Changes to other
+// v9.0.0: which settings keys matter for the visible page. Changes to other
 // keys (seenTips, dismissedDesktopPromo, tourLastStep, lastUpdateCheckAt, etc.)
 // shouldn't trigger a full re-render — those fired multiple "visible refreshes"
 // after every minor click.
@@ -455,7 +455,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     refreshSummary();
     scheduleRender();
   } else if (name === 'settings.updated') {
-    // v8.0.10: only rerender when something visible changed. Tip-dismissals
+    // v9.0.0: only rerender when something visible changed. Tip-dismissals
     // / followup-due updates / etc. don't need a full re-render — they
     // were causing visible "page refreshes" after every minor click.
     const prev = state.settings || {};
@@ -486,7 +486,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     toast(`Installer download failed: ${data.error || 'unknown'}`, 'danger', 8000);
     scheduleRender();
   } else if (name === 'sidebar.reset') {
-    // v8.0.7: background just force-reset the sidebar — pull fresh settings
+    // v9.0.0: background just force-reset the sidebar — pull fresh settings
     // and rerender so the user immediately sees the minimal sidebar.
     send('get-settings').then((r) => {
       if (r?.ok) { state.settings = r.settings || state.settings; scheduleRender(); }
@@ -617,7 +617,7 @@ function render() {
   else if (state.route === '/sources') html = pageSources();
   else if (PAGE_RENDERERS[state.route]) {
     activePageModule = PAGE_RENDERERS[state.route];
-    // v8.0.10: error boundary — a single page module's throw should NOT blank
+    // v9.0.0: error boundary — a single page module's throw should NOT blank
     // the entire app. Surface the error inline + a "Back to Dashboard" exit.
     try { html = activePageModule.render(state); }
     catch (err) {
@@ -651,7 +651,7 @@ function render() {
   if (state.appHealth?.ok && state.route !== '/install-app') {
     // Subtle "synced" pill in sidebar would be nicer; skip top banner when paired
   }
-  // v8.0.8: prominent UPDATE-AVAILABLE banner — top of every page so users
+  // v9.0.0: prominent UPDATE-AVAILABLE banner — top of every page so users
   // with an old extension OR old desktop app see the prompt immediately.
   const eu = state.updateInfo || {};
   const au = state.appUpdateInfo || {};
@@ -678,7 +678,7 @@ function render() {
   try { renderBreadcrumbs(); } catch {}
   try { applyPageFavicon(); } catch {}
   try { renderProfileSwitcher(); } catch {}
-  // v8.0.10: page-enter animation ONLY on route changes — not on every render.
+  // v9.0.0: page-enter animation ONLY on route changes — not on every render.
   // Previously: dismissing a tip / saving a setting fired a broadcast → render
   // → 400ms slide-in animation replayed, looking like "the page refreshed twice".
   if (!document.body.classList.contains('reduced-motion') && _lastRenderedRoute !== state.route) {
@@ -744,7 +744,7 @@ function render() {
       toast(`Page attach failed: ${e.message || e}`, 'danger', 6000);
     }
   }
-  // v8.0.10: error-boundary retry button
+  // v9.0.0: error-boundary retry button
   $('#retry-page-render')?.addEventListener('click', () => render());
 }
 
@@ -991,7 +991,7 @@ function welcomeOverlay() {
     <div class="welcome-overlay" id="welcome-overlay" style="position:fixed;inset:0;background:rgba(0,0,0,0.7);backdrop-filter:blur(8px);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px">
       <div class="card" style="max-width:560px;width:100%;padding:32px;border:1px solid var(--primary)">
         <div style="font-size:48px;margin-bottom:8px">👋</div>
-        <h1 style="margin:0 0 6px;font-size:24px">Welcome to Job Tracker v8</h1>
+        <h1 style="margin:0 0 6px;font-size:24px">Welcome to Job Tracker v9</h1>
         <p style="color:var(--muted);font-size:14px;margin:0 0 20px;line-height:1.6">You're set up with the Chrome extension. Here's what to do next:</p>
         <ol style="margin:0 0 20px 20px;font-size:14px;line-height:1.8;color:var(--text)">
           <li><strong>Connect AI</strong> (optional but powerful). Open <a href="#/ai" style="color:var(--primary)">AI Setup Wizard</a> — defaults to local Ollama with gemma4:e4b.</li>
@@ -1023,7 +1023,7 @@ function desktopAppPromoCard() {
           </p>
           <div style="font-size:12px;color:var(--muted);margin-bottom:12px"><strong>3-step setup:</strong></div>
           <ol style="margin:0 0 12px 20px;font-size:13px;line-height:1.7;color:var(--text)">
-            <li>In a terminal: <code style="background:var(--bg);padding:2px 6px;border-radius:4px;font-family:ui-monospace,Consolas,monospace">cd v8/app</code></li>
+            <li>In a terminal: <code style="background:var(--bg);padding:2px 6px;border-radius:4px;font-family:ui-monospace,Consolas,monospace">cd v9/app</code></li>
             <li><code style="background:var(--bg);padding:2px 6px;border-radius:4px;font-family:ui-monospace,Consolas,monospace">npm install</code> (one-time)</li>
             <li><code style="background:var(--bg);padding:2px 6px;border-radius:4px;font-family:ui-monospace,Consolas,monospace">npm start</code> — extension auto-detects within 5s</li>
           </ol>
@@ -2322,7 +2322,7 @@ function attach() {
     toast(`Theme: ${THEMES.find((t) => t.id === id)?.name}`, 'success');
     render();
   }));
-  // v8.0.7: Reset sidebar button
+  // v9.0.0: Reset sidebar button
   $('#reset-sidebar-btn')?.addEventListener('click', async (e) => {
     if (!confirm('Reset the sidebar to the job-tracker minimum (10 visible pages)? Hidden pages can be re-added at any time via "+ Add a page".')) return;
     const btn = e.currentTarget;
@@ -2337,7 +2337,7 @@ function attach() {
     } finally { btn.disabled = false; btn.textContent = orig; }
   });
 
-  // v8.0.2: Manual "Check for updates" button (extension)
+  // v9.0.0: Manual "Check for updates" button (extension)
   $('#check-update-btn')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget;
     btn.disabled = true; const orig = btn.textContent; btn.textContent = 'Checking…';
@@ -2352,7 +2352,7 @@ function attach() {
       }
     } finally { btn.disabled = false; btn.textContent = orig; }
   });
-  // v8.0.5: Desktop app update controls
+  // v9.0.0: Desktop app update controls
   $('#check-app-update-btn')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget;
     btn.disabled = true; const orig = btn.textContent; btn.textContent = 'Checking…';
@@ -2367,12 +2367,12 @@ function attach() {
       }
     } finally { btn.disabled = false; btn.textContent = orig; }
   });
-  // v8.0.11: "Download update" now grabs the installer directly from GitHub
+  // v9.0.0: "Download update" now grabs the installer directly from GitHub
   // via chrome.downloads.download (same path as "Install with one click"),
   // then auto-launches it. We no longer depend on electron-updater inside a
   // possibly-broken old app to apply the update. Works even if the running
   // desktop app is crashed / hung.
-  // v8.0.11: launch the already-downloaded installer (called within a fresh
+  // v9.0.0: launch the already-downloaded installer (called within a fresh
   // user gesture so chrome.downloads.open() is allowed)
   $('#launch-installer-btn')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget;
@@ -2515,7 +2515,7 @@ function attach() {
   });
   $('#copy-app-cmd')?.addEventListener('click', async () => {
     try {
-      await navigator.clipboard.writeText('cd v8/app && npm install && npm start');
+      await navigator.clipboard.writeText('cd v9/app && npm install && npm start');
       toast('Commands copied. Paste into a terminal.', 'success');
     } catch { toast('Copy failed — copy manually from the card.', 'danger'); }
   });
@@ -3061,7 +3061,7 @@ state.__rerender = render;
 
 // ---------- Sidebar interactions (search / add / reset / palette) ----------
 function bootSidebarChrome() {
-  // v8.0.3: show real manifest version in the sidebar brand, and route clicks
+  // v9.0.0: show real manifest version in the sidebar brand, and route clicks
   // to the Settings → Updates section so users have a 1-click update check.
   try {
     const ver = chrome.runtime.getManifest().version;

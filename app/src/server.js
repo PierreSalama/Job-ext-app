@@ -17,7 +17,7 @@ const crypto = require('crypto');
 const PORT = 7733;
 // Read the actual app version from package.json so /health and /version
 // always report what the user actually has installed.
-let VERSION = '8.0.0';
+let VERSION = '9.0.0';
 try { VERSION = require('../package.json').version; } catch {}
 
 // ---------- Minimal WebSocket implementation ----------
@@ -292,7 +292,7 @@ async function aiCall(data, settings) {
       } catch { return { queries: [], raw: text }; }
     }
     case 'nudges': {
-      // v8.0.9: MISSING case — caller got generic text and UI crashed.
+      // v9.0.0: MISSING case — caller got generic text and UI crashed.
       // Returns an array of { jobId, reason, priority } so the dashboard
       // can render the "AI nudges" card correctly.
       const jobs = (data.jobs || []).filter((j) => !['offer','rejected','withdrawn','archived'].includes(j.status));
@@ -324,7 +324,7 @@ async function aiCall(data, settings) {
 // Broadcasts an event to all WebSocket clients AND the local Electron renderer.
 let _localBroadcast = null;
 function setLocalBroadcast(fn) { _localBroadcast = fn; }
-// v8.0.5: bridge from server.js (HTTP) into main.js (electron-updater). main.js
+// v9.0.0: bridge from server.js (HTTP) into main.js (electron-updater). main.js
 // installs the actual handlers when it boots so this stays decoupled.
 let _updateBridge = null;
 function setUpdateBridge(fns) { _updateBridge = fns || null; }
@@ -413,7 +413,7 @@ async function dispatchRpc(db, msg) {
     case 'ai-status': return { ok: true, status: await aiStatus(db.getSettings()) };
     case 'ai-call': {
       try {
-        // v8.0.9: hard cap so a hung Ollama / model never makes the UI
+        // v9.0.0: hard cap so a hung Ollama / model never makes the UI
         // appear frozen forever. 90s is plenty for any single feature.
         const result = await Promise.race([
           aiCall(data, db.getSettings()),
@@ -435,7 +435,7 @@ function startServer(db) {
     const u = url.parse(req.url, true);
     const p = u.pathname;
 
-    // v8.0.7: detect ANY contact from a chrome-extension origin (not just
+    // v9.0.0: detect ANY contact from a chrome-extension origin (not just
     // /sync/event POSTs) and flip extensionEverConnected. This dismisses the
     // "Install Chrome Extension" promo as soon as the extension has touched
     // the app — the user installed JAT via the extension, so showing the
@@ -465,12 +465,12 @@ function startServer(db) {
         return send(res, 200, { ok: true, version: VERSION, ws: true });
       }
 
-      // v8.0.5: explicit version endpoint for the extension's update probe
+      // v9.0.0: explicit version endpoint for the extension's update probe
       if (p === '/version' && req.method === 'GET') {
         return send(res, 200, { ok: true, version: VERSION });
       }
 
-      // v8.0.5: extension-triggered desktop-app update.
+      // v9.0.0: extension-triggered desktop-app update.
       // GET  /app-update/status      -> { current, latest?, available? }
       // POST /app-update/check       -> kicks off electron-updater check
       // POST /app-update/install     -> quits and installs the staged update
@@ -678,7 +678,7 @@ function applySyncEvent(db, ev) {
   }
 }
 
-// v8.0.8: actively destroy all WS sockets before shutdown so the OS releases
+// v9.0.0: actively destroy all WS sockets before shutdown so the OS releases
 // the listening port immediately. Call from main.js before-quit, BEFORE
 // server.close(). Without this, the WS connection from the extension keeps
 // port 7733 bound for ~30-60s, causing EADDRINUSE on quick relaunch.
