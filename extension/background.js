@@ -213,6 +213,19 @@ setTimeout(() => { try { silentUpdateCheck(); } catch {} }, 3000);
 // new default on existing installs. Compares stored sidebarDefaultsVersion vs
 // the constant in DEFAULT_SETTINGS. Also resets sidebarOrder so newly-visible
 // pages slot in. Skips pages the user has explicitly pinned.
+// v8.0.11: OS detection in the SW context (used for picking the right
+// installer artifact from GitHub Releases). chrome.runtime.getPlatformInfo
+// is the canonical API in MV3.
+async function detectPlatform() {
+  try {
+    const info = await new Promise((res) => chrome.runtime.getPlatformInfo(res));
+    if (info.os === 'win') return 'windows';
+    if (info.os === 'mac') return 'mac';
+    if (info.os === 'linux' || info.os === 'android' || info.os === 'cros') return 'linux';
+  } catch {}
+  return 'windows';
+}
+
 // v8.0.10: TARGET bumped to 4 — ultra-minimal. Hides pipeline, calendar,
 // reminders, inbox too. Only 6 daily essentials visible by default.
 const SIDEBAR_HIDDEN_STRICT = [
@@ -1086,6 +1099,118 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             const r = await fetch(`${base}/app-update/install`, { method: 'POST' });
             const j = await r.json();
             sendResponse(j);
+          } catch (e) { sendResponse({ ok: false, error: String(e?.message || e) }); }
+          break;
+        }
+
+        case 'download-and-install-app-update': {
+          // v8.0.11: bypass electron-updater entirely. Download the installer
+          // from GitHub Releases via chrome.downloads, then auto-launch it.
+          // Works even if the installed app is broken/crashed.
+          try {
+            const settings = await getSettings();
+            const base = (settings.releasesBaseUrl || '').replace(/\/+$/, '');
+            const m = String(base).match(/github\.com\/([^\/]+)\/([^\/]+)\/releases/);
+            if (!m) { sendResponse({ ok: false, error: 'releasesBaseUrl not configured' }); break; }
+
+            // Pick the right asset for the user's OS
+            const os = await detectPlatform();
+            const fileNames = { windows: 'JAT-v8-setup.exe', mac: 'JAT-v8.dmg', linux: 'JAT-v8.AppImage' };
+            const fileName = fileNames[os] || fileNames.windows;
+            const downloadUrl = `${base}/${fileName}`;
+
+            // Fetch latest tag for messaging
+            let version = '';
+            try {
+              const rel = await fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/releases/latest`, { headers: { Accept: 'application/vnd.github+json' } }).then((r) => r.json());
+              version = String(rel.tag_name || '').replace(/^v/, '');
+            } catch {}
+
+            // v8.0.11: try to gracefully quit the running app first if requested
+            if (data?.quitFirst) {
+              try {
+                const appBase = (settings.desktopAppUrl || 'http://localhost:7733').replace(/\/+$/, '');
+                await fetch(`${appBase}/app-update/install`, { method: 'POST', signal: AbortSignal.timeout(1500) }).catch(() => {});
+              } catch {}
+            }
+
+            // Download the installer
+            const downloadId = await new Promise((resolve, reject) => {
+              chrome.downloads.download(
+                { url: downloadUrl, filename: fileName, saveAs: false, conflictAction: 'overwrite' },
+                (id) => {
+                  const err = chrome.runtime.lastError;
+                  if (err || !id) reject(new Error(err?.message || 'download failed'));
+                  else resolve(id);
+                }
+              );
+            });
+
+            // Broadcast started so the UI can show a progress chip immediately.
+            broadcast('app.installer.downloading', { downloadId, version, fileName });
+
+            // When the download finishes, broadcast 'ready' so the page can
+            // surface a "🚀 Launch installer" button. We can't call
+            // chrome.downloads.open() inside onChanged (no user gesture).
+            const onChanged = (delta) => {
+              if (delta.id !== downloadId) return;
+              if (delta.state?.current === 'complete') {
+                chrome.downloads.onChanged.removeListener(onChanged);
+                broadcast('app.installer.ready', { downloadId, version, fileName });
+                // Optional: try to auto-open — many Chrome versions allow it
+                // when initiated from a recent user gesture. Failure is fine.
+                try { chrome.downloads.open(downloadId); } catch {}
+              } else if (delta.state?.current === 'interrupted') {
+                chrome.downloads.onChanged.removeListener(onChanged);
+                broadcast('app.installer.failed', { error: delta.error?.current || 'download interrupted', fileName });
+              }
+            };
+            chrome.downloads.onChanged.addListener(onChanged);
+
+            sendResponse({ ok: true, downloadId, version, fileName, opened: false });
+          } catch (e) { sendResponse({ ok: false, error: String(e?.message || e) }); }
+          break;
+        }
+
+        case 'launch-downloaded-installer': {
+          // v8.0.11: page-context user-gesture wrapper for chrome.downloads.open.
+          // The download itself runs in the background; once complete the
+          // background broadcasts app.installer.ready with the downloadId,
+          // and the page surfaces a "Launch installer" button that calls
+          // here within a fresh user gesture, satisfying Chrome's policy.
+          try {
+            if (data?.id) chrome.downloads.open(data.id);
+            else if (data?.fileName) {
+              // Fallback: search recent downloads by filename and open the
+              // most recent one. Useful if the page's reference is stale.
+              chrome.downloads.search({ filename: data.fileName, orderBy: ['-startTime'], limit: 1 }, (items) => {
+                if (items && items[0]) chrome.downloads.open(items[0].id);
+              });
+            }
+            sendResponse({ ok: true });
+          } catch (e) { sendResponse({ ok: false, error: String(e?.message || e) }); }
+          break;
+        }
+
+        case 'get-release-notes': {
+          // v8.0.11: fetch the latest release's markdown body so the UI can
+          // surface patch notes alongside the update prompt.
+          try {
+            const settings = await getSettings();
+            const base = settings.releasesBaseUrl || '';
+            const m = String(base).match(/github\.com\/([^\/]+)\/([^\/]+)\/releases/);
+            if (!m) { sendResponse({ ok: false, error: 'releasesBaseUrl not set' }); break; }
+            const r = await fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/releases/latest`, { headers: { Accept: 'application/vnd.github+json' } });
+            if (!r.ok) { sendResponse({ ok: false, error: `HTTP ${r.status}` }); break; }
+            const rel = await r.json();
+            sendResponse({
+              ok: true,
+              tag: rel.tag_name,
+              name: rel.name || rel.tag_name,
+              publishedAt: rel.published_at,
+              body: rel.body || '',
+              url: rel.html_url
+            });
           } catch (e) { sendResponse({ ok: false, error: String(e?.message || e) }); }
           break;
         }

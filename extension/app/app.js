@@ -383,6 +383,12 @@ async function load() {
   (async () => {
     try { await send('check-extension-update'); } catch {}
     try { await send('check-app-update'); } catch {}
+    // v8.0.11: also fetch the release notes once so the "What's new" expander
+    // works without a separate user action.
+    try {
+      const rn = await send('get-release-notes');
+      if (rn?.ok) { state.releaseNotes = rn; scheduleRender(); }
+    } catch {}
   })();
 }
 
@@ -468,6 +474,17 @@ chrome.runtime.onMessage.addListener((msg) => {
   } else if (name === 'sync.status') {
     state.syncStatus = data || state.syncStatus;
     updateSyncPill(); // pill only — no full render
+  } else if (name === 'app.installer.downloading') {
+    state.installerStatus = { phase: 'downloading', ...data };
+    scheduleRender();
+  } else if (name === 'app.installer.ready') {
+    state.installerStatus = { phase: 'ready', ...data };
+    toast(`Installer for v${data.version || 'latest'} downloaded — click 🚀 Launch installer to update.`, 'success', 10000);
+    scheduleRender();
+  } else if (name === 'app.installer.failed') {
+    state.installerStatus = { phase: 'failed', ...data };
+    toast(`Installer download failed: ${data.error || 'unknown'}`, 'danger', 8000);
+    scheduleRender();
   } else if (name === 'sidebar.reset') {
     // v8.0.7: background just force-reset the sidebar — pull fresh settings
     // and rerender so the user immediately sees the minimal sidebar.
@@ -1706,13 +1723,25 @@ function pageSettings() {
           </div>
           <div class="s" style="font-size:11px;color:var(--muted);margin-top:2px">Last checked: ${escape(aCheckedAt)}</div>
         </div>
-        <div style="display:flex;gap:6px">
-          <button class="btn" id="check-app-update-btn" ${appReachable ? '' : 'disabled'}>Check now</button>
-          ${a.hasUpdate && !a.downloaded ? `<button class="btn primary" id="trigger-app-update-btn">⬇ Download update</button>` : ''}
-          ${a.downloaded ? `<button class="btn primary" id="install-app-update-btn">🚀 Install &amp; restart</button>` : ''}
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn" id="check-app-update-btn">Check now</button>
+          ${a.hasUpdate && (!state.installerStatus || state.installerStatus.phase === 'failed') ? `<button class="btn primary" id="trigger-app-update-btn">⬇ Download update</button>` : ''}
+          ${state.installerStatus?.phase === 'downloading' ? `<span class="pill" style="background:rgba(99,102,241,0.18);color:#6366f1;align-self:center">⏬ Downloading v${escape(state.installerStatus.version || '')}…</span>` : ''}
+          ${state.installerStatus?.phase === 'ready' ? `<button class="btn primary" id="launch-installer-btn">🚀 Launch installer (v${escape(state.installerStatus.version || '')})</button>` : ''}
         </div>
       </div>
       ${!appReachable ? `<div class="s" style="font-size:11px;color:var(--muted);margin-top:8px">Launch the desktop app to enable update controls (or <a href="#/install-app" style="color:var(--primary)">install it</a>).</div>` : ''}
+
+      ${state.releaseNotes && (u.hasUpdate || a.hasUpdate) ? `
+        <details style="margin-top:14px;border-top:1px solid var(--border);padding-top:10px" ${state.releaseNotesOpen ? 'open' : ''}>
+          <summary style="cursor:pointer;font-size:13px;font-weight:600">📋 What's new in ${escape(state.releaseNotes.name || state.releaseNotes.tag || 'this update')}</summary>
+          <div style="margin-top:10px;font-size:13px;line-height:1.6;max-height:300px;overflow-y:auto;padding:10px;background:var(--bg);border-radius:6px;white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;font-size:12px">${escape(state.releaseNotes.body || '(no notes provided)')}</div>
+          <div style="margin-top:8px;font-size:11px;color:var(--muted)">
+            Published ${state.releaseNotes.publishedAt ? escape(new Date(state.releaseNotes.publishedAt).toLocaleString()) : ''} ·
+            <a href="${escape(state.releaseNotes.url || '#')}" target="_blank" rel="noreferrer" style="color:var(--primary)">View on GitHub →</a>
+          </div>
+        </details>
+      ` : ''}
     </div>
 
     <div class="card" style="margin-bottom:14px">
@@ -2338,30 +2367,53 @@ function attach() {
       }
     } finally { btn.disabled = false; btn.textContent = orig; }
   });
+  // v8.0.11: "Download update" now grabs the installer directly from GitHub
+  // via chrome.downloads.download (same path as "Install with one click"),
+  // then auto-launches it. We no longer depend on electron-updater inside a
+  // possibly-broken old app to apply the update. Works even if the running
+  // desktop app is crashed / hung.
+  // v8.0.11: launch the already-downloaded installer (called within a fresh
+  // user gesture so chrome.downloads.open() is allowed)
+  $('#launch-installer-btn')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; const orig = btn.textContent; btn.textContent = 'Launching…';
+    try {
+      const r = await send('launch-downloaded-installer', { id: state.installerStatus?.downloadId, fileName: state.installerStatus?.fileName });
+      if (r?.ok) toast('Installer launching. Walk through the wizard.', 'success', 8000);
+      else toast(`Could not launch: ${r?.error || 'unknown'}. Open Downloads folder and run it manually.`, 'danger', 8000);
+    } finally { btn.disabled = false; btn.textContent = orig; }
+  });
+
   $('#trigger-app-update-btn')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget;
-    btn.disabled = true; const orig = btn.textContent; btn.textContent = 'Starting download…';
+    btn.disabled = true; const orig = btn.textContent;
     try {
-      const r = await send('trigger-app-update-check');
+      const r = await send('download-and-install-app-update');
       if (r?.ok) {
-        toast(r.available ? `Downloading v${r.version}… The app will show a Restart prompt when ready.` : 'No update available.', 'success', 6000);
-        // Re-check status in a moment
-        setTimeout(() => send('check-app-update').then(() => { /* broadcast triggers render */ }), 2000);
+        if (r.opened) {
+          toast(`Installer launching. Walk through the wizard to update to v${r.version || 'latest'}.`, 'success', 9000);
+        } else {
+          toast(`Installer downloaded to your Downloads folder. Double-click to install.`, 'success', 9000);
+        }
       } else {
-        toast(`Failed: ${r?.error || 'unknown'}`, 'danger');
+        toast(`Failed: ${r?.error || 'unknown'}`, 'danger', 7000);
       }
     } finally { btn.disabled = false; btn.textContent = orig; }
   });
+  // The "Install & restart" button now also uses the installer path — if the
+  // running app supports it, it asks the app to quit cleanly first, then
+  // launches the installer. Otherwise just launches the installer (NSIS
+  // handles a running instance).
   $('#install-app-update-btn')?.addEventListener('click', async (e) => {
-    if (!confirm('The desktop app will quit and re-launch with the new version. Continue?')) return;
+    if (!confirm('The desktop app will quit and the installer will run. Continue?')) return;
     const btn = e.currentTarget;
-    btn.disabled = true; const orig = btn.textContent; btn.textContent = 'Restarting…';
+    btn.disabled = true; const orig = btn.textContent;
     try {
-      const r = await send('install-app-update');
+      const r = await send('download-and-install-app-update', { quitFirst: true });
       if (r?.ok) {
-        toast('Desktop app is restarting with the new version. ✨', 'success', 6000);
+        toast('Installer launching. Walk through the wizard to install the update.', 'success', 9000);
       } else {
-        toast(`Install failed: ${r?.error || 'unknown'}`, 'danger');
+        toast(`Install failed: ${r?.error || 'unknown'}`, 'danger', 7000);
         btn.disabled = false; btn.textContent = orig;
       }
     } catch (err) { btn.disabled = false; btn.textContent = orig; }
