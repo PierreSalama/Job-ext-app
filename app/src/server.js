@@ -652,4 +652,15 @@ function applySyncEvent(db, ev) {
   }
 }
 
-module.exports = { startServer, PORT, VERSION, setLocalBroadcast, setUpdateBridge };
+// v8.0.8: actively destroy all WS sockets before shutdown so the OS releases
+// the listening port immediately. Call from main.js before-quit, BEFORE
+// server.close(). Without this, the WS connection from the extension keeps
+// port 7733 bound for ~30-60s, causing EADDRINUSE on quick relaunch.
+function destroyAllWs() {
+  for (const sock of wsClients) {
+    try { sock.destroy(); } catch {}
+  }
+  wsClients.clear();
+}
+
+module.exports = { startServer, PORT, VERSION, setLocalBroadcast, setUpdateBridge, destroyAllWs };

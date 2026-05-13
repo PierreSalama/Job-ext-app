@@ -205,6 +205,10 @@ chrome.runtime.onInstalled.addListener(() => {
 // is idempotent (early-returns when marker already matches TARGET) so this is safe.
 migrateSidebarDefaults();
 
+// v8.0.8: fire one update check immediately on SW boot so users with an old
+// install see the prompt within seconds, not after the 6h alarm tick.
+setTimeout(() => { try { silentUpdateCheck(); } catch {} }, 3000);
+
 // v8.0.4: when the bundled DEFAULT_SETTINGS.sidebarHidden changes, replay the
 // new default on existing installs. Compares stored sidebarDefaultsVersion vs
 // the constant in DEFAULT_SETTINGS. Also resets sidebarOrder so newly-visible

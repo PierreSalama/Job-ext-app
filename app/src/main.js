@@ -12,7 +12,7 @@ const { app, BrowserWindow, ipcMain, dialog, shell, nativeImage, Tray, Menu, glo
 const path = require('path');
 
 const { JatDb } = require('./db.js');
-const { startServer, PORT, setLocalBroadcast, setUpdateBridge } = require('./server.js');
+const { startServer, PORT, setLocalBroadcast, setUpdateBridge, destroyAllWs } = require('./server.js');
 
 // v8.0.2: Auto-update via electron-updater (GitHub Releases backend).
 // Reads provider config from package.json build.publish at build time.
@@ -352,6 +352,28 @@ ipcMain.handle('notify', (_e, { title, body, urgent }) => {
 // surfaced as a friendly dialog instead of a silent process crash. The window
 // is created FIRST so users can see what failed; sub-failures degrade
 // gracefully rather than aborting the whole startup.
+// v8.0.8: try to kill whatever process is holding the given TCP port. Used
+// on relaunch when a previous instance left a zombie binding port 7733.
+function tryKillPortHolder(port) {
+  try {
+    const { execSync } = require('child_process');
+    if (process.platform === 'win32') {
+      const out = execSync(`netstat -ano -p tcp | findstr :${port}`, { encoding: 'utf8' });
+      const pids = new Set();
+      for (const line of out.split('\n')) {
+        const m = line.match(/LISTENING\s+(\d+)/);
+        if (m) pids.add(m[1]);
+      }
+      for (const pid of pids) {
+        try { execSync(`taskkill /F /PID ${pid}`, { stdio: 'ignore' }); console.log(`[v8] killed zombie PID ${pid} on port ${port}`); } catch {}
+      }
+    } else {
+      const pid = execSync(`lsof -ti:${port}`, { encoding: 'utf8' }).trim();
+      if (pid) { execSync(`kill -9 ${pid}`); console.log(`[v8] killed zombie PID ${pid} on port ${port}`); }
+    }
+  } catch (e) { /* port wasn't bound, or no permission */ }
+}
+
 function fatalDialog(title, detail, allowReinstall = true) {
   try {
     const buttons = allowReinstall ? ['Quit', 'Open log folder'] : ['Quit'];
@@ -366,7 +388,7 @@ function fatalDialog(title, detail, allowReinstall = true) {
   } catch {}
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // 1. Create the window FIRST (so the user has something on screen even if
   //    sub-systems fail) — but in a try because GPU init can throw.
   try { createWindow(); } catch (e) {
@@ -392,22 +414,49 @@ app.whenReady().then(() => {
   }
 
   // 3. Start the local HTTP/WS server. If port 7733 is already taken (usually
-  //    a zombie instance), this throws EADDRINUSE — catch it cleanly.
-  try {
-    if (db) {
-      server = startServer(db);
-      setLocalBroadcast(broadcastEvent);
-      console.log(`[jat8] sync server listening on :${PORT}`);
-    }
-  } catch (e) {
-    console.error('[v8] server start failed:', e);
-    const portInUse = /EADDRINUSE|address already in use/i.test(String(e?.message || e));
-    fatalDialog(
-      portInUse ? 'Port 7733 is already in use' : 'Sync server failed to start',
-      portInUse
-        ? 'Another instance of Job Application Tracker (or another app) is using port 7733.\nClose the other instance and relaunch.'
-        : String(e?.message || e)
-    );
+  //    a zombie instance from a crashed previous run), retry with backoff —
+  //    Node's http.server.close() only stops *accepting* new connections,
+  //    sockets already open keep the port bound for several seconds.
+  if (db) {
+    const startWithRetry = async () => {
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          server = startServer(db);
+          setLocalBroadcast(broadcastEvent);
+          console.log(`[jat8] sync server listening on :${PORT} (attempt ${attempt})`);
+          return true;
+        } catch (e) {
+          const portInUse = /EADDRINUSE|address already in use/i.test(String(e?.message || e));
+          if (!portInUse) { console.error('[v8] server start failed:', e); return false; }
+          if (attempt < 5) {
+            console.warn(`[v8] port :${PORT} busy (attempt ${attempt}/5), retrying in 1.5s…`);
+            // If this is our own zombie process from a previous run, try to kill it.
+            if (attempt === 2) tryKillPortHolder(PORT);
+            await new Promise((r) => setTimeout(r, 1500));
+          } else {
+            // Final failure — present a clear actionable dialog with three buttons.
+            const choice = dialog.showMessageBoxSync({
+              type: 'warning',
+              title: `Port ${PORT} is in use`,
+              message: `Another process is using port ${PORT}.`,
+              detail: 'Likely a previous instance of Job Application Tracker that didn\'t exit cleanly.\n\nOptions:\n  • Retry — try to free the port and continue\n  • Continue without sync — start the app anyway (Chrome extension won\'t connect until you restart)\n  • Quit',
+              buttons: ['Retry', 'Continue without sync', 'Quit'],
+              defaultId: 0,
+              cancelId: 2
+            });
+            if (choice === 0) {
+              tryKillPortHolder(PORT);
+              await new Promise((r) => setTimeout(r, 2000));
+              return startWithRetry();
+            }
+            if (choice === 2) { app.quit(); return false; }
+            return false; // 1 = continue without sync
+          }
+        }
+      }
+      return false;
+    };
+    await startWithRetry();
   }
 
   global.__jat = { db, server, broadcastEvent };
@@ -445,6 +494,17 @@ app.on('will-quit', () => {
 });
 
 app.on('before-quit', () => {
-  try { server?.close(); } catch {}
-  try { db?.close(); } catch {}
+  // v8.0.8: actively destroy keep-alive sockets + WS connections so port 7733
+  // releases immediately. Without this, the WS keeps the port bound for
+  // 30-60s, causing EADDRINUSE on quick relaunch (= "app breaks, reinstall").
+  try {
+    try { destroyAllWs(); } catch {}
+    if (server) {
+      try { server.closeAllConnections?.(); } catch {}
+      try { server.closeIdleConnections?.(); } catch {}
+      try { server.close(); } catch {}
+      server = null;
+    }
+  } catch {}
+  try { db?.close(); db = null; } catch {}
 });

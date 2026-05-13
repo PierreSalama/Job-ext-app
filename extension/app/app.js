@@ -374,6 +374,16 @@ async function load() {
     v8Loads2.forEach((r, i) => { if (r?.ok) state[keys[i]] = r.items || []; });
   } catch {}
   render();
+
+  // v8.0.8: kick off an immediate update check on every app load so users with
+  // an outdated extension OR an outdated desktop app see the prompt within
+  // seconds. Runs in parallel, doesn't block the initial render. Each call
+  // broadcasts (extension|app).update.checked which the listener picks up and
+  // re-renders cheaply.
+  (async () => {
+    try { await send('check-extension-update'); } catch {}
+    try { await send('check-app-update'); } catch {}
+  })();
 }
 
 // Reload a single store slice and re-render. Page modules call ctx.reload(name).
@@ -582,6 +592,17 @@ function render() {
   }
   if (state.appHealth?.ok && state.route !== '/install-app') {
     // Subtle "synced" pill in sidebar would be nicer; skip top banner when paired
+  }
+  // v8.0.8: prominent UPDATE-AVAILABLE banner — top of every page so users
+  // with an old extension OR old desktop app see the prompt immediately.
+  const eu = state.updateInfo || {};
+  const au = state.appUpdateInfo || {};
+  if (eu.hasUpdate && state.route !== '/settings') {
+    banner += `<a href="#/settings" class="update-banner" style="background:linear-gradient(90deg,#6366f1,#ec4899);color:#fff;display:block;padding:10px 14px;text-decoration:none;font-size:13px;font-weight:600;border-radius:8px;margin-bottom:10px">⬆️ Extension update available — v${escape(eu.current)} → v${escape(eu.latest)} · click to update</a>`;
+  }
+  if (au.hasUpdate && state.route !== '/settings') {
+    const label = au.downloaded ? '🚀 Desktop app update ready to install' : `⬆️ Desktop app update available — v${escape(au.current)} → v${escape(au.latest)}`;
+    banner += `<a href="#/settings" class="update-banner" style="background:linear-gradient(90deg,#10b981,#3b82f6);color:#fff;display:block;padding:10px 14px;text-decoration:none;font-size:13px;font-weight:600;border-radius:8px;margin-bottom:10px">${label} · click to update</a>`;
   }
   const main = $('#main');
   // Prefer the dedicated page-content slot (added in v8.5) so the topbar persists
