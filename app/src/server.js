@@ -408,9 +408,36 @@ function startServer(db) {
     if (req.method === 'OPTIONS') { send(res, 204, null); return; }
     const u = url.parse(req.url, true);
     const p = u.pathname;
+
+    // v8.0.7: detect ANY contact from a chrome-extension origin (not just
+    // /sync/event POSTs) and flip extensionEverConnected. This dismisses the
+    // "Install Chrome Extension" promo as soon as the extension has touched
+    // the app — the user installed JAT via the extension, so showing the
+    // promo would be silly.
     try {
-      // Health
-      if (p === '/health' && req.method === 'GET') return send(res, 200, { ok: true, version: VERSION, ws: true });
+      const origin = String(req.headers.origin || req.headers.referer || '');
+      if (origin.startsWith('chrome-extension://')) {
+        const s = db.getSettings?.();
+        if (s && !s.extensionEverConnected) {
+          db.patchSettings?.({ extensionEverConnected: true, extensionFirstSeenAt: new Date().toISOString() });
+          try { _localBroadcast?.({ type: 'jat-event', name: 'settings.updated', data: { settings: db.getSettings() } }); } catch {}
+        }
+      }
+    } catch {}
+
+    try {
+      // Health — also a heuristic "extension is alive" signal since the
+      // extension's sync-client probes /health every 5s on the user's machine.
+      if (p === '/health' && req.method === 'GET') {
+        try {
+          const s = db.getSettings?.();
+          if (s && !s.extensionEverConnected) {
+            db.patchSettings?.({ extensionEverConnected: true, extensionFirstSeenAt: new Date().toISOString() });
+            try { _localBroadcast?.({ type: 'jat-event', name: 'settings.updated', data: { settings: db.getSettings() } }); } catch {}
+          }
+        } catch {}
+        return send(res, 200, { ok: true, version: VERSION, ws: true });
+      }
 
       // v8.0.5: explicit version endpoint for the extension's update probe
       if (p === '/version' && req.method === 'GET') {

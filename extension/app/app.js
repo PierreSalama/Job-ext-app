@@ -431,6 +431,12 @@ chrome.runtime.onMessage.addListener((msg) => {
   } else if (name === 'sync.status') {
     state.syncStatus = data || state.syncStatus;
     updateSyncPill(); // pill only — no full render
+  } else if (name === 'sidebar.reset') {
+    // v8.0.7: background just force-reset the sidebar — pull fresh settings
+    // and rerender so the user immediately sees the minimal sidebar.
+    send('get-settings').then((r) => {
+      if (r?.ok) { state.settings = r.settings || state.settings; scheduleRender(); }
+    });
   } else if (name === 'extension.update.checked') {
     state.updateInfo = { ...data, checkedAt: Date.now() };
     scheduleRender();
@@ -1641,6 +1647,14 @@ function pageSettings() {
       ${!appReachable ? `<div class="s" style="font-size:11px;color:var(--muted);margin-top:8px">Launch the desktop app to enable update controls (or <a href="#/install-app" style="color:var(--primary)">install it</a>).</div>` : ''}
     </div>
 
+    <div class="card" style="margin-bottom:14px">
+      <h3 style="margin-top:0;font-size:14px">🧭 Sidebar</h3>
+      <p style="margin:0 0 10px;font-size:12px;color:var(--muted)">
+        Reset the sidebar back to the strict job-tracker minimum (10 visible pages: Dashboard, Applications, Pipeline, Calendar, Reminders, Inbox, Profile, Documents, Install desktop app, Settings). All other pages are still one click away under "+ Add a page" in the sidebar footer.
+      </p>
+      <button class="btn" id="reset-sidebar-btn">Reset sidebar to defaults</button>
+    </div>
+
     <div class="card">
       <h3 style="margin-top:0;font-size:14px">🎨 Theme <span style="font-weight:400;color:var(--muted);font-size:12px">${THEMES.length} built-in</span></h3>
       <div class="theme-grid">
@@ -2211,6 +2225,21 @@ function attach() {
     toast(`Theme: ${THEMES.find((t) => t.id === id)?.name}`, 'success');
     render();
   }));
+  // v8.0.7: Reset sidebar button
+  $('#reset-sidebar-btn')?.addEventListener('click', async (e) => {
+    if (!confirm('Reset the sidebar to the job-tracker minimum (10 visible pages)? Hidden pages can be re-added at any time via "+ Add a page".')) return;
+    const btn = e.currentTarget;
+    btn.disabled = true; const orig = btn.textContent; btn.textContent = 'Resetting…';
+    try {
+      const r = await send('reset-sidebar');
+      if (r?.ok) {
+        state.settings = r.settings;
+        toast('Sidebar reset to defaults.', 'success');
+        render();
+      } else { toast('Reset failed.', 'danger'); }
+    } finally { btn.disabled = false; btn.textContent = orig; }
+  });
+
   // v8.0.2: Manual "Check for updates" button (extension)
   $('#check-update-btn')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget;

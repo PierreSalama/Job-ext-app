@@ -371,14 +371,16 @@ export function attach($main, ctx) {
         const r = await send('probe-app-health');
         if (!r?.health) return;
         const prevOk = state.appHealth?.ok;
-        const prevReason = state.appHealth?.reason;
         state.appHealth = r.health;
         let stepChanged = false;
         if (r.health.ok && (state.installAppStep || 1) < 4) {
           state.installAppStep = 4; stepChanged = true;
         }
-        // Only rerender when something actually changed — avoids tight loops.
-        if (prevOk !== r.health.ok || prevReason !== r.health.reason || stepChanged) rerender();
+        // v8.0.7: rerender ONLY when ok flips or step changes. The 'reason'
+        // text flaps between transient strings (ECONNREFUSED / timeout etc.)
+        // when the app is offline; rerendering on every flap was the
+        // user-visible "page refreshes itself" bug.
+        if (prevOk !== r.health.ok || stepChanged) rerender();
       } catch {}
     }, 2000);
   }

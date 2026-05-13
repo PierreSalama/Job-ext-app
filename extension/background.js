@@ -200,36 +200,60 @@ chrome.runtime.onInstalled.addListener(() => {
   migrateSidebarDefaults();
 });
 
+// v8.0.7: also run migration on every SW startup as a safety net — onInstalled
+// can be missed if the extension wasn't reloaded properly. migrateSidebarDefaults
+// is idempotent (early-returns when marker already matches TARGET) so this is safe.
+migrateSidebarDefaults();
+
 // v8.0.4: when the bundled DEFAULT_SETTINGS.sidebarHidden changes, replay the
 // new default on existing installs. Compares stored sidebarDefaultsVersion vs
 // the constant in DEFAULT_SETTINGS. Also resets sidebarOrder so newly-visible
 // pages slot in. Skips pages the user has explicitly pinned.
+// v8.0.7: TARGET bumped to 3 so users where v2 ran but didn't visibly apply
+// (open-tab stale state, cached order, etc.) get a fresh force-overwrite.
+const SIDEBAR_HIDDEN_STRICT = [
+  'todos','threads','templates','contacts','companies','network','sources',
+  'resume-builder','cover-studio','interview-prep','salary','notes',
+  'mock-interview','company-hub','references','analytics','goals',
+  'achievements','skills','recommendations','offer-compare','negotiation',
+  'roadmap','ai','ai-lab','integrations','tour','bulk-tools','pomodoro',
+  'ai-coach','daily-digest','audit','backup','logs','fit-scores','red-flags',
+  'autopsy','tags','saved-views','health','sandbox','permissions','recipes',
+  'webhooks','voice','timeline'
+];
 async function migrateSidebarDefaults() {
   try {
     const settings = await getSettings();
-    const TARGET = 2; // bump in lockstep with DEFAULT_SETTINGS.sidebarDefaultsVersion
+    const TARGET = 3;
     if ((settings.sidebarDefaultsVersion || 1) >= TARGET) return;
-    // Pull the fresh default list from the same source as DEFAULT_SETTINGS by
-    // re-reading via getSettings on a wiped key (cheap shortcut: hard-code here)
-    const newHidden = [
-      'todos','threads','templates','contacts','companies','network','sources',
-      'resume-builder','cover-studio','interview-prep','salary','notes',
-      'mock-interview','company-hub','references','analytics','goals',
-      'achievements','skills','recommendations','offer-compare','negotiation',
-      'roadmap','ai','ai-lab','integrations','tour','bulk-tools','pomodoro',
-      'ai-coach','daily-digest','audit','backup','logs','fit-scores','red-flags',
-      'autopsy','tags','saved-views','health','sandbox','permissions','recipes',
-      'webhooks','voice','timeline'
-    ];
     await patchSettings({
-      sidebarHidden: newHidden,
+      sidebarHidden: SIDEBAR_HIDDEN_STRICT,
       sidebarOrder: null,         // recompute from registry
       sidebarPinned: [],          // clear pins so the new minimal set is clean
+      sidebarSections: null,
       sidebarDefaultsVersion: TARGET
     });
-    log.info('migrate', 'Applied v2 sidebar defaults (minimal job-tracker set)');
+    log.info('migrate', `Applied v${TARGET} sidebar defaults (force-overwrite strict job-tracker set)`);
+    // Aggressive broadcast so any already-open extension page reloads its
+    // sidebar immediately rather than waiting for the next reload.
     await broadcast('settings.updated', { settings: await getSettings() });
+    await broadcast('sidebar.reset', { sidebarHidden: SIDEBAR_HIDDEN_STRICT });
   } catch (e) { log.warn('migrate', `sidebar defaults: ${e.message || e}`); }
+}
+
+// v8.0.7: manual reset handler — user can hit a button in Settings to force
+// the sidebar back to the strict default at any time.
+async function resetSidebarToDefaults() {
+  await patchSettings({
+    sidebarHidden: SIDEBAR_HIDDEN_STRICT,
+    sidebarOrder: null,
+    sidebarPinned: [],
+    sidebarSections: null,
+    sidebarDefaultsVersion: 3
+  });
+  await broadcast('settings.updated', { settings: await getSettings() });
+  await broadcast('sidebar.reset', { sidebarHidden: SIDEBAR_HIDDEN_STRICT });
+  return await getSettings();
 }
 // Also boot the sync client at module load — covers SW wakeups that don't
 // trigger 'activate' (e.g. cold start to handle a message).
@@ -948,6 +972,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
         // ============ v8 NEW HANDLERS ============
         case 'ping': sendResponse({ ok: true, ts: Date.now() }); break;
+
+        case 'reset-sidebar': {
+          const next = await resetSidebarToDefaults();
+          sendResponse({ ok: true, settings: next });
+          break;
+        }
 
         case 'check-extension-update': {
           // Compares running extension manifest version to the latest GitHub

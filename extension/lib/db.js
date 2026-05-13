@@ -467,7 +467,10 @@ const DEFAULT_SETTINGS = {
   ],
   // Migration marker — bump when defaults change. Background applies the
   // newer hidden list when the stored value here is lower than the constant.
-  sidebarDefaultsVersion: 2,
+  // v3 (2026-05-13): force-rewrite to make sure stricter list actually applies
+  // for users where v2 ran but somehow didn't stick (no broadcast / cached
+  // state in open tabs / etc.). Same hidden list, different marker = re-runs.
+  sidebarDefaultsVersion: 3,
   sidebarPinned: [],            // array of page IDs pinned to top
   sidebarSections: null,        // optional grouping {label, pageIds[]}[]
   // Tour
