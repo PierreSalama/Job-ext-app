@@ -213,22 +213,26 @@ setTimeout(() => { try { silentUpdateCheck(); } catch {} }, 3000);
 // new default on existing installs. Compares stored sidebarDefaultsVersion vs
 // the constant in DEFAULT_SETTINGS. Also resets sidebarOrder so newly-visible
 // pages slot in. Skips pages the user has explicitly pinned.
-// v8.0.7: TARGET bumped to 3 so users where v2 ran but didn't visibly apply
-// (open-tab stale state, cached order, etc.) get a fresh force-overwrite.
+// v8.0.10: TARGET bumped to 4 — ultra-minimal. Hides pipeline, calendar,
+// reminders, inbox too. Only 6 daily essentials visible by default.
 const SIDEBAR_HIDDEN_STRICT = [
-  'todos','threads','templates','contacts','companies','network','sources',
+  'pipeline','calendar','reminders','todos',
+  'inbox','threads','templates',
+  'contacts','companies','network','sources',
   'resume-builder','cover-studio','interview-prep','salary','notes',
-  'mock-interview','company-hub','references','analytics','goals',
-  'achievements','skills','recommendations','offer-compare','negotiation',
-  'roadmap','ai','ai-lab','integrations','tour','bulk-tools','pomodoro',
-  'ai-coach','daily-digest','audit','backup','logs','fit-scores','red-flags',
-  'autopsy','tags','saved-views','health','sandbox','permissions','recipes',
-  'webhooks','voice','timeline'
+  'mock-interview','company-hub','references',
+  'analytics','goals','achievements','skills','recommendations',
+  'offer-compare','negotiation','roadmap',
+  'ai','ai-lab','integrations','tour','bulk-tools','pomodoro',
+  'ai-coach','daily-digest',
+  'audit','backup','logs',
+  'fit-scores','red-flags','autopsy','tags','saved-views','health',
+  'sandbox','permissions','recipes','webhooks','voice','timeline'
 ];
 async function migrateSidebarDefaults() {
   try {
     const settings = await getSettings();
-    const TARGET = 3;
+    const TARGET = 4;
     if ((settings.sidebarDefaultsVersion || 1) >= TARGET) return;
     await patchSettings({
       sidebarHidden: SIDEBAR_HIDDEN_STRICT,
@@ -253,7 +257,7 @@ async function resetSidebarToDefaults() {
     sidebarOrder: null,
     sidebarPinned: [],
     sidebarSections: null,
-    sidebarDefaultsVersion: 3
+    sidebarDefaultsVersion: 4
   });
   await broadcast('settings.updated', { settings: await getSettings() });
   await broadcast('sidebar.reset', { sidebarHidden: SIDEBAR_HIDDEN_STRICT });

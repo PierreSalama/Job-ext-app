@@ -444,24 +444,19 @@ const DEFAULT_SETTINGS = {
   // Reminders, Inbox, Profile, Documents, Install desktop app, Settings.
   // Everything else (40+ pages) is one click away under "+ Add a page".
   sidebarHidden: [
-    // Pipeline cluster — leave dashboard/jobs/pipeline/calendar/reminders only
-    'todos',
-    // Inbox cluster — leave inbox only
-    'threads', 'templates',
-    // Network cluster — hide all
+    // v8.0.10: ULTRA-MINIMAL default. Only the daily core remains visible.
+    // Visible: dashboard, jobs, profile, documents, install-app, settings.
+    // Everything else is one click away under "+ Add a page".
+    'pipeline', 'calendar', 'reminders', 'todos',
+    'inbox', 'threads', 'templates',
     'contacts', 'companies', 'network', 'sources',
-    // Knowledge cluster — leave profile + documents only
     'resume-builder', 'cover-studio', 'interview-prep', 'salary', 'notes',
     'mock-interview', 'company-hub', 'references',
-    // Growth cluster — hide all
     'analytics', 'goals', 'achievements', 'skills', 'recommendations',
     'offer-compare', 'negotiation', 'roadmap',
-    // Workspace cluster — leave only install-app
     'ai', 'ai-lab', 'integrations', 'tour', 'bulk-tools', 'pomodoro',
     'ai-coach', 'daily-digest',
-    // System cluster — leave settings only
     'audit', 'backup', 'logs',
-    // v8 NEW power-user pages — all hidden
     'fit-scores', 'red-flags', 'autopsy', 'tags', 'saved-views', 'health',
     'sandbox', 'permissions', 'recipes', 'webhooks', 'voice', 'timeline'
   ],
@@ -470,7 +465,9 @@ const DEFAULT_SETTINGS = {
   // v3 (2026-05-13): force-rewrite to make sure stricter list actually applies
   // for users where v2 ran but somehow didn't stick (no broadcast / cached
   // state in open tabs / etc.). Same hidden list, different marker = re-runs.
-  sidebarDefaultsVersion: 3,
+  // v4 (2026-05-13): tightened to ULTRA-MINIMAL — hides pipeline, calendar,
+  // reminders, inbox too. Only 6 daily-essential pages visible by default.
+  sidebarDefaultsVersion: 4,
   sidebarPinned: [],            // array of page IDs pinned to top
   sidebarSections: null,        // optional grouping {label, pageIds[]}[]
   // Tour

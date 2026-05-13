@@ -405,6 +405,27 @@ window.addEventListener('hashchange', setRoute);
 // apply + webhook fire) coalesces into one re-render, not 4. Also: only render
 // if the active route actually shows this store's data.
 let _renderTimer = null;
+let _lastRenderedRoute = null; // v8.0.10: only animate on route changes
+
+// v8.0.10: which settings keys matter for the visible page. Changes to other
+// keys (seenTips, dismissedDesktopPromo, tourLastStep, lastUpdateCheckAt, etc.)
+// shouldn't trigger a full re-render — those fired multiple "visible refreshes"
+// after every minor click.
+const VISUAL_SETTINGS_KEYS = new Set([
+  'theme', 'density', 'fontScale', 'highContrast', 'dyslexiaFriendly', 'reducedMotion',
+  'sidebarOrder', 'sidebarHidden', 'sidebarPinned', 'sidebarSections',
+  'iconPreset', 'iconCustomDataUrl', 'dashboardShortcuts',
+  'aiProvider', 'ollamaModel', 'desktopAppEnabled'
+]);
+function settingsAffectVisuals(prev, next) {
+  if (!prev || !next) return true;
+  for (const k of VISUAL_SETTINGS_KEYS) {
+    const a = JSON.stringify(prev[k]);
+    const b = JSON.stringify(next[k]);
+    if (a !== b) return true;
+  }
+  return false;
+}
 function scheduleRender(immediate = false) {
   if (immediate) {
     if (_renderTimer) { clearTimeout(_renderTimer); _renderTimer = null; }
@@ -428,9 +449,15 @@ chrome.runtime.onMessage.addListener((msg) => {
     refreshSummary();
     scheduleRender();
   } else if (name === 'settings.updated') {
-    state.settings = data.settings;
-    if (data.settings?.theme) applyTheme(data.settings.theme);
-    scheduleRender();
+    // v8.0.10: only rerender when something visible changed. Tip-dismissals
+    // / followup-due updates / etc. don't need a full re-render — they
+    // were causing visible "page refreshes" after every minor click.
+    const prev = state.settings || {};
+    const next = data.settings || {};
+    state.settings = next;
+    if (next.theme && next.theme !== prev.theme) applyTheme(next.theme);
+    if (settingsAffectVisuals(prev, next)) scheduleRender();
+    else { updateAiPill?.(); updateSyncPill?.(); }
   } else if (name === 'recommendations.updated') {
     send('list-recommendations').then((r) => { if (r?.ok) { state.recommendations = r.items; scheduleRender(); } });
   } else if (name === 'documents.updated') {
@@ -573,7 +600,21 @@ function render() {
   else if (state.route === '/sources') html = pageSources();
   else if (PAGE_RENDERERS[state.route]) {
     activePageModule = PAGE_RENDERERS[state.route];
-    html = activePageModule.render(state);
+    // v8.0.10: error boundary — a single page module's throw should NOT blank
+    // the entire app. Surface the error inline + a "Back to Dashboard" exit.
+    try { html = activePageModule.render(state); }
+    catch (err) {
+      console.error('[v8] page render error:', state.route, err);
+      activePageModule = null;
+      html = `<div class="card"><h2 style="margin-top:0">⚠️ Something went wrong on this page</h2>
+        <p style="font-size:13px;color:var(--muted)">A page module crashed while rendering. Your data is safe — only this page failed.</p>
+        <pre style="background:var(--bg);padding:10px;border-radius:6px;font-size:12px;overflow:auto;max-height:200px">${escape(String(err?.stack || err?.message || err))}</pre>
+        <div style="display:flex;gap:6px;margin-top:10px">
+          <a class="btn primary" href="#/">← Back to Dashboard</a>
+          <button class="btn" id="retry-page-render">🔁 Retry</button>
+        </div>
+      </div>`;
+    }
   }
   else html = `<div class="empty"><strong>Coming soon.</strong>${escape(state.route)} hasn't been built yet.</div>`;
   // Global AI-unavailable banner (skip on the AI page itself to avoid duplication)
@@ -620,12 +661,15 @@ function render() {
   try { renderBreadcrumbs(); } catch {}
   try { applyPageFavicon(); } catch {}
   try { renderProfileSwitcher(); } catch {}
-  // Page enter animation
-  if (!document.body.classList.contains('reduced-motion')) {
+  // v8.0.10: page-enter animation ONLY on route changes — not on every render.
+  // Previously: dismissing a tip / saving a setting fired a broadcast → render
+  // → 400ms slide-in animation replayed, looking like "the page refreshed twice".
+  if (!document.body.classList.contains('reduced-motion') && _lastRenderedRoute !== state.route) {
     main.classList.remove('page-enter');
     requestAnimationFrame(() => main.classList.add('page-enter'));
     setTimeout(() => main.classList.remove('page-enter'), 400);
   }
+  _lastRenderedRoute = state.route;
   // Density class
   const density = state.settings.density || 'comfortable';
   document.body.classList.remove('density-compact', 'density-comfortable', 'density-spacious');
@@ -680,8 +724,11 @@ function render() {
       activePageModule.attach($('#main'), { send, toast, render, state, aiCall, reload: reloadStateSlice });
     } catch (e) {
       console.error('page attach failed:', e);
+      toast(`Page attach failed: ${e.message || e}`, 'danger', 6000);
     }
   }
+  // v8.0.10: error-boundary retry button
+  $('#retry-page-render')?.addEventListener('click', () => render());
 }
 
 function escape(s) { return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]); }
