@@ -135,6 +135,7 @@ export function render(state) {
       <div style="display:flex;gap:6px;align-items:center">
         <span class="pill ${status.ok ? 'offer' : 'rejected'}">${status.ok ? '✓ App detected' : '⚠ App not running'}</span>
         ${paired ? `<button class="btn primary" id="launch-app" title="Open the desktop app via the jat8:// URL handler">🚀 Launch app</button>` : ''}
+        <button class="btn" id="reinstall-app-btn" title="Downloads the latest installer to re-install over the existing app">🔁 Reinstall app</button>
       </div>
     </div>
 
@@ -568,6 +569,29 @@ export function attach($main, ctx) {
       : 'bash clean-uninstall-jat-linux.sh';
     try { await navigator.clipboard.writeText(cmd); e.currentTarget.textContent = '✓ Copied'; setTimeout(() => { e.currentTarget.textContent = 'Copy run command'; }, 2000); }
     catch { toast('Copy failed.', 'danger'); }
+  });
+
+  // v8.0.9: one-click reinstall — downloads latest installer over the existing one.
+  $main.querySelector('#reinstall-app-btn')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const os2 = state.installAppOS || detectOS();
+    const release = state.settings?.releasesBaseUrl ? await probeRelease(os2, state.settings.releasesBaseUrl) : null;
+    if (!release) {
+      toast('Could not find installer on GitHub Releases. Check your internet.', 'danger');
+      return;
+    }
+    btn.disabled = true; const orig = btn.textContent; btn.textContent = '⬇ Downloading…';
+    try {
+      await new Promise((res, rej) => {
+        chrome.downloads.download({ url: release.url, filename: release.name, saveAs: false, conflictAction: 'overwrite' }, (id) => {
+          const err = chrome.runtime.lastError;
+          if (err || !id) rej(new Error(err?.message || 'download failed')); else res(id);
+        });
+      });
+      toast(`✓ ${release.label} downloaded. Open your Downloads folder and double-click it to reinstall.`, 'success', 10000);
+    } catch (err) {
+      toast(`Download failed: ${err.message || err}`, 'danger');
+    } finally { btn.disabled = false; btn.textContent = orig; }
   });
 
   $main.querySelector('#launch-app')?.addEventListener('click', () => {

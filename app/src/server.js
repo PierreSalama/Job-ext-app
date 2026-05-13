@@ -291,6 +291,27 @@ async function aiCall(data, settings) {
         return { queries: Array.isArray(parsed) ? parsed : (parsed.queries || []) };
       } catch { return { queries: [], raw: text }; }
     }
+    case 'nudges': {
+      // v8.0.9: MISSING case — caller got generic text and UI crashed.
+      // Returns an array of { jobId, reason, priority } so the dashboard
+      // can render the "AI nudges" card correctly.
+      const jobs = (data.jobs || []).filter((j) => !['offer','rejected','withdrawn','archived'].includes(j.status));
+      if (jobs.length === 0) return [];
+      const sample = jobs.slice(0, 15).map((j) => ({
+        id: j.id,
+        title: j.title || '',
+        company: j.company || '',
+        status: j.status,
+        submittedAt: j.submittedAt || j.createdAt,
+        followUpDueAt: j.followUpDueAt || ''
+      }));
+      const prompt = `Given these active job applications, return the top 3-6 that the user should act on RIGHT NOW. Output JSON array of {"jobId": "<id>", "reason": "<one short sentence>", "priority": "high"|"medium"|"low"}. Output ONLY the JSON array, nothing else.\n\nApplications:\n${JSON.stringify(sample)}`;
+      const text = await ollamaChat(settings, prompt, { format: 'json' });
+      try {
+        const parsed = JSON.parse(text);
+        return Array.isArray(parsed) ? parsed : (parsed.nudges || []);
+      } catch { return []; }
+    }
     default: {
       // Best-effort generic prompt
       const text = await ollamaChat(settings, `AI feature "${f}" with payload:\n${JSON.stringify(data).slice(0, 4000)}`);
@@ -392,7 +413,12 @@ async function dispatchRpc(db, msg) {
     case 'ai-status': return { ok: true, status: await aiStatus(db.getSettings()) };
     case 'ai-call': {
       try {
-        const result = await aiCall(data, db.getSettings());
+        // v8.0.9: hard cap so a hung Ollama / model never makes the UI
+        // appear frozen forever. 90s is plenty for any single feature.
+        const result = await Promise.race([
+          aiCall(data, db.getSettings()),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('AI call timed out after 90s — check Ollama is running and the model is pulled.')), 90000))
+        ]);
         return { ok: true, result };
       } catch (e) {
         return { ok: false, error: String(e.message || e) };

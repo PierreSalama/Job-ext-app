@@ -397,20 +397,38 @@ app.whenReady().then(async () => {
     return app.exit(1);
   }
 
-  // 2. Open the database. If this fails it's almost always a corrupt sqlite
-  //    file or a native-module ABI mismatch from an old install. Tell the
-  //    user how to recover instead of silently crashing.
-  try {
-    const dbPath = path.join(app.getPath('userData'), 'jat5.sqlite3');
-    db = new JatDb(dbPath);
-    console.log(`[jat8] db at ${dbPath}`);
-  } catch (e) {
-    console.error('[v8] db init failed:', e);
-    fatalDialog(
-      'Could not open the local database',
-      `${String(e?.message || e)}\n\nLikely causes:\n  • Native module ABI mismatch from an old install\n  • Corrupt database file from a previous crash`
-    );
-    // Don't quit — let the user see the window and the dialog, then quit themselves.
+  // 2. Open the database with active recovery if it fails (corrupt sqlite,
+  //    ABI mismatch from a botched update, etc.) — offer to reset rather
+  //    than just showing a fatal dialog.
+  const dbPath = path.join(app.getPath('userData'), 'jat5.sqlite3');
+  const tryOpenDb = () => {
+    try { db = new JatDb(dbPath); console.log(`[jat8] db at ${dbPath}`); return true; }
+    catch (e) { console.error('[v8] db init failed:', e); return e; }
+  };
+  let dbResult = tryOpenDb();
+  if (dbResult !== true) {
+    const fs = require('fs');
+    const choice = dialog.showMessageBoxSync({
+      type: 'warning',
+      title: 'Local database could not be opened',
+      message: 'The Job Tracker database appears to be corrupted or from an incompatible version.',
+      detail: `Error: ${String(dbResult?.message || dbResult)}\n\nOptions:\n  • Reset database — wipes local jobs/settings, then continues with a fresh DB\n  • Continue without DB — app starts but nothing persists (read-only state)\n  • Quit`,
+      buttons: ['Reset database', 'Continue without DB', 'Quit'],
+      defaultId: 0,
+      cancelId: 2
+    });
+    if (choice === 0) {
+      try {
+        for (const ext of ['', '-shm', '-wal']) { try { fs.unlinkSync(dbPath + ext); } catch {} }
+        dbResult = tryOpenDb();
+        if (dbResult !== true) {
+          fatalDialog('Still could not open the database', String(dbResult?.message || dbResult), false);
+        }
+      } catch (e) { fatalDialog('Reset failed', String(e?.message || e), false); }
+    } else if (choice === 2) {
+      return app.quit();
+    }
+    // choice === 1: continue with db = null
   }
 
   // 3. Start the local HTTP/WS server. If port 7733 is already taken (usually
@@ -419,7 +437,10 @@ app.whenReady().then(async () => {
   //    sockets already open keep the port bound for several seconds.
   if (db) {
     const startWithRetry = async () => {
-      for (let attempt = 1; attempt <= 5; attempt++) {
+      // v8.0.9: silent retry — no dialog flashes, no user-visible noise.
+      // Try aggressively to clear the zombie port and start cleanly.
+      // Only show a dialog if all attempts fail.
+      for (let attempt = 1; attempt <= 8; attempt++) {
         try {
           server = startServer(db);
           setLocalBroadcast(broadcastEvent);
@@ -428,11 +449,11 @@ app.whenReady().then(async () => {
         } catch (e) {
           const portInUse = /EADDRINUSE|address already in use/i.test(String(e?.message || e));
           if (!portInUse) { console.error('[v8] server start failed:', e); return false; }
-          if (attempt < 5) {
-            console.warn(`[v8] port :${PORT} busy (attempt ${attempt}/5), retrying in 1.5s…`);
-            // If this is our own zombie process from a previous run, try to kill it.
-            if (attempt === 2) tryKillPortHolder(PORT);
-            await new Promise((r) => setTimeout(r, 1500));
+          if (attempt < 8) {
+            console.warn(`[v8] port :${PORT} busy (attempt ${attempt}/8), retrying…`);
+            // Kill the zombie on attempt 1 (immediately) and again on 4 (in case it respawned).
+            if (attempt === 1 || attempt === 4) tryKillPortHolder(PORT);
+            await new Promise((r) => setTimeout(r, 800));
           } else {
             // Final failure — present a clear actionable dialog with three buttons.
             const choice = dialog.showMessageBoxSync({
@@ -484,9 +505,11 @@ process.on('uncaughtException', (e) => {
 });
 
 app.on('window-all-closed', () => {
-  // v8: keep app alive in tray on Windows/Linux when window closes
-  // (mac is already idiomatic with the dock running)
-  // User must use the tray menu to quit explicitly.
+  // v8.0.9: close = quit. Previous behavior (stay in tray) confused users
+  // — they thought the app was closed but it kept port 7733 bound, so the
+  // next "launch" hit the single-instance lock and looked broken. macOS
+  // gets the standard dock-stays-running idiom.
+  if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('will-quit', () => {
