@@ -1442,7 +1442,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case 'open-app': {
           // v9.0.2: accept an optional data.route (e.g. '#/documents') so the
           // tailor prompt can deep-link the user straight to the upload page.
+          // v9.0.3: suppressWelcome flag flips onboardingDone=true atomically
+          // so the welcome tutorial doesn't block deep-link landings.
           const sub = data?.route || '';
+          if (data?.suppressWelcome) {
+            try {
+              const settings = await getSettings();
+              if (!settings.onboardingDone) {
+                await patchSettings({ onboardingDone: true });
+              }
+            } catch {}
+          }
           const url = chrome.runtime.getURL('app/app.html') + (sub.startsWith('#') ? sub : '');
           chrome.tabs.create({ url });
           sendResponse({ ok: true });

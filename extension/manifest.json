@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Job Application Tracker v9",
   "short_name": "JAT v9",
-  "version": "9.0.2",
+  "version": "9.0.3",
   "description": "v9 — Universal job-application tracker with 100+ AI features. Job-fit scoring, JD red-flag detection, application autopsy, voice quick-add, smart tags, recipes, webhooks, full health monitoring, and a sandbox to try every feature. Captures across LinkedIn, Indeed, Glassdoor, Greenhouse, Lever, Workday, Ashby, Workable, BambooHR, SmartRecruiters.",
   "permissions": ["storage", "tabs", "scripting", "alarms", "notifications", "clipboardWrite", "declarativeNetRequestWithHostAccess", "downloads"],
   "host_permissions": [
