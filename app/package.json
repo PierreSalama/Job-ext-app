@@ -1,6 +1,6 @@
 {
   "name": "jat9-app",
-  "version": "9.0.0",
+  "version": "9.0.1",
   "description": "Desktop companion for the Job Application Tracker v9 Chrome extension. System tray, native notifications, global hotkey, real-time sync on :7733.",
   "main": "src/main.js",
   "scripts": {

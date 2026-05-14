@@ -226,6 +226,22 @@ async function detectPlatform() {
   return 'windows';
 }
 
+// v9.0.1: best-effort fallback when the user's default resume is binary
+// (PDF/DOCX) and we can't extract text. Synthesizes a readable resume from
+// their profile so AI tailoring still works.
+function synthesizeResumeFromProfile(p) {
+  const sec = (h, body) => body ? `\n\n${h}\n${body}\n` : '';
+  return [
+    `${p.fullName || `${p.firstName || ''} ${p.lastName || ''}`.trim() || 'Candidate'}`.trim(),
+    [p.email, p.phone, p.city, p.linkedinUrl, p.githubUrl, p.portfolioUrl].filter(Boolean).join(' · '),
+    sec('SUMMARY', p.summary || p.headline || ''),
+    sec('SKILLS', (p.skills || []).join(', ')),
+    sec('EDUCATION', [p.university, p.major, p.highestDegree, p.graduationYear].filter(Boolean).join(', ')),
+    sec('YEARS OF EXPERIENCE', p.yearsExperience || ''),
+    sec('AVAILABILITY', [p.noticePeriod, p.willRelocate ? `Open to relocation: ${p.willRelocate}` : '', p.willTravel ? `Travel: ${p.willTravel}` : ''].filter(Boolean).join('; '))
+  ].filter(Boolean).join('').trim();
+}
+
 // v9.0.0: TARGET bumped to 4 — ultra-minimal. Hides pipeline, calendar,
 // reminders, inbox too. Only 6 daily essentials visible by default.
 const SIDEBAR_HIDDEN_STRICT = [
@@ -1413,6 +1429,123 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           chrome.tabs.create({ url: chrome.runtime.getURL('app/app.html') });
           sendResponse({ ok: true });
           break;
+
+        // ============ v9.0.1: Resume tailor ============
+        case 'get-default-resume': {
+          try {
+            const docs = await listDocuments();
+            const settings = await getSettings();
+            const defId = settings.defaultResumeId || '';
+            const document =
+              (defId && docs.find((d) => d.id === defId))
+              || docs.find((d) => d.type === 'resume')
+              || null;
+            sendResponse({ ok: true, document: document ? { id: document.id, name: document.name, type: document.type, mimeType: document.mimeType } : null });
+          } catch (e) { sendResponse({ ok: false, error: String(e?.message || e) }); }
+          break;
+        }
+
+        case 'set-default-resume': {
+          try {
+            await patchSettings({ defaultResumeId: data?.id || '' });
+            sendResponse({ ok: true });
+          } catch (e) { sendResponse({ ok: false, error: String(e?.message || e) }); }
+          break;
+        }
+
+        case 'tailor-resume-for-job': {
+          // Tailor the user's default resume to a job. Pulls resume text from
+          // the document store, asks AI to rewrite the summary + bullet
+          // emphasis, persists the result under tailoredResumes for later
+          // download. Returns the new tailored doc's id.
+          try {
+            const docs = await listDocuments();
+            const settings = await getSettings();
+            const defId = settings.defaultResumeId || '';
+            const resume = (defId && docs.find((d) => d.id === defId)) || docs.find((d) => d.type === 'resume');
+            if (!resume) { sendResponse({ ok: false, error: 'No default resume. Upload one in Documents first.' }); break; }
+
+            // Best-effort text extraction. ArrayBuffer -> string for TXT/plain;
+            // for PDF/DOCX we just pass the metadata (filename) since text
+            // extraction is heavy; AI still produces tailored content based on
+            // the user's profile summary + job description.
+            let baseText = '';
+            if (resume.data) {
+              try {
+                const buf = resume.data instanceof ArrayBuffer ? resume.data
+                  : (resume.data.buffer ? resume.data.buffer : null);
+                if (buf) baseText = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(buf)).slice(0, 12000);
+              } catch {}
+            }
+            const profile = await getProfile();
+            // Fallback when binary: synthesize a text resume from profile
+            if (!baseText || baseText.length < 200) {
+              baseText = synthesizeResumeFromProfile(profile);
+            }
+
+            const prompt = `You are a resume editor. Rewrite the resume below so that the summary, headline, and skills section emphasize the qualifications most relevant to this job. Keep all dates, employers, and degrees factually identical. Do not invent experience. Output the full revised resume as plain text.\n\nTARGET JOB:\nTitle: ${data?.title || ''}\nCompany: ${data?.company || ''}\nDescription:\n${(data?.description || '').slice(0, 3000)}\n\nORIGINAL RESUME:\n${baseText}\n\nREWRITTEN RESUME (plain text, ready to read):`;
+            const tailoredText = await ai.aiPrompt(prompt, settings);
+            if (!tailoredText) { sendResponse({ ok: false, error: 'AI returned empty result' }); break; }
+
+            const id = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : 'tr-' + Date.now();
+            const row = {
+              id,
+              sourceDocId: resume.id,
+              sourceDocName: resume.name,
+              targetTitle: data?.title || '',
+              targetCompany: data?.company || '',
+              targetSource: data?.source || '',
+              text: tailoredText,
+              createdAt: new Date().toISOString()
+            };
+            await db.put('tailoredResumes', row);
+            await broadcast('tailoredResumes.updated', { id });
+            sendResponse({ ok: true, id, name: `${resume.name.replace(/\.[^.]+$/, '')}_tailored_${(data?.company || 'job').replace(/[^a-z0-9]+/gi, '-').slice(0, 20)}.txt` });
+          } catch (e) {
+            sendResponse({ ok: false, error: String(e?.message || e) });
+          }
+          break;
+        }
+
+        case 'download-tailored-resume': {
+          try {
+            const row = await db.get('tailoredResumes', data?.id);
+            if (!row) { sendResponse({ ok: false, error: 'Not found' }); break; }
+            const blob = new Blob([row.text || ''], { type: 'text/plain;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const filename = `${(row.sourceDocName || 'resume').replace(/\.[^.]+$/, '')}_tailored_${(row.targetCompany || 'job').replace(/[^a-z0-9]+/gi, '-').slice(0, 20)}.txt`;
+            chrome.downloads.download({ url, filename, saveAs: true }, (id) => {
+              const err = chrome.runtime.lastError;
+              setTimeout(() => URL.revokeObjectURL(url), 30000);
+              if (err || !id) sendResponse({ ok: false, error: err?.message || 'download failed' });
+              else sendResponse({ ok: true, downloadId: id });
+            });
+          } catch (e) { sendResponse({ ok: false, error: String(e?.message || e) }); }
+          return true; // async sendResponse
+        }
+
+        // ============ v9.0.1: Auto-Apply trigger ============
+        case 'start-auto-apply-current-tab': {
+          try {
+            const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (!tab?.id) { sendResponse({ ok: false, error: 'No active tab' }); break; }
+            chrome.tabs.sendMessage(tab.id, { type: 'start-auto-apply' }, (r) => {
+              const err = chrome.runtime.lastError;
+              if (err) sendResponse({ ok: false, error: err.message });
+              else sendResponse(r || { ok: false, error: 'no response' });
+            });
+            return true; // async
+          } catch (e) { sendResponse({ ok: false, error: String(e?.message || e) }); }
+          break;
+        }
+        case 'stop-auto-apply-current-tab': {
+          try {
+            const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (tab?.id) chrome.tabs.sendMessage(tab.id, { type: 'stop-auto-apply' }, () => {});
+            sendResponse({ ok: true });
+          } catch (e) { sendResponse({ ok: false, error: String(e?.message || e) }); }
+          break;
+        }
 
         case 'launch-app': {
           // Launches the desktop companion via the jat9:// URL handler that

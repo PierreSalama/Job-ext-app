@@ -523,6 +523,12 @@ const DEFAULT_SETTINGS = {
   dyslexiaFriendly: false,
   // Welcome / sandbox
   sandboxSeeded: false,
+  // v9.0.1: Resume-tailor feature
+  autoTailorEnabled: 'ask',     // 'ask' | 'always' | 'never'
+  defaultResumeId: '',          // documents row id
+  // v9.0.1: Auto-Apply (RPA) feature
+  autoApplyEnabled: false,      // bool — show the toolbar trigger
+  autoApplyMaxSteps: 20,
   // Per-route tips dismissal map (v8). { '/jobs': true, ... }
   seenTips: {},
   // v8: GitHub Releases — where the desktop installers are hosted.

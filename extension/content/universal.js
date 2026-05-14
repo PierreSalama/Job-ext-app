@@ -488,6 +488,15 @@ const sendBg = (type, data) => new Promise((res) => chrome.runtime.sendMessage({
     obs.observe(document.documentElement, { childList: true, subtree: true });
     setTimeout(() => tick().catch(() => {}), 600);
     setTimeout(() => { try { maybeOfferProfileSync(); } catch {} }, 1200);
+    // v9.0.1: fire the resume-tailor prompt once we have a confident job context
+    setTimeout(async () => {
+      try {
+        const ctx = await getContextWithRetry();
+        if (ctx?.title && ctx?.company && typeof window.__jat_tailor_show === 'function') {
+          window.__jat_tailor_show({ ...ctx, source: adapter.id });
+        }
+      } catch {}
+    }, 2200);
     clog('info', 'universal', `Boot complete on ${adapter.name}`);
   }
 

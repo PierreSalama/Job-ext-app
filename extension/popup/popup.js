@@ -87,6 +87,24 @@ function paintThemePicker(currentId) {
   });
 
   $('#open')?.addEventListener('click', () => send('open-app'));
+  // v9.0.1: Auto-apply trigger on the active tab — sends a message to the
+  // running content script which launches the RPA overlay in the page.
+  $('#auto-apply')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget; const orig = btn.textContent;
+    btn.disabled = true; btn.textContent = '🤖 Starting…';
+    try {
+      const r = await send('start-auto-apply-current-tab');
+      if (r?.ok === false && r?.error) {
+        btn.textContent = '⚠ ' + (r.error.length > 24 ? r.error.slice(0, 24) + '…' : r.error);
+        setTimeout(() => { btn.disabled = false; btn.textContent = orig; }, 4000);
+      } else {
+        btn.textContent = '🤖 Running…';
+        setTimeout(() => window.close(), 700);
+      }
+    } catch (err) {
+      btn.disabled = false; btn.textContent = orig;
+    }
+  });
   $('#ai')?.addEventListener('click', () => chrome.tabs.create({ url: chrome.runtime.getURL('app/app.html#/settings') }));
   $('#add')?.addEventListener('click', () => chrome.tabs.create({ url: chrome.runtime.getURL('app/app.html#/jobs') }));
   $('#tour')?.addEventListener('click', () => chrome.tabs.create({ url: chrome.runtime.getURL('app/app.html#/tour') }));
