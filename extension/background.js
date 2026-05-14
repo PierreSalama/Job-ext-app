@@ -788,6 +788,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case 'add-document': {
           const doc = await addDocument(data);
           await broadcast('documents.updated', {});
+          // v9.0.2: if this is a resume and the user has no default yet,
+          // mark it as default automatically. This makes the tailor-prompt
+          // flow work seamlessly — the user uploads, we auto-default, the
+          // re-check immediately sees a resume and offers to tailor.
+          try {
+            if (doc?.type === 'resume') {
+              const settings = await getSettings();
+              if (!settings.defaultResumeId) {
+                await patchSettings({ defaultResumeId: doc.id });
+                await broadcast('settings.updated', { settings: await getSettings() });
+                log.info('default-resume', `Auto-set ${doc.name} as default resume`);
+              }
+            }
+          } catch {}
           audit('user', 'document.added', `Added document ${doc?.name || ''}`, { id: doc?.id, name: doc?.name, type: doc?.type });
           sendResponse({ ok: true, doc });
           break;
@@ -1425,10 +1439,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
         case 'log':
 
-        case 'open-app':
-          chrome.tabs.create({ url: chrome.runtime.getURL('app/app.html') });
+        case 'open-app': {
+          // v9.0.2: accept an optional data.route (e.g. '#/documents') so the
+          // tailor prompt can deep-link the user straight to the upload page.
+          const sub = data?.route || '';
+          const url = chrome.runtime.getURL('app/app.html') + (sub.startsWith('#') ? sub : '');
+          chrome.tabs.create({ url });
           sendResponse({ ok: true });
           break;
+        }
 
         // ============ v9.0.1: Resume tailor ============
         case 'get-default-resume': {

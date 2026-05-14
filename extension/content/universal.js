@@ -481,6 +481,15 @@ const sendBg = (type, data) => new Promise((res) => chrome.runtime.sendMessage({
     setTimeout(() => { if (document.getElementById(PROF_ID)) el.remove(); }, 90000);
   }
 
+  // v9.0.2: expose context-getter to the tailor prompt so it can re-query
+  // on SPA navigations (LinkedIn pushState job-switches etc.)
+  window.__jat_get_context = async () => {
+    try {
+      const ctx = await getContextWithRetry(12, 250);
+      return ctx?.title && ctx?.company ? { ...ctx, source: adapter.id } : null;
+    } catch { return null; }
+  };
+
   function boot() {
     ensurePanel();
     panelMeta(adapter.getContext());
@@ -488,15 +497,19 @@ const sendBg = (type, data) => new Promise((res) => chrome.runtime.sendMessage({
     obs.observe(document.documentElement, { childList: true, subtree: true });
     setTimeout(() => tick().catch(() => {}), 600);
     setTimeout(() => { try { maybeOfferProfileSync(); } catch {} }, 1200);
-    // v9.0.1: fire the resume-tailor prompt once we have a confident job context
-    setTimeout(async () => {
+    // v9.0.1: fire the resume-tailor prompt once we have a confident job context.
+    // v9.0.2: increased retry budget (6→12 with 250ms backoff = ~3s total) AND
+    // a second deferred attempt at 5s for slow SPA renders (LinkedIn).
+    const tryFire = async () => {
       try {
-        const ctx = await getContextWithRetry();
+        const ctx = await getContextWithRetry(12, 250);
         if (ctx?.title && ctx?.company && typeof window.__jat_tailor_show === 'function') {
           window.__jat_tailor_show({ ...ctx, source: adapter.id });
         }
       } catch {}
-    }, 2200);
+    };
+    setTimeout(tryFire, 2200);
+    setTimeout(tryFire, 5500);
     clog('info', 'universal', `Boot complete on ${adapter.name}`);
   }
 
