@@ -171,10 +171,17 @@
       const hasResume = r?.ok && r.document;
 
       STATE.lastPromptedJobKey = key;
-      // If they're already in a "pending upload" state for THIS job, just
-      // show a passive status card instead of re-firing the question.
+      // If they're already pending an upload for this job AND we now confirmed
+      // they still have no resume, just show the waiting card. No new prompt.
       if (STATE.pendingResumeUploadJob === key && !hasResume) {
         showWaitingForResumeCard(ctx);
+        return;
+      }
+      // If pending an upload AND they now have a resume, jump straight to tailoring.
+      if (STATE.pendingResumeUploadJob === key && hasResume) {
+        STATE.pendingResumeUploadJob = null;
+        await runTailor(ctx);
+        STATE.finalized.add(key);
         return;
       }
 
@@ -195,9 +202,12 @@
       }
       // choice === 'yes'
       if (!hasResume) {
+        // v9.0.4: DO NOT auto-open the dashboard. The previous behavior was
+        // racy and caused duplicate tabs. Just show a card with a button the
+        // user explicitly clicks. STATE.pendingResumeUploadJob is set so
+        // when they DO upload, visibilitychange picks up and re-prompts.
         STATE.pendingResumeUploadJob = key;
-        await safeOpenApp('#/documents');
-        showWaitingForResumeCard(ctx);
+        showUploadPromptCard(ctx);
         return;
       }
       await runTailor(ctx);
@@ -205,6 +215,51 @@
     } finally {
       STATE.busy = false;
     }
+  }
+
+  // v9.0.4: Explicit upload-prompt card. User clicks button to open Documents tab.
+  // Replaces the auto-open behavior which caused duplicate dashboard tabs.
+  function showUploadPromptCard(ctx) {
+    injectStyles(); removeCard();
+    const card = document.createElement('div');
+    card.id = 'jat-tailor-card';
+    card.innerHTML = `
+      <button class="jat-close" aria-label="Close">×</button>
+      <h3 class="jat-h"><span class="jat-logo">JAT</span><span>Upload a resume to use AI tailoring</span></h3>
+      <p>To use AI resume tailoring for <strong>${escapeHtml(ctx.title.slice(0, 30))}</strong> at <strong>${escapeHtml(ctx.company.slice(0, 24))}</strong>, you'll first need to upload a default resume in JAT.</p>
+      <div class="jat-row">
+        <button class="jat-btn primary" data-act="open-docs">📁 Open Documents page</button>
+        <button class="jat-btn ghost" data-act="dismiss">Not now</button>
+      </div>
+      <div class="jat-status">Upload a resume → it's auto-set as default → come back and JAT will offer to tailor it.</div>
+    `;
+    document.body.appendChild(card);
+    card.querySelector('.jat-close').addEventListener('click', () => {
+      STATE.pendingResumeUploadJob = null;
+      STATE.finalized.add(jobKey(ctx));
+      removeCard();
+    });
+    card.querySelector('[data-act=dismiss]').addEventListener('click', () => {
+      STATE.pendingResumeUploadJob = null;
+      STATE.finalized.add(jobKey(ctx));
+      removeCard();
+    });
+    // Single user-gesture click → opens dashboard exactly once.
+    card.querySelector('[data-act=open-docs]').addEventListener('click', async (e) => {
+      e.currentTarget.disabled = true;
+      e.currentTarget.textContent = '📁 Opening…';
+      await safeOpenApp('#/documents');
+      // Card stays visible — user will return after uploading and the
+      // visibilitychange / documents.updated broadcast will retrigger the
+      // tailor flow automatically.
+      e.currentTarget.textContent = '✓ Dashboard opened';
+      setTimeout(() => {
+        if (document.getElementById('jat-tailor-card')) {
+          // Replace with waiting card
+          showWaitingForResumeCard(ctx);
+        }
+      }, 1500);
+    });
   }
 
   function showWaitingForResumeCard(ctx) {
