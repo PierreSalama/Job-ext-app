@@ -404,22 +404,39 @@ async function paintRuntime() {
 }
 
 // ---------- Live refresh ----------
+// Polls every 12s but only re-renders when the data actually changed.
+// Diff signature: total job count + most-recently-updated job's timestamp.
+// This is enough to detect any insert/update/delete without re-rendering
+// the whole DOM every tick (which caused the visible flicker).
 let pollTimer = null;
+let lastSig = null;
+async function refreshIfChanged() {
+  const p = location.hash.replace(/^#/, '') || '/';
+  if (p !== '/' && p !== '/applications') return; // not a list view, skip
+  try {
+    const [s, j] = await Promise.all([apiGet('/stats'), apiGet('/jobs?limit=1')]);
+    const items = (j?.ok && j.items) || [];
+    const sig = `${s?.total ?? 0}|${items[0]?.id || ''}|${items[0]?.updatedAt || ''}`;
+    if (sig !== lastSig) {
+      lastSig = sig;
+      navigate();
+    }
+  } catch {}
+}
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(() => {
-    // Only refresh list/dashboard routes, not detail edit forms
-    const p = location.hash.replace(/^#/, '') || '/';
-    if (p === '/' || p === '/applications') navigate();
+    refreshIfChanged();
     paintRuntime();
-  }, 4000);
+  }, 12000);
 }
 // Background broadcast → immediate refresh
 if (RUNTIME.isExt) {
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg?.type === 'jobs.updated') {
-      const p = location.hash.replace(/^#/, '') || '/';
-      if (p === '/' || p === '/applications') navigate();
+      // Force the diff to consider this new
+      lastSig = null;
+      refreshIfChanged();
     }
   });
 }

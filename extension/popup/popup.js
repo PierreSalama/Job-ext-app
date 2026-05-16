@@ -57,6 +57,16 @@ const SNOOZE_KEY = 'jat10.updateSnoozeVersion';
       && r.current !== r.latest              // sanity guard
       && snoozed !== r.latest                // not snoozed for THIS latest
     );
+    // Visible log so Pierre can right-click popup → Inspect to verify
+    console.log('[JAT popup] update check', {
+      r, snoozed, shouldShow,
+      reasons: {
+        ok: r?.ok, appRunning: r?.appRunning, hasUpdate: r?.hasUpdate,
+        currentTruthy: !!r?.current, latestTruthy: !!r?.latest,
+        notEqual: r?.current !== r?.latest,
+        notSnoozed: snoozed !== r?.latest,
+      },
+    });
     if (shouldShow) {
       $('#update-current').textContent = `v${r.current}`;
       $('#update-latest').textContent = `v${r.latest}`;

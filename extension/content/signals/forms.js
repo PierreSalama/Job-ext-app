@@ -180,9 +180,30 @@ export function findResumeFilename(root) {
 
   for (const s of scopes) {
     if (!s) continue;
+    // Pass 1: visible text content
     const text = (s.textContent || '').slice(0, 20000);
-    const m = text.match(FILENAME_RX);
-    if (m) return m[1].trim();
+    const tm = text.match(FILENAME_RX);
+    if (tm) return tm[1].trim();
+    // Pass 2: scan attribute values (title, aria-label, alt, data-*)
+    const found = scanAttributesForFilename(s);
+    if (found) return found;
+  }
+  return '';
+}
+
+function scanAttributesForFilename(root) {
+  const ATTR_NAMES = ['title', 'aria-label', 'alt', 'data-filename', 'data-name', 'data-resume', 'data-file'];
+  // We only need a few thousand elements scanned, so cap to avoid pathological pages.
+  const els = root.querySelectorAll('*');
+  let scanned = 0;
+  for (const el of els) {
+    if (scanned++ > 5000) break;
+    for (const a of ATTR_NAMES) {
+      const v = el.getAttribute?.(a);
+      if (!v) continue;
+      const m = v.match(FILENAME_RX);
+      if (m) return m[1].trim();
+    }
   }
   return '';
 }

@@ -361,6 +361,8 @@ function installWatchers() {
     if (location.href === state.lastUrl) return;
     log('url changed', { from: state.lastUrl, to: location.href });
     state.lastUrl = location.href;
+
+    // Success URL during an active flow → fire submitted
     if (!state.fired.submitted && urlLooksLikeSuccess()) {
       state.fired.submitted = true;
       state.stage = 'submitted';
@@ -368,19 +370,39 @@ function installWatchers() {
       persist('submitted', { summary: 'URL → success pattern' });
       return;
     }
-    const probe = recognizePage();
-    if (probe && (probe.ctx.title !== state.ctx?.title || probe.ctx.company !== state.ctx?.company)) {
-      log('new job context — resetting');
-      dismissPanel();
-      Object.assign(state, {
-        ctx: probe.ctx, jobId: null,
-        externalId: detectExternalId(), source: detectSource(),
-        stage: 'detected', resumeName: null, attachments: [],
-        answers: {}, answersCount: 0, persisted: false,
-        fired: { started: false, submitted: false },
-      });
+
+    // CRITICAL: never reset state mid-application. Once user has clicked
+    // Apply OR we've persisted a record, every URL change is just an
+    // intra-flow navigation (form step, validation page, etc.) — keep the
+    // identity (source, externalId, jobId) intact so dedup works.
+    if (state.fired.started || state.persisted) {
+      log('url changed mid-flow — keeping state intact');
+      // Refresh the captured state so the panel reflects the latest DOM
+      captureFormState('url-mid-flow');
       paintPanel();
+      return;
     }
+
+    // Otherwise (only stage='detected', no apply click yet), see if it's a
+    // genuinely different job and re-detect. Use normalized comparison so
+    // tiny title differences (capitalization, whitespace) don't trip a reset.
+    const probe = recognizePage();
+    if (!probe) return;
+    const normalize = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    const oldKey = normalize(state.ctx?.title) + '|' + normalize(state.ctx?.company);
+    const newKey = normalize(probe.ctx.title)  + '|' + normalize(probe.ctx.company);
+    if (oldKey === newKey) { log('url changed but same job — keep state'); return; }
+    log('genuinely new job — resetting');
+    dismissPanel();
+    Object.assign(state, {
+      ctx: probe.ctx, jobId: null,
+      externalId: detectExternalId(), source: detectSource(),
+      stage: 'detected', resumeName: null, attachments: [],
+      answers: {}, answersCount: 0, persisted: false,
+      fired: { started: false, submitted: false },
+    });
+    storeHandoff();
+    paintPanel();
   }, 1200);
 
   // ---- Load-on-success-page check ----
