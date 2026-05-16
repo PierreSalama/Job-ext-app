@@ -1,46 +1,50 @@
 // JAT v10 — universal detector.
-// Generic pipeline that works on every site (no per-host adapters):
-//
-//   PHASE 1 — page recognition
-//     Score the page against JSON-LD JobPosting + URL/title heuristics.
-//     If score >= MIN_PAGE_SCORE, this is "probably a job page" — wake up.
-//     Otherwise stay dormant; re-check on SPA URL changes.
-//
-//   PHASE 2 — apply intent
-//     Click handler at document level. Click on element matching the apply
-//     vocabulary → fire 'started' to background, render panel.
-//
-//   PHASE 3 — in-progress capture
-//     While the apply form/dialog is open, snapshot attachments + answers
-//     on every step-advance click. Each snapshot upserts the job (forward-
-//     only) so the database always reflects the latest known state.
-//
-//   PHASE 4 — submitted
-//     Three independent detectors: success text in DOM, success URL pattern,
-//     submit-button click. Any one fires 'submitted' once.
-//
-// All sends go through chrome.runtime.sendMessage({ type: 'pipeline-event' })
-// to background.js, which proxies to localhost:7744.
+// Generic pipeline; no per-host adapters. Pipeline persists to DB only when
+// there's real signal of investment — `started` alone (Apply click but no
+// progress) stays in the panel and is NOT written to the database. Once the
+// user picks a resume or fills out the form, status becomes `progressing`
+// and the job is upserted. Submission elevates to `submitted`.
 
 import { readJsonLdJobPosting } from './signals/json-ld.js';
-import { detectApplyForm, detectAttachments, snapshotAnswers } from './signals/forms.js';
+import { detectApplyForm, detectAttachments, snapshotAnswers, findCompanyLink, findResumeFilename, inferFromApplyHeader } from './signals/forms.js';
 import { isApplyClick, isSubmitClick, isStepAdvanceClick } from './signals/intent.js';
 import { pageTextLooksLikeSuccess, urlLooksLikeSuccess, nodeLooksLikeSuccess } from './signals/success.js';
 import { renderPanel, dismissPanel } from './panel.js';
 
 const MIN_PAGE_SCORE = 0.35;
+const TAG = '[JAT]';
+const HANDOFF_KEY = 'jat10.lastJobContext';
+const HANDOFF_TTL_MS = 10 * 60 * 1000;     // 10 minutes
+const log = (...args) => console.log(TAG, ...args);
 const send = (type, data) => new Promise((res) => chrome.runtime.sendMessage({ type, data }, res));
 
-// Track state per page-load. SPA URL changes reset some of it.
+async function storeHandoff() {
+  try {
+    await chrome.storage.local.set({
+      [HANDOFF_KEY]: { ctx: state.ctx, source: state.source, externalId: state.externalId, ts: Date.now(), url: location.href },
+    });
+    log('handoff stored', { source: state.source, externalId: state.externalId });
+  } catch {}
+}
+async function loadHandoff() {
+  try {
+    const s = (await chrome.storage.local.get(HANDOFF_KEY))[HANDOFF_KEY];
+    if (!s || Date.now() - s.ts > HANDOFF_TTL_MS) return null;
+    return s;
+  } catch { return null; }
+}
+
 const state = {
   ctx: null,
-  jobId: null,           // set after first upsert
+  jobId: null,
   externalId: null,
   source: null,
   stage: null,           // 'detected' | 'started' | 'progressing' | 'submitted'
   resumeName: null,
   attachments: [],
+  answers: {},
   answersCount: 0,
+  persisted: false,      // becomes true on first DB write
   fired: { started: false, submitted: false },
   lastUrl: location.href,
 };
@@ -60,12 +64,11 @@ function detectSource() {
   if (/workable\.com$/.test(h))             return 'workable';
   if (/bamboohr\.com$/.test(h))             return 'bamboohr';
   if (/smartrecruiters\.com$/.test(h))      return 'smartrecruiters';
-  return h; // unknown ATS / company career page — keep the hostname as source
+  return h;
 }
 
 function detectExternalId() {
   const u = new URL(location.href);
-  // LinkedIn job-id patterns
   const cur = u.searchParams.get('currentJobId');
   if (cur) return cur;
   const m1 = u.pathname.match(/\/jobs\/view\/(\d+)/);
@@ -78,29 +81,47 @@ function detectExternalId() {
 }
 
 function urlLooksJobby() {
-  const p = location.pathname;
-  if (/\/(jobs?|career|careers|position|opening|vacancies|apply|application)(\/|$)/i.test(p)) return 0.4;
+  // Substring match — far more permissive than the previous /-segment regex.
+  // Catches `/viewjob` (Indeed listing), `/indeedapply/` (Indeed apply form),
+  // `/smartapply/`, `/easy-apply/`, `/jobs/`, `/careers/`, etc. False
+  // positives are filtered out by the page-score gate downstream.
+  const p = location.pathname.toLowerCase();
+  if (/(jobs?|career|position|opening|vacanc|apply|application|posting|hiring|recruit|smartapply|viewjob)/.test(p)) return 0.4;
   return 0;
 }
 function titleLooksJobby() {
-  const t = document.title || '';
-  if (/job|career|hiring|position|opening|apply|engineer|developer|designer|manager/i.test(t)) return 0.15;
-  return 0;
+  return /job|career|hiring|position|opening|apply|engineer|developer|designer|manager/i.test(document.title || '') ? 0.15 : 0;
 }
 
 function recognizePage() {
   let score = 0;
   let ctx = null;
   const jp = readJsonLdJobPosting();
-  if (jp) { score += jp.confidence; ctx = jp.context; }
-  score += urlLooksJobby();
-  score += titleLooksJobby();
-
+  if (jp) {
+    score += jp.confidence;
+    ctx = jp.context;
+    log('json-ld jobposting →', ctx);
+  }
+  const urlScore = urlLooksJobby();
+  const titleScore = titleLooksJobby();
+  // A high-confidence apply form on the page is itself a strong signal that
+  // this is job-related — even when the URL/title look generic and JSON-LD
+  // is missing (smartapply.indeed.com, greenhouse.io/apply, etc.).
+  const applyFormProbe = detectApplyForm();
+  const formScore = applyFormProbe?.confidence >= 0.5 ? 0.5 : 0;
+  score += urlScore + titleScore + formScore;
+  log('page score', { score, jsonLd: !!jp, urlScore, titleScore, formScore });
   if (score < MIN_PAGE_SCORE) return null;
-
-  if (!ctx) {
-    // No JSON-LD — fall back to <title> + heuristic metadata
-    ctx = ctxFromMeta();
+  if (!ctx) ctx = ctxFromMeta();
+  // Always overlay generic DOM fallbacks on top — JSON-LD is sometimes
+  // partial (no company name on LinkedIn search-results view, for example).
+  if (!ctx.company || ctx.company === location.hostname.replace(/^www\./, '').split('.')[0]) {
+    const fromDom = findCompanyLink();
+    if (fromDom) { log('company recovered from DOM /company link →', fromDom); ctx.company = fromDom; }
+  }
+  if (!ctx.title) {
+    const h1 = document.querySelector('h1');
+    if (h1) ctx.title = h1.textContent.trim().slice(0, 200);
   }
   ctx.jobUrl = ctx.jobUrl || location.href;
   return { score, ctx };
@@ -110,17 +131,16 @@ function ctxFromMeta() {
   const og = (p) => document.querySelector(`meta[property="og:${p}"]`)?.content || '';
   const meta = (n) => document.querySelector(`meta[name="${n}"]`)?.content || '';
   const title = og('title') || document.title.split(/[|·-]/)[0].trim() || '';
-  // Best-effort company name: <meta og:site_name>, then domain
   const company = og('site_name') || meta('author') || location.hostname.replace(/^www\./, '').split('.')[0];
   const description = (og('description') || meta('description') || '').slice(0, 4000);
   return { title, company, location: '', description, compensation: '', workMode: '', employmentType: '' };
 }
 
 // ============================================================
-// PHASE 2/3/4 — pipeline events
+// PIPELINE EVENTS
 // ============================================================
-async function firePipelineEvent(stage, extra = {}) {
-  if (!state.ctx) return;
+async function persist(stage, extra = {}) {
+  if (!state.ctx) { log('persist skipped — no ctx'); return; }
   const payload = {
     stage,
     job: {
@@ -136,15 +156,20 @@ async function firePipelineEvent(stage, extra = {}) {
       workMode: state.ctx.workMode,
       employmentType: state.ctx.employmentType,
       attachments: state.attachments,
-      answers: extra.answers || undefined,
+      answers: Object.keys(state.answers).length ? state.answers : undefined,
     },
     eventType: stage,
     summary: extra.summary || '',
   };
-  const r = await send('pipeline-event', payload).catch(() => null);
-  if (r?.ok && r?.jobId) state.jobId = r.jobId;
+  log('→ POST /jobs', { stage, title: payload.job.title, company: payload.job.company, attachments: state.attachments.length });
+  const r = await send('pipeline-event', payload).catch((e) => ({ ok: false, error: String(e) }));
+  log('← response', r);
+  if (r?.ok && r?.jobId) { state.jobId = r.jobId; state.persisted = true; }
+}
+
+function paintPanel() {
   renderPanel({
-    stage,
+    stage: state.stage,
     ctx: state.ctx,
     resumeName: state.resumeName,
     attachments: state.attachments,
@@ -156,33 +181,80 @@ function captureFormState(reason) {
   const formProbe = detectApplyForm();
   const root = formProbe?.form || document;
   const attachments = detectAttachments(root);
+  // Fallback: scan visible text for a resume filename when no file input has files
+  if (!attachments.length) {
+    const guessed = findResumeFilename(root);
+    if (guessed) {
+      attachments.push({ name: guessed, sizeBytes: 0, type: '', role: 'resume' });
+      log('resume guessed from text →', guessed);
+    }
+  }
   const answers = snapshotAnswers(root);
   if (attachments.length) {
     state.attachments = attachments;
     const resume = attachments.find((a) => a.role === 'resume') || attachments[0];
     state.resumeName = resume?.name || state.resumeName;
   }
-  if (Object.keys(answers).length) state.answersCount = Object.keys(answers).length;
-  return { attachments, answers };
+  if (Object.keys(answers).length) {
+    state.answers = { ...state.answers, ...answers };
+    state.answersCount = Object.keys(state.answers).length;
+  }
+  log('captureFormState', { reason, attachments: state.attachments.length, answers: state.answersCount, formScore: formProbe?.confidence });
+  return { attachments, answers, hasProgress: state.attachments.length > 0 || state.answersCount > 0 };
 }
 
 // ============================================================
 // Boot
 // ============================================================
-function boot() {
-  const probe = recognizePage();
-  if (!probe) return; // not a job page — stay dormant
+async function boot() {
+  log('boot @', location.href);
+  let probe = recognizePage();
+
+  // ---- Cross-domain handoff fallback ----
+  // If the page doesn't recognize on its own (no JSON-LD, no /jobs URL — i.e.
+  // smartapply.indeed.com after Indeed opened a new tab), pull the context
+  // we stored from the previous job-listing page. We use the handoff anytime
+  // there's *any* apply signal — apply URL pattern, apply form on the page,
+  // or success text. Without one of those signals the handoff isn't safe to
+  // apply (we'd contaminate random pages).
+  const applyFormHere = detectApplyForm();
+  const hasApplySignal = (
+    urlLooksJobby() > 0
+    || pageTextLooksLikeSuccess()
+    || urlLooksLikeSuccess()
+    || (applyFormHere?.confidence >= 0.5)
+  );
+  if ((!probe || !probe.ctx.title || !probe.ctx.company) && hasApplySignal) {
+    const handoff = await loadHandoff();
+    if (handoff) {
+      const header = inferFromApplyHeader();
+      const enriched = {
+        ...handoff.ctx,
+        title:    probe?.ctx?.title   || header?.title   || handoff.ctx.title,
+        company:  probe?.ctx?.company || header?.company || handoff.ctx.company,
+      };
+      probe = { score: 0.6, ctx: enriched };
+      log('using handoff context from', handoff.url, '→', enriched);
+      state.source = handoff.source;
+      state.externalId = handoff.externalId;
+    } else if (!probe) {
+      const header = inferFromApplyHeader();
+      if (header?.title) {
+        probe = { score: 0.5, ctx: { ...ctxFromMeta(), title: header.title, company: header.company || ctxFromMeta().company } };
+        log('using apply-form header alone →', probe.ctx);
+      }
+    }
+  }
+
+  if (!probe) { log('boot: not a job page; dormant'); return; }
+
   state.ctx = probe.ctx;
-  state.source = detectSource();
-  state.externalId = detectExternalId();
+  if (!state.source) state.source = detectSource();
+  if (!state.externalId) state.externalId = detectExternalId();
   state.stage = 'detected';
-  renderPanel({
-    stage: 'detected',
-    ctx: state.ctx,
-    resumeName: null,
-    attachments: [],
-    answersCount: 0,
-  });
+  log('boot: detected', { source: state.source, externalId: state.externalId, ctx: state.ctx });
+  storeHandoff();      // cache for the next page in the apply flow
+  paintPanel();
   installWatchers();
 }
 
@@ -191,99 +263,132 @@ function installWatchers() {
   document.addEventListener('click', async (ev) => {
     const t = ev.target?.closest?.('button, a, [role="button"], input[type="submit"]');
     if (!t) return;
+    const txt = (t.textContent || '').trim().slice(0, 80);
 
     if (!state.fired.started && isApplyClick(t)) {
       state.fired.started = true;
       state.stage = 'started';
-      await firePipelineEvent('started', { summary: 'Apply clicked' });
+      log('click: APPLY', { text: txt });
+      // NO DB write yet — panel only. We persist on first progress signal.
+      paintPanel();
       return;
     }
     if (isStepAdvanceClick(t)) {
-      const { answers } = captureFormState('step-advance');
-      state.stage = 'progressing';
-      await firePipelineEvent('progressing', { answers, summary: 'Step advanced' });
+      log('click: STEP', { text: txt });
+      // First pass immediately, second pass after DOM settles (some sites
+      // mount the resume name into the DOM only after the click takes effect).
+      const cap = captureFormState('step-advance');
+      setTimeout(() => {
+        const cap2 = captureFormState('step-advance-delayed');
+        if (cap2.hasProgress && !state.persisted) {
+          state.stage = 'progressing';
+          persist('progressing', { summary: 'Form progress detected (post-step)' });
+        } else if (state.persisted && (cap2.attachments.length || Object.keys(cap2.answers).length)) {
+          state.stage = 'progressing';
+          persist('progressing', { summary: 'Step advanced (delayed catch)' });
+        }
+      }, 500);
+      if (cap.hasProgress && !state.persisted) {
+        state.stage = 'progressing';
+        await persist('progressing', { summary: 'Form progress detected' });
+      } else if (state.persisted) {
+        state.stage = 'progressing';
+        await persist('progressing', { summary: 'Step advanced' });
+      } else {
+        paintPanel();
+      }
       return;
     }
+    // Any other click inside an apply dialog → try a lightweight resume
+    // re-scan. LinkedIn's "click a resume card to select" doesn't surface
+    // as a step-advance or submit, but it does update the DOM with the
+    // selected filename. Cheap to retry.
+    if (state.fired.started && t.closest('[role="dialog"], [aria-modal="true"]')) {
+      setTimeout(() => {
+        const before = state.resumeName;
+        captureFormState('dialog-click');
+        if (state.resumeName !== before) {
+          log('resume name updated post-click →', state.resumeName);
+          paintPanel();
+        }
+      }, 250);
+    }
     if (isSubmitClick(t)) {
-      const { answers } = captureFormState('submit-click');
+      log('click: SUBMIT', { text: txt });
+      captureFormState('submit-click');
       if (!state.fired.submitted) {
         state.fired.submitted = true;
         state.stage = 'submitted';
-        await firePipelineEvent('submitted', { answers, summary: 'Submit clicked' });
+        await persist('submitted', { summary: 'Submit clicked' });
       }
     }
   }, true);
 
-  // ---- DOM mutation watcher (success node injection + late-loading apply forms) ----
+  // ---- DOM mutation watcher ----
   let debounce = null;
   const obs = new MutationObserver((records) => {
-    // Fast path: a success node just appeared
     for (const r of records) {
       for (const node of r.addedNodes || []) {
         if (nodeLooksLikeSuccess(node) && !state.fired.submitted) {
+          log('mutation: SUCCESS NODE');
           state.fired.submitted = true;
           state.stage = 'submitted';
-          firePipelineEvent('submitted', { summary: 'Success node injected' });
+          captureFormState('success-injected');
+          persist('submitted', { summary: 'Success node injected' });
           return;
         }
       }
     }
-    // Slow path: maybe an apply form just rendered (modal). Recapture file inputs.
     clearTimeout(debounce);
     debounce = setTimeout(() => {
       if (state.fired.submitted) return;
-      const { attachments } = captureFormState('mutation');
-      if (attachments.length && state.stage === 'started') {
+      const cap = captureFormState('mutation-tick');
+      // If we just discovered a resume/answers and haven't persisted yet,
+      // upgrade to progressing.
+      if (cap.hasProgress && state.fired.started && !state.persisted) {
         state.stage = 'progressing';
-        firePipelineEvent('progressing', { summary: 'Resume attached' });
-      } else if (state.stage === 'detected' || state.stage === 'started') {
-        // Just update the panel with the current state without re-firing.
-        renderPanel({
-          stage: state.stage,
-          ctx: state.ctx,
-          resumeName: state.resumeName,
-          attachments: state.attachments,
-          answersCount: state.answersCount,
-        });
+        log('auto-progress: resume/answers appeared post-Apply');
+        persist('progressing', { summary: 'Resume / answers captured' });
+      } else {
+        paintPanel();
       }
-    }, 250);
+    }, 350);
   });
   obs.observe(document.documentElement, { childList: true, subtree: true });
 
-  // ---- URL change watcher (SPA navigation) ----
+  // ---- SPA URL change watcher ----
   setInterval(() => {
     if (location.href === state.lastUrl) return;
+    log('url changed', { from: state.lastUrl, to: location.href });
     state.lastUrl = location.href;
-    // If URL flipped to a success pattern, fire submitted
     if (!state.fired.submitted && urlLooksLikeSuccess()) {
       state.fired.submitted = true;
       state.stage = 'submitted';
-      firePipelineEvent('submitted', { summary: 'URL → success pattern' });
+      captureFormState('url-success');
+      persist('submitted', { summary: 'URL → success pattern' });
       return;
     }
-    // Otherwise, re-recognize. Different job → reset state.
     const probe = recognizePage();
     if (probe && (probe.ctx.title !== state.ctx?.title || probe.ctx.company !== state.ctx?.company)) {
-      // New job: reset and fire 'detected' again
+      log('new job context — resetting');
       dismissPanel();
       Object.assign(state, {
         ctx: probe.ctx, jobId: null,
         externalId: detectExternalId(), source: detectSource(),
-        stage: 'detected', resumeName: null, attachments: [], answersCount: 0,
+        stage: 'detected', resumeName: null, attachments: [],
+        answers: {}, answersCount: 0, persisted: false,
         fired: { started: false, submitted: false },
       });
-      renderPanel({
-        stage: 'detected', ctx: state.ctx,
-        resumeName: null, attachments: [], answersCount: 0,
-      });
+      paintPanel();
     }
   }, 1200);
 
-  // ---- One-time check: maybe the page already shows a success state (e.g. refresh after submit) ----
+  // ---- Load-on-success-page check ----
   if (!state.fired.submitted && (pageTextLooksLikeSuccess() || urlLooksLikeSuccess())) {
+    log('boot landed on success page');
     state.fired.submitted = true;
     state.stage = 'submitted';
-    firePipelineEvent('submitted', { summary: 'Loaded on success page' });
+    persist('submitted', { summary: 'Loaded on success page' });
   }
 }
 

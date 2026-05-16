@@ -1,27 +1,21 @@
 // JAT v10 popup.
-// On open: pings the SW, probes the desktop app, checks if a newer app
-// release is published. If the app is running but outdated, surfaces a
-// non-intrusive update banner with a one-click "Update now" button that
-// triggers the same download-app-installer pipeline as the footer button.
+// On open: pings the SW, probes the desktop app, forces a fresh app-update
+// check (no stale cache), and surfaces the gold update banner only when the
+// running app is genuinely behind the latest published release.
+// "Later" persists per-version — once snoozed for v10.0.X, the banner stays
+// hidden until a newer version is published.
 
 const $ = (sel) => document.querySelector(sel);
 const send = (msg) => chrome.runtime.sendMessage(msg);
+const SNOOZE_KEY = 'jat10.updateSnoozeVersion';
 
 (async () => {
   // ---- SW health ----
   try {
     const r = await send({ type: 'ping' });
-    if (r?.ok) {
-      $('#sw-status').textContent = `ok · v${r.version}`;
-      $('#sw-status').classList.add('ok');
-    } else {
-      $('#sw-status').textContent = 'no response';
-      $('#sw-status').classList.add('bad');
-    }
-  } catch (e) {
-    $('#sw-status').textContent = String(e?.message || e);
-    $('#sw-status').classList.add('bad');
-  }
+    if (r?.ok) { $('#sw-status').textContent = `ok · v${r.version}`; $('#sw-status').classList.add('ok'); }
+    else       { $('#sw-status').textContent = 'no response'; $('#sw-status').classList.add('bad'); }
+  } catch (e) { $('#sw-status').textContent = String(e?.message || e); $('#sw-status').classList.add('bad'); }
 
   // ---- Desktop app health ----
   let appVersion = null;
@@ -50,23 +44,23 @@ const send = (msg) => chrome.runtime.sendMessage(msg);
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     const url = tab?.url || '';
-    if (url) {
-      const u = new URL(url);
-      $('#active-tab').textContent = u.host + u.pathname;
-    }
+    if (url) { const u = new URL(url); $('#active-tab').textContent = u.host + u.pathname; }
   } catch {}
 
-  // ---- Update check ----
-  // Show the banner only when the app is running AND a newer release exists.
-  // If the app is offline, the user can still install/upgrade via the
-  // "Download desktop app" button in the footer — no need to nag here.
+  // ---- Update check (force=true so we never trust stale cache) ----
   try {
-    const r = await send({ type: 'check-app-update' });
-    if (r?.ok && r.appRunning && r.hasUpdate) {
-      const banner = $('#update-banner');
+    const r = await send({ type: 'check-app-update', force: true });
+    const snoozed = (await chrome.storage.local.get(SNOOZE_KEY))[SNOOZE_KEY];
+    const shouldShow = (
+      r?.ok && r.appRunning && r.hasUpdate
+      && r.current && r.latest               // never show with null versions
+      && r.current !== r.latest              // sanity guard
+      && snoozed !== r.latest                // not snoozed for THIS latest
+    );
+    if (shouldShow) {
       $('#update-current').textContent = `v${r.current}`;
       $('#update-latest').textContent = `v${r.latest}`;
-      banner.hidden = false;
+      $('#update-banner').hidden = false;
 
       $('#update-now').addEventListener('click', async () => {
         const btn = $('#update-now');
@@ -92,11 +86,19 @@ const send = (msg) => chrome.runtime.sendMessage(msg);
         }
       });
 
-      $('#update-later').addEventListener('click', () => {
+      $('#update-later').addEventListener('click', async () => {
+        // Persist the snooze so this version stops nagging until a newer one
+        // is published.
+        try { await chrome.storage.local.set({ [SNOOZE_KEY]: r.latest }); } catch {}
         $('#update-banner').hidden = true;
       });
+    } else {
+      // Be defensive: if for any reason the banner is visible, force-hide it.
+      $('#update-banner').hidden = true;
     }
-  } catch {}
+  } catch {
+    $('#update-banner').hidden = true;
+  }
 
   // ---- Footer buttons ----
   $('#open-dashboard').addEventListener('click', () => {

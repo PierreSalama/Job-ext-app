@@ -100,9 +100,13 @@ route('/', async () => {
   const [statsR, jobsR] = await Promise.all([apiGet('/stats'), apiGet('/jobs?limit=5')]);
   const stats = statsR.ok ? statsR : { total: 0, thisWeek: 0, byStatus: {} };
   const jobs = jobsR.ok ? (jobsR.items || []) : [];
-  const inProgress = ['contacted', 'interview_1', 'interview_2', 'interview_final', 'offer']
+  // "In progress" = anything Pierre still expects to act on, including started.
+  const inProgress = ['started', 'submitted', 'contacted', 'interview_1', 'interview_2', 'interview_final', 'offer']
+    .reduce((s, id) => s + (stats.byStatus[id] || 0), 0);
+  const submitted = ['submitted', 'contacted', 'interview_1', 'interview_2', 'interview_final', 'offer', 'hired']
     .reduce((s, id) => s + (stats.byStatus[id] || 0), 0);
   const offers = (stats.byStatus.offer || 0) + (stats.byStatus.hired || 0);
+  const started = stats.byStatus.started || 0;
 
   const pipelinePills = STATUSES.filter((s) => ['started','submitted','contacted','interview_1','offer','rejected'].includes(s.id))
     .map((s) => `<div class="pill" data-status="${s.id}"><span class="dot"></span>${esc(s.label)}<span class="count">${stats.byStatus[s.id] || 0}</span></div>`)
@@ -140,8 +144,8 @@ route('/', async () => {
 
       <section class="stats">
         <div class="stat"><div class="stat-label">Applications</div><div class="stat-value">${stats.total || 0}</div><div class="stat-delta">All time</div></div>
-        <div class="stat"><div class="stat-label">This week</div><div class="stat-value">${stats.thisWeek || 0}</div><div class="stat-delta">Last 7 days</div></div>
-        <div class="stat"><div class="stat-label">In progress</div><div class="stat-value">${inProgress}</div><div class="stat-delta">Contacted → final round</div></div>
+        <div class="stat"><div class="stat-label">In progress</div><div class="stat-value">${started}</div><div class="stat-delta">Started · not submitted</div></div>
+        <div class="stat"><div class="stat-label">Submitted</div><div class="stat-value">${submitted}</div><div class="stat-delta">Submitted → hired</div></div>
         <div class="stat"><div class="stat-label">Offers</div><div class="stat-value gold">${offers}</div><div class="stat-delta">All time (incl. hired)</div></div>
       </section>
 
@@ -174,9 +178,25 @@ route('/', async () => {
 });
 
 // ---------- View: Applications list ----------
+// Persisted filter state across renders
+const APP_FILTER = { status: localStorage.getItem('jat10.filter.status') || 'all' };
+
 route('/applications', async () => {
   const r = await apiGet('/jobs');
-  const jobs = r.ok ? (r.items || []) : [];
+  const all = r.ok ? (r.items || []) : [];
+  const jobs = (() => {
+    if (APP_FILTER.status === 'all') return all;
+    if (APP_FILTER.status === 'in_progress') return all.filter((j) => j.status === 'started');
+    if (APP_FILTER.status === 'completed')   return all.filter((j) => j.status !== 'started');
+    return all.filter((j) => j.status === APP_FILTER.status);
+  })();
+
+  const statusFilterOpts = `
+    <option value="all"        ${APP_FILTER.status === 'all' ? 'selected' : ''}>All statuses (${all.length})</option>
+    <option value="in_progress" ${APP_FILTER.status === 'in_progress' ? 'selected' : ''}>In progress only</option>
+    <option value="completed"   ${APP_FILTER.status === 'completed' ? 'selected' : ''}>Submitted +</option>
+    ${STATUSES.map((s) => `<option value="${s.id}" ${APP_FILTER.status === s.id ? 'selected' : ''}>${esc(s.label)}</option>`).join('')}
+  `;
 
   const rows = jobs.length
     ? jobs.map((j) => `
@@ -190,9 +210,9 @@ route('/applications', async () => {
         </tr>`).join('')
     : `<tr><td colspan="6"><div class="empty">
          <div class="empty-mark"></div>
-         <div class="empty-eyebrow">No entries</div>
-         <div class="empty-title">The ledger is empty</div>
-         <div class="empty-sub">Hit Apply on a job and JAT will record it here. Or click <strong>+ New application</strong> to add one by hand.</div>
+         <div class="empty-eyebrow">${all.length ? 'No matches' : 'No entries'}</div>
+         <div class="empty-title">${all.length ? 'Nothing matches the current filter' : 'The ledger is empty'}</div>
+         <div class="empty-sub">${all.length ? 'Try a different filter or pick "All statuses".' : 'Hit Apply on a job and JAT will record it here.'}</div>
        </div></td></tr>`;
 
   const wrap = h(`
@@ -209,6 +229,10 @@ route('/applications', async () => {
         </div>
       </header>
 
+      <div class="toolbar">
+        <select class="select" id="filter-status">${statusFilterOpts}</select>
+      </div>
+
       <section class="section">
         <table class="table">
           <thead><tr><th>Title</th><th>Company</th><th>Status</th><th>Source</th><th>Applied</th><th>Updated</th></tr></thead>
@@ -217,6 +241,11 @@ route('/applications', async () => {
       </section>
     </div>
   `);
+  wrap.querySelector('#filter-status').addEventListener('change', (ev) => {
+    APP_FILTER.status = ev.target.value;
+    localStorage.setItem('jat10.filter.status', APP_FILTER.status);
+    navigate();
+  });
   wrap.querySelector('#btn-new').addEventListener('click', () => { location.hash = '#/applications/new'; });
   wrap.querySelector('#btn-refresh').addEventListener('click', navigate);
   wrap.querySelectorAll('.row-link').forEach((tr) => {

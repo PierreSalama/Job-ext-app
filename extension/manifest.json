@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Job Application Tracker v10",
   "short_name": "JAT v10",
-  "version": "10.0.7",
+  "version": "10.0.10",
   "description": "Captures job applications across every job board. Generic detector + atelier dashboard backed by a local SQLite desktop companion.",
   "permissions": ["storage", "downloads", "tabs", "alarms"],
   "host_permissions": [

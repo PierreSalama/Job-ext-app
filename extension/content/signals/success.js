@@ -2,8 +2,8 @@
 // Three independent detectors, any one of which → "this application was just
 // submitted". Combined in detector.js to avoid double-firing for the same job.
 
-const SUCCESS_TEXT_RX = /(your\s*application\s*(was|has\s*been)\s*(sent|submitted)|application\s*(sent|submitted|received)|thank\s*you\s*for\s*applying|we['\s]?ve\s*received\s*your\s*application|application\s*complete)/i;
-const SUCCESS_URL_RX  = /\/(confirmation|thank[-_]?you|applied|success|submitted|application[-_]?complete)(\/|\?|$)/i;
+const SUCCESS_TEXT_RX = /(your\s*application\s*(was|has\s*been)\s*(sent|submitted)|application\s*(sent|submitted|received|complete)|thank\s*you\s*for\s*applying|we['\s]?ve\s*received\s*your\s*application)/i;
+const SUCCESS_URL_RX  = /\/(confirmation|thank[-_]?you|applied|success|submitted|post[-_]?apply|apply[-_]?complete|application[-_]?(complete|received|sent))(\/|\?|$|#)/i;
 
 export function pageTextLooksLikeSuccess(maxLen = 4000) {
   const text = (document.body?.textContent || '').slice(0, maxLen);

@@ -123,19 +123,35 @@ function semverGt(a, b) {
 }
 
 async function checkAppUpdate(force = false) {
+  // Probe health FIRST. If the cached current doesn't match what the running
+  // app reports right now, the cache is stale — invalidate.
+  const health = await probeAppHealth();
+  const liveCurrent = health.ok ? (health.app?.version || null) : null;
+
   if (!force) {
     const cached = (await chrome.storage.local.get(UPDATE_CACHE_KEY))[UPDATE_CACHE_KEY];
-    if (cached && Date.now() - cached.checkedAt < UPDATE_CACHE_TTL_MS) return cached;
+    if (cached
+        && Date.now() - cached.checkedAt < UPDATE_CACHE_TTL_MS
+        && cached.current === liveCurrent) {
+      return cached;
+    }
   }
-  const health = await probeAppHealth();
-  const current = health.ok ? (health.app?.version || null) : null;
+
   let latest = null, releaseUrl = null;
   try {
     const release = await fetchMatchingRelease(extensionMajor());
     if (release) { latest = String(release.tag_name || '').replace(/^v/, '') || null; releaseUrl = release.html_url; }
   } catch {}
-  const hasUpdate = !!(current && latest && semverGt(latest, current));
-  const result = { ok: true, appRunning: !!current, current, latest, hasUpdate, releaseUrl, checkedAt: Date.now() };
+  const hasUpdate = !!(liveCurrent && latest && semverGt(latest, liveCurrent));
+  const result = {
+    ok: true,
+    appRunning: !!liveCurrent,
+    current: liveCurrent,
+    latest,
+    hasUpdate,
+    releaseUrl,
+    checkedAt: Date.now(),
+  };
   await chrome.storage.local.set({ [UPDATE_CACHE_KEY]: result });
   return result;
 }

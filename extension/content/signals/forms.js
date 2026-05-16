@@ -126,3 +126,85 @@ function normalizeLabel(s) {
 function cssEscape(s) {
   return (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/([!"#$%&'()*+,\-./:;<=>?@[\\\]^`{|}~])/g, '\\$1');
 }
+
+// ----- Generic company-link recovery -----
+// Walks <a> tags for href patterns the major job boards + ATSes share for
+// linking to a company profile / careers page. Returns the trimmed link text
+// of the first match, or empty string.
+const COMPANY_HREF_RX = /\/(company|companies|employer|organisation|organization|orgs?|emp)\/[\w\-_]+/i;
+export function findCompanyLink(root = document) {
+  const links = root.querySelectorAll('a[href]');
+  for (const a of links) {
+    const href = a.getAttribute('href') || '';
+    if (!COMPANY_HREF_RX.test(href)) continue;
+    const text = (a.textContent || '').trim();
+    if (!text) continue;
+    // Skip obviously-non-company text like "View company" or "About this company"
+    if (/^(view|about|see|more|explore)\b/i.test(text)) continue;
+    if (text.length > 120) continue;
+    return text;
+  }
+  return '';
+}
+
+// ----- Generic resume filename recovery -----
+// When no <input type="file"> has .files (the LinkedIn case — resumes are
+// selected from a list of previously uploaded ones), look for a visible
+// filename token within the page. We require the file extension to be a
+// resume-y format. We don't try to verify "this is THE resume" — it's
+// metadata only, and the user can edit it in the dashboard.
+const FILENAME_RX = /\b([\w()&,'\-.+ ]{3,120}?\.(pdf|docx?|rtf|odt|txt|pages))\b/i;
+export function findResumeFilename(root) {
+  // Build candidate scopes in order of specificity. We try each until we hit
+  // a hit. Going from narrow (current form) → wider (parent dialog, body)
+  // catches LinkedIn's case where the resume card is a sibling of the form.
+  const scopes = [];
+  if (root && root !== document) {
+    scopes.push(root);
+    // Walk up looking for a containing dialog/modal/section
+    let p = root.parentElement;
+    let hops = 0;
+    while (p && hops < 8) {
+      if (p.matches?.('[role="dialog"], [aria-modal="true"], section, main, [class*="modal"], [class*="apply"]')) {
+        scopes.push(p);
+      }
+      p = p.parentElement; hops++;
+    }
+  }
+  // Also consider any visible dialog on the page (LinkedIn's Easy Apply modal)
+  for (const d of document.querySelectorAll('[role="dialog"], [aria-modal="true"]')) {
+    if (!scopes.includes(d)) scopes.push(d);
+  }
+  // Last resort: body
+  scopes.push(document.body || document.documentElement);
+
+  for (const s of scopes) {
+    if (!s) continue;
+    const text = (s.textContent || '').slice(0, 20000);
+    const m = text.match(FILENAME_RX);
+    if (m) return m[1].trim();
+  }
+  return '';
+}
+
+// ----- Generic title/company extraction from apply-form headers -----
+// On standalone apply pages (smartapply.indeed.com, greenhouse.io/apply,
+// etc.) the job listing is gone but the form header usually says something
+// like "Apply for X at Y" or shows the role + company in an h1/h2.
+const APPLY_HEADER_RX = /apply(?:ing)?\s+(?:for|to)\s+(.+?)(?:\s+at\s+(.+?))?(?:\s+on\s+\w+)?$/i;
+export function inferFromApplyHeader() {
+  // Walk h1/h2 first; they're usually right.
+  const headings = document.querySelectorAll('h1, h2, [role="heading"]');
+  for (const h of headings) {
+    const t = (h.textContent || '').trim();
+    if (!t || t.length > 200) continue;
+    const m = t.match(APPLY_HEADER_RX);
+    if (m) return { title: m[1]?.trim() || '', company: m[2]?.trim() || '' };
+    // Sometimes headings are just "Software Engineer · Acme Inc"
+    const parts = t.split(/\s+[·•|—-]\s+/);
+    if (parts.length >= 2 && parts[0].length < 80 && parts[1].length < 80) {
+      return { title: parts[0].trim(), company: parts[1].trim() };
+    }
+  }
+  return null;
+}
