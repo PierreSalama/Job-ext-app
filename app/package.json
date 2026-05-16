@@ -1,6 +1,6 @@
 {
   "name": "jat10-app",
-  "version": "10.0.3",
+  "version": "10.0.4",
   "description": "Desktop companion for the Job Application Tracker v10 Chrome extension. Skeleton — exposes a single /health endpoint on http://localhost:7744 so the extension popup can see it.",
   "main": "src/main.js",
   "scripts": {
@@ -10,6 +10,9 @@
     "build:mac": "electron-builder --mac --publish never",
     "build:linux": "electron-builder --linux --publish never",
     "publish:win": "electron-builder --win --publish always"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
   },
   "devDependencies": {
     "electron": "^32.0.0",
