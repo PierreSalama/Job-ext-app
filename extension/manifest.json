@@ -1,49 +1,25 @@
 {
   "manifest_version": 3,
-  "name": "Job Application Tracker v9",
-  "short_name": "JAT v9",
-  "version": "9.0.4",
-  "description": "v9 — Universal job-application tracker with 100+ AI features. Job-fit scoring, JD red-flag detection, application autopsy, voice quick-add, smart tags, recipes, webhooks, full health monitoring, and a sandbox to try every feature. Captures across LinkedIn, Indeed, Glassdoor, Greenhouse, Lever, Workday, Ashby, Workable, BambooHR, SmartRecruiters.",
-  "permissions": ["storage", "tabs", "scripting", "alarms", "notifications", "clipboardWrite", "declarativeNetRequestWithHostAccess", "downloads"],
+  "name": "Job Application Tracker v10",
+  "short_name": "JAT v10",
+  "version": "10.0.2",
+  "description": "Skeleton rebuild. Bare-bones MV3 extension + Electron companion app. Features added one at a time, tested before the next is started.",
+  "permissions": ["storage", "downloads"],
   "host_permissions": [
     "https://*.linkedin.com/*",
-    "https://*.indeed.com/*",
-    "https://*.glassdoor.com/*",
-    "https://*.glassdoor.ca/*",
-    "https://*.glassdoor.co.uk/*",
-    "https://*.greenhouse.io/*",
-    "https://jobs.lever.co/*",
-    "https://*.myworkdayjobs.com/*",
-    "https://*.ashbyhq.com/*",
-    "https://apply.workable.com/*",
-    "https://*.bamboohr.com/*",
-    "https://jobs.smartrecruiters.com/*",
+    "http://localhost:7744/*",
+    "http://127.0.0.1:7744/*",
     "https://api.github.com/*",
     "https://github.com/*",
-    "https://*.githubusercontent.com/*",
-    "http://localhost:11434/*",
-    "http://127.0.0.1:11434/*",
-    "http://localhost:7733/*",
-    "http://127.0.0.1:7733/*",
-    "ws://localhost:7733/*",
-    "ws://127.0.0.1:7733/*"
+    "https://*.githubusercontent.com/*"
   ],
-  "declarative_net_request": {
-    "rule_resources": [
-      {
-        "id": "ollama-cors",
-        "enabled": true,
-        "path": "rules/ollama-cors.json"
-      }
-    ]
-  },
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
   "action": {
     "default_popup": "popup/popup.html",
-    "default_title": "Job Application Tracker v9",
+    "default_title": "Job Application Tracker v10",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",
@@ -59,29 +35,10 @@
   },
   "content_scripts": [
     {
-      "matches": [
-        "https://*.linkedin.com/*",
-        "https://*.indeed.com/*",
-        "https://*.glassdoor.com/*",
-        "https://*.glassdoor.ca/*",
-        "https://*.glassdoor.co.uk/*",
-        "https://*.greenhouse.io/*",
-        "https://jobs.lever.co/*",
-        "https://*.myworkdayjobs.com/*",
-        "https://*.ashbyhq.com/*",
-        "https://apply.workable.com/*",
-        "https://*.bamboohr.com/*",
-        "https://jobs.smartrecruiters.com/*"
-      ],
-      "js": ["content/loader.js"],
+      "matches": ["https://*.linkedin.com/*"],
+      "js": ["content/linkedin.js"],
       "run_at": "document_idle",
       "all_frames": false
-    }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": ["content/universal.js", "content/autofill.js", "content/profile-scraper.js", "content/adapters/*.js", "content/resume-tailor-prompt.js", "content/auto-apply.js", "setup/*", "setup/jat-app-bundle/*", "setup/jat-app-bundle/src/*"],
-      "matches": ["<all_urls>"]
     }
   ]
 }

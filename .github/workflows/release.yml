@@ -1,12 +1,12 @@
-name: Build & Release JAT v9 installers
+name: Build & Release JAT v10 installers
 
 # Triggers:
-#   • Push a tag like `v9.0.0` → automatic build + release
+#   • Push a tag like `v10.0.0` → automatic build + release
 #   • Manual run via "Run workflow" button on the Actions tab
 on:
   push:
     tags:
-      - 'v9.*'
+      - 'v10.*'
   workflow_dispatch:
 
 permissions:
@@ -19,7 +19,7 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact: '*Setup*.exe'
+            artifact: '*setup*.exe'
             label: Windows
           - os: macos-latest
             artifact: '*.dmg'
@@ -48,31 +48,12 @@ jobs:
           npm install sharp --no-save --no-audit --no-fund
           node build/make-icons.mjs
 
-      - name: Pre-build env dump
-        working-directory: app
-        shell: bash
-        run: |
-          echo "::group::Environment"
-          node --version
-          npm --version
-          echo "::endgroup::"
-          echo "::group::package.json"
-          cat package.json
-          echo "::endgroup::"
-
       - name: Build (${{ matrix.label }})
         working-directory: app
-        # --publish never: the workflow uploads artifacts separately via
-        # softprops/action-gh-release. We just want electron-builder to
-        # produce the files locally, and electron-updater needs the publish
-        # provider config in package.json to know where to check for updates.
         run: npx electron-builder --publish never
         env:
-          # Avoid the auto-publish flow; we attach files explicitly below.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_IDENTITY_AUTO_DISCOVERY: false
-          # Helpful diagnostics if the build fails — surfaced in the run log,
-          # which Actions exposes on the Summary page even without auth.
           DEBUG: electron-builder
 
       - name: List build output
@@ -83,37 +64,13 @@ jobs:
           echo "::group::dist/ contents"
           ls -la dist/ 2>/dev/null || echo "(no dist/)"
           echo "::endgroup::"
-          echo "::group::dist/ recursive (top 50)"
-          find dist -maxdepth 3 -print 2>/dev/null | head -50 || true
-          echo "::endgroup::"
-
-      - name: Collect logs on failure
-        if: failure()
-        shell: bash
-        run: |
-          mkdir -p /tmp/jat-logs
-          # npm debug logs (any platform)
-          if [ -d "$HOME/.npm/_logs" ]; then cp -r "$HOME/.npm/_logs" /tmp/jat-logs/npm-logs 2>/dev/null || true; fi
-          # electron-builder debug output (sometimes written into the app dir)
-          cp -r app/dist /tmp/jat-logs/dist 2>/dev/null || true
-          # Recent stdout — node_modules listing for sanity
-          ls -la app 2>/dev/null > /tmp/jat-logs/app-ls.txt || true
-          ls -la app/node_modules 2>/dev/null | head -40 > /tmp/jat-logs/app-node_modules-ls.txt || true
-
-      - name: Upload failure logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: failure-logs-${{ matrix.label }}
-          path: /tmp/jat-logs
-          if-no-files-found: ignore
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: jat-v9-${{ matrix.label }}
+          name: jat-v10-${{ matrix.label }}
           # Include the installer AND the *.yml + *.blockmap metadata files
-          # that electron-updater needs to discover new versions.
+          # that electron-updater will need once that feature is added.
           path: |
             app/dist/${{ matrix.artifact }}
             app/dist/latest*.yml
@@ -132,36 +89,37 @@ jobs:
         with:
           path: artifacts
 
-      - name: Rename for predictable URLs
+      - name: Stage release files
         shell: bash
         run: |
           mkdir -p release
-          # Windows installer + auto-updater metadata
-          if compgen -G "artifacts/jat-v9-Windows/*.exe" > /dev/null; then
-            cp artifacts/jat-v9-Windows/*.exe release/JAT-v9-setup.exe
+          # Windows — electron-builder already names this JAT-v10-setup.exe
+          # via the `artifactName` in package.json.
+          if compgen -G "artifacts/jat-v10-Windows/*.exe" > /dev/null; then
+            cp artifacts/jat-v10-Windows/*.exe release/JAT-v10-setup.exe
           fi
-          if compgen -G "artifacts/jat-v9-Windows/latest.yml" > /dev/null; then
-            cp artifacts/jat-v9-Windows/latest.yml release/latest.yml
+          if compgen -G "artifacts/jat-v10-Windows/latest.yml" > /dev/null; then
+            cp artifacts/jat-v10-Windows/latest.yml release/latest.yml
           fi
-          if compgen -G "artifacts/jat-v9-Windows/*.blockmap" > /dev/null; then
-            cp artifacts/jat-v9-Windows/*.blockmap release/ 2>/dev/null || true
+          if compgen -G "artifacts/jat-v10-Windows/*.blockmap" > /dev/null; then
+            cp artifacts/jat-v10-Windows/*.blockmap release/ 2>/dev/null || true
           fi
-          # macOS installer + auto-updater metadata
-          if compgen -G "artifacts/jat-v9-macOS/*.dmg" > /dev/null; then
-            cp artifacts/jat-v9-macOS/*.dmg release/JAT-v9.dmg
+          # macOS
+          if compgen -G "artifacts/jat-v10-macOS/*.dmg" > /dev/null; then
+            cp artifacts/jat-v10-macOS/*.dmg release/JAT-v10.dmg
           fi
-          if compgen -G "artifacts/jat-v9-macOS/latest-mac.yml" > /dev/null; then
-            cp artifacts/jat-v9-macOS/latest-mac.yml release/latest-mac.yml
+          if compgen -G "artifacts/jat-v10-macOS/latest-mac.yml" > /dev/null; then
+            cp artifacts/jat-v10-macOS/latest-mac.yml release/latest-mac.yml
           fi
-          if compgen -G "artifacts/jat-v9-macOS/*.blockmap" > /dev/null; then
-            cp artifacts/jat-v9-macOS/*.blockmap release/ 2>/dev/null || true
+          if compgen -G "artifacts/jat-v10-macOS/*.blockmap" > /dev/null; then
+            cp artifacts/jat-v10-macOS/*.blockmap release/ 2>/dev/null || true
           fi
-          # Linux installer + auto-updater metadata
-          if compgen -G "artifacts/jat-v9-Linux/*.AppImage" > /dev/null; then
-            cp artifacts/jat-v9-Linux/*.AppImage release/JAT-v9.AppImage
+          # Linux
+          if compgen -G "artifacts/jat-v10-Linux/*.AppImage" > /dev/null; then
+            cp artifacts/jat-v10-Linux/*.AppImage release/JAT-v10.AppImage
           fi
-          if compgen -G "artifacts/jat-v9-Linux/latest-linux.yml" > /dev/null; then
-            cp artifacts/jat-v9-Linux/latest-linux.yml release/latest-linux.yml
+          if compgen -G "artifacts/jat-v10-Linux/latest-linux.yml" > /dev/null; then
+            cp artifacts/jat-v10-Linux/latest-linux.yml release/latest-linux.yml
           fi
           ls -la release/
 

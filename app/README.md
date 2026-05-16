@@ -1,72 +1,41 @@
-# JAT v6 — Desktop App
+# JAT v10 — Desktop companion (skeleton)
 
-Electron + better-sqlite3 + zero other native deps. Mirrors the extension's UI verbatim.
+The smallest possible Electron app: one window + one HTTP route. Pairs with the v10 Chrome extension so you can verify end-to-end connectivity before any real feature is layered on.
 
-## You can stop here
+## What it does
 
-The app works on its own. SQLite-backed storage, native menus, AI calls, all 25+ workspaces. You don't need the Chrome extension.
+- Opens a 520×360 Electron window showing connection status
+- Starts a Node `http` server on **`http://localhost:7744`**
+- Serves a single endpoint: `GET /health` → `{ ok, version, ts }` (with permissive CORS so the extension SW can fetch it)
 
-## To unlock more
+That's it. No tray. No database. No global hotkey. No sync. No native notifications. No auto-update.
 
-Install the [Chrome extension](../extension/README.md) for: real-time capture as you apply on LinkedIn / Indeed / Glassdoor / etc., universal autofill, profile sync from source pages. The app and extension auto-discover each other on `localhost:7733` over WebSocket — install one, install the other, they sync instantly.
+## How to run
 
-```
-1. Open chrome://extensions/
-2. Toggle Developer mode
-3. Load unpacked → select ../extension/
-```
-
-## Run
-
-```sh
-npm install   # one-time. Pulls Electron + better-sqlite3 (native module).
-npm start     # launches the app
+```bash
+cd F:\GITHUB\Perosnal\extensions\job-application-tracker\v10\app
+npm install
+npm start
 ```
 
-`npm install` will compile `better-sqlite3` against your Node/Electron ABI on first run. If it picks the wrong ABI, run `npx electron-rebuild -f -w better-sqlite3` once.
+You should see:
 
-The app opens at 1400x900 with a dark titlebar, loads the same SPA as the extension, and starts a sync server on `http://localhost:7733`.
+- An Electron window titled "JAT v10 — Desktop" with two green status rows
+- Console log: `[JAT v10 app] HTTP server listening on http://localhost:7744`
 
-## Architecture
+Hit `http://localhost:7744/health` from any browser to confirm: `{"ok":true,"version":"10.0.0","ts":...}`.
 
-| Layer | Files |
-|---|---|
-| **Electron entry** | `src/main.js` (BrowserWindow, lifecycle, server boot) |
-| **Preload bridge** | `src/preload.js` (`window.jat5.api`, `onEvent`, `openExternal`, `pickFolder`) |
-| **Sync server** | `src/server.js` (HTTP + WebSocket on :7733, REST endpoints, `/sync/event`) |
-| **Storage** | `src/db.js` (better-sqlite3, mirrors extension's IDB API) |
-| **UI** | `src/index.html` + `src/app/{app.html, app.css, app.js}` (copied from extension with chrome.* swapped for `window.jat5.*`) |
-| **Library** | `src/lib/*` (themes, icon-presets, schema, markdown, templates — copied verbatim from extension) |
+## How to verify the extension sees it
 
-## Sync protocol
+1. Load the v10 extension (see `../README.md`).
+2. With the desktop app running, click the extension toolbar icon.
+3. The "Desktop app" row should show **connected · v10.0.0** in green.
+4. Quit the app — the row should flip to **offline**.
 
-Both REST (manual / curl) and WebSocket (real-time):
+## Port
 
-| Endpoint | Method | Purpose |
-|---|---|---|
-| `/health` | GET | Liveness probe (extension polls every 5s) |
-| `/api/snapshot` | GET | Full state dump for initial sync |
-| `/sync/event` | POST | Apply an inbound mutation (last-write-wins by `updatedAt`) |
-| `/ws` | WS | Subscribe to broadcast `{type:'event', name, data}` frames |
-| `/jobs`, `/profile`, `/profiles`, `/qa`, `/documents`, `/settings` | GET / POST / PATCH / DELETE | CRUD |
-| `/rpc` | POST | Generic dispatcher mirroring `chrome.runtime.sendMessage` shape |
+Hardcoded to **7744**. v9 used 7733 — picking a different port lets v9 and v10 coexist during the transition.
 
-The WebSocket implementation is dependency-free (Node `crypto` for the handshake + manual frame encoding). Loop suppression: each side keeps a 30s hash map of `(name|id|updatedAt)` so echoes don't ping-pong.
+## Packaging
 
-## Database
-
-SQLite file lives at:
-- Windows: `%APPDATA%\jat6-app\jat6.db`
-- macOS: `~/Library/Application Support/jat6-app/jat6.db`
-- Linux: `~/.config/jat6-app/jat6.db`
-
-Schema mirrors the extension's IDB stores exactly.
-
-## Build / package
-
-```sh
-npm install -D electron-builder
-npx electron-builder --win --mac --linux
-```
-
-This is not yet wired in `package.json` scripts — add `"build": "electron-builder"` when you're ready to ship.
+`npm run build:win` / `build:mac` / `build:linux` produce installers via `electron-builder`. Configured to publish to the existing `PierreSalama/Job-ext-app` GitHub Releases repo, same as v9. **No actual release artifacts exist yet** — the `⬇ Download desktop app` button in the extension popup just opens the releases page; users will see v9 builds there until v10 is tagged and shipped.
