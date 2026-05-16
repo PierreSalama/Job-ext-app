@@ -477,6 +477,17 @@ body {
 .kv dd { margin: 0; }
 .kv dd .input, .kv dd .select { width: 100%; }
 .timeline { padding: 8px 0; }
+.timeline-item { display: grid; grid-template-columns: 16px 1fr; gap: 14px; padding: 12px 24px; align-items: start; }
+.timeline-dot { width: 8px; height: 8px; margin-top: 5px; background: var(--gold-leaf); box-shadow: 0 0 0 3px rgba(176,138,90,0.15); }
+.timeline-title { font-size: 13px; color: var(--bone-lede); font-weight: 500; }
+.timeline-sub { font-size: 11px; color: var(--bone-mute); margin-top: 2px; letter-spacing: 0.04em; }
+
+.status {
+  font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase;
+  color: var(--bone-mute); padding: 8px 0;
+}
+.status.ok { color: var(--gold-leaf); }
+.status.bad { color: var(--bad); }
 
 .back-link {
   font-size: 10px; letter-spacing: 0.24em;

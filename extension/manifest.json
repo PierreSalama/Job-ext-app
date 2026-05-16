@@ -2,11 +2,11 @@
   "manifest_version": 3,
   "name": "Job Application Tracker v10",
   "short_name": "JAT v10",
-  "version": "10.0.6",
-  "description": "Skeleton rebuild. Bare-bones MV3 extension + Electron companion app. Features added one at a time, tested before the next is started.",
-  "permissions": ["storage", "downloads"],
+  "version": "10.0.7",
+  "description": "Captures job applications across every job board. Generic detector + atelier dashboard backed by a local SQLite desktop companion.",
+  "permissions": ["storage", "downloads", "tabs", "alarms"],
   "host_permissions": [
-    "https://*.linkedin.com/*",
+    "<all_urls>",
     "http://localhost:7744/*",
     "http://127.0.0.1:7744/*",
     "https://api.github.com/*",
@@ -35,10 +35,31 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://*.linkedin.com/*"],
-      "js": ["content/linkedin.js"],
+      "matches": ["<all_urls>"],
+      "exclude_matches": [
+        "*://localhost/*",
+        "*://127.0.0.1/*",
+        "*://*.google.com/*",
+        "*://*.youtube.com/*",
+        "*://*.gmail.com/*",
+        "*://mail.google.com/*",
+        "*://docs.google.com/*",
+        "*://accounts.google.com/*",
+        "*://github.com/*",
+        "*://*.github.com/*",
+        "*://chat.openai.com/*",
+        "*://chatgpt.com/*",
+        "*://claude.ai/*"
+      ],
+      "js": ["content/loader.js"],
       "run_at": "document_idle",
       "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["content/detector.js", "content/panel.js", "content/signals/*.js", "content/lib/*.js"],
+      "matches": ["<all_urls>"]
     }
   ]
 }

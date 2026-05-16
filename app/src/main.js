@@ -7,6 +7,7 @@
 const { app, BrowserWindow, dialog } = require('electron');
 const path = require('path');
 const { startServer, stopServer } = require('./server');
+const db = require('./db');
 const { autoUpdater } = require('electron-updater');
 
 const PORT = 7744;
@@ -90,7 +91,12 @@ function setupAutoUpdater() {
 
 app.whenReady().then(async () => {
   try {
-    await startServer(PORT, () => app.getVersion());
+    db.open(app.getPath('userData'));
+  } catch (e) {
+    console.error('[JAT v10 app] failed to open DB', e);
+  }
+  try {
+    await startServer(PORT, { getVersion: () => app.getVersion(), db });
     console.log(`[JAT v10 app] HTTP server listening on http://localhost:${PORT}`);
   } catch (e) {
     console.error('[JAT v10 app] failed to start server', e);
@@ -104,6 +110,7 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   stopServer();
+  db.close();
   if (updateInterval) clearInterval(updateInterval);
   if (process.platform !== 'darwin') app.quit();
 });
