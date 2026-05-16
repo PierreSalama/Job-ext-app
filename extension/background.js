@@ -1,12 +1,21 @@
 // JAT v10 — background service worker.
-// Skeleton: records install time, responds to 'ping', 'app-health', and
-// 'download-app-installer'. No tabs are opened automatically.
+// Skeleton: records install time + serves a small RPC surface for the popup:
+//   • 'ping'                  — SW health check
+//   • 'app-health'            — probe http://localhost:7744/health
+//   • 'check-app-update'      — compare running app version to latest GitHub release
+//   • 'download-app-installer'— pull OS-matched installer from GitHub Releases
+// Update checks are cached for 5 minutes so opening the popup repeatedly
+// doesn't hammer the GitHub API.
 
 const APP_BASE = 'http://localhost:7744';
 
 // GitHub repo hosting the desktop-app installers.
 const GH_OWNER = 'PierreSalama';
 const GH_REPO = 'Job-ext-app';
+
+// Update-check cache
+const UPDATE_CACHE_KEY = 'jat10.appUpdateCache';
+const UPDATE_CACHE_TTL_MS = 5 * 60 * 1000;
 
 chrome.runtime.onInstalled.addListener(async ({ reason }) => {
   const ts = new Date().toISOString();
@@ -22,13 +31,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg?.type === 'app-health') {
     (async () => {
+      const r = await probeAppHealth();
+      sendResponse(r);
+    })();
+    return true;
+  }
+
+  if (msg?.type === 'check-app-update') {
+    (async () => {
       try {
-        const r = await fetch(`${APP_BASE}/health`, { signal: AbortSignal.timeout(1200) });
-        if (!r.ok) { sendResponse({ ok: false, reason: `HTTP ${r.status}` }); return; }
-        const body = await r.json().catch(() => ({}));
-        sendResponse({ ok: true, app: body });
+        sendResponse(await checkAppUpdate(!!msg?.force));
       } catch (e) {
-        sendResponse({ ok: false, reason: String(e?.message || e).slice(0, 120) });
+        sendResponse({ ok: false, error: String(e?.message || e) });
       }
     })();
     return true;
@@ -36,19 +50,78 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg?.type === 'download-app-installer') {
     (async () => {
-      try {
-        const result = await downloadAppInstaller();
-        sendResponse({ ok: true, ...result });
-      } catch (e) {
-        sendResponse({ ok: false, error: String(e?.message || e) });
-      }
+      try { sendResponse({ ok: true, ...(await downloadAppInstaller()) }); }
+      catch (e) { sendResponse({ ok: false, error: String(e?.message || e) }); }
     })();
     return true;
   }
 });
 
-// ---------- Installer download ----------
+// ---------- App health ----------
+async function probeAppHealth() {
+  try {
+    const r = await fetch(`${APP_BASE}/health`, { signal: AbortSignal.timeout(1200) });
+    if (!r.ok) return { ok: false, reason: `HTTP ${r.status}` };
+    const body = await r.json().catch(() => ({}));
+    return { ok: true, app: body };
+  } catch (e) {
+    return { ok: false, reason: String(e?.message || e).slice(0, 120) };
+  }
+}
 
+// ---------- Update detection ----------
+function semverGt(a, b) {
+  const pa = String(a).split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b).split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) > (pb[i] || 0)) return true;
+    if ((pa[i] || 0) < (pb[i] || 0)) return false;
+  }
+  return false;
+}
+
+async function checkAppUpdate(force = false) {
+  // Returns shape:
+  //   { ok, appRunning, current, latest, hasUpdate, releaseUrl, checkedAt }
+  // `current` is null when the app isn't running.
+  // `latest` is null when GitHub has no v10 release yet.
+
+  if (!force) {
+    const cached = (await chrome.storage.local.get(UPDATE_CACHE_KEY))[UPDATE_CACHE_KEY];
+    if (cached && Date.now() - cached.checkedAt < UPDATE_CACHE_TTL_MS) {
+      return cached;
+    }
+  }
+
+  // Where is the running app, if any?
+  const health = await probeAppHealth();
+  const current = health.ok ? (health.app?.version || null) : null;
+
+  // Latest v10 release tag
+  let latest = null, releaseUrl = null;
+  try {
+    const release = await fetchMatchingRelease(extensionMajor());
+    if (release) {
+      latest = String(release.tag_name || '').replace(/^v/, '') || null;
+      releaseUrl = release.html_url;
+    }
+  } catch {}
+
+  const hasUpdate = !!(current && latest && semverGt(latest, current));
+  const result = {
+    ok: true,
+    appRunning: !!current,
+    current,
+    latest,
+    hasUpdate,
+    releaseUrl,
+    checkedAt: Date.now(),
+  };
+  await chrome.storage.local.set({ [UPDATE_CACHE_KEY]: result });
+  return result;
+}
+
+// ---------- Installer download ----------
 async function detectOs() {
   try {
     const info = await chrome.runtime.getPlatformInfo();
@@ -58,8 +131,6 @@ async function detectOs() {
   } catch { return 'windows'; }
 }
 
-// Match the extension's major version to the desktop app's release line.
-// Extension 10.x.y → look for the latest GitHub release tagged v10.*.*.
 function extensionMajor() {
   const v = chrome.runtime.getManifest().version || '';
   const m = v.match(/^(\d+)/);
@@ -73,8 +144,6 @@ function installerNameFor(os, major) {
 }
 
 async function fetchMatchingRelease(major) {
-  // Latest release on the repo. If its tag starts with v<major>, that's our
-  // answer. Otherwise scan the recent releases list for the first match.
   const headers = { Accept: 'application/vnd.github+json' };
   const latest = await fetch(`https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases/latest`, { headers })
     .then((r) => (r.ok ? r.json() : null)).catch(() => null);
@@ -97,8 +166,6 @@ async function downloadAppInstaller() {
     throw new Error(`no v${major} release published yet at github.com/${GH_OWNER}/${GH_REPO}/releases`);
   }
   const tag = release.tag_name;
-  // Prefer the asset listed on the release (handles renames). Fall back to the
-  // conventional release/download URL if the asset isn't listed.
   const asset = (release.assets || []).find((a) => a.name === fileName);
   const url = asset ? asset.browser_download_url
                     : `https://github.com/${GH_OWNER}/${GH_REPO}/releases/download/${tag}/${fileName}`;

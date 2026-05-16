@@ -7,19 +7,41 @@
 </head>
 <body>
   <header>
-    <h1>JAT v10</h1>
-    <div class="sub">Skeleton build — features pending</div>
+    <div class="eyebrow">Atelier</div>
+    <h1>JAT</h1>
+    <div class="sub">v10 · Skeleton</div>
   </header>
+
+  <!-- Update banner — hidden by default; shown when desktop app is outdated -->
+  <div id="update-banner" class="update-banner" hidden>
+    <div class="update-eyebrow">App update available</div>
+    <div class="update-line">
+      <span class="update-versions">
+        <span id="update-current">—</span>
+        <span class="update-arrow">→</span>
+        <span id="update-latest" class="update-latest">—</span>
+      </span>
+    </div>
+    <div class="update-actions">
+      <button id="update-now" class="btn primary small">Update now</button>
+      <button id="update-later" class="btn small">Later</button>
+    </div>
+    <div id="update-status" class="status"></div>
+  </div>
+
   <main>
-    <div class="row"><span class="label">SW status</span><span id="sw-status" class="value">checking…</span></div>
+    <div class="row"><span class="label">Service worker</span><span id="sw-status" class="value">checking…</span></div>
     <div class="row"><span class="label">Desktop app</span><span id="app-status" class="value">checking…</span></div>
     <div class="row"><span class="label">Installed</span><span id="installed-at" class="value">—</span></div>
     <div class="row"><span class="label">Active tab</span><span id="active-tab" class="value">—</span></div>
   </main>
+
   <footer>
-    <button id="download-app" class="btn primary">⬇ Download desktop app</button>
+    <button id="open-dashboard" class="btn primary">Open dashboard</button>
+    <button id="download-app" class="btn">Download desktop app</button>
     <div id="download-status" class="status"></div>
   </footer>
+
   <script src="popup.js" type="module"></script>
 </body>
 </html>

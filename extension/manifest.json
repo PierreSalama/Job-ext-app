@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Job Application Tracker v10",
   "short_name": "JAT v10",
-  "version": "10.0.2",
+  "version": "10.0.5",
   "description": "Skeleton rebuild. Bare-bones MV3 extension + Electron companion app. Features added one at a time, tested before the next is started.",
   "permissions": ["storage", "downloads"],
   "host_permissions": [

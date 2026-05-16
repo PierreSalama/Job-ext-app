@@ -11,8 +11,10 @@ let mainWindow = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 520,
-    height: 360,
+    width: 1180,
+    height: 760,
+    minWidth: 720,
+    minHeight: 480,
     title: 'Job Application Tracker v10',
     icon: path.join(__dirname, 'icons', process.platform === 'win32' ? 'icon.ico' : process.platform === 'darwin' ? 'icon.icns' : 'icon128.png'),
     backgroundColor: '#0f172a',

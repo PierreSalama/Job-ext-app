@@ -1,35 +1,157 @@
+/* Atelier theme — matches dashboard. Black + gold + bone. Square corners. */
+:root {
+  --ink-obsidian: #0a0a0a;
+  --ink-night:    #141414;
+  --ink-leather:  #1c1a18;
+  --bone-lede:    #f4efe6;
+  --bone-body:    #d9d2c6;
+  --bone-mute:    #8b8378;
+  --bone-rule:    #3a342d;
+  --gold-leaf:    #b08a5a;
+  --gold-warm:    #c9a373;
+  --gold-deep:    #8a6a40;
+  --bad:          #c97070;
+  --ease-firm:    cubic-bezier(0.16, 1, 0.3, 1);
+}
+
 html, body { margin: 0; padding: 0; }
 body {
-  width: 300px;
-  font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
-  background: #0f172a;
-  color: #f8fafc;
+  width: 320px;
+  font-family: "Inter", -apple-system, "Segoe UI", system-ui, sans-serif;
+  background:
+    radial-gradient(ellipse at top, rgba(176,138,90,0.08), transparent 60%),
+    var(--ink-obsidian);
+  color: var(--bone-body);
   font-size: 13px;
 }
+
 header {
-  padding: 14px 16px 10px;
-  background: linear-gradient(135deg, #6366f1, #8b5cf6);
+  padding: 22px 22px 18px;
+  border-bottom: 1px solid var(--bone-rule);
 }
-h1 { margin: 0; font-size: 16px; font-weight: 700; }
-.sub { margin-top: 2px; font-size: 11px; opacity: 0.85; }
-main { padding: 12px 16px 6px; display: grid; gap: 8px; }
-.row { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
-.label { color: #94a3b8; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
-.value { font-variant-numeric: tabular-nums; word-break: break-all; text-align: right; }
-.value.ok { color: #4ade80; }
-.value.bad { color: #f87171; }
-footer { padding: 8px 16px 14px; }
+.eyebrow {
+  font-size: 10px; letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: var(--gold-leaf);
+  font-weight: 500;
+}
+h1 {
+  margin: 6px 0 4px;
+  font-size: 22px; font-weight: 500;
+  color: var(--bone-lede);
+  letter-spacing: -0.01em;
+}
+.sub {
+  font-size: 11px; letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--bone-mute);
+}
+
+/* Update banner — sits between header and main, subdued gold accent */
+.update-banner {
+  padding: 14px 22px 16px;
+  background: linear-gradient(180deg, rgba(176,138,90,0.10), rgba(176,138,90,0.03));
+  border-bottom: 1px solid var(--bone-rule);
+  border-left: 2px solid var(--gold-leaf);
+  display: grid;
+  gap: 8px;
+}
+.update-eyebrow {
+  font-size: 9px; letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: var(--gold-leaf);
+  font-weight: 500;
+}
+.update-line {
+  font-size: 13px;
+  color: var(--bone-lede);
+  font-variant-numeric: tabular-nums;
+}
+.update-versions { display: inline-flex; align-items: baseline; gap: 8px; }
+.update-arrow { color: var(--bone-mute); font-size: 11px; }
+.update-latest { color: var(--gold-leaf); font-weight: 500; }
+.update-actions { display: flex; gap: 6px; margin-top: 4px; }
+.update-actions .btn { flex: 1; }
+.btn.small { padding: 9px 12px; font-size: 9px; letter-spacing: 0.2em; }
+
+main { padding: 14px 22px 8px; display: grid; gap: 12px; }
+.row {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--bone-rule);
+}
+.row:last-child { border-bottom: 0; }
+.label {
+  color: var(--bone-mute);
+  font-size: 10px; letter-spacing: 0.24em;
+  text-transform: uppercase;
+  font-weight: 500;
+}
+.value {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--bone-lede);
+  word-break: break-all;
+  font-size: 12px;
+}
+.value.ok  { color: var(--gold-leaf); }
+.value.bad { color: var(--bad); }
+
+footer { padding: 14px 22px 22px; display: grid; gap: 8px; }
+
+/* Buttons in the same atelier style as the dashboard */
 .btn {
-  display: block; width: 100%; padding: 9px 12px;
-  border: 0; border-radius: 8px; cursor: pointer;
-  font: inherit; font-weight: 600; font-size: 12px;
-  background: rgba(255,255,255,0.10); color: #f8fafc;
-  transition: background 0.15s;
+  font-family: inherit;
+  font-size: 10px; font-weight: 500;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  padding: 12px 16px;
+  border: 1px solid var(--gold-deep);
+  background: transparent;
+  color: var(--gold-leaf);
+  cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  gap: 8px;
+  transition:
+    color 240ms var(--ease-firm),
+    border-color 240ms var(--ease-firm),
+    background 240ms var(--ease-firm),
+    box-shadow 240ms var(--ease-firm),
+    transform 360ms var(--ease-firm);
+  border-radius: 0;
 }
-.btn:hover { background: rgba(255,255,255,0.18); }
-.btn.primary { background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff; }
-.btn.primary:hover { filter: brightness(1.1); }
-.btn[disabled] { opacity: 0.6; cursor: progress; }
-.status { margin-top: 8px; font-size: 11px; min-height: 14px; color: #94a3b8; text-align: center; word-break: break-all; }
-.status.ok { color: #4ade80; }
-.status.bad { color: #f87171; }
+.btn:hover {
+  color: var(--gold-warm);
+  border-color: var(--gold-leaf);
+  background: rgba(176,138,90,0.06);
+  transform: translateY(-1px);
+}
+.btn:active { transform: scale(0.985); }
+
+.btn.primary {
+  background: var(--gold-leaf);
+  border-color: var(--gold-leaf);
+  color: var(--ink-obsidian);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.18),
+    0 12px 22px rgba(0,0,0,0.16);
+}
+.btn.primary:hover {
+  background: var(--gold-warm);
+  border-color: var(--gold-warm);
+  color: var(--ink-obsidian);
+}
+
+.btn[disabled] { opacity: 0.5; cursor: progress; }
+.status {
+  margin-top: 4px;
+  font-size: 10px; letter-spacing: 0.22em;
+  text-transform: uppercase;
+  min-height: 14px;
+  color: var(--bone-mute);
+  text-align: center;
+  word-break: break-all;
+}
+.status.ok { color: var(--gold-leaf); }
+.status.bad { color: var(--bad); }
