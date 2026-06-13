@@ -45,6 +45,30 @@ const DEFAULTS = {
     successRescanMs: 2000,   // success re-scan cadence while a flow is active
   },
 
+  // Auto-learn answers from applications you fill so your profile self-populates.
+  harvest: {
+    enabled: true,           // promote captured form answers into the profile store
+    minLen: 1,               // ignore answers shorter than this many chars
+  },
+
+  // Reverse direction: pre-fill new applications from the harvested profile.
+  // SAFETY: OFF by default and NEVER auto-submits — it only fills empty fields.
+  autofill: {
+    enabled: false,          // master switch — opt-in
+    autoSubmit: false,       // hard invariant: filling never clicks submit
+    fillProfile: true,       // use structured profile fields
+    fillLearned: true,       // use harvested learned answers
+    minConfidence: 0.6,      // fuzzy-match floor for a learned answer to be used
+    skipSensitive: true,     // never touch EEO/demographic/legal/identity fields
+    highlight: true,         // briefly outline fields we filled
+  },
+
+  documents: {
+    keywordCount: 12,        // top-N keywords extracted per indexed document
+    maxFolderFiles: 2000,    // safety cap when indexing a linked local folder
+    maxFolderDepth: 6,       // how deep to walk a linked folder tree
+  },
+
   autoApply: {
     enabled: false,          // master switch — OFF until Pierre flips it
     mode: 'review',          // 'review' (stop before final submit) | 'auto'

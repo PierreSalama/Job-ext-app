@@ -1283,3 +1283,91 @@ details.fold .fold-body {
   .sk-line { animation: none; }
   #main > * { animation: none; }
 }
+
+/* ============================================================
+   PIPELINE — toolbar, richer cards, density, column controls
+   ============================================================ */
+.board-toolbar {
+  display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  margin-bottom: 16px;
+}
+.kb-head .kb-collapse {
+  background: none; border: 0; cursor: pointer; color: var(--muted);
+  font-size: 11px; padding: 0 2px; line-height: 1; font-family: inherit;
+}
+.kb-head .kb-collapse:hover { color: var(--primary); }
+.kb-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kb-sub { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 5px; font-size: 10px; color: var(--muted); }
+.kb-source {
+  text-transform: uppercase; letter-spacing: 0.12em; font-size: 8px;
+  border: 1px solid var(--border); padding: 1px 5px; color: var(--body-text);
+}
+.kb-tags { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 6px; }
+.kb-tag { font-size: 9px; color: var(--muted); border: 1px solid var(--border); padding: 1px 6px; }
+.kb-warn { color: var(--warn); }
+.kb-card.fit-good { border-left: 2px solid var(--success); }
+.kb-card.fit-mid  { border-left: 2px solid var(--primary); }
+.kb-card.fit-low  { border-left: 2px solid var(--muted); }
+.kb-card.stale    { border-left: 2px solid var(--warn); }
+.stale-txt { color: var(--warn); }
+.kanban[data-density="compact"] .kb-card { padding: 7px 10px; }
+.kanban[data-density="compact"] .kb-card .c { margin-top: 1px; }
+.kanban[data-density="compact"] .kb-sub,
+.kanban[data-density="compact"] .kb-tags { display: none; }
+.kanban[data-density="compact"] .kb-meta { margin-top: 5px; }
+.kb-col.collapsed { flex: 0 0 44px; width: 44px; }
+.kb-col.collapsed .kb-body, .kb-col.collapsed .kb-group { display: none; }
+.kb-col.collapsed .kb-head { flex-direction: column; gap: 8px; min-height: 120px; padding: 12px 6px; }
+.kb-col.collapsed .kb-label { writing-mode: vertical-rl; }
+.col-toggle-list { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 18px; }
+.col-toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--body-text); cursor: pointer; }
+
+/* ============================================================
+   DOCUMENTS — filter tabs, keywords, linked folders
+   ============================================================ */
+.doc-toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 4px 0 14px; }
+.doc-tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+.doc-tab {
+  background: none; border: 1px solid var(--border); cursor: pointer;
+  font-family: inherit; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--muted); padding: 6px 12px;
+  transition: color 180ms var(--ease-firm), border-color 180ms var(--ease-firm), background 180ms var(--ease-firm);
+}
+.doc-tab:hover { color: var(--primary); }
+.doc-tab.active { color: var(--primary); border-color: var(--primary); background: var(--wash-06); }
+.doc-tab .tab-n { color: var(--muted); font-variant-numeric: tabular-nums; }
+.doc-tab.active .tab-n { color: var(--primary); }
+.doc-search { margin-left: auto; min-width: 200px; }
+.kw-row { display: flex; gap: 5px; flex-wrap: wrap; max-width: 320px; }
+.kw { font-size: 9px; color: var(--muted); border: 1px solid var(--border); padding: 1px 6px; }
+.doc-src {
+  font-size: 8px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--body-text); border: 1px solid var(--border); padding: 1px 5px; margin-left: 6px;
+}
+.role-badge[data-role="other"] { color: var(--body-text); }
+.folder-list { display: flex; flex-direction: column; gap: 8px; padding: 4px 0 12px; }
+.folder-card {
+  display: flex; align-items: center; gap: 12px;
+  border: 1px solid var(--border); background: var(--bg2); padding: 12px 16px;
+}
+.fc-main { min-width: 0; flex: 1; }
+.fc-path { color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fc-meta { color: var(--muted); font-size: 11px; margin-top: 3px; }
+.fc-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.folder-add { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 6px 0 2px; }
+
+/* ============================================================
+   PROFILE — autofill card, learned-answer locks, custom fields
+   ============================================================ */
+.autofill-card { margin-bottom: 22px; padding: 18px 24px; }
+.af-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.af-row .section-title { margin: 4px 0 2px; }
+.field-control { display: flex; gap: 6px; align-items: center; }
+.field-control .input { flex: 1; }
+.lang-badge {
+  display: inline-block; font-size: 8px; letter-spacing: 0.1em;
+  border: 1px solid var(--border); color: var(--muted); padding: 0 4px; margin-right: 4px;
+  vertical-align: middle;
+}
+.lang-badge.fr { color: var(--primary2); border-color: color-mix(in srgb, var(--primary2) 40%, transparent); }
+tr.pf-locked td:first-child { box-shadow: inset 2px 0 0 var(--primary); }

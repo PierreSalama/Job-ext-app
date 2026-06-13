@@ -12,4 +12,5 @@ contextBridge.exposeInMainWorld('jatDesktop', {
   updateState: () => ipcRenderer.invoke('jat:update-state'),
   openReleases: () => ipcRenderer.invoke('jat:open-releases'),
   restartToUpdate: () => ipcRenderer.invoke('jat:restart-to-update'),
+  pickFolder: () => ipcRenderer.invoke('jat:pick-folder'),
 });

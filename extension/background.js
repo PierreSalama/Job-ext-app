@@ -164,6 +164,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'get-token':
       respond(api.getToken().then((t) => ({ ok: true, token: t })));
       return true;
+    case 'save-document':
+      // Content script harvested a picked resume/cover-letter → store it in the
+      // app's Documents library (dedup is handled extension-side before this).
+      respond(api.call('POST', '/documents', {
+        name: msg.data?.name, role: msg.data?.role || 'resume',
+        mime: msg.data?.mime || '', dataBase64: msg.data?.dataBase64,
+      }, 30000));
+      return true;
     case 'get-document':
       // Binary fetch for the executor's resume upload: bytes → base64.
       respond((async () => {

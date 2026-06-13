@@ -231,6 +231,48 @@ const MIGRATIONS = [
       );
     `);
   },
+
+  // v2 — dynamic profile store + document indexing/folders
+  () => {
+    exec(`
+      CREATE TABLE profile_fields (
+        id            TEXT PRIMARY KEY,
+        key_norm      TEXT NOT NULL UNIQUE,   -- canonical (EN+FR-collapsed) question key
+        label         TEXT NOT NULL,          -- human label, original language
+        locale        TEXT NOT NULL DEFAULT 'en',
+        value         TEXT,
+        field_type    TEXT,                   -- text | select | checkbox | …
+        source_job_id TEXT,                   -- last application this came from
+        source        TEXT,                   -- host/board it was learned on
+        confidence    REAL NOT NULL DEFAULT 0.5,
+        locked        INTEGER NOT NULL DEFAULT 0,  -- user edited → harvest won't overwrite
+        seen_count    INTEGER NOT NULL DEFAULT 1,
+        updated_at    TEXT NOT NULL,
+        created_at    TEXT NOT NULL
+      );
+      CREATE INDEX idx_pf_norm ON profile_fields(key_norm);
+
+      CREATE TABLE document_folders (
+        id            TEXT PRIMARY KEY,
+        path          TEXT NOT NULL UNIQUE,
+        label         TEXT,
+        role_hint     TEXT,                   -- default role for files found here
+        file_count    INTEGER NOT NULL DEFAULT 0,
+        last_scan_at  TEXT,
+        enabled       INTEGER NOT NULL DEFAULT 1,
+        created_at    TEXT NOT NULL
+      );
+
+      ALTER TABLE documents ADD COLUMN keywords      TEXT;     -- JSON array
+      ALTER TABLE documents ADD COLUMN last_modified TEXT;     -- source file mtime
+      ALTER TABLE documents ADD COLUMN indexed_at    TEXT;     -- when text/keywords computed
+      ALTER TABLE documents ADD COLUMN folder_id     TEXT;     -- → document_folders.id
+      ALTER TABLE documents ADD COLUMN source        TEXT;     -- upload | application | folder
+
+      UPDATE documents SET role = 'cover_letter' WHERE role = 'coverLetter';
+      UPDATE documents SET source = 'upload' WHERE source IS NULL;
+    `);
+  },
 ];
 
 function userVersion() {
@@ -526,6 +568,7 @@ function upsertJob(input, opts = {}) {
       ts, ts,
       incoming.status === 'submitted' ? ts : null,
     ]);
+    harvestAnswersToProfile(incoming.answers, { jobId: id, source: incoming.source });
     return { job: getJob(id), action: 'created', previousStatus: null, statusChanged: true };
   }
 
@@ -580,6 +623,8 @@ function upsertJob(input, opts = {}) {
     prev.submittedAt || (crossedSubmitted(prev.status, nextStatus) ? ts : null),
     existing.id,
   ]);
+
+  harvestAnswersToProfile(incoming.answers, { jobId: existing.id, source: incoming.source || prev.source });
 
   const after = getJob(existing.id);
   return {
@@ -666,16 +711,58 @@ function stats() {
 // ============================================================
 // QA (learned answers)
 // ============================================================
-const QA_FILLERS = /\b(please|kindly|select|choose|enter|provide|specify|the|a|an|your|you|do|did|does|are|is|have|has|had|will|would|can|could|how|many|much|what|which|with|in|for|of|to|at|on)\b/g;
+// Filler tokens dropped before keying — English first, then common French so a
+// bilingual user's EN/FR variants of the same question collapse to one key.
+const QA_FILLERS = new Set((
+  'please kindly select choose enter provide specify the a an your you do did does ' +
+  'are is have has had will would can could how many much what which with in for of to at on ' +
+  // French
+  'veuillez selectionnez choisissez entrez indiquez precisez votre vos le la les un une des du de ' +
+  'est sont avez quel quelle quels quelles combien dans pour sur au aux et ou si vous tu ton ta tes ' +
+  // French elided articles (d', l', j', qu', n', c', s', t', m') leave a bare letter after folding
+  'd l j c s t m n qu etes etre suis es a ont'
+).split(' '));
+
+// Bilingual canonicalization: rewrite a French (accent-folded) token onto its
+// shared English token so "Parlez-vous français" and "Do you speak French" key
+// alike. English tokens map to themselves (identity), so existing keys are
+// unchanged — only French is rewritten.
+const QA_CANON = {
+  francais: 'french', anglais: 'english', espagnol: 'spanish', allemand: 'german',
+  annee: 'years', annees: 'years', ans: 'years', an: 'years',
+  experiences: 'experience',
+  courriel: 'email', mail: 'email', adresse: 'address',
+  prenom: 'firstname', telephone: 'phone', tel: 'phone', portable: 'phone',
+  ville: 'city', pays: 'country', langue: 'language', langues: 'language',
+  numero: 'number', mois: 'months', semaine: 'weeks', semaines: 'weeks',
+  niveau: 'level', nom: 'name', noms: 'name',
+  parlez: 'speak', parler: 'speak', parle: 'speak', parlons: 'speak',
+  salaire: 'salary', remuneration: 'salary', poste: 'position',
+  diplome: 'degree', formation: 'education',
+  competence: 'skill', competences: 'skill',
+  autorisation: 'authorization', autorise: 'authorized',
+  travail: 'work', travailler: 'work', travaille: 'work', emploi: 'work',
+  disponibilite: 'availability', disponible: 'available', preavis: 'notice',
+};
 function normalizeQuestion(q) {
-  return String(q || '')
-    .toLowerCase()
-    .normalize('NFD').replace(/[̀-ͯ]/g, '')
-    .replace(QA_FILLERS, ' ')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim()
-    .slice(0, 120);
+  const folded = String(q || '').toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '');
+  // Bag-of-words key: canonicalize, drop fillers, dedup, and SORT so word order
+  // ("email address" vs "address email" / EN vs FR) doesn't fork the key.
+  const toks = new Set();
+  for (let t of folded.split(/[^a-z0-9]+/)) {
+    if (!t) continue;
+    t = QA_CANON[t] || t;
+    if (QA_FILLERS.has(t)) continue;
+    toks.add(t);
+  }
+  return [...toks].sort().join(' ').slice(0, 120);
 }
+
+// Heuristic language tag for a label/answer — advisory only (drives the UI
+// badge), never a hard part of the key (the key is already EN/FR-collapsed).
+const FR_HINT_RX = /\b(vous|votre|vos|français|francais|combien|années|prénom|courriel|veuillez|quel|quelle|salaire|expérience|téléphone|adresse|disponibilité|formation|compétences?)\b/i;
+function guessLocale(text) { return FR_HINT_RX.test(String(text || '')) ? 'fr' : 'en'; }
 
 function qaRecord({ question, answer, source }) {
   const qn = normalizeQuestion(question);
@@ -729,6 +816,121 @@ function qaList(limit = 500) {
 function qaDelete(id) { return (run('DELETE FROM qa WHERE id = ?', [id])?.changes ?? 0) > 0; }
 
 // ============================================================
+// Profile fields — dynamic, auto-harvested, EN/FR-keyed store.
+// As applications are captured, every answer fans out here keyed by a
+// language-collapsed question. Newest non-empty answer wins, unless the user
+// locked the row by editing it in the dashboard. Powers the Profile page and
+// the reverse-autofill of new applications.
+// ============================================================
+function humanizeKey(slug) {
+  return String(slug || '').replace(/[_\-]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function pfRow(r) {
+  if (!r) return null;
+  return {
+    id: r.id, keyNorm: r.key_norm, label: r.label, locale: r.locale,
+    value: r.value || '', fieldType: r.field_type || '',
+    sourceJobId: r.source_job_id || null, source: r.source || '',
+    confidence: r.confidence, locked: !!r.locked, seenCount: r.seen_count,
+    updatedAt: r.updated_at,
+  };
+}
+
+function profileFieldUpsert({ question, value, locale, fieldType, sourceJobId, source, confidence, fromUser }) {
+  const label = String(question || '').trim();
+  const keyNorm = normalizeQuestion(label);
+  const val = value == null ? '' : String(value).trim().slice(0, 2000);
+  if (!keyNorm || !val) return null;
+  const ts = now();
+  const loc = locale || guessLocale(label) || 'en';
+  const cur = get('SELECT * FROM profile_fields WHERE key_norm = ?', [keyNorm]);
+  const suppressed = cur && cur.locked && !fromUser;   // user-locked row, auto harvest
+  if (cur) {
+    if (suppressed) {
+      run('UPDATE profile_fields SET seen_count = seen_count + 1, updated_at = ? WHERE id = ?', [ts, cur.id]);
+    } else {
+      run(`UPDATE profile_fields SET value=?, label=?, locale=?,
+           field_type=COALESCE(?, field_type), source_job_id=COALESCE(?, source_job_id),
+           source=COALESCE(?, source), confidence=?, locked=?, seen_count=seen_count+1, updated_at=?
+           WHERE id=?`,
+          [val, label || cur.label, loc, fieldType || null, sourceJobId || null, source || null,
+           confidence != null ? confidence : cur.confidence, fromUser ? 1 : cur.locked, ts, cur.id]);
+    }
+  } else {
+    run(`INSERT INTO profile_fields
+         (id, key_norm, label, locale, value, field_type, source_job_id, source, confidence, locked, seen_count, updated_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+        [uid('pf'), keyNorm, label || keyNorm, loc, val, fieldType || null, sourceJobId || null,
+         source || null, confidence != null ? confidence : 0.5, fromUser ? 1 : 0, ts, ts]);
+  }
+  // Keep the auto-apply executor's free-text memory in sync, except when a
+  // locked row suppressed the write.
+  if (!suppressed) { try { qaRecord({ question: label, answer: val, source }); } catch {} }
+  return pfRow(get('SELECT * FROM profile_fields WHERE key_norm = ?', [keyNorm]));
+}
+
+function profileFieldList() {
+  return all('SELECT * FROM profile_fields ORDER BY locked DESC, seen_count DESC, updated_at DESC').map(pfRow);
+}
+function profileFieldSet(id, { value, locked, label }) {
+  const cur = get('SELECT * FROM profile_fields WHERE id = ?', [id]);
+  if (!cur) return null;
+  run('UPDATE profile_fields SET value=?, label=?, locked=?, updated_at=? WHERE id=?',
+      [value !== undefined ? String(value).slice(0, 2000) : cur.value,
+       label !== undefined ? String(label).slice(0, 300) : cur.label,
+       locked !== undefined ? (locked ? 1 : 0) : cur.locked, now(), id]);
+  const row = pfRow(get('SELECT * FROM profile_fields WHERE id = ?', [id]));
+  if (row && row.value) { try { qaRecord({ question: row.label, answer: row.value }); } catch {} }
+  return row;
+}
+function profileFieldDelete(id) { return (run('DELETE FROM profile_fields WHERE id = ?', [id])?.changes ?? 0) > 0; }
+
+function profileFieldLookup(question) {
+  const qn = normalizeQuestion(question);
+  if (!qn) return null;
+  const exact = get('SELECT * FROM profile_fields WHERE key_norm = ?', [qn]);
+  if (exact) return { ...pfRow(exact), match: 'exact', score: 1 };
+  const want = new Set(qn.split(' ').filter(Boolean));
+  if (!want.size) return null;
+  let best = null;
+  for (const r of all('SELECT * FROM profile_fields')) {
+    const have = new Set(String(r.key_norm).split(' ').filter(Boolean));
+    let hit = 0; for (const t of want) if (have.has(t)) hit++;
+    const coverage = hit / want.size;
+    const symmetric = hit / Math.max(want.size, have.size);
+    const score = (hit >= 2 && coverage >= 0.75) ? coverage : symmetric;
+    if (score >= 0.6 && (!best || score > best.score)) best = { ...pfRow(r), match: 'fuzzy', score };
+  }
+  return best;
+}
+
+// Everything the extension needs to pre-fill a new application: harvested
+// fields with values + the source-matched structured profile.
+function profileAutofillBundle(source) {
+  const fields = profileFieldList().filter((f) => f.value);
+  const profile = profileForSource(source);
+  return { fields, profile: profile ? { id: profile.id, name: profile.name, data: profile.data } : null };
+}
+
+// Fan a job's captured answers into the profile store (called from upsertJob).
+function harvestAnswersToProfile(answers, { jobId, source } = {}) {
+  if (!answers || typeof answers !== 'object') return 0;
+  let enabled = true;
+  try { enabled = getSettings().harvest.enabled !== false; } catch {}
+  if (!enabled) return 0;
+  let n = 0;
+  for (const [key, raw] of Object.entries(answers)) {
+    const value = Array.isArray(raw) ? raw.join(', ') : raw;
+    if (value == null || String(value).trim() === '') continue;
+    try {
+      if (profileFieldUpsert({ question: humanizeKey(key), value, sourceJobId: jobId, source, confidence: 0.6 })) n++;
+    } catch {}
+  }
+  return n;
+}
+
+// ============================================================
 // Profiles
 // ============================================================
 function listProfiles() {
@@ -773,40 +975,74 @@ function profileForSource(source) {
 // ============================================================
 // Documents
 // ============================================================
+// Normalize legacy role spellings on read so old rows match the canonical
+// vocabulary the UI/filters use (resume | cover_letter | other).
+function canonRole(role) {
+  const r = String(role || 'resume');
+  if (r === 'coverLetter') return 'cover_letter';
+  return r;
+}
+
 function docRow(r, { withText } = {}) {
   if (!r) return null;
   return {
-    id: r.id, name: r.name, role: r.role, filePath: r.file_path,
+    id: r.id, name: r.name, role: canonRole(r.role), filePath: r.file_path,
     hasText: !!r.text_content,
     textContent: withText ? (r.text_content || '') : undefined,
+    keywords: safeParse(r.keywords, []),
+    lastModified: r.last_modified || null,
+    indexedAt: r.indexed_at || null,
+    folderId: r.folder_id || null,
+    source: r.source || 'upload',
     sizeBytes: r.size_bytes, mime: r.mime, isDefault: !!r.is_default, createdAt: r.created_at,
   };
 }
 
-function listDocuments() {
-  return all('SELECT * FROM documents ORDER BY is_default DESC, created_at DESC').map((r) => docRow(r));
+function listDocuments(filter = {}) {
+  const where = [], params = [];
+  if (filter.role && filter.role !== 'all') { where.push('role = ?'); params.push(filter.role); }
+  if (filter.source) { where.push('source = ?'); params.push(filter.source); }
+  if (filter.folderId) { where.push('folder_id = ?'); params.push(filter.folderId); }
+  let sql = 'SELECT * FROM documents';
+  if (where.length) sql += ' WHERE ' + where.join(' AND ');
+  sql += ' ORDER BY is_default DESC, created_at DESC';
+  let rows = all(sql, params).map((r) => docRow(r));
+  if (filter.q) {
+    const q = String(filter.q).toLowerCase();
+    rows = rows.filter((d) => d.name.toLowerCase().includes(q)
+      || (d.keywords || []).some((k) => String(k).toLowerCase().includes(q)));
+  }
+  return rows;
 }
 function getDocument(id, opts = {}) {
   return docRow(get('SELECT * FROM documents WHERE id = ?', [id]), opts);
 }
-function addDocument({ name, role, filePath, textContent, sizeBytes, mime, isDefault }) {
+function documentByPath(filePath) {
+  return docRow(get('SELECT * FROM documents WHERE file_path = ?', [filePath]));
+}
+function addDocument({ name, role, filePath, textContent, sizeBytes, mime, isDefault, source, keywords, lastModified, folderId }) {
   const id = uid('doc');
+  const ts = now();
+  role = canonRole(role);
   transaction(() => {
-    if (isDefault) run('UPDATE documents SET is_default = 0 WHERE role = ?', [role || 'resume']);
-    run(`INSERT INTO documents (id, name, role, file_path, text_content, size_bytes, mime, is_default, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [id, name, role || 'resume', filePath, textContent || null,
-         sizeBytes || 0, mime || '', isDefault ? 1 : 0, now()]);
+    if (isDefault) run('UPDATE documents SET is_default = 0 WHERE role = ?', [role]);
+    run(`INSERT INTO documents (id, name, role, file_path, text_content, size_bytes, mime, is_default, created_at, keywords, last_modified, indexed_at, folder_id, source)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [id, name, role, filePath, textContent || null,
+         sizeBytes || 0, mime || '', isDefault ? 1 : 0, ts,
+         keywords ? JSON.stringify(keywords) : null, lastModified || null,
+         textContent ? ts : null, folderId || null, source || 'upload']);
   });
   return getDocument(id);
 }
 function patchDocument(id, { name, role, isDefault, textContent }) {
   const cur = get('SELECT * FROM documents WHERE id = ?', [id]);
   if (!cur) return null;
+  role = role !== undefined ? canonRole(role) : cur.role;
   transaction(() => {
-    if (isDefault) run('UPDATE documents SET is_default = 0 WHERE role = ?', [role || cur.role]);
+    if (isDefault) run('UPDATE documents SET is_default = 0 WHERE role = ?', [role]);
     run('UPDATE documents SET name=?, role=?, is_default=?, text_content=? WHERE id=?',
-        [name ?? cur.name, role ?? cur.role,
+        [name ?? cur.name, role,
          isDefault !== undefined ? (isDefault ? 1 : 0) : cur.is_default,
          textContent !== undefined ? textContent : cur.text_content, id]);
   });
@@ -816,12 +1052,84 @@ function deleteDocument(id) {
   const cur = get('SELECT * FROM documents WHERE id = ?', [id]);
   if (!cur) return false;
   run('DELETE FROM documents WHERE id = ?', [id]);
-  try { if (cur.file_path && fs.existsSync(cur.file_path)) fs.rmSync(cur.file_path); } catch {}
+  // Only remove files WE created (uploads/harvests under userData/documents);
+  // a linked folder merely INDEXES the user's own files — never delete those.
+  if (cur.source !== 'folder') {
+    try { if (cur.file_path && fs.existsSync(cur.file_path)) fs.rmSync(cur.file_path); } catch {}
+  }
   return true;
 }
 function defaultDocument(role = 'resume') {
-  const r = get('SELECT * FROM documents WHERE role = ? ORDER BY is_default DESC, created_at DESC LIMIT 1', [role]);
+  const r = get('SELECT * FROM documents WHERE role = ? ORDER BY is_default DESC, created_at DESC LIMIT 1', [canonRole(role)]);
   return r ? docRow(r, { withText: true }) : null;
+}
+
+// ---- keyword extraction (deterministic, offline) ----
+const KW_STOP = new Set((
+  'the of and to a an in for on with is are was were be been being at by from as it this that these those ' +
+  'or if then else not no yes you your our we us they them their his her its will would can could should may ' +
+  'have has had do does did but so than into over under about above below up down out off all any each more ' +
+  'most some such only own same other which who whom what when where why how also per via etc using used use ' +
+  'work working experience years year team teams role roles within across ability able strong excellent good'
+).split(' '));
+function extractKeywords(text, topN = 12) {
+  const freq = new Map();
+  for (const raw of String(text || '').toLowerCase().split(/[^a-z0-9+#.]+/)) {
+    const t = raw.replace(/^\.+|\.+$/g, '');
+    if (t.length < 3 || t.length > 30) continue;
+    if (KW_STOP.has(t) || /^\d+$/.test(t)) continue;
+    freq.set(t, (freq.get(t) || 0) + 1);
+  }
+  return [...freq.entries()].sort((a, b) => b[1] - a[1]).slice(0, topN).map(([t]) => t);
+}
+
+// ============================================================
+// Document folders — link a local directory and index its files (filename +
+// mtime + extracted text + keywords) into the library. The crawl/extract lives
+// in server.js (async); these helpers are the sync store side.
+// ============================================================
+function folderRow(r) {
+  if (!r) return null;
+  return {
+    id: r.id, path: r.path, label: r.label || '', roleHint: r.role_hint || 'other',
+    fileCount: r.file_count, lastScanAt: r.last_scan_at || null,
+    enabled: !!r.enabled, createdAt: r.created_at,
+  };
+}
+function folderList() { return all('SELECT * FROM document_folders ORDER BY created_at DESC').map(folderRow); }
+function folderGet(id) { return folderRow(get('SELECT * FROM document_folders WHERE id = ?', [id])); }
+function folderAdd({ path: p, label, roleHint }) {
+  const ex = get('SELECT * FROM document_folders WHERE path = ?', [p]);
+  if (ex) return folderRow(ex);
+  const id = uid('fold');
+  run('INSERT INTO document_folders (id, path, label, role_hint, file_count, enabled, created_at) VALUES (?, ?, ?, ?, 0, 1, ?)',
+      [id, p, label || '', roleHint || 'other', now()]);
+  return folderGet(id);
+}
+function folderTouch(id, fileCount) {
+  run('UPDATE document_folders SET file_count=?, last_scan_at=? WHERE id=?', [fileCount || 0, now(), id]);
+  return folderGet(id);
+}
+function folderDelete(id, { pruneDocs } = {}) {
+  if (!get('SELECT id FROM document_folders WHERE id = ?', [id])) return false;
+  if (pruneDocs) run('DELETE FROM documents WHERE folder_id = ?', [id]);   // never unlinks disk files (source='folder')
+  else run('UPDATE documents SET folder_id = NULL WHERE folder_id = ?', [id]);
+  run('DELETE FROM document_folders WHERE id = ?', [id]);
+  return true;
+}
+// Insert-or-update a folder-indexed file, deduped by its real path so re-scans
+// don't duplicate. Never sets is_default.
+function upsertFolderDocument({ folderId, name, filePath, role, textContent, sizeBytes, mime, lastModified, keywords }) {
+  const ex = get('SELECT * FROM documents WHERE file_path = ?', [filePath]);
+  const ts = now();
+  role = canonRole(role || 'other');
+  if (ex) {
+    run(`UPDATE documents SET name=?, role=?, text_content=?, size_bytes=?, mime=?, keywords=?, last_modified=?, indexed_at=?, folder_id=?, source='folder' WHERE id=?`,
+        [name, role, textContent || null, sizeBytes || 0, mime || '',
+         keywords ? JSON.stringify(keywords) : null, lastModified || null, ts, folderId || ex.folder_id, ex.id]);
+    return getDocument(ex.id);
+  }
+  return addDocument({ name, role, filePath, textContent, sizeBytes, mime, source: 'folder', keywords, lastModified, folderId });
 }
 
 // ============================================================
@@ -958,9 +1266,12 @@ module.exports = {
   getSettings, patchSettings, kvGet, kvSet,
   listJobs, getJob, upsertJob, patchJob, deleteJob, stats,
   listEvents, listRecentEvents, recordEvent,
-  qaRecord, qaLookup, qaList, qaDelete, normalizeQuestion,
+  qaRecord, qaLookup, qaList, qaDelete, normalizeQuestion, guessLocale,
+  profileFieldUpsert, profileFieldList, profileFieldSet, profileFieldDelete,
+  profileFieldLookup, profileAutofillBundle, harvestAnswersToProfile,
   listProfiles, saveProfile, deleteProfile, profileForSource,
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,
+  extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument, documentByPath,
   queueList, queueAdd, queuePatch, queueDelete, queueRunStats,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll,

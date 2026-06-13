@@ -341,7 +341,39 @@ const FILENAME_RX = /\b([\w()&,'\-.+]{2,100}(?:\s[\w()&,'\-.+]{1,40}){0,3}\.(pdf
 // Skip JAT's own injected UI so scans never read the panel/overlay text.
 function isJatUi(el) { return !!el?.closest?.('#jat11-panel, #jat11-aa'); }
 
+// The uploaded-file display (Workday "Successfully Uploaded!", Greenhouse file
+// chips, etc.) shows the filename in its own small element. Find a leaf-ish
+// element whose text is a clean filename ending in a document extension —
+// robust to long multi-word names that the in-text regex would miss.
+const DOC_EXT_RX = /\.(pdf|docx?|rtf|odt|txt|pages|rtf)\b/i;
+const FILENAME_LOOSE_RX = /([\w()&,'’\[\]@#+\-.\s]{2,160}?\.(pdf|docx?|rtf|odt|txt|pages))\b/i;
+const NOT_A_FILENAME_RX = /\b(please|click|upload|drag|drop|review|attach|tips|once|use|ensure|include|consistent|keep|format|formatting|following|either|below|profile|instructions|maximum|accepted|allowed|supported|file types?|max|mb)\b/i;
+function findUploadedFilename(root) {
+  if (!root) return '';
+  let scanned = 0;
+  for (const el of qsa('*', root)) {
+    if (scanned++ > 6000) break;
+    if (isJatUi(el)) continue;
+    if (el.children && el.children.length > 4) continue;   // leaf-ish elements only
+    const t = compactText(el.textContent || '');
+    if (!t || t.length > 200 || !DOC_EXT_RX.test(t)) continue;
+    const m = t.match(FILENAME_LOOSE_RX);
+    if (!m) continue;
+    const name = m[1].trim();
+    const stem = name.replace(DOC_EXT_RX, '');
+    if (stem.length < 2 || NOT_A_FILENAME_RX.test(stem)) continue;   // reject instruction text
+    return name;
+  }
+  return '';
+}
+
 export function findResumeFilename(root) {
+  // The actually-uploaded file is the strongest signal — check it first across
+  // the form (or the page) before falling back to cue-scanning.
+  const uploadScope = (root && root !== document) ? root : (document.body || document.documentElement);
+  const uploaded = findUploadedFilename(uploadScope);
+  if (uploaded) return uploaded;
+
   const scopes = [];
   if (root && root !== document) {
     scopes.push(root);

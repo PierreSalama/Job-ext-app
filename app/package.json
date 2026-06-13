@@ -1,6 +1,6 @@
 {
   "name": "jat11-app",
-  "version": "11.0.2",
+  "version": "11.1.0",
   "description": "Desktop companion for the Job Application Tracker v11 Chrome extension. SQLite store, token-guarded REST + SSE on localhost:7744, AI layer (Codex CLI cloud / Ollama local), auto-apply queue, Gmail status sync.",
   "main": "src/main.js",
   "scripts": {
@@ -27,9 +27,19 @@
   "build": {
     "appId": "com.pierre.jat11",
     "productName": "Job Application Tracker",
-    "files": ["src/**/*", "package.json"],
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
     "artifactName": "JAT-v11-${ext}",
-    "protocols": [{ "name": "Job Application Tracker", "schemes": ["jat11"] }],
+    "protocols": [
+      {
+        "name": "Job Application Tracker",
+        "schemes": [
+          "jat11"
+        ]
+      }
+    ],
     "win": {
       "target": "nsis",
       "icon": "src/icons/icon.ico",
@@ -53,12 +63,14 @@
       "icon": "src/icons/icon128.png",
       "category": "Office"
     },
-    "publish": [{
-      "provider": "github",
-      "owner": "PierreSalama",
-      "repo": "Job-ext-app",
-      "releaseType": "release"
-    }]
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "PierreSalama",
+        "repo": "Job-ext-app",
+        "releaseType": "release"
+      }
+    ]
   },
   "author": "Pierre",
   "license": "MIT",

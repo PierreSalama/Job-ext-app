@@ -40,6 +40,14 @@ const QUEUE_STATE_LABEL = {
 
 const LS_THEME = 'jat11.theme';
 const LS_FILTERS = 'jat11.apps.filters';
+const LS_PIPELINE = 'jat11.pipeline.prefs';
+
+const DOC_ROLES = [
+  { id: 'resume', label: 'Resume' },
+  { id: 'cover_letter', label: 'Cover letter' },
+  { id: 'other', label: 'Other' },
+];
+const DOC_ROLE_LABEL = Object.fromEntries(DOC_ROLES.map((r) => [r.id, r.label]));
 
 // ---------- Tiny utilities ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -157,7 +165,19 @@ const state = {
     try { return { ...def, ...JSON.parse(localStorage.getItem(LS_FILTERS) || '{}'), q: '' }; }
     catch { return def; }
   })(),
+  docsFilter: { role: 'all', q: '' },
+  board: (() => {
+    const def = { q: '', source: 'all', minFit: 0, sort: 'updatedAt', dir: 'desc', density: 'comfortable', hiddenCols: [], collapsed: [] };
+    try { return { ...def, ...JSON.parse(localStorage.getItem(LS_PIPELINE) || '{}'), q: '' }; }
+    catch { return def; }
+  })(),
 };
+function persistBoard() {
+  try {
+    const { source, minFit, sort, dir, density, hiddenCols, collapsed } = state.board;
+    localStorage.setItem(LS_PIPELINE, JSON.stringify({ source, minFit, sort, dir, density, hiddenCols, collapsed }));
+  } catch {}
+}
 const HOST_LABEL = { extension: 'Extension', desktop: 'Desktop', web: 'Web' };
 function persistFilters() {
   try {
@@ -516,7 +536,7 @@ function renderNotConnected() {
 }
 
 // ---------- Refresh pill + SSE ----------
-const LIST_ROUTES = new Set(['/', '/applications', '/pipeline', '/queue', '/documents', '/activity']);
+const LIST_ROUTES = new Set(['/', '/applications', '/pipeline', '/queue', '/documents', '/activity', '/profile']);
 function showRefreshPill() { const p = $('#refresh-pill'); if (p) p.hidden = false; }
 function hideRefreshPill() { const p = $('#refresh-pill'); if (p) p.hidden = true; }
 
@@ -543,7 +563,7 @@ function connectSSE() {
   state.sse = es;
   es.onopen = () => { state.sseOk = true; stopPollingFallback(); };
   es.onerror = () => { state.sseOk = false; startPollingFallback(); };
-  for (const ev of ['jobs.updated', 'queue.updated', 'documents.updated']) {
+  for (const ev of ['jobs.updated', 'queue.updated', 'documents.updated', 'profileFields.updated']) {
     es.addEventListener(ev, () => softRefresh());
   }
   es.addEventListener('settings.updated', async () => {
@@ -1104,39 +1124,136 @@ route(/^\/applications\/(?<id>.+)$/, async ({ id }) => {
 route('/pipeline', async () => {
   const r = await api('/jobs?limit=500');
   const jobs = r.items || [];
+  const b = state.board;
+
+  const sources = [...new Set(jobs.map((j) => j.source).filter(Boolean))].sort();
+  const q = b.q.toLowerCase();
+  const filtered = jobs.filter((j) => {
+    if (b.source !== 'all' && j.source !== b.source) return false;
+    if (b.minFit && !(j.fitScore != null && j.fitScore >= b.minFit)) return false;
+    if (q) {
+      const hay = `${j.title || ''} ${j.company || ''} ${j.location || ''} ${(j.tags || []).join(' ')}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+  const cmp = (x, y) => {
+    let c = 0;
+    if (b.sort === 'fit') c = (y.fitScore ?? -1) - (x.fitScore ?? -1);
+    else if (b.sort === 'title') c = String(x.title || '').localeCompare(String(y.title || ''));
+    else if (b.sort === 'createdAt') c = new Date(y.createdAt || 0) - new Date(x.createdAt || 0);
+    else c = new Date(y.updatedAt || 0) - new Date(x.updatedAt || 0);
+    return b.dir === 'asc' ? -c : c;
+  };
+
   const byStatus = {};
   for (const s of STATUSES) byStatus[s.id] = [];
-  for (const j of jobs) (byStatus[j.status] || (byStatus[j.status] = [])).push(j);
+  for (const j of filtered) (byStatus[j.status] || (byStatus[j.status] = [])).push(j);
+  for (const s of STATUSES) byStatus[s.id].sort(cmp);
 
   const GROUPS = { started: 'Pre', submitted: 'Active', contacted: 'Active', interview_1: 'Interviews', interview_2: 'Interviews', interview_final: 'Interviews', offer: 'Closing', hired: 'Closing', rejected: 'Closed', withdrawn: 'Closed', ghosted: 'Closed' };
+  const TERMINAL_S = ['hired', 'rejected', 'withdrawn', 'ghosted'];
+  const STALE_DAYS = 14;
 
-  const cols = STATUSES.map((s) => `
-    <div class="kb-col" data-status="${s.id}">
+  const cardHtml = (j) => {
+    const stale = j.updatedAt && (Date.now() - new Date(j.updatedAt).getTime()) > STALE_DAYS * 86400000 && !TERMINAL_S.includes(j.status);
+    const fitCls = j.fitScore == null ? '' : (j.fitScore >= 70 ? 'fit-good' : j.fitScore >= 45 ? 'fit-mid' : 'fit-low');
+    const tags = (j.tags || []).slice(0, 3).map((t) => `<span class="kb-tag">${esc(t)}</span>`).join('');
+    const sub = [];
+    if (j.source) sub.push(`<span class="kb-source">${esc(j.source)}</span>`);
+    if (j.location) sub.push(`<span>${esc(j.location)}</span>`);
+    return `<div class="kb-card ${fitCls} ${stale ? 'stale' : ''}" draggable="true" data-id="${esc(j.id)}">
+      <div class="t">${j.needsReview ? '<span class="kb-warn" title="Needs review">⚠</span> ' : ''}${esc(j.title || 'Untitled')}</div>
+      <div class="c">${esc(j.company || '')}</div>
+      ${sub.length ? `<div class="kb-sub">${sub.join('')}</div>` : ''}
+      ${tags ? `<div class="kb-tags">${tags}</div>` : ''}
+      <div class="kb-meta">${fitBadgeHtml(j.fitScore)}<span class="${stale ? 'stale-txt' : ''}">${esc(daysIn(j.updatedAt))}</span></div>
+    </div>`;
+  };
+
+  const cols = STATUSES.filter((s) => !b.hiddenCols.includes(s.id)).map((s) => {
+    const collapsed = b.collapsed.includes(s.id);
+    return `<div class="kb-col ${collapsed ? 'collapsed' : ''}" data-status="${s.id}">
       <div class="kb-group">${esc(GROUPS[s.id] || '')}</div>
-      <div class="kb-head" data-status="${s.id}"><span style="display:flex;align-items:center;gap:8px"><span class="dot"></span>${esc(s.label)}</span><span class="n">${byStatus[s.id].length}</span></div>
-      <div class="kb-body">
-        ${byStatus[s.id].map((j) => `
-          <div class="kb-card" draggable="true" data-id="${esc(j.id)}">
-            <div class="t">${esc(j.title || 'Untitled')}</div>
-            <div class="c">${esc(j.company || '')}</div>
-            <div class="kb-meta">${fitBadgeHtml(j.fitScore)}<span>${esc(daysIn(j.updatedAt))}</span></div>
-          </div>`).join('')}
+      <div class="kb-head" data-status="${s.id}">
+        <span style="display:flex;align-items:center;gap:8px;min-width:0">
+          <button class="kb-collapse" data-collapse="${s.id}" title="Collapse / expand">${collapsed ? '▸' : '▾'}</button>
+          <span class="dot"></span><span class="kb-label">${esc(s.label)}</span>
+        </span>
+        <span class="n">${byStatus[s.id].length}</span>
       </div>
-    </div>`).join('');
+      <div class="kb-body">${byStatus[s.id].map(cardHtml).join('')}</div>
+    </div>`;
+  }).join('');
 
   const v = el(`<div>
     <header class="page-header">
       <div>
         <div class="page-eyebrow">Board</div>
         <h1 class="page-title">Pipeline</h1>
-        <div class="page-sub">Drag a card to change its status.</div>
+        <div class="page-sub">Drag a card to change its status${filtered.length !== jobs.length ? ` · ${filtered.length}/${jobs.length} shown` : ''}.</div>
       </div>
-      <div class="page-actions"><button class="btn" data-refresh>Refresh</button></div>
+      <div class="page-actions">
+        <button class="btn" data-columns>Columns</button>
+        <button class="btn" data-refresh>Refresh</button>
+      </div>
     </header>
-    <div class="kanban">${cols}</div>
+
+    <div class="board-toolbar">
+      <input class="input" id="pb-q" placeholder="Search title, company, tag…" value="${esc(b.q)}" style="min-width:180px" />
+      <select class="select" id="pb-source"><option value="all">All sources</option>${sources.map((sc) => `<option value="${esc(sc)}" ${b.source === sc ? 'selected' : ''}>${esc(sc)}</option>`).join('')}</select>
+      <select class="select" id="pb-fit"><option value="0">Any fit</option><option value="45" ${b.minFit === 45 ? 'selected' : ''}>Fit 45+</option><option value="70" ${b.minFit === 70 ? 'selected' : ''}>Fit 70+</option></select>
+      <select class="select" id="pb-sort">
+        <option value="updatedAt" ${b.sort === 'updatedAt' ? 'selected' : ''}>Recently updated</option>
+        <option value="createdAt" ${b.sort === 'createdAt' ? 'selected' : ''}>Newest</option>
+        <option value="fit" ${b.sort === 'fit' ? 'selected' : ''}>Best fit</option>
+        <option value="title" ${b.sort === 'title' ? 'selected' : ''}>Title</option>
+      </select>
+      <button class="btn small" id="pb-dir" title="Toggle sort direction">${b.dir === 'asc' ? '↑' : '↓'}</button>
+      <button class="btn small" id="pb-density" title="Toggle card density">${b.density === 'compact' ? 'Compact' : 'Comfortable'}</button>
+    </div>
+
+    <div class="kanban" data-density="${esc(b.density)}">${cols}</div>
   </div>`);
 
+  const apply = () => { persistBoard(); navigate(); };
+  v.querySelector('#pb-q').addEventListener('input', debounce((e) => { state.board.q = e.target.value.trim(); navigate(); }, 250));
+  v.querySelector('#pb-source').addEventListener('change', (e) => { state.board.source = e.target.value; apply(); });
+  v.querySelector('#pb-fit').addEventListener('change', (e) => { state.board.minFit = Number(e.target.value) || 0; apply(); });
+  v.querySelector('#pb-sort').addEventListener('change', (e) => { state.board.sort = e.target.value; apply(); });
+  v.querySelector('#pb-dir').addEventListener('click', () => { state.board.dir = state.board.dir === 'asc' ? 'desc' : 'asc'; apply(); });
+  v.querySelector('#pb-density').addEventListener('click', () => { state.board.density = state.board.density === 'compact' ? 'comfortable' : 'compact'; apply(); });
+
+  v.querySelectorAll('[data-collapse]').forEach((btn) => btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const set = new Set(state.board.collapsed);
+    set.has(btn.dataset.collapse) ? set.delete(btn.dataset.collapse) : set.add(btn.dataset.collapse);
+    state.board.collapsed = [...set];
+    apply();
+  }));
+
+  v.querySelector('[data-columns]').addEventListener('click', () => {
+    const m = el(`<div class="modal">
+      <div class="modal-head"><h3 class="modal-title">Columns</h3><button class="toast-x" data-close aria-label="Close">×</button></div>
+      <div class="modal-body"><div class="col-toggle-list">${STATUSES.map((s) => `<label class="col-toggle"><input type="checkbox" data-col="${s.id}" ${b.hiddenCols.includes(s.id) ? '' : 'checked'} /> ${esc(s.label)}</label>`).join('')}</div></div>
+      <div class="modal-foot"><button class="btn small" data-hide-closed>Hide closed</button><button class="btn small primary" data-close>Done</button></div>
+    </div>`);
+    const close = openOverlay(m);
+    m.querySelectorAll('[data-close]').forEach((b2) => b2.addEventListener('click', () => { close(); navigate(); }));
+    m.querySelectorAll('[data-col]').forEach((cb) => cb.addEventListener('change', () => {
+      const hidden = new Set(state.board.hiddenCols);
+      cb.checked ? hidden.delete(cb.dataset.col) : hidden.add(cb.dataset.col);
+      state.board.hiddenCols = [...hidden];
+      persistBoard();
+    }));
+    m.querySelector('[data-hide-closed]').addEventListener('click', () => {
+      state.board.hiddenCols = [...new Set([...state.board.hiddenCols, ...TERMINAL_S])];
+      persistBoard(); close(); navigate();
+    });
+  });
+
   v.querySelector('[data-refresh]').addEventListener('click', navigate);
+
   v.querySelectorAll('.kb-card').forEach((card) => {
     card.addEventListener('dragstart', (e) => {
       e.dataTransfer.setData('text/plain', card.dataset.id);
@@ -1146,6 +1263,7 @@ route('/pipeline', async () => {
     card.addEventListener('dragend', () => card.classList.remove('dragging'));
     card.addEventListener('click', () => { location.hash = '#/applications/' + card.dataset.id; });
   });
+
   v.querySelectorAll('.kb-col').forEach((col) => {
     col.addEventListener('dragover', (e) => { e.preventDefault(); col.classList.add('dragover'); });
     col.addEventListener('dragleave', () => col.classList.remove('dragover'));
@@ -1155,12 +1273,22 @@ route('/pipeline', async () => {
       const jobId = e.dataTransfer.getData('text/plain');
       const status = col.dataset.status;
       if (!jobId || !status) return;
+      // Optimistic move: relocate the card + adjust counts now, PATCH in the
+      // background. Avoids the full re-render flicker and scroll jump.
+      const card = v.querySelector(`.kb-card[data-id="${CSS.escape(jobId)}"]`);
+      const fromCol = card?.closest('.kb-col');
+      const body = col.querySelector('.kb-body');
+      if (card && body && fromCol !== col) {
+        body.appendChild(card);
+        const bump = (c, d) => { const n = c?.querySelector('.kb-head .n'); if (n) n.textContent = String((Number(n.textContent) || 0) + d); };
+        bump(fromCol, -1); bump(col, +1);
+      }
       try {
         await api('/jobs/' + encodeURIComponent(jobId), { method: 'PATCH', body: { status, _source: 'manual' } });
-        navigate();
-      } catch (err) { errToast(err); }
+      } catch (err) { errToast(err); navigate(); }
     });
   });
+
   return v;
 });
 
@@ -1313,34 +1441,55 @@ const PROFILE_FIELDS = [
 ];
 
 route('/profile', async () => {
-  const [profilesR, qaR] = await Promise.all([api('/profiles'), api('/qa?limit=300').catch(() => ({ items: [] }))]);
+  const [profilesR, fieldsR, settings] = await Promise.all([
+    api('/profiles'),
+    api('/profile-fields').catch(() => ({ items: [] })),
+    getSettings(),
+  ]);
   const profiles = profilesR.items || [];
+  const harvested = fieldsR.items || [];
+  const af = settings.autofill || {};
+
   if (!state.profileSel || !profiles.find((p) => p.id === state.profileSel)) {
     state.profileSel = profiles[0]?.id || 'new';
   }
   const cur = profiles.find((p) => p.id === state.profileSel) || { name: 'Main', isDefault: !profiles.length, sourceAssignments: [], data: {} };
   const d = cur.data || {};
-  const qa = qaR.items || [];
 
-  const fieldRows = PROFILE_FIELDS.map(([k, label]) =>
-    `<div class="form-row"><label class="form-label" for="pf-${k}">${esc(label)}</label>
-     <div class="form-control"><input class="input" id="pf-${k}" value="${esc(d[k] ?? '')}" /></div></div>`).join('');
+  // Dynamic structured fields = the seed list ∪ any custom keys already saved in
+  // this profile's data — so harvested/custom questions become first-class,
+  // editable fields with no hardcoding.
+  const seedKeys = new Set(PROFILE_FIELDS.map(([k]) => k));
+  const humanize = (k) => k.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').replace(/^\w/, (c) => c.toUpperCase());
+  const extraKeys = Object.keys(d).filter((k) => !seedKeys.has(k) && k !== 'skills' && k !== 'summary' && !k.startsWith('_'));
+  const fieldDefs = [
+    ...PROFILE_FIELDS.map(([k, label]) => ({ k, label, custom: false })),
+    ...extraKeys.map((k) => ({ k, label: humanize(k), custom: true })),
+  ];
+  const fieldRowHtml = (f) => `
+    <div class="form-row" data-fieldrow="${esc(f.k)}"><label class="form-label" for="pf-${esc(f.k)}">${esc(f.label)}${f.custom ? ' <span class="muted">· custom</span>' : ''}</label>
+      <div class="form-control field-control"><input class="input pf-input" id="pf-${esc(f.k)}" data-key="${esc(f.k)}" value="${esc(d[f.k] ?? '')}" />${f.custom ? '<button class="btn small" data-rmfield title="Remove field">✕</button>' : ''}</div></div>`;
+  const fieldRows = fieldDefs.map(fieldRowHtml).join('');
 
-  const qaRows = qa.length ? qa.map((it) => `
-    <tr data-qa="${esc(it.id)}">
-      <td class="title-cell" title="${esc(it.question)}">${esc(it.question.length > 70 ? it.question.slice(0, 70) + '…' : it.question)}</td>
-      <td><input class="input" data-qa-answer value="${esc(it.answer)}" style="width:100%" /></td>
-      <td class="num">${esc(it.seen_count)}</td>
-      <td><button class="btn small" data-qa-del>✕</button></td>
+  const langBadge = (loc) => loc === 'fr' ? '<span class="lang-badge fr">FR</span>' : '<span class="lang-badge">EN</span>';
+  const harvestRows = harvested.length ? harvested.map((it) => `
+    <tr data-pf="${esc(it.id)}" class="${it.locked ? 'pf-locked' : ''}">
+      <td class="title-cell" title="${esc(it.label)}${it.source ? ' · from ' + esc(it.source) : ''}">${langBadge(it.locale)} ${esc(it.label.length > 60 ? it.label.slice(0, 60) + '…' : it.label)}</td>
+      <td><input class="input" data-pf-answer value="${esc(it.value)}" style="width:100%" /></td>
+      <td class="num">${esc(it.seenCount)}</td>
+      <td class="nowrap">
+        <button class="btn small ${it.locked ? 'primary' : ''}" data-pf-lock title="${it.locked ? 'Locked — new applications won’t overwrite. Click to unlock.' : 'Lock so new applications don’t overwrite this value.'}">${it.locked ? '🔒' : '🔓'}</button>
+        <button class="btn small" data-pf-del title="Forget">✕</button>
+      </td>
     </tr>`).join('')
-    : `<tr><td colspan="4">${emptyHtml('Empty memory', 'No learned answers yet', 'Every application you fill teaches JAT how you answer.')}</td></tr>`;
+    : `<tr><td colspan="4">${emptyHtml('Empty memory', 'No learned answers yet', 'Every application you fill teaches JAT how you answer — in English or French.')}</td></tr>`;
 
   const v = el(`<div>
     <header class="page-header">
       <div>
         <div class="page-eyebrow">Material</div>
         <h1 class="page-title">Profile</h1>
-        <div class="page-sub">What autofill and auto-apply know about you.</div>
+        <div class="page-sub">What autofill and auto-apply know about you — self-populating as you apply.</div>
       </div>
       <div class="page-actions">
         <button class="btn" data-import>Import from resume</button>
@@ -1348,6 +1497,20 @@ route('/profile', async () => {
         <button class="btn primary" data-save>Save profile</button>
       </div>
     </header>
+
+    <section class="section autofill-card">
+      <div class="af-row">
+        <div>
+          <div class="section-eyebrow">Autofill</div>
+          <h2 class="section-title">Pre-fill new applications from this profile</h2>
+          <div class="form-hint">${af.enabled
+            ? 'On — empty fields are filled automatically when you open an application. It never submits for you.'
+            : 'Off — turn on to have JAT fill matching fields on new applications. Empty fields only; never submits.'}</div>
+        </div>
+        <label class="toggle"><input type="checkbox" id="af-enabled" ${af.enabled ? 'checked' : ''} /><span class="knob"></span></label>
+      </div>
+      <div class="form-hint" style="margin-top:6px">More options in <a href="#/settings" class="section-link">Settings → Autofill</a>.</div>
+    </section>
 
     <div class="profile-layout">
       <div class="profile-list">
@@ -1364,18 +1527,20 @@ route('/profile', async () => {
             <div class="form-control"><label class="toggle"><input type="checkbox" id="pf-default" ${cur.isDefault ? 'checked' : ''} /><span class="knob"></span></label></div></div>
           <div class="form-row"><div class="form-label">Use on sites <div class="form-hint">hostname contains…</div></div>
             <div class="form-control" id="pf-sources-slot"></div></div>
-          ${fieldRows}
+          <div id="pf-fields">${fieldRows}</div>
+          <div class="form-row"><div class="form-label"></div><div class="form-control"><button class="btn small" data-addfield>+ Add custom field</button></div></div>
           <div class="form-row"><label class="form-label" for="pf-summary">Summary</label>
             <div class="form-control"><textarea class="input" id="pf-summary" rows="4" style="width:100%;resize:vertical">${esc(d.summary || '')}</textarea></div></div>
           <div class="form-row"><div class="form-label">Skills</div><div class="form-control" id="pf-skills-slot"></div></div>
         </section>
 
         <section class="section">
-          <header class="section-header"><div><div class="section-eyebrow">Memory</div><h2 class="section-title">Learned answers</h2></div>
-            <span class="section-link muted">${qa.length} stored</span></header>
+          <header class="section-header"><div><div class="section-eyebrow">Memory</div><h2 class="section-title">Learned answers</h2>
+            <div class="form-hint">Auto-captured from your applications (EN + FR). Edit a value to override it — that locks it so future applications won’t change it. Otherwise the newest answer wins.</div></div>
+            <span class="section-link muted">${harvested.length} stored</span></header>
           <div class="table-wrap"><table class="table">
             <thead><tr><th>Question</th><th>Answer</th><th>Seen</th><th></th></tr></thead>
-            <tbody>${qaRows}</tbody>
+            <tbody>${harvestRows}</tbody>
           </table></div>
         </section>
       </div>
@@ -1387,16 +1552,40 @@ route('/profile', async () => {
   const skills = chipsInput(d.skills || [], 'Add skill…');
   v.querySelector('#pf-skills-slot').appendChild(skills.node);
 
+  // Autofill master toggle (persists to settings.autofill.enabled).
+  v.querySelector('#af-enabled').addEventListener('change', async (e) => {
+    const on = e.target.checked;
+    try {
+      await api('/settings', { method: 'PATCH', body: { autofill: { enabled: on } } });
+      state.settings = null;
+      toast(on ? 'Autofill on — new applications will be pre-filled' : 'Autofill off');
+    } catch (err) { errToast(err); e.target.checked = !on; }
+  });
+
   v.querySelectorAll('[data-prof]').forEach((b) => b.addEventListener('click', () => {
     state.profileSel = b.dataset.prof;
     navigate();
   }));
 
+  // Add / remove custom structured fields.
+  const wireRemove = (btn) => btn.addEventListener('click', () => btn.closest('[data-fieldrow]')?.remove());
+  v.querySelectorAll('[data-rmfield]').forEach(wireRemove);
+  v.querySelector('[data-addfield]').addEventListener('click', () => {
+    const name = window.prompt('Field name (e.g. “Years of AutoCAD”, “Preferred shift”):');
+    if (!name || !name.trim()) return;
+    const key = (name.trim().replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 60)) || ('field_' + Date.now());
+    if (v.querySelector('#pf-fields [data-key="' + key + '"]')) { toast('That field already exists', 'danger'); return; }
+    const row = el(fieldRowHtml({ k: key, label: name.trim(), custom: true }));
+    wireRemove(row.querySelector('[data-rmfield]'));
+    v.querySelector('#pf-fields').appendChild(row);
+    row.querySelector('input').focus();
+  });
+
   const collect = () => {
     const data = {};
-    for (const [k] of PROFILE_FIELDS) {
-      const val = v.querySelector('#pf-' + k).value.trim();
-      if (val) data[k] = val;
+    for (const input of v.querySelectorAll('.pf-input')) {
+      const val = input.value.trim();
+      if (val) data[input.dataset.key] = val;
     }
     const summary = v.querySelector('#pf-summary').value.trim();
     if (summary) data.summary = summary;
@@ -1437,9 +1626,9 @@ route('/profile', async () => {
       const r = await api('/ai/resume-parse', { method: 'POST', body: {}, timeoutMs: 240000 });
       const parsed = r.result || {};
       let filled = 0;
-      for (const [k] of PROFILE_FIELDS) {
-        const input = v.querySelector('#pf-' + k);
-        if (input && !input.value.trim() && parsed[k]) { input.value = parsed[k]; filled++; }
+      for (const input of v.querySelectorAll('.pf-input')) {
+        const k = input.dataset.key;
+        if (!input.value.trim() && parsed[k]) { input.value = parsed[k]; filled++; }
       }
       const sum = v.querySelector('#pf-summary');
       if (!sum.value.trim() && parsed.summary) { sum.value = parsed.summary; filled++; }
@@ -1451,17 +1640,30 @@ route('/profile', async () => {
     btn.disabled = false; btn.textContent = 'Import from resume';
   });
 
-  v.querySelectorAll('tr[data-qa]').forEach((tr) => {
-    const qaId = tr.dataset.qa;
-    const item = qa.find((x) => x.id === qaId);
-    tr.querySelector('[data-qa-answer]').addEventListener('change', async (e2) => {
+  // Harvested answers: edit (override + lock), lock toggle, forget.
+  v.querySelectorAll('tr[data-pf]').forEach((tr) => {
+    const id = tr.dataset.pf;
+    const answerEl = tr.querySelector('[data-pf-answer]');
+    const lockBtn = tr.querySelector('[data-pf-lock]');
+    answerEl.addEventListener('change', async () => {
       try {
-        await api('/qa', { method: 'POST', body: { question: item.question, answer: e2.target.value } });
-        toast('Answer updated');
+        await api('/profile-fields/' + encodeURIComponent(id), { method: 'PATCH', body: { value: answerEl.value, locked: true } });
+        tr.classList.add('pf-locked');
+        lockBtn.classList.add('primary'); lockBtn.textContent = '🔒';
+        toast('Saved & locked — new applications won’t overwrite this');
       } catch (err) { errToast(err); }
     });
-    tr.querySelector('[data-qa-del]').addEventListener('click', async () => {
-      try { await api('/qa/' + encodeURIComponent(qaId), { method: 'DELETE' }); tr.remove(); }
+    lockBtn.addEventListener('click', async () => {
+      const willLock = !tr.classList.contains('pf-locked');
+      try {
+        await api('/profile-fields/' + encodeURIComponent(id), { method: 'PATCH', body: { locked: willLock } });
+        tr.classList.toggle('pf-locked', willLock);
+        lockBtn.classList.toggle('primary', willLock);
+        lockBtn.textContent = willLock ? '🔒' : '🔓';
+      } catch (err) { errToast(err); }
+    });
+    tr.querySelector('[data-pf-del]').addEventListener('click', async () => {
+      try { await api('/profile-fields/' + encodeURIComponent(id), { method: 'DELETE' }); tr.remove(); }
       catch (err) { errToast(err); }
     });
   });
@@ -1473,47 +1675,144 @@ route('/profile', async () => {
 // VIEW: Documents (#/documents)
 // ============================================================
 route('/documents', async () => {
-  const r = await api('/documents');
-  const docs = r.items || [];
+  const [docsR, foldersR] = await Promise.all([
+    api('/documents'),
+    api('/document-folders').catch(() => ({ items: [] })),
+  ]);
+  const docs = docsR.items || [];
+  const folders = foldersR.items || [];
+  const filt = state.docsFilter;
 
-  const rows = docs.length ? docs.map((doc) => `
+  const counts = docs.reduce((a, dd) => { a[dd.role] = (a[dd.role] || 0) + 1; return a; }, {});
+  const tabs = [{ id: 'all', label: 'All' }, ...DOC_ROLES].map((t) => {
+    const n = t.id === 'all' ? docs.length : (counts[t.id] || 0);
+    return `<button class="doc-tab ${filt.role === t.id ? 'active' : ''}" data-tab="${t.id}">${esc(t.label)} <span class="tab-n">${n}</span></button>`;
+  }).join('');
+
+  const shown = () => {
+    let list = filt.role === 'all' ? docs : docs.filter((dd) => dd.role === filt.role);
+    if (filt.q) {
+      const q = filt.q.toLowerCase();
+      list = list.filter((dd) => dd.name.toLowerCase().includes(q) || (dd.keywords || []).some((k) => String(k).toLowerCase().includes(q)));
+    }
+    return list;
+  };
+  const srcTag = (dd) => dd.source === 'folder' ? '<span class="doc-src">folder</span>'
+    : dd.source === 'application' ? '<span class="doc-src">from application</span>' : '';
+  const kwHtml = (dd) => (dd.keywords && dd.keywords.length)
+    ? `<div class="kw-row">${dd.keywords.slice(0, 8).map((k) => `<span class="kw">${esc(k)}</span>`).join('')}</div>` : '<span class="muted">—</span>';
+
+  const rowsHtml = (list) => list.length ? list.map((doc) => `
     <tr data-doc="${esc(doc.id)}">
-      <td><button class="star-btn ${doc.isDefault ? 'on' : ''}" data-star title="Default ${esc(doc.role)}">★</button></td>
-      <td class="title-cell">${esc(doc.name)}</td>
-      <td><span class="role-badge" data-role="${esc(doc.role)}">${esc(doc.role)}</span></td>
+      <td><button class="star-btn ${doc.isDefault ? 'on' : ''}" data-star title="Default ${esc(DOC_ROLE_LABEL[doc.role] || doc.role)}">★</button></td>
+      <td class="title-cell">${esc(doc.name)} ${srcTag(doc)}</td>
+      <td><span class="role-badge" data-role="${esc(doc.role)}">${esc(DOC_ROLE_LABEL[doc.role] || doc.role)}</span></td>
+      <td>${kwHtml(doc)}</td>
       <td class="num">${fmtBytes(doc.sizeBytes)}</td>
-      <td><span class="text-ind ${doc.hasText ? 'ok' : 'no'}">${doc.hasText ? 'text ✓' : 'no text'}</span></td>
-      <td>${dateHtml(doc.createdAt)}</td>
+      <td>${dateHtml(doc.lastModified || doc.createdAt)}</td>
       <td class="nowrap">
-        <button class="btn small" data-dl>Download</button>
+        ${doc.hasText ? '<button class="btn small" data-text>Text</button>' : ''}
+        ${doc.source !== 'folder' ? '<button class="btn small" data-dl>Download</button>' : ''}
         <button class="btn small" data-del>✕</button>
       </td>
     </tr>`).join('')
-    : `<tr><td colspan="7">${emptyHtml('Empty drawer', 'No documents yet', 'Drop your resume here — auto-apply and tailoring need it.')}</td></tr>`;
+    : `<tr><td colspan="7">${emptyHtml('Empty drawer', filt.role === 'all' ? 'No documents yet' : 'No ' + (DOC_ROLE_LABEL[filt.role] || filt.role).toLowerCase() + ' here', 'Upload one, or link a local folder to index it automatically.')}</td></tr>`;
+
+  const folderCards = folders.length ? folders.map((f) => `
+    <div class="folder-card" data-folder="${esc(f.id)}">
+      <div class="fc-main">
+        <div class="fc-path" title="${esc(f.path)}">${esc(f.label || f.path)}</div>
+        <div class="fc-meta">${esc(f.fileCount)} file(s) · ${f.lastScanAt ? 'scanned ' + esc(fmtRel(f.lastScanAt)) : 'not scanned yet'}</div>
+      </div>
+      <div class="fc-actions">
+        <button class="btn small" data-rescan>Re-index</button>
+        <button class="btn small" data-unlink>Unlink</button>
+      </div>
+    </div>`).join('') : '<div class="muted" style="padding:6px 2px">No linked folders. Link one to auto-index its résumés / letters.</div>';
 
   const v = el(`<div>
     <header class="page-header">
       <div>
         <div class="page-eyebrow">Material</div>
         <h1 class="page-title">Documents</h1>
-        <div class="page-sub">Resumes and cover letters, with extracted text for the AI.</div>
+        <div class="page-sub">Résumés, cover letters & more — auto-collected from applications, with extracted text and keywords.</div>
       </div>
       <div class="page-actions">
-        <select class="select" id="up-role"><option value="resume">resume</option><option value="coverLetter">cover letter</option><option value="other">other</option></select>
+        <select class="select" id="up-role">${DOC_ROLES.map((r) => `<option value="${r.id}">${esc(r.label)}</option>`).join('')}</select>
         <button class="btn primary" data-pick>Upload…</button>
         <input type="file" id="up-file" accept=".pdf,.docx,.doc,.txt,.md,.rtf" hidden />
       </div>
     </header>
 
+    <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">Folders</div><h2 class="section-title">Linked local folders</h2>
+        <div class="form-hint">Indexed read-only — JAT reads filename, modified date, text and keywords. Your files are never moved or changed.</div></div></header>
+      <div class="folder-list">${folderCards}</div>
+      <div class="folder-add">
+        <input class="input" id="fold-path" placeholder="C:\\Users\\you\\Documents\\Job applications" style="flex:1" />
+        <select class="select" id="fold-role"><option value="auto">auto-detect role</option>${DOC_ROLES.map((r) => `<option value="${r.id}">${esc(r.label)}</option>`).join('')}</select>
+        ${state.host === 'desktop' ? '<button class="btn small" data-browse>Browse…</button>' : ''}
+        <button class="btn small primary" data-link>Link &amp; index</button>
+      </div>
+    </section>
+
+    <div class="doc-toolbar">
+      <div class="doc-tabs">${tabs}</div>
+      <input class="input doc-search" id="doc-q" placeholder="Search name or keyword…" value="${esc(filt.q)}" />
+    </div>
+
     <div class="dropzone" id="dropzone">Drop a file here, or click Upload</div>
 
     <section class="section">
       <div class="table-wrap"><table class="table">
-        <thead><tr><th></th><th>Name</th><th>Role</th><th>Size</th><th>Extraction</th><th>Added</th><th></th></tr></thead>
-        <tbody>${rows}</tbody>
+        <thead><tr><th></th><th>Name</th><th>Role</th><th>Keywords</th><th>Size</th><th>Modified</th><th></th></tr></thead>
+        <tbody id="doc-rows">${rowsHtml(shown())}</tbody>
       </table></div>
     </section>
   </div>`);
+
+  if (filt.role !== 'all') { const sel = v.querySelector('#up-role'); if (sel.querySelector('option[value="' + filt.role + '"]')) sel.value = filt.role; }
+
+  function wireRows() {
+    v.querySelectorAll('tr[data-doc]').forEach((tr) => {
+      const docId = tr.dataset.doc;
+      const doc = docs.find((x) => x.id === docId);
+      tr.querySelector('[data-star]')?.addEventListener('click', async () => {
+        try { await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { isDefault: true } }); navigate(); }
+        catch (e) { errToast(e); }
+      });
+      tr.querySelector('[data-dl]')?.addEventListener('click', async () => {
+        try {
+          const res = await api('/documents/' + encodeURIComponent(docId) + '?raw=1', { raw: true, timeoutMs: 30000 });
+          downloadBlob(await res.blob(), doc.name);
+        } catch (e) { errToast(e); }
+      });
+      tr.querySelector('[data-text]')?.addEventListener('click', async () => {
+        try {
+          const r2 = await api('/documents/' + encodeURIComponent(docId) + '?text=1');
+          textModal(doc.name, r2.document?.textContent || '(no text extracted)', { downloadName: doc.name + '.txt' });
+        } catch (e) { errToast(e); }
+      });
+      tr.querySelector('[data-del]')?.addEventListener('click', async () => {
+        const permanent = doc && doc.source !== 'folder';
+        const msg = permanent
+          ? `Delete “${doc.name}”? The file will be permanently removed from the app.`
+          : `Remove “${doc?.name || 'this entry'}” from the library? Your original file is untouched.`;
+        if (!window.confirm(msg)) return;
+        try { await api('/documents/' + encodeURIComponent(docId), { method: 'DELETE' }); toast('Document removed'); navigate(); }
+        catch (e) { errToast(e); }
+      });
+    });
+  }
+  const rerenderRows = () => { v.querySelector('#doc-rows').innerHTML = rowsHtml(shown()); wireRows(); };
+  wireRows();
+
+  v.querySelectorAll('[data-tab]').forEach((b) => b.addEventListener('click', () => {
+    state.docsFilter.role = b.dataset.tab;
+    v.querySelectorAll('[data-tab]').forEach((x) => x.classList.toggle('active', x === b));
+    rerenderRows();
+  }));
+  v.querySelector('#doc-q').addEventListener('input', debounce((e) => { state.docsFilter.q = e.target.value.trim(); rerenderRows(); }, 200));
 
   async function upload(file) {
     if (!file) return;
@@ -1539,27 +1838,35 @@ route('/documents', async () => {
   dz.addEventListener('click', () => v.querySelector('#up-file').click());
   dz.addEventListener('dragover', (e) => { e.preventDefault(); dz.classList.add('over'); });
   dz.addEventListener('dragleave', () => dz.classList.remove('over'));
-  dz.addEventListener('drop', (e) => {
-    e.preventDefault(); dz.classList.remove('over');
-    upload(e.dataTransfer.files[0]);
-  });
+  dz.addEventListener('drop', (e) => { e.preventDefault(); dz.classList.remove('over'); upload(e.dataTransfer.files[0]); });
 
-  v.querySelectorAll('tr[data-doc]').forEach((tr) => {
-    const docId = tr.dataset.doc;
-    const doc = docs.find((x) => x.id === docId);
-    tr.querySelector('[data-star]').addEventListener('click', async () => {
-      try { await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { isDefault: true } }); navigate(); }
-      catch (e) { errToast(e); }
+  // folder linking + indexing
+  const browse = v.querySelector('[data-browse]');
+  if (browse) browse.addEventListener('click', async () => {
+    try { const p = await window.jatDesktop?.pickFolder?.(); if (p) v.querySelector('#fold-path').value = p; }
+    catch (e) { errToast(e); }
+  });
+  v.querySelector('[data-link]').addEventListener('click', async (e) => {
+    const path = v.querySelector('#fold-path').value.trim();
+    if (!path) { toast('Enter a folder path', 'danger'); return; }
+    const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Indexing…';
+    try {
+      const r2 = await api('/document-folders', { method: 'POST', timeoutMs: 300000, body: { path, roleHint: v.querySelector('#fold-role').value } });
+      toast(`Linked & indexed ${r2.indexed} file(s)`);
+      navigate();
+    } catch (err) { errToast(err, 'Link failed'); btn.disabled = false; btn.textContent = 'Link & index'; }
+  });
+  v.querySelectorAll('.folder-card').forEach((card) => {
+    const fid = card.dataset.folder;
+    card.querySelector('[data-rescan]').addEventListener('click', async (e) => {
+      const btn = e.currentTarget; btn.disabled = true; btn.textContent = '…';
+      try { const r2 = await api('/document-folders/' + encodeURIComponent(fid) + '/scan', { method: 'POST', timeoutMs: 300000 }); toast(`Re-indexed ${r2.indexed} file(s)`); navigate(); }
+      catch (err) { errToast(err); btn.disabled = false; btn.textContent = 'Re-index'; }
     });
-    tr.querySelector('[data-dl]').addEventListener('click', async () => {
-      try {
-        const res = await api('/documents/' + encodeURIComponent(docId) + '?raw=1', { raw: true, timeoutMs: 30000 });
-        downloadBlob(await res.blob(), doc.name);
-      } catch (e) { errToast(e); }
-    });
-    tr.querySelector('[data-del]').addEventListener('click', async () => {
-      try { await api('/documents/' + encodeURIComponent(docId), { method: 'DELETE' }); toast('Document deleted'); navigate(); }
-      catch (e) { errToast(e); }
+    card.querySelector('[data-unlink]').addEventListener('click', async () => {
+      if (!window.confirm('Unlink this folder? Its indexed entries leave the library (your actual files are untouched).')) return;
+      try { await api('/document-folders/' + encodeURIComponent(fid) + '?prune=1', { method: 'DELETE' }); toast('Folder unlinked'); navigate(); }
+      catch (err) { errToast(err); }
     });
   });
 
@@ -1714,6 +2021,18 @@ route('/settings', async () => {
     </section>
 
     <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">Autofill</div><h2 class="section-title">Profile autofill &amp; learning</h2></div>
+        <button class="btn small primary" data-save-section="autofill">Save</button></header>
+      ${row('Auto-fill new applications', toggle('saf-enabled', s.autofill.enabled), 'fills EMPTY fields from your profile when you open an application — never submits for you')}
+      ${row('Use structured profile fields', toggle('saf-profile', s.autofill.fillProfile))}
+      ${row('Use learned answers', toggle('saf-learned', s.autofill.fillLearned))}
+      ${row('Skip sensitive fields', toggle('saf-sensitive', s.autofill.skipSensitive), 'never auto-fill EEO / demographic / identity questions')}
+      ${row('Highlight filled fields', toggle('saf-highlight', s.autofill.highlight))}
+      ${row('Match confidence', `<input class="input" id="saf-minconf" type="number" min="0.3" max="1" step="0.05" value="${esc(s.autofill.minConfidence)}" />`, 'higher = only fill very confident matches (0.3–1.0)')}
+      ${row('Learn answers from applications', toggle('hv-enabled', s.harvest.enabled), 'auto-build your profile from the answers you give — appears under Profile → Learned answers')}
+    </section>
+
+    <section class="section">
       <header class="section-header"><div><div class="section-eyebrow">Mail</div><h2 class="section-title">Gmail status sync</h2></div>
         <button class="btn small primary" data-save-section="gmail">Save</button></header>
       <div class="section-body">
@@ -1830,6 +2149,17 @@ route('/settings', async () => {
       panelOnDetect: v.querySelector('#cap-panel').checked,
       askWhenUnsure: v.querySelector('#cap-ask').checked,
     } }),
+    autofill: () => ({
+      autofill: {
+        enabled: v.querySelector('#saf-enabled').checked,
+        fillProfile: v.querySelector('#saf-profile').checked,
+        fillLearned: v.querySelector('#saf-learned').checked,
+        skipSensitive: v.querySelector('#saf-sensitive').checked,
+        highlight: v.querySelector('#saf-highlight').checked,
+        minConfidence: Math.min(1, Math.max(0.3, Number(v.querySelector('#saf-minconf').value) || 0.6)),
+      },
+      harvest: { enabled: v.querySelector('#hv-enabled').checked },
+    }),
     gmail: () => ({ gmail: {
       enabled: v.querySelector('#gm-enabled').checked,
       query: v.querySelector('#gm-query').value.trim(),

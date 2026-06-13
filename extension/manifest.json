@@ -2,9 +2,17 @@
   "manifest_version": 3,
   "name": "Job Application Tracker v11",
   "short_name": "JAT v11",
-  "version": "11.0.2",
+  "version": "11.1.0",
   "description": "Captures job applications across every job board, with a local SQLite desktop companion, AI assistance (Codex/Ollama), and a paced auto-apply engine.",
-  "permissions": ["storage", "downloads", "downloads.open", "tabs", "alarms", "webNavigation", "contextMenus"],
+  "permissions": [
+    "storage",
+    "downloads",
+    "downloads.open",
+    "tabs",
+    "alarms",
+    "webNavigation",
+    "contextMenus"
+  ],
   "host_permissions": [
     "<all_urls>",
     "http://localhost:7744/*",
@@ -35,7 +43,9 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": [
+        "<all_urls>"
+      ],
       "exclude_matches": [
         "*://localhost/*",
         "*://127.0.0.1/*",
@@ -50,7 +60,9 @@
         "*://chatgpt.com/*",
         "*://claude.ai/*"
       ],
-      "js": ["content/loader.js"],
+      "js": [
+        "content/loader.js"
+      ],
       "run_at": "document_idle",
       "all_frames": true,
       "match_about_blank": false
@@ -67,7 +79,9 @@
         "content/signals/*.js",
         "content/sites/*.js"
       ],
-      "matches": ["<all_urls>"]
+      "matches": [
+        "<all_urls>"
+      ]
     }
   ]
 }

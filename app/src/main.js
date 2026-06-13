@@ -294,6 +294,12 @@ ipcMain.handle('jat:restart-to-update', () => {
   if (updateState.status === 'downloaded') { isQuitting = true; autoUpdater.quitAndInstall(true, true); return true; }
   return false;
 });
+ipcMain.handle('jat:pick-folder', async () => {
+  const r = await dialog.showOpenDialog(mainWindow, {
+    title: 'Choose a folder to index', properties: ['openDirectory'],
+  });
+  return (r.canceled || !r.filePaths?.length) ? null : r.filePaths[0];
+});
 
 // ---------- lifecycle ----------
 app.whenReady().then(async () => {

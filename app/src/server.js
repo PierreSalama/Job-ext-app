@@ -126,6 +126,7 @@ async function queueNext() {
 
   const profile = db.profileForSource(job.source);
   const resume = db.defaultDocument('resume');
+  const harvested = db.profileFieldList().filter((f) => f.value);
   const siteCfg = s.sites?.[String(job.source || '').toLowerCase()] || {};
   const mode = siteCfg.mode || task.mode || s.mode;
 
@@ -141,12 +142,85 @@ async function queueNext() {
     context: {
       job,
       profile: profile || null,
+      harvested,
       resume: resume ? {
         id: resume.id, name: resume.name, mime: resume.mime,
       } : null,
       aiConfidenceMin: s.aiAnswerConfidenceMin,
     },
   };
+}
+
+// ============================================================
+// Document-folder indexing (read-only crawl of a user-linked directory)
+// ============================================================
+const FOLDER_EXT_RX = /\.(pdf|docx?|txt|md|rtf|odt)$/i;
+const MAX_INDEX_FILE_BYTES = 15 * 1024 * 1024;
+
+function isUnsafeFolder(p) {
+  const r = path.resolve(p);
+  if (/^[A-Za-z]:\\?$/.test(r) || r === path.parse(r).root) return true;   // drive/filesystem root
+  const lower = r.toLowerCase();
+  const banned = [
+    'c:\\windows', 'c:\\program files', 'c:\\program files (x86)', 'c:\\programdata',
+    '/system', '/usr', '/bin', '/sbin', '/etc', '/var', '/private',
+  ];
+  return banned.some((b) => lower === b || lower.startsWith(b + path.sep));
+}
+
+function roleForFile(name, roleHint) {
+  if (roleHint && roleHint !== 'auto') return roleHint;
+  if (/cover|lettre|motivation/i.test(name)) return 'cover_letter';
+  if (/resume|cv|curriculum/i.test(name)) return 'resume';
+  return 'other';
+}
+
+// Walk a linked folder, extract text + keywords per supported file, and upsert
+// each into the library (deduped by path; unchanged files skip re-extraction).
+async function scanFolder(folder) {
+  const s = db.getSettings().documents;
+  const maxFiles = s.maxFolderFiles || 2000;
+  const maxDepth = s.maxFolderDepth || 6;
+  const topN = s.keywordCount || 12;
+
+  const found = [];
+  const walk = (dir, depth) => {
+    if (depth > maxDepth || found.length >= maxFiles) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (found.length >= maxFiles) break;
+      if (e.name.startsWith('.')) continue;
+      if (e.isSymbolicLink && e.isSymbolicLink()) continue;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full, depth + 1);
+      else if (e.isFile() && FOLDER_EXT_RX.test(e.name)) found.push(full);
+    }
+  };
+  walk(folder.path, 0);
+
+  let indexed = 0, processed = 0;
+  for (const full of found) {
+    // Yield to the event loop every few files so a big index doesn't starve SSE
+    // keep-alives / other REST requests on this single-threaded process.
+    if (processed++ % 6 === 0) await new Promise((r) => setImmediate(r));
+    let st; try { st = fs.statSync(full); } catch { continue; }
+    if (st.size > MAX_INDEX_FILE_BYTES) continue;
+    const mtime = st.mtime.toISOString();
+    const role = roleForFile(path.basename(full), folder.roleHint);
+    const prev = db.documentByPath(full);
+    if (prev && prev.lastModified === mtime && prev.hasText) { indexed++; continue; }  // unchanged → skip extract
+    let text = '';
+    try { text = await extractText(full, ''); } catch {}
+    db.upsertFolderDocument({
+      folderId: folder.id, name: path.basename(full), filePath: full, role,
+      textContent: text, sizeBytes: st.size, mime: '', lastModified: mtime,
+      keywords: db.extractKeywords(text, topN),
+    });
+    indexed++;
+  }
+  db.folderTouch(folder.id, indexed);
+  return indexed;
 }
 
 // ============================================================
@@ -328,9 +402,48 @@ async function handle(req, res, parsed) {
     return sendJson(res, db.deleteProfile(jm[1]) ? 200 : 404, { ok: true });
   }
 
+  // ---- profile fields (dynamic, auto-harvested) ----
+  if (req.method === 'GET' && pathname === '/profile-fields') {
+    return sendJson(res, 200, { ok: true, items: db.profileFieldList() });
+  }
+  if (req.method === 'POST' && pathname === '/profile-fields') {
+    const body = await readJson(req);
+    if (!body.question) return sendJson(res, 400, { ok: false, error: 'question required' });
+    // A manual add/edit from the dashboard is authoritative → high confidence + locked.
+    const item = db.profileFieldUpsert({ ...body, confidence: 1, fromUser: true });
+    broadcast('profileFields.updated', {});
+    return sendJson(res, 200, { ok: true, item });
+  }
+  if (req.method === 'PATCH' && (jm = m(/^\/profile-fields\/([^/]+)$/))) {
+    const body = await readJson(req);
+    const item = db.profileFieldSet(jm[1], body);
+    if (!item) return sendJson(res, 404, { ok: false, error: 'not found' });
+    broadcast('profileFields.updated', {});
+    return sendJson(res, 200, { ok: true, item });
+  }
+  if (req.method === 'DELETE' && (jm = m(/^\/profile-fields\/([^/]+)$/))) {
+    const okDel = db.profileFieldDelete(jm[1]);
+    broadcast('profileFields.updated', {});
+    return sendJson(res, okDel ? 200 : 404, { ok: okDel });
+  }
+
+  // Everything the extension needs to pre-fill a new application (gated by the
+  // autofill setting — returns disabled:true when off so the client no-ops).
+  if (req.method === 'GET' && pathname === '/autofill/bundle') {
+    const af = db.getSettings().autofill;
+    if (!af.enabled) return sendJson(res, 200, { ok: true, enabled: false });
+    const bundle = db.profileAutofillBundle(parsed.searchParams.get('source') || '');
+    return sendJson(res, 200, { ok: true, enabled: true, settings: af, ...bundle });
+  }
+
   // ---- documents ----
   if (req.method === 'GET' && pathname === '/documents') {
-    return sendJson(res, 200, { ok: true, items: db.listDocuments() });
+    return sendJson(res, 200, { ok: true, items: db.listDocuments({
+      role: parsed.searchParams.get('role') || undefined,
+      source: parsed.searchParams.get('source') || undefined,
+      folderId: parsed.searchParams.get('folderId') || undefined,
+      q: parsed.searchParams.get('q') || undefined,
+    }) });
   }
   if (req.method === 'GET' && (jm = m(/^\/documents\/([^/]+)$/))) {
     const withText = parsed.searchParams.get('text') === '1';
@@ -383,6 +496,35 @@ async function handle(req, res, parsed) {
   if (req.method === 'DELETE' && (jm = m(/^\/documents\/([^/]+)$/))) {
     const okDel = db.deleteDocument(jm[1]);
     broadcast('documents.updated', { id: jm[1] });
+    return sendJson(res, okDel ? 200 : 404, { ok: okDel });
+  }
+
+  // ---- document folders (link + index a local directory) ----
+  if (req.method === 'GET' && pathname === '/document-folders') {
+    return sendJson(res, 200, { ok: true, items: db.folderList() });
+  }
+  if (req.method === 'POST' && pathname === '/document-folders') {
+    const body = await readJson(req);
+    const dir = String(body.path || '').trim();
+    if (!dir) return sendJson(res, 400, { ok: false, error: 'path required' });
+    let st; try { st = fs.statSync(dir); } catch { return sendJson(res, 400, { ok: false, error: 'folder not found' }); }
+    if (!st.isDirectory()) return sendJson(res, 400, { ok: false, error: 'not a folder' });
+    if (isUnsafeFolder(dir)) return sendJson(res, 400, { ok: false, error: 'that folder is not allowed (system directory)' });
+    const folder = db.folderAdd({ path: dir, label: body.label, roleHint: body.roleHint });
+    const indexed = await scanFolder(folder);
+    broadcast('documents.updated', { folderId: folder.id });
+    return sendJson(res, 200, { ok: true, folder: db.folderGet(folder.id), indexed });
+  }
+  if (req.method === 'POST' && (jm = m(/^\/document-folders\/([^/]+)\/scan$/))) {
+    const folder = db.folderGet(jm[1]);
+    if (!folder) return sendJson(res, 404, { ok: false, error: 'not found' });
+    const indexed = await scanFolder(folder);
+    broadcast('documents.updated', { folderId: folder.id });
+    return sendJson(res, 200, { ok: true, folder: db.folderGet(folder.id), indexed });
+  }
+  if (req.method === 'DELETE' && (jm = m(/^\/document-folders\/([^/]+)$/))) {
+    const okDel = db.folderDelete(jm[1], { pruneDocs: parsed.searchParams.get('prune') === '1' });
+    broadcast('documents.updated', { folderId: jm[1] });
     return sendJson(res, okDel ? 200 : 404, { ok: okDel });
   }
 

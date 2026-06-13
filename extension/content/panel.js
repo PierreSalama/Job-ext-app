@@ -117,15 +117,60 @@ function injectStyles() {
   document.head.appendChild(style);
 }
 
+let panelEl = null;
+let fadeTimer = null;
+let onDismissCb = null;
+
+function attachTarget() { return document.body || document.documentElement; }
+
+function buildSkeleton(root) {
+  root.innerHTML = `
+    <div class="jat-progress"><i></i></div>
+    <div class="jat-pill" data-act="expand" title="Expand"><span class="dot"></span><span class="lbl"></span></div>
+    <div class="jat-h">
+      <div class="jat-topbar">
+        <div class="jat-eyebrow"></div>
+        <button class="jat-collapse" data-act="collapse" title="Collapse">‒</button>
+      </div>
+      <div class="jat-title"></div>
+      <div class="jat-co"></div>
+      <div class="jat-loc"></div>
+    </div>
+    <div class="jat-section"><div class="jat-section-label">Stage</div><div class="jat-stages"></div></div>
+    <div class="jat-section"><div class="jat-section-label">Resume</div><div class="jat-resume jat-line muted"></div></div>
+    <div class="jat-section"><div class="jat-section-label">Answers</div><div class="jat-answers jat-line muted"></div><div class="jat-save-wrap"></div></div>
+    <div class="jat-actions"><button class="jat-btn" data-act="dismiss">Dismiss</button></div>
+  `;
+  root.querySelector('[data-act="dismiss"]').addEventListener('click', () => {
+    if (onDismissCb) { try { onDismissCb(); } catch {} }
+    dismissPanel();
+  });
+  root.querySelector('[data-act="collapse"]').addEventListener('click', () => {
+    collapsed = true; try { sessionStorage.setItem('jat11.panelCollapsed', '1'); } catch {}
+    root.classList.add('mini');
+  });
+  root.querySelector('[data-act="expand"]').addEventListener('click', () => {
+    collapsed = false; try { sessionStorage.setItem('jat11.panelCollapsed', '0'); } catch {}
+    root.classList.remove('mini');
+  });
+}
+
 function ensureRoot() {
   injectStyles();
   let root = document.getElementById(PANEL_ID);
-  if (root) return root;
+  if (root) { panelEl = root; if (!root.querySelector('.jat-stages')) buildSkeleton(root); return root; }
   root = document.createElement('div');
   root.id = PANEL_ID;
-  document.body.appendChild(root);
+  buildSkeleton(root);
+  attachTarget().appendChild(root);
+  panelEl = root;
   requestAnimationFrame(() => root.classList.add('visible'));
   return root;
+}
+
+function setText(root, sel, text) {
+  const el = root.querySelector(sel);
+  if (el && el.textContent !== text) el.textContent = text;
 }
 
 function esc(s) {
@@ -139,86 +184,54 @@ function stageClass(targetIdx, currentIdx) {
 }
 
 export function renderPanel(state, { onDismiss } = {}) {
-  const root = ensureRoot();
+  if (onDismiss) onDismissCb = onDismiss;
+  // Re-attach in place if a SPA tore the panel out of the DOM — re-appending the
+  // SAME node (content + listeners intact) avoids the disappear/reappear flicker.
+  if (panelEl && !panelEl.isConnected) attachTarget().appendChild(panelEl);
+  const root = (panelEl && panelEl.isConnected) ? panelEl : ensureRoot();
+
   const currentIdx = STAGE_LABELS.findIndex((s) => s.id === state.stage);
   const isSubmitted = state.stage === 'submitted';
   root.classList.toggle('captured', isSubmitted);
+  root.classList.toggle('mini', collapsed);
+  if (!root.classList.contains('visible')) requestAnimationFrame(() => root.classList.add('visible'));
 
   const ctx = state.ctx || {};
-  const titleLine = ctx.title ? esc(ctx.title) : 'Detecting…';
-  const coLine = ctx.company ? `<div class="jat-co">${esc(ctx.company)}</div>` : '';
-  const locLine = ctx.location ? `<div class="jat-loc">${esc(ctx.location)}</div>` : '';
+  // ---- in-place field updates (no innerHTML churn → no flicker) ----
+  setText(root, '.jat-eyebrow', isSubmitted ? 'JAT · CAPTURED' : 'JAT · CAPTURING');
+  setText(root, '.jat-title', ctx.title || 'Detecting…');
+  const co = root.querySelector('.jat-co'); co.textContent = ctx.company || ''; co.style.display = ctx.company ? '' : 'none';
+  const loc = root.querySelector('.jat-loc'); loc.textContent = ctx.location || ''; loc.style.display = ctx.location ? '' : 'none';
+  setText(root, '.jat-pill .lbl', 'JAT · ' + ((STAGE_LABELS.find((s) => s.id === state.stage) || {}).label || 'Detecting'));
+  root.querySelector('.jat-progress > i').style.width = (STAGE_PCT[state.stage] || 8) + '%';
 
-  const stagesHtml = STAGE_LABELS.map((s, i) =>
-    `<div class="jat-stage ${stageClass(i, currentIdx)}"><span class="dot"></span>${s.label}</div>`,
-  ).join('');
+  const stagesEl = root.querySelector('.jat-stages');
+  const stagesHtml = STAGE_LABELS.map((s, i) => `<div class="jat-stage ${stageClass(i, currentIdx)}"><span class="dot"></span>${s.label}</div>`).join('');
+  if (stagesEl.__sig !== stagesHtml) { stagesEl.innerHTML = stagesHtml; stagesEl.__sig = stagesHtml; }
 
-  const resumeLine = state.resumeName
-    ? `<div class="jat-line">${esc(state.resumeName)}</div>`
-    : '<div class="jat-line muted">No resume picked yet</div>';
+  const resumeEl = root.querySelector('.jat-resume');
+  resumeEl.className = 'jat-resume jat-line' + (state.resumeName ? '' : ' muted');
+  resumeEl.textContent = state.resumeName || 'No resume picked yet';
 
-  const answersLine = state.answersCount
-    ? `<div class="jat-line">${state.answersCount} fields captured</div>`
-    : '<div class="jat-line muted">No answers captured yet</div>';
+  const ansEl = root.querySelector('.jat-answers');
+  ansEl.className = 'jat-answers jat-line' + (state.answersCount ? '' : ' muted');
+  ansEl.textContent = state.answersCount ? `${state.answersCount} fields captured` : 'No answers captured yet';
 
-  const saveLine = state.saveState === 'saved'
-    ? '<div class="jat-save ok">Saved to tracker ✓</div>'
-    : state.saveState === 'queued'
-      ? '<div class="jat-save queued">App offline — queued ⏳</div>'
-      : state.saveState === 'failed'
-        ? '<div class="jat-save failed">Save failed — open the popup ⚠</div>'
-        : '';
+  const saveWrap = root.querySelector('.jat-save-wrap');
+  const saveKey = state.saveState || '';
+  if (saveWrap.__sig !== saveKey) {
+    saveWrap.__sig = saveKey;
+    if (state.saveState) {
+      const cls = state.saveState === 'saved' ? 'ok' : state.saveState;
+      const txt = state.saveState === 'saved' ? 'Saved to tracker ✓'
+        : state.saveState === 'queued' ? 'App offline — queued ⏳' : 'Save failed — open the popup ⚠';
+      saveWrap.innerHTML = `<div class="jat-save ${cls}" style="margin-top:8px">${esc(txt)}</div>`;
+    } else saveWrap.innerHTML = '';
+  }
 
-  const eyebrowText = isSubmitted ? 'JAT · CAPTURED' : 'JAT · CAPTURING';
-  const pct = STAGE_PCT[state.stage] || 8;
-  const stageLabel = (STAGE_LABELS.find((s) => s.id === state.stage) || {}).label || 'Detecting';
+  setText(root, '.jat-actions [data-act="dismiss"]', isSubmitted ? 'Done' : 'Dismiss');
 
-  root.classList.toggle('mini', collapsed);
-  root.innerHTML = `
-    <div class="jat-progress"><i style="width:${pct}%"></i></div>
-    <div class="jat-pill" data-act="expand" title="Expand"><span class="dot"></span><span class="lbl">JAT · ${esc(stageLabel)}</span></div>
-    <div class="jat-h">
-      <div class="jat-topbar">
-        <div class="jat-eyebrow">${eyebrowText}</div>
-        <button class="jat-collapse" data-act="collapse" title="Collapse">‒</button>
-      </div>
-      <div class="jat-title">${titleLine}</div>
-      ${coLine}
-      ${locLine}
-    </div>
-    <div class="jat-section">
-      <div class="jat-section-label">Stage</div>
-      <div class="jat-stages">${stagesHtml}</div>
-    </div>
-    <div class="jat-section">
-      <div class="jat-section-label">Resume</div>
-      ${resumeLine}
-    </div>
-    <div class="jat-section">
-      <div class="jat-section-label">Answers</div>
-      ${answersLine}
-      ${saveLine ? `<div style="margin-top:8px">${saveLine}</div>` : ''}
-    </div>
-    <div class="jat-actions">
-      <button class="jat-btn" data-act="dismiss">${isSubmitted ? 'Done' : 'Dismiss'}</button>
-    </div>
-  `;
-  root.querySelector('[data-act="dismiss"]').addEventListener('click', () => {
-    if (onDismiss) onDismiss();
-    dismissPanel();
-  });
-  root.querySelector('[data-act="collapse"]').addEventListener('click', () => {
-    collapsed = true;
-    try { sessionStorage.setItem('jat11.panelCollapsed', '1'); } catch {}
-    root.classList.add('mini');
-  });
-  root.querySelector('[data-act="expand"]').addEventListener('click', () => {
-    collapsed = false;
-    try { sessionStorage.setItem('jat11.panelCollapsed', '0'); } catch {}
-    root.classList.remove('mini');
-  });
-
-  if (isSubmitted) setTimeout(() => dismissPanel(), 7000);
+  if (isSubmitted && !fadeTimer) fadeTimer = setTimeout(() => dismissPanel(), 7000);
 }
 
 export function paintSaveState(saveState) {
@@ -231,7 +244,9 @@ export function paintSaveState(saveState) {
 }
 
 export function dismissPanel() {
-  const root = document.getElementById(PANEL_ID);
+  if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null; }
+  const root = document.getElementById(PANEL_ID) || panelEl;
+  panelEl = null;
   if (!root) return;
   root.classList.remove('visible');
   setTimeout(() => { try { root.remove(); } catch {} }, 240);

@@ -74,6 +74,7 @@ const state = {
   lastProgressAt: 0,
   recognitionDone: false,      // true once the page is classified (stop re-trying)
   recognitionAttempts: 0,      // bounded re-recognition while a SPA hydrates
+  autofillBundle: undefined,   // undefined=not fetched, null=off/empty, obj=ready
 };
 
 // ============================================================
@@ -558,7 +559,7 @@ function acceptContext(probe) {
 async function isApplyPageNow() {
   const form = detectApplyForm();
   const onApplyUrl = APPLY_URL_RX.test((location.pathname + location.search + location.hash).toLowerCase());
-  if (form && (form.confidence >= 0.5 || (onApplyUrl && form.confidence >= 0.34))) return true;
+  if (form && (form.confidence >= 0.45 || (onApplyUrl && form.confidence >= 0.3))) return true;
   if (onApplyUrl) {
     // Board's Apply handed off here recently → trust it even before the SPA
     // form is detectable.
@@ -596,6 +597,7 @@ function enterApplyFlow(probe) {
   state.stage = cap.hasProgress ? 'progressing' : 'started';
   persistFnf(state.stage, { summary: 'Application page opened' });
   paintPanel();
+  setTimeout(() => runProfileAutofill('apply-arrival'), 800);
 }
 
 function resetForNewJob(probe) {
@@ -620,6 +622,7 @@ function resetForNewJob(probe) {
     asked: false,
     recognitionDone: true,        // already recognized the new job
     recognitionAttempts: 0,
+    autofillBundle: undefined,
   });
   storeHandoff();
   paintPanel();
@@ -636,6 +639,7 @@ function hardReset() {
     lastPersistFingerprint: null, inflight: null, saveState: null,
     lastProgressAt: 0, asked: false,
     recognitionDone: false, recognitionAttempts: 0,
+    autofillBundle: undefined,
   });
 }
 
@@ -650,6 +654,205 @@ function switchedToDifferentJob() {
   if (!state.externalId) return false;
   const newId = detectExternalId();
   return !!newId && newId !== state.externalId && detectSource() === state.source;
+}
+
+// ============================================================
+// Document harvest — when the user picks a resume/cover-letter file during an
+// apply flow, read its bytes and save it into the app's Documents library so it
+// shows up on the Documents page. Best-effort: only fires for files the user
+// uploads while JAT is watching (an already-uploaded file on an SPA exposes its
+// NAME but not its bytes, so those are captured as the resume name only).
+// ============================================================
+const DOC_FILE_RX = /\.(pdf|docx?|rtf|odt|txt|pages)$/i;
+const MAX_HARVEST_BYTES = 8 * 1024 * 1024;   // 8 MB — skip oversized uploads
+const HARVEST_KEY = 'jat11.harvestedDocs';   // dedup across sessions (name:size)
+const harvestedDocs = new Set();             // dedup within this page
+
+// Persistent dedup: one copy of a given file in the Documents library, even if
+// the same resume is uploaded across dozens of applications over many sessions.
+async function alreadyHarvested(key) {
+  if (harvestedDocs.has(key)) return true;
+  try {
+    const cur = (await chrome.storage.local.get(HARVEST_KEY))[HARVEST_KEY] || [];
+    return cur.includes(key);
+  } catch { return false; }
+}
+async function markHarvested(key) {
+  harvestedDocs.add(key);
+  try {
+    const cur = (await chrome.storage.local.get(HARVEST_KEY))[HARVEST_KEY] || [];
+    if (!cur.includes(key)) {
+      cur.push(key);
+      await chrome.storage.local.set({ [HARVEST_KEY]: cur.slice(-100) });
+    }
+  } catch {}
+}
+
+function uploadFieldContext(input) {
+  const bits = [
+    input?.name, input?.id,
+    input?.getAttribute?.('aria-label'),
+    input?.getAttribute?.('data-automation-id'),
+    input?.getAttribute?.('title'),
+  ];
+  try {
+    const lab = input?.labels?.[0]?.textContent
+      || input?.closest?.('label')?.textContent
+      || input?.closest?.('[role="group"], section, fieldset, div')
+          ?.querySelector?.('label, h1, h2, h3, [class*="label" i], [class*="title" i]')?.textContent
+      || '';
+    bits.push(lab);
+  } catch {}
+  return compactText(bits.filter(Boolean).join(' ')).toLowerCase();
+}
+
+async function maybeHarvestDoc(file, input) {
+  if (!file || !file.name || !DOC_FILE_RX.test(file.name)) return;
+  if (file.size > MAX_HARVEST_BYTES) { log('harvest skip (too big)', file.name, file.size); return; }
+  const key = `${file.name}:${file.size}`;
+
+  const ctx = `${uploadFieldContext(input)} ${file.name.toLowerCase()}`;
+  const role = /(cover|lettre|motivation)/i.test(ctx) ? 'cover_letter'
+    : /(resume|cv|curriculum|résumé)/i.test(ctx) ? 'resume'
+    : 'other';
+
+  // Reflect the resume name on the panel regardless of whether we re-save the
+  // bytes — the user should always see "which resume" was picked.
+  if (role === 'resume') state.resumeName = file.name;
+  state.attachments = state.attachments || [];
+  if (!state.attachments.some((a) => a.name === file.name)) {
+    state.attachments.push({ name: file.name, sizeBytes: file.size, type: file.type || '', role });
+  }
+  paintPanel();
+
+  // Only push the bytes into the Documents library once per distinct file.
+  if (await alreadyHarvested(key)) return;
+  await markHarvested(key);
+
+  let dataBase64 = '';
+  try {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    const CHUNK = 0x7e00;
+    for (let i = 0; i < buf.length; i += CHUNK) {
+      dataBase64 += btoa(String.fromCharCode.apply(null, buf.subarray(i, i + CHUNK)));
+    }
+  } catch (e) { log('harvest read failed', e); return; }
+
+  log('harvesting doc →', file.name, `(${role})`);
+  send('save-document', {
+    name: file.name, role, mime: file.type || '',
+    dataBase64, jobUrl: state.ctx?.jobUrl || location.href,
+  });
+}
+
+// ============================================================
+// Reverse autofill — pre-fill a NEW application from the harvested profile.
+// Gated by the app's autofill setting (OFF by default). Fills EMPTY fields
+// only and NEVER clicks submit. The bundle is fetched once per flow.
+// ============================================================
+const AUTOFILL_SKIP_RX = /(ethnic|race\b|gender|\bsex\b|disabilit|veteran|criminal|background.*check|felony|conviction|pronoun|ssn|social.?security|date.?of.?birth)/i;
+
+function clientTokens(s) {
+  return new Set(String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .split(/[^a-z0-9]+/).filter((t) => t.length > 2));
+}
+function matchHarvested(label, fields, minConf) {
+  const want = clientTokens(label);
+  if (!want.size) return null;
+  const floor = minConf || 0.6;
+  let best = null, bestScore = 0;
+  for (const f of fields) {
+    if (!f.value) continue;
+    const have = String(f.keyNorm || '').split(' ').filter(Boolean);
+    if (!have.length) continue;
+    let hit = 0; for (const t of have) if (want.has(t)) hit++;
+    if (!hit) continue;
+    const covHave = hit / have.length;   // how much of the stored question the field covers
+    const covWant = hit / want.size;     // how much of the field IS the stored question
+    // Single-token stored keys ("supervisor", "referral") are dangerous: any page
+    // label merely containing that word would match. Require the page field to be
+    // dominated by it. Multi-token keys need ≥2 shared tokens (mirrors qaLookup).
+    const ok = have.length === 1 ? covWant >= 0.6 : (hit >= 2 && covHave >= floor);
+    if (!ok) continue;
+    const score = (covHave + covWant) / 2;
+    if (score > bestScore) { bestScore = score; best = f; }
+  }
+  return best ? best.value : null;
+}
+function matchStructured(label, profile, patterns) {
+  for (const [rx, field] of patterns) {
+    if (rx.test(label) && profile[field] != null && profile[field] !== '') return String(profile[field]);
+  }
+  return null;
+}
+
+async function runProfileAutofill(reason) {
+  if (state.fired.submitted) return;
+  // Fetch once per flow; undefined = not fetched, null = fetched-but-off/empty.
+  // NOTE: the 'api-call' background handler reads method/path at the TOP level of
+  // the message (not under .data), so we must NOT use the send(type,data) helper
+  // here — send it raw, exactly like loadSettings() does.
+  if (state.autofillBundle === undefined) {
+    try {
+      const r = await new Promise((res) => {
+        try {
+          chrome.runtime.sendMessage({
+            type: 'api-call', method: 'GET',
+            path: '/autofill/bundle?source=' + encodeURIComponent(state.source || location.hostname),
+          }, (x) => { void chrome.runtime.lastError; res(x); });
+        } catch { res(null); }
+      });
+      state.autofillBundle = (r?.ok && r.enabled) ? r : null;
+    } catch { state.autofillBundle = null; }
+  }
+  const bundle = state.autofillBundle;
+  if (!bundle) return;
+  const af = bundle.settings || {};
+  const profile = bundle.profile?.data || {};
+  const fields = bundle.fields || [];
+  try {
+    const mod = await import(chrome.runtime.getURL('content/autofill.js'));
+    const root = detectApplyForm()?.form || document.body || document;
+    const engine = new mod.AutofillEngine({});
+    const filled = [];
+    for (const input of engine.fields(root)) {
+      if (!mod.isFillable(input)) continue;
+      if (input.tagName === 'SELECT') { if (input.selectedIndex > 0) continue; }
+      else if (input.type === 'checkbox' || input.type === 'radio') continue;   // never auto-toggle consents
+      else if (input.value && String(input.value).trim()) continue;             // empty fields only
+      const label = mod.fieldLabel(input);
+      if (!label) continue;
+      if (af.skipSensitive !== false && AUTOFILL_SKIP_RX.test(label)) continue;
+      let value = (af.fillProfile !== false) ? matchStructured(label, profile, mod.PROFILE_PATTERNS) : null;
+      if (value == null && af.fillLearned !== false) value = matchHarvested(label, fields, af.minConfidence);
+      if (value == null || value === '') continue;
+      try {
+        if (input.tagName === 'SELECT') {
+          const opt = mod.matchOption(input, String(value));
+          if (!opt) continue;
+          mod.setNativeValue(input, opt.value);
+        } else {
+          mod.setNativeValue(input, String(value));
+        }
+        filled.push(input);
+      } catch {}
+    }
+    if (filled.length) {
+      if (af.highlight !== false) flashFilled(filled);
+      log('autofill: filled', filled.length, 'field(s) (' + reason + ')');
+    }
+  } catch (e) { log('autofill failed', e); }
+}
+
+function flashFilled(inputs) {
+  for (const el of inputs) {
+    try {
+      const prevOutline = el.style.outline, prevOffset = el.style.outlineOffset;
+      el.style.outline = '2px solid #4f9dff';
+      el.style.outlineOffset = '1px';
+      setTimeout(() => { try { el.style.outline = prevOutline; el.style.outlineOffset = prevOffset; } catch {} }, 1800);
+    } catch {}
+  }
 }
 
 // ============================================================
@@ -681,6 +884,7 @@ function installWatchers() {
       storeHandoff();
       startSuccessTicker();
       paintPanel();   // first visible moment in silent mode
+      setTimeout(() => runProfileAutofill('apply-click'), 900);
       return;
     }
     if (isStepAdvanceClick(t)) {
@@ -699,6 +903,7 @@ function installWatchers() {
         } else {
           paintPanel();
         }
+        runProfileAutofill('step-advance');   // fill fields revealed by the new step
       }, 500);
       return;
     }
@@ -731,6 +936,17 @@ function installWatchers() {
       log('pointerdown: SUBMIT (early persist)', txt);
       fireSubmitted('Submit pressed');
     }
+  }, true);
+
+  // ---- file picks: harvest resume/cover-letter into the Documents library ----
+  document.addEventListener('change', (ev) => {
+    const input = eventTarget(ev);
+    if (!input || input.tagName !== 'INPUT') return;
+    if ((input.type || '').toLowerCase() !== 'file' || !input.files || !input.files.length) return;
+    // Only while an application is genuinely in progress — avoids hoovering up
+    // unrelated uploads on random pages.
+    if (!state.ctx && !state.fired.started) return;
+    for (const f of input.files) maybeHarvestDoc(f, input).catch((e) => log('harvest failed', e));
   }, true);
 
   // ---- mutations ----
