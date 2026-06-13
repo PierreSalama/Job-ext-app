@@ -1,692 +1,597 @@
-// Local sync HTTP server on :7733.
+// JAT v11 — HTTP server (REST + SSE) on 127.0.0.1.
 //
-// Two surfaces:
-//   1. REST  — for the Chrome extension to push/pull and for ad-hoc curl/test.
-//   2. /rpc  — single JSON envelope { type, data } used by the desktop UI's
-//              window.jat5.api(). Mirrors the extension's chrome.runtime.sendMessage
-//              dispatcher so app.js works unchanged.
-//
-// Stack: Node built-in http only (no Express dep) per the spec.
-// Concurrency: better-sqlite3 is synchronous, so we just call it inline.
-// AI: 'ai-call' / 'ai-status' are forwarded to Ollama directly via fetch.
+// Security model (fixes the v10 hole where ANY web page could read/delete the DB):
+//  • Every route except GET /health and POST /pair requires the per-install
+//    token (header X-JAT-Token, or ?token= for the EventSource /stream route).
+//  • Token is generated at first run and stored in the kv table. The Electron
+//    renderer receives it via preload IPC; the extension gets it once through
+//    the /pair flow, which pops a native consent dialog in the app.
+//  • Host header must be localhost/127.0.0.1 (DNS-rebinding guard).
+//  • CORS: we echo the Origin and allow X-JAT-Token — actual access control is
+//    the token, not CORS. Bodies are capped at 15 MB (base64 document uploads).
 
 const http = require('http');
-const url = require('url');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const db = require('./db');
+const provider = require('./ai/provider');
+const prompts = require('./ai/prompts');
+const { extractText } = require('./ai/extract');
+const fit = require('./fit');
+const { scope } = require('./logger');
 
-const PORT = 7733;
-// Read the actual app version from package.json so /health and /version
-// always report what the user actually has installed.
-let VERSION = '9.0.0';
-try { VERSION = require('../package.json').version; } catch {}
+const log = scope('server');
 
-// ---------- Minimal WebSocket implementation ----------
-// We only need short text frames (<= 65535 bytes — covers JSON event payloads).
-// Implements just enough of RFC 6455 to send/receive single-frame text messages.
-const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-const wsClients = new Set();
+const MAX_BODY = 15 * 1024 * 1024;
+const HOST_RX = /^(localhost|127\.0\.0\.1)(:\d+)?$/i;
 
-function wsAcceptKey(key) {
-  return crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
-}
+let server = null;
+let sseClients = new Set();
+let opts = {};   // { getVersion, userDataDir, confirmPair(info)→Promise<bool>, notify(type,payload) }
 
-function wsEncodeText(str) {
-  const payload = Buffer.from(String(str), 'utf8');
-  const len = payload.length;
-  let header;
-  if (len < 126) {
-    header = Buffer.alloc(2);
-    header[0] = 0x81; // FIN + text frame
-    header[1] = len;
-  } else if (len < 65536) {
-    header = Buffer.alloc(4);
-    header[0] = 0x81;
-    header[1] = 126;
-    header.writeUInt16BE(len, 2);
-  } else {
-    header = Buffer.alloc(10);
-    header[0] = 0x81;
-    header[1] = 127;
-    // 64-bit length — high 32 bits zero
-    header.writeUInt32BE(0, 2);
-    header.writeUInt32BE(len, 6);
+// ---------- token ----------
+function getToken() {
+  let t = db.kvGet('authToken');
+  if (!t) {
+    t = crypto.randomBytes(32).toString('hex');
+    db.kvSet('authToken', t);
   }
-  return Buffer.concat([header, payload]);
+  return t;
 }
 
-function wsDecodeFrame(buf) {
-  // Returns { opcode, payload, total } or null if incomplete
-  if (buf.length < 2) return null;
-  const b0 = buf[0];
-  const b1 = buf[1];
-  const opcode = b0 & 0x0f;
-  const masked = (b1 & 0x80) === 0x80;
-  let len = b1 & 0x7f;
-  let offset = 2;
-  if (len === 126) {
-    if (buf.length < 4) return null;
-    len = buf.readUInt16BE(2);
-    offset = 4;
-  } else if (len === 127) {
-    if (buf.length < 10) return null;
-    // Truncate to lower 32 bits — we don't accept frames > 4GB anyway
-    len = buf.readUInt32BE(6);
-    offset = 10;
-  }
-  let mask;
-  if (masked) {
-    if (buf.length < offset + 4) return null;
-    mask = buf.slice(offset, offset + 4);
-    offset += 4;
-  }
-  if (buf.length < offset + len) return null;
-  let payload = buf.slice(offset, offset + len);
-  if (masked) {
-    const out = Buffer.alloc(len);
-    for (let i = 0; i < len; i++) out[i] = payload[i] ^ mask[i % 4];
-    payload = out;
-  }
-  return { opcode, payload, total: offset + len };
+function authed(req, parsed) {
+  const header = req.headers['x-jat-token'];
+  const q = parsed.searchParams.get('token');
+  const token = getToken();
+  const candidate = header || q || '';
+  return candidate.length === token.length &&
+    crypto.timingSafeEqual(Buffer.from(candidate), Buffer.from(token));
 }
 
-function wsBroadcast(obj) {
-  const frame = wsEncodeText(JSON.stringify(obj));
-  for (const sock of wsClients) {
-    try { sock.write(frame); } catch {}
-  }
+// ---------- helpers ----------
+function sendJson(res, status, body) {
+  const data = JSON.stringify(body);
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(data);
 }
 
-function handleUpgrade(req, socket) {
-  const key = req.headers['sec-websocket-key'];
-  if (!key || (req.headers.upgrade || '').toLowerCase() !== 'websocket') {
-    socket.destroy();
-    return;
-  }
-  const accept = wsAcceptKey(key);
-  socket.write(
-    'HTTP/1.1 101 Switching Protocols\r\n' +
-    'Upgrade: websocket\r\n' +
-    'Connection: Upgrade\r\n' +
-    `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
-  );
-  wsClients.add(socket);
-  let buffer = Buffer.alloc(0);
-  socket.on('data', (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    while (true) {
-      const frame = wsDecodeFrame(buffer);
-      if (!frame) break;
-      buffer = buffer.slice(frame.total);
-      if (frame.opcode === 0x8) { // close
-        try { socket.end(); } catch {}
-        wsClients.delete(socket);
-        return;
-      } else if (frame.opcode === 0x9) { // ping → pong
-        const pong = Buffer.from([0x8a, 0]);
-        try { socket.write(pong); } catch {}
-      }
-      // Ignore inbound text frames — extension only listens, not talks here
-    }
-  });
-  const cleanup = () => { wsClients.delete(socket); };
-  socket.on('end', cleanup);
-  socket.on('close', cleanup);
-  socket.on('error', cleanup);
-  // Send hello so the extension knows the channel is live
-  try { socket.write(wsEncodeText(JSON.stringify({ type: 'hello', version: VERSION }))); } catch {}
-}
-
-// ---------- Shared status logic (mirrors lib/schema.js) ----------
-const STATUSES = [
-  'started', 'submitted', 'received', 'reviewing', 'recruiter_replied',
-  'interview', 'assessment', 'offer', 'rejected', 'withdrawn', 'archived'
-];
-const STATUS_PRIORITY = Object.fromEntries(STATUSES.map((s, i) => [s, i + 1]));
-function normalizeStatus(s) {
-  const v = String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-  return STATUSES.includes(v) ? v : 'started';
-}
-
-// ---------- HTTP helpers ----------
-function setCors(res) {
-  // Allow the extension's chrome-extension://<id> origin and dev tools.
-  // Browsers don't accept wildcard subdomains for chrome-extension, so we just
-  // echo back what the request sends.
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Max-Age', '86400');
-}
-function send(res, status, body, extraHeaders = {}) {
-  setCors(res);
-  for (const [k, v] of Object.entries(extraHeaders)) res.setHeader(k, v);
-  if (body == null) { res.statusCode = status; res.end(); return; }
-  if (Buffer.isBuffer(body)) { res.statusCode = status; res.end(body); return; }
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.statusCode = status;
-  res.end(JSON.stringify(body));
-}
-function readJson(req, limitBytes = 50 * 1024 * 1024) {
+function readJson(req) {
   return new Promise((resolve, reject) => {
-    let total = 0;
+    let size = 0;
     const chunks = [];
     req.on('data', (c) => {
-      total += c.length;
-      if (total > limitBytes) { req.destroy(); reject(new Error('Body too large')); return; }
+      size += c.length;
+      if (size > MAX_BODY) {
+        reject(Object.assign(new Error('body too large'), { status: 413 }));
+        req.destroy();
+        return;
+      }
       chunks.push(c);
     });
     req.on('end', () => {
-      const buf = Buffer.concat(chunks);
-      if (buf.length === 0) return resolve(null);
-      try { resolve(JSON.parse(buf.toString('utf8'))); }
-      catch (e) { reject(new Error('Invalid JSON: ' + e.message)); }
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (!raw) return resolve({});
+      try { resolve(JSON.parse(raw)); }
+      catch { reject(Object.assign(new Error('invalid JSON body'), { status: 400 })); }
     });
     req.on('error', reject);
   });
 }
 
-// ---------- AI passthrough (simple Ollama call) ----------
-// The desktop main process can talk straight to localhost:11434 — no
-// extension-style header rewriting needed. We expose just enough surface
-// for the UI's coverLetter / summarize / score / etc. features.
-async function aiStatus(settings) {
-  const baseUrl = settings.ollamaUrl || 'http://localhost:11434';
-  try {
-    const r = await fetch(`${baseUrl}/api/tags`, { signal: AbortSignal.timeout(2500) });
-    if (!r.ok) return { provider: 'none', available: false, reason: `Ollama HTTP ${r.status}` };
-    const data = await r.json();
-    const models = (data.models || []).map((m) => m.name);
-    const want = settings.ollamaModel || 'gemma4:e4b';
-    const has = models.includes(want);
-    return {
-      provider: 'ollama',
-      available: has,
-      model: has ? want : (models[0] || ''),
-      models,
-      reason: has ? '' : `Model "${want}" not pulled. Available: ${models.join(', ') || '(none)'}`
-    };
-  } catch (e) {
-    return { provider: 'none', available: false, reason: `Ollama unreachable at ${baseUrl}: ${e.message}` };
+// ---------- SSE ----------
+function broadcast(type, data) {
+  const payload = `event: ${type}\ndata: ${JSON.stringify(data || {})}\n\n`;
+  for (const res of sseClients) {
+    try { res.write(payload); } catch { sseClients.delete(res); }
   }
 }
 
-async function ollamaChat(settings, prompt, { format } = {}) {
-  const baseUrl = settings.ollamaUrl || 'http://localhost:11434';
-  const model = settings.ollamaModel || 'gemma4:e4b';
-  const body = {
-    model, prompt, stream: false,
-    options: { temperature: 0.4 }
-  };
-  if (format === 'json') body.format = 'json';
-  const r = await fetch(`${baseUrl}/api/generate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(135000)
+// ---------- auto-apply pacing ----------
+function withinWindow(settings) {
+  const [sh, sm] = String(settings.windowStart || '00:00').split(':').map(Number);
+  const [eh, em] = String(settings.windowEnd || '23:59').split(':').map(Number);
+  const nowD = new Date();
+  const mins = nowD.getHours() * 60 + nowD.getMinutes();
+  return mins >= sh * 60 + (sm || 0) && mins <= eh * 60 + (em || 0);
+}
+
+// Decide whether a task may run now. Returns { task, context } or { wait }.
+async function queueNext() {
+  const s = db.getSettings().autoApply;
+  if (!s.enabled) return { task: null, reason: 'disabled' };
+  if (!withinWindow(s)) return { task: null, reason: 'outside-window' };
+
+  const stats = db.queueRunStats();
+  if (stats.doneDay >= s.maxPerDay) return { task: null, reason: 'daily-cap' };
+  if (stats.doneHour >= s.maxPerHour) return { task: null, reason: 'hourly-cap' };
+
+  if (stats.lastRun) {
+    const gapMin = s.minGapMinutes + Math.random() * Math.max(0, s.maxGapMinutes - s.minGapMinutes);
+    const eligibleAt = new Date(stats.lastRun).getTime() + gapMin * 60000;
+    if (Date.now() < eligibleAt) {
+      return { task: null, reason: 'gap', nextEligibleAt: new Date(eligibleAt).toISOString() };
+    }
+  }
+
+  const queued = db.queueList({ state: 'queued' });
+  if (!queued.length) return { task: null, reason: 'empty' };
+  const task = queued[queued.length - 1]; // oldest (list is DESC)
+
+  const job = db.getJob(task.jobId);
+  if (!job || !job.jobUrl) {
+    db.queuePatch(task.id, { state: 'failed', lastError: 'job missing or has no URL' });
+    return { task: null, reason: 'bad-task' };
+  }
+
+  const profile = db.profileForSource(job.source);
+  const resume = db.defaultDocument('resume');
+  const siteCfg = s.sites?.[String(job.source || '').toLowerCase()] || {};
+  const mode = siteCfg.mode || task.mode || s.mode;
+
+  db.queuePatch(task.id, {
+    state: 'scheduled',
+    scheduledAt: new Date().toISOString(),
+    transcriptAppend: { note: `scheduled (mode=${mode})` },
   });
-  if (!r.ok) throw new Error(`Ollama HTTP ${r.status}`);
-  const data = await r.json();
-  return data.response || '';
+  broadcast('queue.updated', { taskId: task.id, state: 'scheduled' });
+
+  return {
+    task: { ...task, mode },
+    context: {
+      job,
+      profile: profile || null,
+      resume: resume ? {
+        id: resume.id, name: resume.name, mime: resume.mime,
+      } : null,
+      aiConfidenceMin: s.aiAnswerConfidenceMin,
+    },
+  };
 }
 
-async function aiCall(data, settings) {
-  // Minimal prompt templates — enough to wire up the UI. Falls back to the
-  // model with a free-form prompt for less common features.
-  const f = data.feature;
-  const job = data.job || {};
-  const profile = data.profile || {};
-  const summary = (j) => `Title: ${j.title || ''}\nCompany: ${j.company || ''}\nLocation: ${j.location || ''}\nDescription: ${(j.description || '').slice(0, 4000)}`;
-  switch (f) {
-    case 'summarize': {
-      const text = await ollamaChat(settings, `Summarize this job in 3 short bullets and list 3 key skills required. Use plain text.\n\n${summary(job)}`);
-      return { text };
-    }
-    case 'score': {
-      const text = await ollamaChat(settings,
-        `On a scale of 0-100, how well does this candidate match this job? Respond with JSON {"score": N, "reasons": ["..."], "gaps": ["..."]}.\n\nCandidate: ${JSON.stringify(profile).slice(0, 2000)}\n\nJob:\n${summary(job)}`,
-        { format: 'json' });
-      try { return JSON.parse(text); } catch { return { score: 0, reasons: [], gaps: [], raw: text }; }
-    }
-    case 'coverLetter': {
-      const text = await ollamaChat(settings,
-        `Write a concise, professional cover letter (200-300 words) for this candidate applying to the job below. No greeting placeholders — use "${profile.firstName || 'the candidate'} ${profile.lastName || ''}" directly.\n\nCandidate: ${JSON.stringify(profile).slice(0, 2000)}\n\nJob:\n${summary(job)}`);
-      return { text };
-    }
-    case 'skills': {
-      const text = await ollamaChat(settings,
-        `Extract a JSON array of skill names (strings) required by this job. Output ONLY a JSON array.\n\n${summary(job)}`,
-        { format: 'json' });
-      try {
-        const parsed = JSON.parse(text);
-        return { skills: Array.isArray(parsed) ? parsed : (parsed.skills || []) };
-      } catch { return { skills: [], raw: text }; }
-    }
-    case 'questions': {
-      const text = await ollamaChat(settings,
-        `Generate 8 likely interview questions for this job. Output as a JSON array of strings.\n\n${summary(job)}`,
-        { format: 'json' });
-      try {
-        const parsed = JSON.parse(text);
-        return { questions: Array.isArray(parsed) ? parsed : (parsed.questions || []) };
-      } catch { return { questions: [], raw: text }; }
-    }
-    case 'followup': {
-      const text = await ollamaChat(settings,
-        `Write a polite follow-up email (under 120 words) for this application. Sign as "${profile.firstName || ''} ${profile.lastName || ''}".\n\nJob:\n${summary(job)}`);
-      return { text };
-    }
-    case 'insights': {
-      const jobs = data.jobs || [];
-      const text = await ollamaChat(settings,
-        `Given these ${jobs.length} job applications, write 3-5 short insights about the user's job-search patterns.\n\n${JSON.stringify(jobs.slice(0, 30).map((j) => ({ title: j.title, company: j.company, status: j.status })))}`);
-      return { text };
-    }
-    case 'recommend': {
-      const jobs = data.jobs || [];
-      const text = await ollamaChat(settings,
-        `Based on this user's recent applications and profile, suggest 8 search queries (string array) for finding similar jobs. Output ONLY a JSON array of strings.\n\nApplications: ${JSON.stringify(jobs.slice(0, 20).map((j) => ({ title: j.title, company: j.company })))}\n\nProfile skills: ${JSON.stringify(profile.skills || [])}`,
-        { format: 'json' });
-      try {
-        const parsed = JSON.parse(text);
-        return { queries: Array.isArray(parsed) ? parsed : (parsed.queries || []) };
-      } catch { return { queries: [], raw: text }; }
-    }
-    case 'nudges': {
-      // v9.0.0: MISSING case — caller got generic text and UI crashed.
-      // Returns an array of { jobId, reason, priority } so the dashboard
-      // can render the "AI nudges" card correctly.
-      const jobs = (data.jobs || []).filter((j) => !['offer','rejected','withdrawn','archived'].includes(j.status));
-      if (jobs.length === 0) return [];
-      const sample = jobs.slice(0, 15).map((j) => ({
-        id: j.id,
-        title: j.title || '',
-        company: j.company || '',
-        status: j.status,
-        submittedAt: j.submittedAt || j.createdAt,
-        followUpDueAt: j.followUpDueAt || ''
-      }));
-      const prompt = `Given these active job applications, return the top 3-6 that the user should act on RIGHT NOW. Output JSON array of {"jobId": "<id>", "reason": "<one short sentence>", "priority": "high"|"medium"|"low"}. Output ONLY the JSON array, nothing else.\n\nApplications:\n${JSON.stringify(sample)}`;
-      const text = await ollamaChat(settings, prompt, { format: 'json' });
-      try {
-        const parsed = JSON.parse(text);
-        return Array.isArray(parsed) ? parsed : (parsed.nudges || []);
-      } catch { return []; }
-    }
-    default: {
-      // Best-effort generic prompt
-      const text = await ollamaChat(settings, `AI feature "${f}" with payload:\n${JSON.stringify(data).slice(0, 4000)}`);
-      return { text };
-    }
+// ============================================================
+// Router
+// ============================================================
+async function handle(req, res, parsed) {
+  const pathname = parsed.pathname.replace(/\/+$/, '') || '/';
+  const m = (re) => pathname.match(re);
+  let jm;
+
+  // ---- unauthenticated ----
+  if (req.method === 'GET' && pathname === '/health') {
+    return sendJson(res, 200, {
+      ok: true, version: opts.getVersion(), ts: Date.now(),
+      requiresAuth: true,
+    });
   }
-}
-
-// ---------- /rpc dispatcher (mirrors background.js) ----------
-// Broadcasts an event to all WebSocket clients AND the local Electron renderer.
-let _localBroadcast = null;
-function setLocalBroadcast(fn) { _localBroadcast = fn; }
-// v9.0.0: bridge from server.js (HTTP) into main.js (electron-updater). main.js
-// installs the actual handlers when it boots so this stays decoupled.
-let _updateBridge = null;
-function setUpdateBridge(fns) { _updateBridge = fns || null; }
-function broadcastSync(name, data) {
-  const msg = { type: 'event', name, data };
-  wsBroadcast(msg);
-  if (_localBroadcast) {
-    try { _localBroadcast({ type: 'jat-event', name, data }); } catch {}
+  if (req.method === 'POST' && pathname === '/pair') {
+    const body = await readJson(req);
+    const info = { client: String(body.client || 'unknown').slice(0, 60), origin: req.headers.origin || '' };
+    const allowed = await opts.confirmPair(info);
+    if (!allowed) return sendJson(res, 403, { ok: false, error: 'pairing rejected' });
+    log.info('paired client', info);
+    return sendJson(res, 200, { ok: true, token: getToken() });
   }
-}
 
-async function dispatchRpc(db, msg) {
-  const { type, data = {} } = msg || {};
-  switch (type) {
-    case 'capture': {
-      const settings = db.getSettings();
-      const result = db.upsertJob(data, { statusPriority: STATUS_PRIORITY, normalizeStatus });
-      // Auto follow-up date if applied
-      if (result.job?.applied && !result.job.followUpDueAt) {
-        const days = settings.defaultFollowUpDays || 10;
-        const due = new Date(Date.now() + days * 86400000).toISOString();
-        const j = db.patchJobShallow(result.job.id, { followUpDueAt: due });
-        result.job = j;
-      }
-      broadcastSync(result.action === 'created' ? 'job.created' : 'job.updated', { job: result.job });
-      return { ok: true, action: result.action, job: result.job };
-    }
-    case 'list-jobs':       return { ok: true, items: db.listJobs() };
-    case 'get-job':         return { ok: true, job: db.getJob(data.id) };
-    case 'patch-job': {
-      const j = db.patchJobShallow(data.id, data.patch || {});
-      if (j) broadcastSync('job.updated', { job: j });
-      return { ok: !!j, job: j };
-    }
-    case 'delete-job':      db.deleteJob(data.id); broadcastSync('job.deleted', { id: data.id }); return { ok: true };
-    case 'status-summary':  return { ok: true, summary: db.statusSummary() };
-
-    case 'get-settings':    return { ok: true, settings: db.getSettings() };
-    case 'patch-settings':  {
-      const settings = db.patchSettings(data || {});
-      broadcastSync('settings.updated', { settings });
-      return { ok: true, settings };
-    }
-
-    // Icon bundles aren't meaningful in the desktop window (no toolbar action).
-    // Accept the call so the UI doesn't error out, but no-op.
-    case 'set-icon-bundle': return { ok: true };
-
-    case 'get-profile':     return { ok: true, profile: db.getProfile() };
-    case 'patch-profile':   {
-      const profile = db.patchProfile(data || {});
-      broadcastSync('profile.updated', { profile });
-      return { ok: true, profile };
-    }
-
-    case 'list-documents':  return { ok: true, items: db.listDocuments() };
-    case 'add-document':    return { ok: true, doc: db.addDocument(data) };
-    case 'patch-document':  return { ok: true, doc: db.patchDocument(data.id, data.patch || {}) };
-    case 'delete-document': db.deleteDocument(data.id); return { ok: true };
-
-    case 'list-notifications': return { ok: true, items: db.listNotifications() };
-
-    case 'record-answer':   return { ok: true, entry: db.recordAnswer(data || {}) };
-    case 'lookup-answer':   return { ok: true, answer: db.lookupAnswer(data?.question || '') };
-    case 'list-answers':    return { ok: true, items: db.listAnswers() };
-    case 'delete-answer':   db.deleteAnswer(data.key); return { ok: true };
-
-    case 'list-recommendations': return { ok: true, items: db.listRecommendations() };
-    case 'persist-recommendations': {
-      const queries = Array.isArray(data?.queries) ? data.queries : [];
-      const items = queries.map((q) => ({
-        query: q,
-        urls: [
-          { label: 'LinkedIn', url: `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(q)}` },
-          { label: 'Indeed',   url: `https://www.indeed.com/jobs?q=${encodeURIComponent(q)}` }
-        ]
-      }));
-      db.saveRecommendations(items);
-      return { ok: true, items };
-    }
-
-    case 'list-logs': return { ok: true, items: db.listLogs(data?.limit || 200) };
-    case 'log':       db.appendLog(data?.level || 'info', data?.ctx || 'unknown', data?.message || '', data?.data); return { ok: true };
-
-    case 'open-app':  return { ok: true }; // already in the app
-    case 'ai-status': return { ok: true, status: await aiStatus(db.getSettings()) };
-    case 'ai-call': {
-      try {
-        // v9.0.0: hard cap so a hung Ollama / model never makes the UI
-        // appear frozen forever. 90s is plenty for any single feature.
-        const result = await Promise.race([
-          aiCall(data, db.getSettings()),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('AI call timed out after 90s — check Ollama is running and the model is pulled.')), 90000))
-        ]);
-        return { ok: true, result };
-      } catch (e) {
-        return { ok: false, error: String(e.message || e) };
-      }
-    }
-    default: return { ok: false, error: `Unknown type: ${type}` };
+  // ---- everything else requires the token ----
+  if (!authed(req, parsed)) {
+    return sendJson(res, 401, { ok: false, error: 'unauthorized', pairHint: 'POST /pair' });
   }
-}
 
-// ---------- Server ----------
-function startServer(db) {
-  const server = http.createServer(async (req, res) => {
-    if (req.method === 'OPTIONS') { send(res, 204, null); return; }
-    const u = url.parse(req.url, true);
-    const p = u.pathname;
+  // ---- SSE stream ----
+  if (req.method === 'GET' && pathname === '/stream') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+    res.write(':connected\n\n');
+    sseClients.add(res);
+    const ka = setInterval(() => { try { res.write(':ka\n\n'); } catch {} }, 25000);
+    req.on('close', () => { clearInterval(ka); sseClients.delete(res); });
+    return;
+  }
 
-    // v9.0.0: detect ANY contact from a chrome-extension origin (not just
-    // /sync/event POSTs) and flip extensionEverConnected. This dismisses the
-    // "Install Chrome Extension" promo as soon as the extension has touched
-    // the app — the user installed JAT via the extension, so showing the
-    // promo would be silly.
-    try {
-      const origin = String(req.headers.origin || req.headers.referer || '');
-      if (origin.startsWith('chrome-extension://')) {
-        const s = db.getSettings?.();
-        if (s && !s.extensionEverConnected) {
-          db.patchSettings?.({ extensionEverConnected: true, extensionFirstSeenAt: new Date().toISOString() });
-          try { _localBroadcast?.({ type: 'jat-event', name: 'settings.updated', data: { settings: db.getSettings() } }); } catch {}
-        }
-      }
-    } catch {}
-
-    try {
-      // Health — also a heuristic "extension is alive" signal since the
-      // extension's sync-client probes /health every 5s on the user's machine.
-      if (p === '/health' && req.method === 'GET') {
-        try {
-          const s = db.getSettings?.();
-          if (s && !s.extensionEverConnected) {
-            db.patchSettings?.({ extensionEverConnected: true, extensionFirstSeenAt: new Date().toISOString() });
-            try { _localBroadcast?.({ type: 'jat-event', name: 'settings.updated', data: { settings: db.getSettings() } }); } catch {}
-          }
-        } catch {}
-        return send(res, 200, { ok: true, version: VERSION, ws: true });
-      }
-
-      // v9.0.0: explicit version endpoint for the extension's update probe
-      if (p === '/version' && req.method === 'GET') {
-        return send(res, 200, { ok: true, version: VERSION });
-      }
-
-      // v9.0.0: extension-triggered desktop-app update.
-      // GET  /app-update/status      -> { current, latest?, available? }
-      // POST /app-update/check       -> kicks off electron-updater check
-      // POST /app-update/install     -> quits and installs the staged update
-      if (p === '/app-update/status' && req.method === 'GET') {
-        if (!_updateBridge?.status) return send(res, 200, { ok: true, current: VERSION, available: false });
-        try { return send(res, 200, { ok: true, ...(await _updateBridge.status()) }); }
-        catch (e) { return send(res, 500, { ok: false, error: String(e?.message || e) }); }
-      }
-      if (p === '/app-update/check' && req.method === 'POST') {
-        if (!_updateBridge?.check) return send(res, 503, { ok: false, error: 'updater not available' });
-        try { return send(res, 200, { ok: true, ...(await _updateBridge.check()) }); }
-        catch (e) { return send(res, 500, { ok: false, error: String(e?.message || e) }); }
-      }
-      if (p === '/app-update/install' && req.method === 'POST') {
-        if (!_updateBridge?.install) return send(res, 503, { ok: false, error: 'updater not available' });
-        try { _updateBridge.install(); return send(res, 200, { ok: true, quitting: true }); }
-        catch (e) { return send(res, 500, { ok: false, error: String(e?.message || e) }); }
-      }
-
-      // Pairing endpoint — extension POSTs a token to authorize itself.
-      // Token is stored in app's settings store; subsequent requests include it.
-      if (p === '/pair' && req.method === 'POST') {
-        try {
-          const body = await readJson(req);
-          if (!body?.token) return send(res, 400, { ok: false, error: 'token required' });
-          // Read existing paired list (if any) and add
-          let paired = [];
-          try { paired = JSON.parse(db.getSetting?.('pairedExtensions') || '[]'); } catch {}
-          paired = paired.filter((p) => p.extensionId !== body.extensionId);
-          paired.push({
-            token: body.token,
-            extensionId: body.extensionId || '',
-            name: body.name || 'Extension',
-            pairedAt: new Date().toISOString()
-          });
-          if (typeof db.setSetting === 'function') db.setSetting('pairedExtensions', JSON.stringify(paired));
-          return send(res, 200, { ok: true, paired: paired.length });
-        } catch (e) {
-          return send(res, 500, { ok: false, error: String(e.message || e) });
-        }
-      }
-
-      // Full snapshot for initial sync
-      if (p === '/api/snapshot' && req.method === 'GET') {
-        return send(res, 200, db.exportSnapshot());
-      }
-
-      // Sync event push from extension — apply locally and broadcast
-      if (p === '/sync/event' && req.method === 'POST') {
-        const body = await readJson(req);
-        const ev = body || {};
-        // First-time extension contact: flip a flag so the extension-promo
-        // banner stops showing in the desktop app
-        try {
-          const s = db.getSettings();
-          if (!s.extensionEverConnected) {
-            db.patchSettings({ extensionEverConnected: true, extensionFirstSeenAt: new Date().toISOString() });
-            broadcastSync('settings.updated', { settings: db.getSettings() });
-          }
-        } catch {}
-        try {
-          applySyncEvent(db, ev);
-        } catch (e) {
-          return send(res, 200, { ok: false, error: String(e.message || e) });
-        }
-        // Re-broadcast to other clients (excluding ourselves is impossible to
-        // discriminate here — last-write-wins on the receiver side avoids loops)
-        broadcastSync(ev.name, ev.data);
-        return send(res, 200, { ok: true });
-      }
-
-      // RPC bridge — used by the desktop UI's window.jat5.api()
-      if (p === '/rpc' && req.method === 'POST') {
-        const body = await readJson(req);
-        const out = await dispatchRpc(db, body);
-        return send(res, 200, out);
-      }
-
-      // ----- Jobs -----
-      if (p === '/jobs' && req.method === 'GET')  return send(res, 200, { items: db.listJobs() });
-      if (p === '/jobs' && req.method === 'POST') {
-        const body = await readJson(req);
-        const result = db.upsertJob(body || {}, { statusPriority: STATUS_PRIORITY, normalizeStatus });
-        return send(res, 200, result);
-      }
-      let m = p.match(/^\/jobs\/([^/]+)$/);
-      if (m) {
-        const id = decodeURIComponent(m[1]);
-        if (req.method === 'GET')    return send(res, 200, { job: db.getJob(id) });
-        if (req.method === 'PATCH')  { const body = await readJson(req); return send(res, 200, { job: db.patchJobShallow(id, body || {}) }); }
-        if (req.method === 'DELETE') { db.deleteJob(id); return send(res, 200, { ok: true }); }
-      }
-
-      // ----- Profile (default) -----
-      if (p === '/profile' && req.method === 'GET')   return send(res, 200, { profile: db.getProfile() });
-      if (p === '/profile' && req.method === 'PATCH') { const body = await readJson(req); return send(res, 200, { profile: db.patchProfile(body || {}) }); }
-
-      // ----- Profiles (named, multi) -----
-      if (p === '/profiles' && req.method === 'GET')  return send(res, 200, { items: db.listProfiles() });
-      if (p === '/profiles' && req.method === 'POST') { const body = await readJson(req); return send(res, 200, { profile: db.createProfile(body || {}) }); }
-      m = p.match(/^\/profiles\/([^/]+)$/);
-      if (m) {
-        const id = decodeURIComponent(m[1]);
-        if (req.method === 'PATCH')  { const body = await readJson(req); return send(res, 200, { profile: db.patchProfileById(id, body || {}) }); }
-        if (req.method === 'DELETE') { return send(res, 200, { ok: db.deleteProfile(id) }); }
-      }
-
-      // ----- QA -----
-      if (p === '/qa' && req.method === 'GET')  return send(res, 200, { items: db.listAnswers() });
-      if (p === '/qa' && req.method === 'POST') { const body = await readJson(req); return send(res, 200, { entry: db.recordAnswer(body || {}) }); }
-      m = p.match(/^\/qa\/([^/]+)$/);
-      if (m && req.method === 'DELETE') { db.deleteAnswer(decodeURIComponent(m[1])); return send(res, 200, { ok: true }); }
-
-      // ----- Documents -----
-      if (p === '/documents' && req.method === 'GET')  return send(res, 200, { items: db.listDocuments().map((d) => ({ ...d, data: undefined })) });
-      if (p === '/documents' && req.method === 'POST') {
-        // We accept JSON with { name, mimeType, sizeBytes, type, base64 } —
-        // real multipart parsing would need an extra dep we're avoiding.
-        const body = await readJson(req);
-        if (!body) return send(res, 400, { error: 'No body' });
-        const buffer = body.base64 ? Buffer.from(body.base64, 'base64')
-                     : body.buffer ? body.buffer
-                     : null;
-        const doc = db.addDocument({ ...body, buffer });
-        return send(res, 200, { doc: { ...doc, data: undefined } });
-      }
-      m = p.match(/^\/documents\/([^/]+)\/file$/);
-      if (m && req.method === 'GET') {
-        const got = db.getDocumentBlob(decodeURIComponent(m[1]));
-        if (!got || !got.buffer) return send(res, 404, { error: 'Not found' });
-        return send(res, 200, got.buffer, {
-          'Content-Type': got.meta.mimeType || 'application/octet-stream',
-          'Content-Disposition': `inline; filename="${(got.meta.originalFilename || got.meta.name || 'file').replace(/"/g, '')}"`
+  // ---- jobs ----
+  if (req.method === 'GET' && pathname === '/jobs') {
+    return sendJson(res, 200, {
+      ok: true,
+      items: db.listJobs({
+        status: parsed.searchParams.get('status') || undefined,
+        source: parsed.searchParams.get('source') || undefined,
+        needsReview: parsed.searchParams.has('needsReview')
+          ? parsed.searchParams.get('needsReview') === '1' : undefined,
+        q: parsed.searchParams.get('q') || undefined,
+        limit: parsed.searchParams.get('limit') || undefined,
+        offset: parsed.searchParams.get('offset') || undefined,
+      }),
+    });
+  }
+  if (req.method === 'GET' && (jm = m(/^\/jobs\/([^/]+)$/))) {
+    const job = db.getJob(jm[1]);
+    if (!job) return sendJson(res, 404, { ok: false, error: 'not found' });
+    return sendJson(res, 200, { ok: true, job });
+  }
+  if (req.method === 'POST' && pathname === '/jobs') {
+    const body = await readJson(req);
+    // Job upsert + its timeline event commit atomically — never a job without
+    // its creation/status event, nor an orphan event.
+    const result = db.transaction(() => {
+      const r = db.upsertJob(body, { manual: !!body._manual });
+      if (r.statusChanged || r.action === 'created' || r.action === 'reopened') {
+        db.recordEvent({
+          jobId: r.job.id,
+          type: r.action === 'created' ? 'created'
+              : r.action === 'reopened' ? 'reopened' : 'status_changed',
+          source: body._source || 'extension',
+          summary: r.action === 'created'
+            ? `Captured as ${r.job.status}`
+            : `${r.previousStatus} → ${r.job.status}`,
+          data: { from: r.previousStatus, to: r.job.status },
         });
       }
-
-      // ----- Settings -----
-      if (p === '/settings' && req.method === 'GET')   return send(res, 200, { settings: db.getSettings() });
-      if (p === '/settings' && req.method === 'PATCH') { const body = await readJson(req); return send(res, 200, { settings: db.patchSettings(body || {}) }); }
-
-      // ----- Sync with extension -----
-      if (p === '/sync/pull-from-extension' && req.method === 'POST') {
-        // Extension pushes its full IDB snapshot; we merge it.
-        const body = await readJson(req);
-        const r = db.importSnapshot(body || {});
-        return send(res, 200, r);
-      }
-      if (p === '/sync/push-to-extension' && req.method === 'POST') {
-        // Extension asks for our merged state.
-        return send(res, 200, db.exportSnapshot());
-      }
-
-      send(res, 404, { error: 'Not found', path: p });
-    } catch (e) {
-      send(res, 500, { error: String(e.message || e) });
+      return r;
+    });
+    if (result.statusChanged || result.action === 'created' || result.action === 'reopened') {
+      if (opts.notify) opts.notify('status', result);
     }
-  });
-  server.on('upgrade', (req, socket) => {
-    const u = url.parse(req.url, true);
-    if (u.pathname === '/ws') {
-      handleUpgrade(req, socket);
-    } else {
-      socket.destroy();
-    }
-  });
-  server.listen(PORT, '127.0.0.1');
-  return server;
-}
+    broadcast('jobs.updated', { jobId: result.job.id, action: result.action });
+    return sendJson(res, 200, { ok: true, ...result });
+  }
+  if (req.method === 'PATCH' && (jm = m(/^\/jobs\/([^/]+)$/))) {
+    const body = await readJson(req);
+    const result = db.transaction(() => {
+      const r = db.patchJob(jm[1], body);
+      if (r && r.statusChanged) {
+        db.recordEvent({
+          jobId: r.job.id, type: 'status_changed', source: body._source || 'manual',
+          summary: `${r.previousStatus} → ${r.job.status}`,
+          data: { from: r.previousStatus, to: r.job.status },
+        });
+      }
+      return r;
+    });
+    if (!result) return sendJson(res, 404, { ok: false, error: 'not found' });
+    broadcast('jobs.updated', { jobId: result.job.id, action: 'updated' });
+    return sendJson(res, 200, { ok: true, ...result });
+  }
+  if (req.method === 'DELETE' && (jm = m(/^\/jobs\/([^/]+)$/))) {
+    const existed = db.deleteJob(jm[1]);
+    if (!existed) return sendJson(res, 404, { ok: false, error: 'not found' });
+    broadcast('jobs.updated', { jobId: jm[1], action: 'deleted' });
+    return sendJson(res, 200, { ok: true });
+  }
 
-// Apply a sync event coming in from a remote (extension) client. Last-write-
-// wins by updatedAt — if our local copy is newer, skip.
-function applySyncEvent(db, ev) {
-  const { name, data } = ev || {};
-  if (!name) return;
-  const newer = (incoming) => {
-    if (!incoming?.id || !incoming?.updatedAt) return true;
-    let cur = null;
-    try {
-      if (name.startsWith('job.')) cur = db.getJob(incoming.id);
-    } catch {}
-    if (!cur || !cur.updatedAt) return true;
-    return new Date(incoming.updatedAt).getTime() >= new Date(cur.updatedAt).getTime();
+  // ---- events ----
+  if (req.method === 'GET' && pathname === '/events') {
+    const jobId = parsed.searchParams.get('jobId');
+    if (!jobId) return sendJson(res, 400, { ok: false, error: 'jobId required' });
+    return sendJson(res, 200, { ok: true, items: db.listEvents(jobId, parsed.searchParams.get('limit') || undefined) });
+  }
+  if (req.method === 'GET' && pathname === '/events/recent') {
+    return sendJson(res, 200, { ok: true, items: db.listRecentEvents(parsed.searchParams.get('limit') || 100) });
+  }
+  if (req.method === 'POST' && pathname === '/events') {
+    const body = await readJson(req);
+    if (!body.jobId || !body.type) return sendJson(res, 400, { ok: false, error: 'jobId + type required' });
+    if (!db.getJob(body.jobId)) return sendJson(res, 404, { ok: false, error: 'job not found' });
+    const ev = db.recordEvent(body);
+    broadcast('jobs.updated', { jobId: body.jobId, action: 'event' });
+    return sendJson(res, 200, { ok: true, event: ev });
+  }
+
+  // ---- stats ----
+  if (req.method === 'GET' && pathname === '/stats') {
+    return sendJson(res, 200, { ok: true, ...db.stats() });
+  }
+
+  // ---- settings ----
+  if (req.method === 'GET' && pathname === '/settings') {
+    return sendJson(res, 200, { ok: true, settings: db.getSettings() });
+  }
+  if (req.method === 'PATCH' && pathname === '/settings') {
+    const body = await readJson(req);
+    const settings = db.patchSettings(body);
+    broadcast('settings.updated', {});
+    return sendJson(res, 200, { ok: true, settings });
+  }
+
+  // ---- qa ----
+  if (req.method === 'GET' && pathname === '/qa') {
+    return sendJson(res, 200, { ok: true, items: db.qaList(Number(parsed.searchParams.get('limit')) || 500) });
+  }
+  if (req.method === 'POST' && pathname === '/qa') {
+    const body = await readJson(req);
+    if (!body.question || body.answer == null) return sendJson(res, 400, { ok: false, error: 'question + answer required' });
+    return sendJson(res, 200, { ok: true, item: db.qaRecord(body) });
+  }
+  if (req.method === 'POST' && pathname === '/qa/lookup') {
+    const body = await readJson(req);
+    return sendJson(res, 200, { ok: true, match: db.qaLookup(body.question || '') });
+  }
+  if (req.method === 'DELETE' && (jm = m(/^\/qa\/([^/]+)$/))) {
+    return sendJson(res, db.qaDelete(jm[1]) ? 200 : 404, { ok: true });
+  }
+
+  // ---- profiles ----
+  if (req.method === 'GET' && pathname === '/profiles') {
+    return sendJson(res, 200, { ok: true, items: db.listProfiles() });
+  }
+  if (req.method === 'GET' && pathname === '/profiles/for-source') {
+    return sendJson(res, 200, { ok: true, profile: db.profileForSource(parsed.searchParams.get('source') || '') });
+  }
+  if (req.method === 'POST' && pathname === '/profiles') {
+    const body = await readJson(req);
+    return sendJson(res, 200, { ok: true, profile: db.saveProfile(body) });
+  }
+  if (req.method === 'DELETE' && (jm = m(/^\/profiles\/([^/]+)$/))) {
+    return sendJson(res, db.deleteProfile(jm[1]) ? 200 : 404, { ok: true });
+  }
+
+  // ---- documents ----
+  if (req.method === 'GET' && pathname === '/documents') {
+    return sendJson(res, 200, { ok: true, items: db.listDocuments() });
+  }
+  if (req.method === 'GET' && (jm = m(/^\/documents\/([^/]+)$/))) {
+    const withText = parsed.searchParams.get('text') === '1';
+    const doc = db.getDocument(jm[1], { withText });
+    if (!doc) return sendJson(res, 404, { ok: false, error: 'not found' });
+    if (parsed.searchParams.get('raw') === '1') {
+      // Defense-in-depth: never read outside userData/documents even if the
+      // stored path was tampered with (local DB edit / corruption recovery).
+      const docsDir = path.resolve(opts.userDataDir, 'documents');
+      const real = path.resolve(doc.filePath);
+      if (real !== docsDir && !real.startsWith(docsDir + path.sep)) {
+        return sendJson(res, 403, { ok: false, error: 'access denied' });
+      }
+      try {
+        const buf = fs.readFileSync(real);
+        res.writeHead(200, {
+          'Content-Type': doc.mime || 'application/octet-stream',
+          'Content-Disposition': `attachment; filename="${encodeURIComponent(doc.name)}"`,
+        });
+        return res.end(buf);
+      } catch { return sendJson(res, 410, { ok: false, error: 'file missing on disk' }); }
+    }
+    return sendJson(res, 200, { ok: true, document: doc });
+  }
+  if (req.method === 'POST' && pathname === '/documents') {
+    const body = await readJson(req);
+    if (!body.name || !body.dataBase64) return sendJson(res, 400, { ok: false, error: 'name + dataBase64 required' });
+    const dir = path.join(opts.userDataDir, 'documents');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const safeName = String(body.name).replace(/[^\w.\- ()]/g, '_').slice(0, 150);
+    const filePath = path.join(dir, `${Date.now()}-${safeName}`);
+    const buf = Buffer.from(body.dataBase64, 'base64');
+    fs.writeFileSync(filePath, buf);
+    const text = await extractText(filePath, body.mime || '');
+    const doc = db.addDocument({
+      name: safeName, role: body.role || 'resume', filePath,
+      textContent: text, sizeBytes: buf.length, mime: body.mime || '',
+      isDefault: !!body.isDefault,
+    });
+    broadcast('documents.updated', { id: doc.id });
+    return sendJson(res, 200, { ok: true, document: doc, extractedChars: text.length });
+  }
+  if (req.method === 'PATCH' && (jm = m(/^\/documents\/([^/]+)$/))) {
+    const body = await readJson(req);
+    const doc = db.patchDocument(jm[1], body);
+    if (!doc) return sendJson(res, 404, { ok: false, error: 'not found' });
+    broadcast('documents.updated', { id: doc.id });
+    return sendJson(res, 200, { ok: true, document: doc });
+  }
+  if (req.method === 'DELETE' && (jm = m(/^\/documents\/([^/]+)$/))) {
+    const okDel = db.deleteDocument(jm[1]);
+    broadcast('documents.updated', { id: jm[1] });
+    return sendJson(res, okDel ? 200 : 404, { ok: okDel });
+  }
+
+  // ---- auto-apply queue ----
+  if (req.method === 'GET' && pathname === '/queue') {
+    return sendJson(res, 200, { ok: true, items: db.queueList({ state: parsed.searchParams.get('state') || undefined }) });
+  }
+  if (req.method === 'GET' && pathname === '/queue/next') {
+    return sendJson(res, 200, { ok: true, ...(await queueNext()) });
+  }
+  if (req.method === 'POST' && pathname === '/queue') {
+    const body = await readJson(req);
+    if (!body.jobId) return sendJson(res, 400, { ok: false, error: 'jobId required' });
+    const task = db.queueAdd(body.jobId, { mode: body.mode });
+    if (!task) return sendJson(res, 404, { ok: false, error: 'job not found' });
+    broadcast('queue.updated', { taskId: task.id, state: task.state });
+    return sendJson(res, 200, { ok: true, task });
+  }
+  if (req.method === 'PATCH' && (jm = m(/^\/queue\/([^/]+)$/))) {
+    const body = await readJson(req);
+    const task = db.queuePatch(jm[1], body);
+    if (!task) return sendJson(res, 404, { ok: false, error: 'not found' });
+    broadcast('queue.updated', { taskId: task.id, state: task.state });
+    if (opts.notify && ['awaiting_review', 'awaiting_input', 'done', 'failed'].includes(task.state)) {
+      opts.notify('autoApply', task);
+    }
+    return sendJson(res, 200, { ok: true, task });
+  }
+  if (req.method === 'DELETE' && (jm = m(/^\/queue\/([^/]+)$/))) {
+    const okDel = db.queueDelete(jm[1]);
+    broadcast('queue.updated', { taskId: jm[1], state: 'deleted' });
+    return sendJson(res, okDel ? 200 : 404, { ok: okDel });
+  }
+
+  // ---- AI ----
+  if (req.method === 'GET' && pathname === '/ai/status') {
+    return sendJson(res, 200, { ok: true, ...(await provider.statusAll(parsed.searchParams.get('force') === '1')) });
+  }
+  if (req.method === 'GET' && pathname === '/ai/usage') {
+    return sendJson(res, 200, { ok: true, usage: db.aiUsage(), recent: db.aiLogList(50) });
+  }
+  if (req.method === 'POST' && pathname === '/ai/generate') {
+    const body = await readJson(req);
+    if (!body.prompt) return sendJson(res, 400, { ok: false, error: 'prompt required' });
+    const r = await provider.run({
+      kind: body.kind || 'raw', prompt: body.prompt, system: body.system,
+      schema: body.schema || null, prose: !!body.prose,
+      providerOverride: body.provider || null, modelOverride: body.model || null,
+    });
+    return sendJson(res, 200, { ok: true, ...r });
+  }
+
+  // AI feature endpoints — thin wrappers: load context → prompt builder → provider.
+  const aiFeature = async (builder, extra = {}) => {
+    const body = await readJson(req);
+    const job = body.jobId ? db.getJob(body.jobId) : (body.job || {});
+    if (body.jobId && !job) { sendJson(res, 404, { ok: false, error: 'job not found' }); return null; }
+    const profile = db.profileForSource(job?.source);
+    const resume = body.documentId
+      ? db.getDocument(body.documentId, { withText: true })
+      : db.defaultDocument('resume');
+    return { body, job, profile, resumeText: resume?.textContent || '', resume, ...extra };
   };
-  switch (name) {
-    case 'job.created':
-    case 'job.updated': {
-      const j = data?.job;
-      if (j && newer(j)) {
-        db.upsertJob(j, { statusPriority: STATUS_PRIORITY, normalizeStatus });
-      }
-      return;
+
+  if (req.method === 'POST' && pathname === '/ai/fit-score') {
+    const ctx = await aiFeature(); if (!ctx) return;
+    const p = prompts.fitScore(ctx);
+    // Deterministic score is instant + free; AI refines it.
+    const deterministic = fit.score(ctx.job, ctx.profile, ctx.resumeText);
+    const r = await provider.run(p);
+    if (ctx.body.jobId) {
+      db.patchJob(ctx.body.jobId, { fitScore: r.json.score, fitData: { ...r.json, deterministic } });
+      broadcast('jobs.updated', { jobId: ctx.body.jobId, action: 'updated' });
     }
-    case 'job.deleted':
-      if (data?.id) db.deleteJob(data.id);
-      return;
-    case 'settings.updated':
-      if (data?.settings) db.patchSettings(data.settings);
-      return;
-    case 'profile.updated':
-      if (data?.profile) db.patchProfile(data.profile);
-      return;
-    default:
-      // Unknown event — ignore (keeps forward compat with new event names)
-      return;
+    return sendJson(res, 200, { ok: true, result: r.json, deterministic, provider: r.provider });
   }
+  if (req.method === 'POST' && pathname === '/ai/cover-letter') {
+    const ctx = await aiFeature(); if (!ctx) return;
+    const r = await provider.run(prompts.coverLetter({ ...ctx, tone: ctx.body.tone }));
+    return sendJson(res, 200, { ok: true, text: r.text, provider: r.provider });
+  }
+  if (req.method === 'POST' && pathname === '/ai/tailor-resume') {
+    const ctx = await aiFeature(); if (!ctx) return;
+    if (!ctx.resumeText) return sendJson(res, 400, { ok: false, error: 'no resume text on file — upload a resume in Documents' });
+    const r = await provider.run(prompts.tailorResume(ctx));
+    if (ctx.body.jobId) {
+      db.recordEvent({ jobId: ctx.body.jobId, type: 'resume_tailored', source: 'ai', summary: `Tailored from ${ctx.resume?.name || 'resume'}` });
+    }
+    return sendJson(res, 200, { ok: true, text: r.text, provider: r.provider });
+  }
+  if (req.method === 'POST' && pathname === '/ai/answer-question') {
+    const body = await readJson(req);
+    if (!body.question) return sendJson(res, 400, { ok: false, error: 'question required' });
+    const job = body.jobId ? db.getJob(body.jobId) : (body.job || {});
+    const profile = db.profileForSource(job?.source);
+    const resume = db.defaultDocument('resume');
+    const qaHistory = db.qaList(12);
+    const r = await provider.run(prompts.answerQuestion({
+      question: body.question, fieldType: body.fieldType, options: body.options,
+      job, profile, qaHistory, resumeText: resume?.textContent || '',
+    }));
+    return sendJson(res, 200, { ok: true, result: r.json, provider: r.provider });
+  }
+  if (req.method === 'POST' && pathname === '/ai/classify-email') {
+    const body = await readJson(req);
+    const r = await provider.run(prompts.classifyEmail(body));
+    return sendJson(res, 200, { ok: true, result: r.json, provider: r.provider });
+  }
+  if (req.method === 'POST' && pathname === '/ai/summarize') {
+    const ctx = await aiFeature(); if (!ctx) return;
+    const r = await provider.run(prompts.summarizeJob(ctx));
+    return sendJson(res, 200, { ok: true, text: r.text, provider: r.provider });
+  }
+  if (req.method === 'POST' && pathname === '/ai/follow-up') {
+    const ctx = await aiFeature(); if (!ctx) return;
+    const daysSince = ctx.job.submittedAt
+      ? Math.round((Date.now() - new Date(ctx.job.submittedAt).getTime()) / 86400000) : null;
+    const r = await provider.run(prompts.followUp({ ...ctx, daysSince }));
+    return sendJson(res, 200, { ok: true, text: r.text, provider: r.provider });
+  }
+  if (req.method === 'POST' && pathname === '/ai/resume-parse') {
+    const body = await readJson(req);
+    const doc = body.documentId ? db.getDocument(body.documentId, { withText: true }) : db.defaultDocument('resume');
+    if (!doc?.textContent) return sendJson(res, 400, { ok: false, error: 'no extractable text in that document' });
+    const r = await provider.run(prompts.resumeParse({ resumeText: doc.textContent }));
+    return sendJson(res, 200, { ok: true, result: r.json, provider: r.provider });
+  }
+  if (req.method === 'POST' && pathname === '/ai/validate-capture') {
+    const ctx = await aiFeature(); if (!ctx) return;
+    const r = await provider.run(prompts.validateCapture(ctx));
+    return sendJson(res, 200, { ok: true, result: r.json, provider: r.provider });
+  }
+
+  // ---- gmail ----
+  if (pathname === '/gmail/status' && req.method === 'GET') {
+    const gmail = require('./gmail');
+    return sendJson(res, 200, { ok: true, ...gmail.status() });
+  }
+  if (pathname === '/gmail/auth-url' && req.method === 'POST') {
+    const gmail = require('./gmail');
+    const r = await gmail.startAuth();
+    return sendJson(res, r.ok ? 200 : 400, r);
+  }
+  if (pathname === '/gmail/sync' && req.method === 'POST') {
+    const gmail = require('./gmail');
+    const r = await gmail.syncNow();
+    if (r.updated) broadcast('jobs.updated', { action: 'gmail-sync' });
+    return sendJson(res, 200, { ok: true, ...r });
+  }
+
+  // ---- data ----
+  if (req.method === 'GET' && pathname === '/export') {
+    return sendJson(res, 200, { ok: true, data: db.exportAll() });
+  }
+  if (req.method === 'POST' && pathname === '/import') {
+    const body = await readJson(req);
+    const r = db.importAll(body.data || body);
+    broadcast('jobs.updated', { action: 'import' });
+    return sendJson(res, 200, { ok: true, ...r });
+  }
+  if (req.method === 'POST' && pathname === '/backup') {
+    const dest = db.backupNow('manual-' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19));
+    return sendJson(res, dest ? 200 : 500, { ok: !!dest, path: dest });
+  }
+
+  return sendJson(res, 404, { ok: false, error: 'not found' });
 }
 
-// v9.0.0: actively destroy all WS sockets before shutdown so the OS releases
-// the listening port immediately. Call from main.js before-quit, BEFORE
-// server.close(). Without this, the WS connection from the extension keeps
-// port 7733 bound for ~30-60s, causing EADDRINUSE on quick relaunch.
-function destroyAllWs() {
-  for (const sock of wsClients) {
-    try { sock.destroy(); } catch {}
-  }
-  wsClients.clear();
+// ============================================================
+// Lifecycle
+// ============================================================
+function startServer(port, options) {
+  opts = options;
+  return new Promise((resolve, reject) => {
+    server = http.createServer(async (req, res) => {
+      // DNS-rebinding guard
+      if (!HOST_RX.test(req.headers.host || '')) {
+        return sendJson(res, 403, { ok: false, error: 'bad host' });
+      }
+      // CORS: token is the access control; echo origin so extension pages can read.
+      const origin = req.headers.origin;
+      if (origin) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Vary', 'Origin');
+      }
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-JAT-Token');
+      if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+      const parsed = new URL(req.url, `http://${req.headers.host}`);
+      try {
+        await handle(req, res, parsed);
+      } catch (e) {
+        const status = e.status || 500;
+        log.error(req.method, parsed.pathname, e);
+        if (!res.headersSent) {
+          sendJson(res, status, { ok: false, error: status === 500 ? 'internal error' : String(e.message || e) });
+        }
+      }
+    });
+    server.on('error', reject);
+    server.listen(port, '127.0.0.1', () => resolve(server));
+  });
 }
 
-module.exports = { startServer, PORT, VERSION, setLocalBroadcast, setUpdateBridge, destroyAllWs };
+function stopServer() {
+  for (const c of sseClients) { try { c.end(); } catch {} }
+  sseClients.clear();
+  if (server) { try { server.close(); } catch {} server = null; }
+}
+
+module.exports = { startServer, stopServer, broadcast, getToken };

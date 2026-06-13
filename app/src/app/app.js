@@ -1,1513 +1,1941 @@
-// Single-page app for v5. Hash routing, vanilla JS, no build step.
-// DESKTOP BUILD: chrome.* APIs are replaced with window.jat5 bridge → local
-// HTTP server on :7733 backed by SQLite. The shape of `send(type, data)` is
-// preserved verbatim so the same logic works in both extension and desktop.
-import { STATUS_LABELS, STATUSES } from '../lib/schema.js';
-import { THEMES, applyTheme } from '../lib/themes.js';
-import { ICON_PRESETS, presetToSvgDataUrl, presetToIconBundle, imageUrlToIconBundle } from '../lib/icon-presets.js';
+// JAT v11 dashboard SPA.
+// The SAME file runs in two hosts:
+//   • Chrome extension page  (chrome-extension://…/app/app.html)
+//       token via chrome.runtime.sendMessage({type:'get-token'})
+//   • Electron renderer      (file://…/app/app.html + preload bridge)
+//       token via window.jatDesktop.boot() → { token, version, port }
+// All data flows through the desktop app's REST API (X-JAT-Token header);
+// live updates ride the SSE /stream. No frameworks, no build step.
+//
+// v10 lesson baked in: NEVER blow away the DOM while the user is typing.
+// List views refresh on SSE only when no input/textarea/select is focused and
+// no overlay is open; detail/editor views never auto-refresh — they show a
+// "Data changed — refresh" pill instead. 30s polling only while SSE is down.
 
-const send = (type, data) => window.jat5.api({ type, data });
+import { THEMES, applyTheme, DEFAULT_THEME } from './lib/themes.js';
 
-// Pre-rasterize an icon bundle in the page (which has full SVG → canvas
-// support) and ship it to the main process as a structure-cloneable plain
-// object. (Desktop build doesn't drive a browser-action icon, but we keep
-// the wire format so the extension and desktop share message shapes.)
-function imageDataToPlain(id) {
-  return { width: id.width, height: id.height, data: Array.from(id.data) };
-}
-async function applyIconBundle(bundle) {
-  const plain = {};
-  for (const k of Object.keys(bundle)) plain[k] = imageDataToPlain(bundle[k]);
-  return send('set-icon-bundle', { bundle: plain });
-}
-async function clearIconBundle() {
-  return send('set-icon-bundle', { bundle: null });
-}
+// ---------- Status FSM (mirror of extension/lib/status.js — keep in lockstep) ----------
+const STATUSES = [
+  { id: 'started',         label: 'Started',          order: 10 },
+  { id: 'submitted',       label: 'Submitted',        order: 20 },
+  { id: 'contacted',       label: 'Contacted',        order: 30 },
+  { id: 'interview_1',     label: 'First interview',  order: 40 },
+  { id: 'interview_2',     label: 'Second interview', order: 50 },
+  { id: 'interview_final', label: 'Final interview',  order: 60 },
+  { id: 'offer',           label: 'Offer',            order: 70 },
+  { id: 'hired',           label: 'Hired',            order: 80 },
+  { id: 'rejected',        label: 'Rejected',         order: 90 },
+  { id: 'withdrawn',       label: 'Withdrawn',        order: 91 },
+  { id: 'ghosted',         label: 'Ghosted',          order: 92 },
+];
+const STATUS_LABEL = Object.fromEntries(STATUSES.map((s) => [s.id, s.label]));
+const STATUS_INDEX = Object.fromEntries(STATUSES.map((s, i) => [s.id, i]));
+const PIPELINE_ACTIVE = ['submitted', 'contacted', 'interview_1', 'interview_2', 'interview_final', 'offer'];
 
-// Normalize whatever survived the structured-clone roundtrip back into a Blob
-// with the correct MIME type. Some Chrome versions deliver the IDB ArrayBuffer
-// as an object with numeric keys after sendMessage — this guards against that.
-const MIME_BY_EXT = {
-  pdf: 'application/pdf',
-  doc: 'application/msword',
-  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  txt: 'text/plain',
-  rtf: 'application/rtf',
-  odt: 'application/vnd.oasis.opendocument.text',
-  png: 'image/png',
-  jpg: 'image/jpeg',
-  jpeg: 'image/jpeg',
-  gif: 'image/gif',
-  svg: 'image/svg+xml'
+const QUEUE_STATE_ORDER = ['running', 'awaiting_review', 'awaiting_input', 'queued', 'scheduled', 'done', 'failed', 'skipped'];
+const QUEUE_STATE_LABEL = {
+  running: 'Running', awaiting_review: 'Awaiting review', awaiting_input: 'Awaiting input',
+  queued: 'Queued', scheduled: 'Scheduled', done: 'Done', failed: 'Failed', skipped: 'Skipped',
 };
-function makeDocBlob(d) {
-  const filename = d.originalFilename || d.name || '';
-  const ext = (filename.split('.').pop() || '').toLowerCase();
-  let mime = d.mimeType && d.mimeType !== 'application/octet-stream' ? d.mimeType : (MIME_BY_EXT[ext] || 'application/octet-stream');
-  let buf = d.data;
-  if (buf == null) throw new Error('No file data');
-  // Already a Blob
-  if (buf instanceof Blob) return buf.type ? buf : new Blob([buf], { type: mime });
-  // ArrayBuffer or typed array — fastest path
-  if (buf instanceof ArrayBuffer) return new Blob([buf], { type: mime });
-  if (ArrayBuffer.isView(buf)) return new Blob([buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)], { type: mime });
-  // Plain object with numeric keys (post-clone fallback)
-  if (typeof buf === 'object') {
-    const keys = Object.keys(buf);
-    if (keys.length && keys.every((k) => /^\d+$/.test(k))) {
-      const arr = new Uint8Array(keys.length);
-      for (const k of keys) arr[+k] = buf[k];
-      return new Blob([arr.buffer], { type: mime });
+
+const LS_THEME = 'jat11.theme';
+const LS_FILTERS = 'jat11.apps.filters';
+
+// ---------- Tiny utilities ----------
+const $ = (sel, root = document) => root.querySelector(sel);
+const el = (html) => { const t = document.createElement('template'); t.innerHTML = html.trim(); return t.content.firstElementChild; };
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+const fmtFull = (iso) => { if (!iso) return ''; try { return new Date(iso).toLocaleString(); } catch { return ''; } };
+const fmtRel = (iso) => {
+  if (!iso) return '—';
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms)) return '—';
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m}m`;
+  const hr = Math.floor(m / 60);
+  if (hr < 24) return `${hr}h`;
+  const d = Math.floor(hr / 24);
+  if (d < 30) return `${d}d`;
+  try { return new Date(iso).toLocaleDateString(); } catch { return '—'; }
+};
+const relHtml = (iso) => iso
+  ? `<span class="num" title="${esc(fmtFull(iso))}">${esc(fmtRel(iso))}</span>`
+  : '<span class="muted">—</span>';
+const dateHtml = (iso) => iso
+  ? `<span class="num" title="${esc(fmtFull(iso))}">${esc(new Date(iso).toLocaleDateString())}</span>`
+  : '<span class="muted">—</span>';
+const daysIn = (iso) => {
+  if (!iso) return '';
+  const d = Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
+  return d <= 0 ? 'today' : `${d}d in stage`;
+};
+const fmtBytes = (n) => {
+  if (!n && n !== 0) return '—';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / 1048576).toFixed(1)} MB`;
+};
+function debounce(fn, ms) {
+  let t = null;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+function downloadBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+function bufToB64(buf) {
+  const u8 = new Uint8Array(buf);
+  let s = '';
+  const CH = 0x8000;
+  for (let i = 0; i < u8.length; i += CH) s += String.fromCharCode.apply(null, u8.subarray(i, i + CH));
+  return btoa(s);
+}
+function fileToB64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(',')[1] || '');
+    r.onerror = () => reject(new Error('could not read file'));
+    r.readAsDataURL(file);
+  });
+}
+const skeletonHtml = () => `
+  <div class="skeleton">
+    <div class="sk-head">
+      <div style="flex:1;max-width:240px"><div class="sk-line tall" style="width:55%"></div><div class="sk-line" style="width:80%;margin-top:12px"></div></div>
+      <div class="sk-line" style="width:120px;height:34px"></div>
+    </div>
+    <div class="sk-grid" style="margin-bottom:22px">
+      <div><div class="sk-line" style="width:60%"></div><div class="sk-line tall" style="width:40%;margin-top:12px"></div></div>
+      <div><div class="sk-line" style="width:60%"></div><div class="sk-line tall" style="width:40%;margin-top:12px"></div></div>
+      <div><div class="sk-line" style="width:60%"></div><div class="sk-line tall" style="width:40%;margin-top:12px"></div></div>
+      <div><div class="sk-line" style="width:60%"></div><div class="sk-line tall" style="width:40%;margin-top:12px"></div></div>
+    </div>
+    <div class="sk-card">
+      <div class="sk-line" style="width:30%"></div>
+      <div class="sk-line" style="width:100%"></div>
+      <div class="sk-line" style="width:92%"></div>
+      <div class="sk-line" style="width:96%"></div>
+      <div class="sk-line" style="width:70%"></div>
+    </div>
+  </div>`;
+const emptyHtml = (eyebrow, title, sub) =>
+  `<div class="empty"><div class="empty-mark"></div>
+   <div class="empty-eyebrow">${esc(eyebrow)}</div>
+   <div class="empty-title">${esc(title)}</div>
+   <div class="empty-sub">${esc(sub)}</div></div>`;
+const statusChip = (s) =>
+  `<span class="status-chip" data-status="${esc(s)}"><span class="dot"></span>${esc(STATUS_LABEL[s] || s)}</span>`;
+const fitBadgeHtml = (score) => (score == null || score === '') ? ''
+  : `<span class="fit-badge ${score >= 70 ? 'good' : score >= 45 ? 'mid' : 'low'}" title="AI fit score">${esc(score)}</span>`;
+const statusOptions = (sel) =>
+  STATUSES.map((s) => `<option value="${s.id}" ${sel === s.id ? 'selected' : ''}>${esc(s.label)}</option>`).join('');
+
+// ---------- State ----------
+const state = {
+  host: 'web',                       // 'extension' | 'desktop' | 'web'
+  token: null,
+  base: 'http://localhost:7744',
+  version: '',
+  settings: null,                    // cached merged settings
+  online: false,
+  sse: null,
+  sseOk: false,
+  pollTimer: null,
+  lastWrite: 0,                      // ts of our last non-GET (suppresses own-change pills)
+  route: { path: '/' },
+  selection: new Set(),              // bulk selection on the applications list
+  profileSel: null,
+  apps: (() => {
+    const def = { q: '', status: 'all', source: 'all', sort: 'updatedAt', dir: 'desc' };
+    try { return { ...def, ...JSON.parse(localStorage.getItem(LS_FILTERS) || '{}'), q: '' }; }
+    catch { return def; }
+  })(),
+};
+const HOST_LABEL = { extension: 'Extension', desktop: 'Desktop', web: 'Web' };
+function persistFilters() {
+  try {
+    const { status, source, sort, dir } = state.apps;
+    localStorage.setItem(LS_FILTERS, JSON.stringify({ status, source, sort, dir }));
+  } catch {}
+}
+
+// ---------- API ----------
+async function api(path, opts = {}) {
+  const { method = 'GET', body, timeoutMs = 20000, raw = false } = opts;
+  let res;
+  try {
+    res = await fetch(state.base + path, {
+      method,
+      headers: {
+        'X-JAT-Token': state.token || '',
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (e) {
+    const err = new Error('app unreachable');
+    err.status = 0;
+    throw err;
+  }
+  if (method !== 'GET') state.lastWrite = Date.now();
+  if (res.status === 401) {
+    renderNotConnected();
+    const err = new Error('unauthorized');
+    err.status = 401;
+    throw err;
+  }
+  if (raw) {
+    if (!res.ok) { const err = new Error('HTTP ' + res.status); err.status = res.status; throw err; }
+    return res;
+  }
+  let data = {};
+  try { data = await res.json(); } catch {}
+  if (!res.ok || data.ok === false) {
+    const err = new Error(data.error || ('HTTP ' + res.status));
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+async function getSettings(force = false) {
+  if (!force && state.settings) return state.settings;
+  const r = await api('/settings');
+  state.settings = r.settings || {};
+  return state.settings;
+}
+
+// ---------- Theme ----------
+function setTheme(id, persist = true) {
+  applyTheme(id);
+  try { localStorage.setItem(LS_THEME, id); } catch {}
+  if (persist) {
+    api('/settings', { method: 'PATCH', body: { appearance: { theme: id } } })
+      .then((r) => { state.settings = r.settings || state.settings; })
+      .catch((e) => toast('Could not save theme: ' + e.message, 'danger'));
+  }
+}
+
+// ---------- Toasts ----------
+function toast(msg, kind = 'info', opts = {}) {
+  const box = $('#toasts');
+  if (!box) return () => {};
+  const t = document.createElement('div');
+  t.className = 'toast' + (kind && kind !== 'info' ? ' ' + kind : '');
+  const span = document.createElement('span');
+  span.className = 'toast-msg';
+  span.textContent = msg;
+  t.appendChild(span);
+  let closed = false;
+  const close = () => { if (closed) return; closed = true; t.remove(); };
+  if (opts.actionLabel) {
+    const b = document.createElement('button');
+    b.className = 'btn-link';
+    b.textContent = opts.actionLabel;
+    b.addEventListener('click', () => { close(); try { opts.onAction && opts.onAction(); } catch {} });
+    t.appendChild(b);
+  }
+  const x = document.createElement('button');
+  x.className = 'toast-x';
+  x.textContent = '×';
+  x.setAttribute('aria-label', 'Dismiss');
+  x.addEventListener('click', close);
+  t.appendChild(x);
+  box.appendChild(t);
+  const ttl = opts.ttl !== undefined ? opts.ttl : (kind === 'danger' ? 8000 : 5000);
+  if (ttl > 0) setTimeout(close, ttl);
+  return close;
+}
+const errToast = (e, prefix = '') => toast((prefix ? prefix + ': ' : '') + (e && e.message ? e.message : String(e)), 'danger');
+const undoToast = (msg, onUndo) => toast(msg, 'info', { actionLabel: 'Undo', onAction: onUndo, ttl: 5000 });
+
+// ---------- Overlays (modal + palette) ----------
+function openOverlay(node) {
+  const root = $('#overlay-root');
+  const ov = document.createElement('div');
+  ov.className = 'overlay';
+  ov.appendChild(node);
+  ov.addEventListener('mousedown', (e) => { if (e.target === ov) ov.remove(); });
+  root.appendChild(ov);
+  return () => ov.remove();
+}
+function closeTopOverlay() {
+  const ovs = document.querySelectorAll('#overlay-root .overlay');
+  if (ovs.length) { ovs[ovs.length - 1].remove(); return true; }
+  return false;
+}
+function closeAllOverlays() {
+  document.querySelectorAll('#overlay-root .overlay').forEach((o) => o.remove());
+}
+
+function textModal(title, text, opts = {}) {
+  const m = el(`<div class="modal">
+    <div class="modal-head"><h3 class="modal-title"></h3><button class="toast-x" data-close aria-label="Close">×</button></div>
+    <div class="modal-body"><pre></pre></div>
+    <div class="modal-foot">
+      ${opts.downloadName ? '<button class="btn small" data-dl>Download .txt</button>' : ''}
+      <button class="btn small primary" data-copy>Copy</button>
+    </div>
+  </div>`);
+  m.querySelector('.modal-title').textContent = title;
+  m.querySelector('pre').textContent = text;
+  const close = openOverlay(m);
+  m.querySelector('[data-close]').addEventListener('click', close);
+  m.querySelector('[data-copy]').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    try {
+      await navigator.clipboard.writeText(text);
+      btn.textContent = 'Copied ✓';
+      setTimeout(() => { btn.textContent = 'Copy'; }, 1400);
+    } catch { toast('Clipboard unavailable in this context', 'danger'); }
+  });
+  const dl = m.querySelector('[data-dl]');
+  if (dl) dl.addEventListener('click', () => downloadBlob(new Blob([text], { type: 'text/plain' }), opts.downloadName));
+}
+
+// ---------- Command palette (Ctrl/Cmd+K) ----------
+function openPalette() {
+  if (document.querySelector('#overlay-root .palette')) return;
+  const p = el(`<div class="palette">
+    <input type="text" placeholder="Jump to a page or search applications…" />
+    <div class="palette-list"></div>
+  </div>`);
+  const close = openOverlay(p);
+  const input = p.querySelector('input');
+  const list = p.querySelector('.palette-list');
+  const PAGES = [
+    { label: 'Dashboard', hint: 'page', go: '#/' },
+    { label: 'Applications', hint: 'page', go: '#/applications' },
+    { label: 'Pipeline', hint: 'page', go: '#/pipeline' },
+    { label: 'Auto-apply queue', hint: 'page', go: '#/queue' },
+    { label: 'Profile', hint: 'page', go: '#/profile' },
+    { label: 'Documents', hint: 'page', go: '#/documents' },
+    { label: 'Activity', hint: 'page', go: '#/activity' },
+    { label: 'Settings', hint: 'page', go: '#/settings' },
+    { label: 'New application', hint: 'action', go: '#/applications/new' },
+  ];
+  let jobs = [];
+  let items = [];
+  let sel = 0;
+  function rebuild() {
+    const q = input.value.trim().toLowerCase();
+    const pages = PAGES.filter((c) => !q || c.label.toLowerCase().includes(q));
+    items = [
+      ...pages.map((c) => ({ label: c.label, hint: c.hint, run: () => { location.hash = c.go; } })),
+      ...jobs.map((j) => ({
+        label: `${j.title || 'Untitled'} — ${j.company || ''}`,
+        hint: STATUS_LABEL[j.status] || 'application',
+        run: () => { location.hash = '#/applications/' + j.id; },
+      })),
+    ];
+    sel = Math.min(sel, Math.max(0, items.length - 1));
+    paint();
+  }
+  function paint() {
+    list.replaceChildren();
+    if (!items.length) {
+      list.innerHTML = '<div class="palette-empty">Nothing matches.</div>';
+      return;
+    }
+    items.forEach((it, i) => {
+      const d = el('<div class="palette-item"><span class="pi-label"></span><span class="pi-hint"></span></div>');
+      d.querySelector('.pi-label').textContent = it.label;
+      d.querySelector('.pi-hint').textContent = it.hint;
+      if (i === sel) d.classList.add('sel');
+      d.addEventListener('click', () => { close(); it.run(); });
+      list.appendChild(d);
+    });
+  }
+  const searchJobs = debounce(async () => {
+    const q = input.value.trim();
+    if (q.length < 2) { jobs = []; rebuild(); return; }
+    try {
+      const r = await api('/jobs?q=' + encodeURIComponent(q) + '&limit=10');
+      jobs = r.items || [];
+    } catch { jobs = []; }
+    rebuild();
+  }, 220);
+  input.addEventListener('input', () => { sel = 0; rebuild(); searchJobs(); });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); sel = Math.min(sel + 1, items.length - 1); paint(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); sel = Math.max(sel - 1, 0); paint(); }
+    else if (e.key === 'Enter') { e.preventDefault(); const it = items[sel]; if (it) { close(); it.run(); } }
+  });
+  rebuild();
+  input.focus();
+}
+
+// ---------- Chips input ----------
+function chipsInput(initial, placeholder) {
+  const root = el('<div class="chips"><input type="text" /></div>');
+  const input = root.querySelector('input');
+  input.placeholder = placeholder || 'Add…';
+  let values = [...(initial || [])];
+  function paint() {
+    root.querySelectorAll('.chip').forEach((c) => c.remove());
+    for (const v of values) {
+      const c = el('<span class="chip"><span class="chip-t"></span><span class="chip-x" title="Remove">×</span></span>');
+      c.querySelector('.chip-t').textContent = v;
+      c.querySelector('.chip-x').addEventListener('click', () => { values = values.filter((x) => x !== v); paint(); });
+      root.insertBefore(c, input);
     }
   }
-  if (Array.isArray(buf)) return new Blob([new Uint8Array(buf).buffer], { type: mime });
-  throw new Error('Unrecognized file data shape: ' + (typeof buf));
+  function add(raw) {
+    for (const piece of String(raw).split(',')) {
+      const v = piece.trim();
+      if (v && !values.includes(v)) values.push(v);
+    }
+    paint();
+  }
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ',') {
+      e.preventDefault();
+      if (input.value.trim()) { add(input.value); input.value = ''; }
+    } else if (e.key === 'Backspace' && !input.value && values.length) {
+      values.pop(); paint();
+    }
+  });
+  input.addEventListener('blur', () => { if (input.value.trim()) { add(input.value); input.value = ''; } });
+  root.addEventListener('click', (e) => { if (e.target === root) input.focus(); });
+  paint();
+  return { node: root, get: () => [...values], set: (v) => { values = [...(v || [])]; paint(); } };
 }
 
-// Desktop AI client. The main process can talk directly to Ollama via fetch
-// (no MV3 service-worker concerns), so we route AI calls through the same
-// JSON-RPC channel as everything else. Long requests are fine — the HTTP
-// connection stays alive until the response lands.
-function aiCall(data) {
-  return window.jat5.api({ type: 'ai-call', data });
+// ---------- Router ----------
+const routes = [];
+function route(pattern, render) { routes.push({ pattern, render }); }
+function resolve(path) {
+  for (const r of routes) {
+    if (typeof r.pattern === 'string') {
+      if (r.pattern === path) return { render: r.render, params: {} };
+    } else {
+      const m = path.match(r.pattern);
+      if (m) return { render: r.render, params: m.groups || {} };
+    }
+  }
+  return null;
 }
-const $ = (s, root) => (root || document).querySelector(s);
-const $$ = (s, root) => Array.from((root || document).querySelectorAll(s));
+let navSeq = 0;
+async function navigate() {
+  const path = (location.hash.replace(/^#/, '') || '/').replace(/\/+$/, '') || '/';
+  state.route = { path };
+  state.selection = new Set();
+  hideRefreshPill();
+  closeAllOverlays();
+  document.querySelectorAll('.nav-item').forEach((n) => {
+    const r = n.dataset.route;
+    n.classList.toggle('active', r === path || (r !== '/' && path.startsWith(r + '/')));
+  });
+  if (!state.token) { renderNotConnected(); return; }
+  const seq = ++navSeq;
+  const match = resolve(path) || resolve('/');
+  const main = $('#main');
+  const loadT = setTimeout(() => {
+    if (seq === navSeq) main.innerHTML = skeletonHtml();
+  }, 130);
+  try {
+    const node = await match.render(match.params);
+    clearTimeout(loadT);
+    if (seq !== navSeq) return;
+    main.replaceChildren(node);
+  } catch (e) {
+    clearTimeout(loadT);
+    if (seq !== navSeq) return;
+    if (e && e.status === 401) return; // not-connected screen already rendered
+    main.replaceChildren(errorView(e));
+  }
+}
 
-const state = {
-  route: location.hash.slice(1) || '/',
-  jobs: [],
-  summary: null,
-  profile: {},
-  settings: {},
-  selectedJobId: null,
-  aiStatus: null,
-  aiResults: {},     // jobId -> { feature -> result }
-  aiLoading: {},     // jobId -> { feature -> bool }
-  filter: { status: 'all', source: 'all', search: '' },
-  answers: [],
-  recommendations: [],
-  recsLoading: false,
-  aiWizardStep: 1,
-  aiTestResult: null,
-  documents: [],
-};
+// ---------- Error / not-connected states ----------
+function errorView(e) {
+  const v = el(`<div>
+    <div class="empty">
+      <div class="empty-mark"></div>
+      <div class="empty-eyebrow">App offline</div>
+      <div class="empty-title">The desktop companion isn't answering</div>
+      <div class="empty-sub"></div>
+      <div class="mt"><button class="btn primary" data-retry>Retry</button></div>
+    </div>
+  </div>`);
+  v.querySelector('.empty-sub').textContent =
+    (e && e.message ? e.message + ' — ' : '') + 'Start the Job Application Tracker app, then retry.';
+  v.querySelector('[data-retry]').addEventListener('click', navigate);
+  return v;
+}
 
-const DOC_TYPES = [
-  ['resume', 'Resume'],
-  ['coverLetter', 'Cover letter'],
-  ['transcript', 'Transcript'],
-  ['portfolio', 'Portfolio'],
-  ['other', 'Other'],
-];
-const DOC_TYPE_LABEL = Object.fromEntries(DOC_TYPES);
+function renderNotConnected() {
+  const main = $('#main');
+  if (!main) return;
+  const isExt = state.host === 'extension';
+  const v = el(`<div>
+    <div class="empty">
+      <div class="empty-mark"></div>
+      <div class="empty-eyebrow">Not connected</div>
+      <div class="empty-title">Pair this dashboard with the desktop app</div>
+      <div class="empty-sub">${isExt
+        ? 'The extension needs a one-time approval from the app. Make sure the app is running, then connect — a dialog will appear in the app window.'
+        : 'The desktop app could not hand over its access token. Restart the app; if this persists, check the logs.'}</div>
+      <div class="mt">
+        ${isExt ? '<button class="btn primary" data-pair>Connect to app</button>' : ''}
+        <button class="btn" data-retry>Retry</button>
+      </div>
+    </div>
+  </div>`);
+  const pair = v.querySelector('[data-pair]');
+  if (pair) {
+    pair.addEventListener('click', async () => {
+      pair.disabled = true;
+      pair.textContent = 'Check the app window…';
+      try {
+        const r = await new Promise((res) => chrome.runtime.sendMessage({ type: 'pair-app' }, (x) => {
+          void chrome.runtime.lastError; res(x);
+        }));
+        if (r?.ok) {
+          const t = await new Promise((res) => chrome.runtime.sendMessage({ type: 'get-token' }, (x) => {
+            void chrome.runtime.lastError; res(x);
+          }));
+          state.token = t?.token || null;
+          if (state.token) { toast('Connected ✓'); connectSSE(); navigate(); return; }
+        }
+        toast(r?.error || 'Pairing failed — is the app running?', 'danger');
+      } finally {
+        pair.disabled = false;
+        pair.textContent = 'Connect to app';
+      }
+    });
+  }
+  v.querySelector('[data-retry]').addEventListener('click', () => boot(true));
+  main.replaceChildren(v);
+}
 
-const SOURCES = [
-  { id: 'LinkedIn', host: 'linkedin.com', icon: 'in', desc: 'Watches job pages and Easy Apply' },
-  { id: 'Indeed', host: 'indeed.com', icon: 'I', desc: 'Indeed Apply modal + applied state' },
-  { id: 'Glassdoor', host: 'glassdoor.com', icon: 'G', desc: 'JobListing pages + apply modal' },
-  { id: 'Greenhouse', host: 'boards.greenhouse.io', icon: 'GH', desc: 'Inline application form + thank you' },
-  { id: 'Lever', host: 'jobs.lever.co', icon: 'L', desc: 'Lever-hosted apply forms' },
-  { id: 'Workday', host: '*.myworkdayjobs.com', icon: 'W', desc: 'Multi-step Workday wizard' },
-  { id: 'Generic', host: 'JSON-LD JobPosting', icon: '★', desc: 'Any site with structured data' },
-];
+// ---------- Refresh pill + SSE ----------
+const LIST_ROUTES = new Set(['/', '/applications', '/pipeline', '/queue', '/documents', '/activity']);
+function showRefreshPill() { const p = $('#refresh-pill'); if (p) p.hidden = false; }
+function hideRefreshPill() { const p = $('#refresh-pill'); if (p) p.hidden = true; }
 
-async function load() {
-  const [s, l, p, st, ai] = await Promise.all([
-    send('status-summary'),
-    send('list-jobs'),
-    send('get-profile'),
-    send('get-settings'),
-    send('ai-status'),
+function canAutoRefresh() {
+  if (!LIST_ROUTES.has(state.route.path)) return false;
+  const a = document.activeElement;
+  if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable)) return false;
+  if (document.querySelector('#overlay-root .overlay')) return false;
+  return true;
+}
+
+const softRefresh = debounce(() => {
+  if (canAutoRefresh()) { hideRefreshPill(); navigate(); }
+  else showRefreshPill();
+}, 350);
+
+function connectSSE() {
+  if (state.sse) { try { state.sse.close(); } catch {} state.sse = null; }
+  if (!state.token) return;
+  let es;
+  try {
+    es = new EventSource(`${state.base}/stream?token=${encodeURIComponent(state.token)}`);
+  } catch { startPollingFallback(); return; }
+  state.sse = es;
+  es.onopen = () => { state.sseOk = true; stopPollingFallback(); };
+  es.onerror = () => { state.sseOk = false; startPollingFallback(); };
+  for (const ev of ['jobs.updated', 'queue.updated', 'documents.updated']) {
+    es.addEventListener(ev, () => softRefresh());
+  }
+  es.addEventListener('settings.updated', async () => {
+    try {
+      const s = await getSettings(true);
+      if (s.appearance?.theme) { applyTheme(s.appearance.theme); try { localStorage.setItem(LS_THEME, s.appearance.theme); } catch {} }
+    } catch {}
+    softRefresh();
+  });
+}
+function startPollingFallback() {
+  if (state.pollTimer) return;
+  state.pollTimer = setInterval(() => {
+    if (!state.sseOk && canAutoRefresh()) navigate();
+    if (!state.sseOk) connectSSE();
+  }, 30000);
+}
+function stopPollingFallback() {
+  if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+}
+
+// ---------- Runtime footer ----------
+async function paintRuntime() {
+  const dot = $('#runtime-dot');
+  const txt = $('#runtime-text');
+  if (!dot || !txt) return;
+  try {
+    const r = await fetch(state.base + '/health', { signal: AbortSignal.timeout(1500) });
+    const body = r.ok ? await r.json() : null;
+    state.online = !!body?.ok;
+    dot.className = 'status-dot' + (state.online ? ' ok' : ' bad');
+    txt.textContent = `${HOST_LABEL[state.host]} · ${state.online ? 'app v' + (body.version || '?') : 'app offline'}${state.sseOk ? ' · live' : ''}`;
+  } catch {
+    state.online = false;
+    dot.className = 'status-dot bad';
+    txt.textContent = `${HOST_LABEL[state.host]} · app offline`;
+  }
+}
+
+// ============================================================
+// VIEW: Dashboard (#/)
+// ============================================================
+route('/', async () => {
+  const [statsR, jobsR, queueR, aiR, gmailR] = await Promise.all([
+    api('/stats'),
+    api('/jobs?limit=8'),
+    api('/queue').catch(() => ({ items: [] })),
+    api('/ai/status').catch(() => null),
+    api('/gmail/status').catch(() => null),
   ]);
-  if (s?.ok) state.summary = s.summary;
-  if (l?.ok) state.jobs = l.items || [];
-  if (p?.ok) state.profile = p.profile || {};
-  if (st?.ok) state.settings = st.settings || {};
-  if (ai?.ok) state.aiStatus = ai.status;
-  applyTheme(state.settings.theme || 'midnight');
-  // Also load Q&A and recommendations
-  const [qa, recs, docs] = await Promise.all([send('list-answers'), send('list-recommendations'), send('list-documents')]);
-  if (qa?.ok) state.answers = qa.items || [];
-  if (recs?.ok) state.recommendations = recs.items || [];
-  if (docs?.ok) state.documents = docs.items || [];
-  render();
-}
+  const stats = statsR;
+  const jobs = jobsR.items || [];
+  const tasks = queueR.items || [];
+  const byStatus = stats.byStatus || {};
+  const inPipeline = PIPELINE_ACTIVE.reduce((s, id) => s + (byStatus[id] || 0), 0);
+  const qCounts = {};
+  for (const t of tasks) qCounts[t.state] = (qCounts[t.state] || 0) + 1;
 
-function setRoute() {
-  state.route = location.hash.slice(1) || '/';
-  if (state.route.startsWith('/job/')) {
-    state.selectedJobId = state.route.split('/')[2];
+  const aiChip = (label, st) => {
+    if (!st) return '';
+    const ok = !!st.available;
+    return `<span class="sys-chip ${ok ? 'ok' : 'bad'}" title="${esc(st.reason || '')}">${esc(label)} ${ok ? '●' : '○'}</span>`;
+  };
+  const sysBits = [];
+  if (aiR) {
+    sysBits.push(aiChip('Codex', aiR.codex));
+    sysBits.push(aiChip('Ollama', aiR.ollama));
   }
-  render();
-}
-window.addEventListener('hashchange', setRoute);
+  if (gmailR?.enabled) {
+    const lr = gmailR.lastResult;
+    sysBits.push(`<span class="sys-chip">Gmail · ${lr?.at ? 'synced ' + fmtRel(lr.at) : (gmailR.authorized ? 'connected' : 'not connected')}</span>`);
+  }
+  const awaiting = (qCounts.awaiting_review || 0) + (qCounts.awaiting_input || 0);
+  if (tasks.length) {
+    sysBits.push(`<span class="sys-chip ${awaiting ? 'warn' : ''}">Auto-apply · ${qCounts.queued || 0} queued${awaiting ? ` · ${awaiting} need you` : ''}</span>`);
+  }
 
-// Desktop event bridge — main-process broadcasts (e.g. when the extension
-// pushes an IDB snapshot via the sync server) arrive on window.jat5.onEvent.
-// The handler shape mirrors the extension's chrome.runtime.onMessage payload
-// so the rest of this function is identical.
-window.jat5.onEvent((msg) => {
-  if (msg?.type !== 'jat-event') return;
-  const { name, data } = msg;
-  if (name === 'job.created' || name === 'job.updated') {
-    const i = state.jobs.findIndex((j) => j.id === data.job.id);
-    if (i >= 0) state.jobs[i] = data.job; else state.jobs.push(data.job);
-    refreshSummary();
-    render();
-  } else if (name === 'job.deleted') {
-    state.jobs = state.jobs.filter((j) => j.id !== data.id);
-    refreshSummary();
-    render();
-  } else if (name === 'settings.updated') {
-    state.settings = data.settings;
-    if (data.settings?.theme) applyTheme(data.settings.theme);
-    render();
-  } else if (name === 'recommendations.updated') {
-    send('list-recommendations').then((r) => { if (r?.ok) { state.recommendations = r.items; render(); } });
-  } else if (name === 'documents.updated') {
-    send('list-documents').then((r) => { if (r?.ok) { state.documents = r.items || []; render(); } });
-  } else if (name === 'profile.updated') {
-    state.profile = data.profile || state.profile;
-    // Refresh learned answers too — record-answer often triggers this
-    send('list-answers').then((r) => { if (r?.ok) { state.answers = r.items || []; render(); } });
-  }
+  const pills = STATUSES.map((s) =>
+    `<button class="pill" data-status="${s.id}" type="button"><span class="dot"></span>${esc(s.label)}<span class="count">${byStatus[s.id] || 0}</span></button>`).join('');
+
+  const recent = jobs.length ? jobs.map((j) => `
+    <tr data-id="${esc(j.id)}" class="row-link">
+      <td class="title-cell">${esc(j.title || 'Untitled')}${j.needsReview ? ' <span class="muted" title="Needs review">⚠</span>' : ''}</td>
+      <td>${esc(j.company || '')}</td>
+      <td>${statusChip(j.status)}</td>
+      <td>${fitBadgeHtml(j.fitScore)}</td>
+      <td>${esc(j.source || '—')}</td>
+      <td>${relHtml(j.updatedAt)}</td>
+    </tr>`).join('')
+    : `<tr><td colspan="6">${emptyHtml('Quiet ledger', 'No applications yet', 'Apply to a job — JAT captures it automatically. Or press “/” and add one by hand.')}</td></tr>`;
+
+  const v = el(`<div>
+    <header class="page-header">
+      <div>
+        <div class="page-eyebrow">Overview</div>
+        <h1 class="page-title">Dashboard</h1>
+        <div class="page-sub">A considered record of your job search.</div>
+      </div>
+      <div class="page-actions">
+        <button class="btn" data-refresh>Refresh</button>
+        <a href="#/applications/new" class="btn primary">+ New application</a>
+      </div>
+    </header>
+
+    ${sysBits.length ? `<div class="sys-strip">${sysBits.join('')}</div>` : ''}
+
+    <section class="stats">
+      <div class="stat"><div class="stat-label">Applications</div><div class="stat-value">${stats.total || 0}</div><div class="stat-delta">All time</div></div>
+      <div class="stat"><div class="stat-label">This week</div><div class="stat-value">${stats.thisWeek || 0}</div><div class="stat-delta">Captured</div></div>
+      <div class="stat"><div class="stat-label">In pipeline</div><div class="stat-value">${inPipeline}</div><div class="stat-delta">Submitted → offer</div></div>
+      <div class="stat" data-go-review style="cursor:pointer"><div class="stat-label">Needs review</div><div class="stat-value ${stats.needsReview ? 'warn' : ''}">${stats.needsReview || 0}</div><div class="stat-delta">Sparse captures</div></div>
+    </section>
+
+    <section class="section">
+      <header class="section-header">
+        <div><div class="section-eyebrow">Status</div><h2 class="section-title">Pipeline</h2></div>
+        <a href="#/pipeline" class="section-link">Board view</a>
+      </header>
+      <div class="pipeline">${pills}</div>
+    </section>
+
+    <section class="section">
+      <header class="section-header">
+        <div><div class="section-eyebrow">Recent</div><h2 class="section-title">Latest applications</h2></div>
+        <a href="#/applications" class="section-link">All applications</a>
+      </header>
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>Title</th><th>Company</th><th>Status</th><th></th><th>Source</th><th>Updated</th></tr></thead>
+        <tbody>${recent}</tbody>
+      </table></div>
+    </section>
+  </div>`);
+
+  v.querySelector('[data-refresh]').addEventListener('click', navigate);
+  v.querySelector('[data-go-review]').addEventListener('click', () => {
+    state.apps.status = 'needs_review'; persistFilters();
+    location.hash = '#/applications';
+  });
+  v.querySelectorAll('.pill').forEach((p) => p.addEventListener('click', () => {
+    state.apps.status = p.dataset.status; persistFilters();
+    location.hash = '#/applications';
+  }));
+  v.querySelectorAll('.row-link').forEach((tr) => {
+    tr.style.cursor = 'pointer';
+    tr.addEventListener('click', () => { location.hash = '#/applications/' + tr.dataset.id; });
+  });
+  return v;
 });
 
-async function refreshSummary() {
-  const r = await send('status-summary');
-  if (r?.ok) state.summary = r.summary;
-}
+// ============================================================
+// VIEW: Applications list (#/applications)
+// ============================================================
+route('/applications', async () => {
+  const f = state.apps;
+  let q = '/jobs?limit=500';
+  if (f.status === 'needs_review') q += '&needsReview=1';
+  else if (f.status !== 'all') q += '&status=' + encodeURIComponent(f.status);
+  if (f.source !== 'all') q += '&source=' + encodeURIComponent(f.source);
+  if (f.q) q += '&q=' + encodeURIComponent(f.q);
+  const r = await api(q);
+  let rows = r.items || [];
 
-function render() {
-  $$('#nav a').forEach((a) => a.classList.toggle('active', a.dataset.route === state.route || (state.route.startsWith('/job/') && a.dataset.route === '/jobs')));
-  // Sidebar brand icon — reflects chosen preset / custom icon
-  const brand = $('.brand .logo');
-  if (brand) {
-    const presetId = state.settings.iconPreset;
-    const custom = state.settings.iconCustomDataUrl;
-    if (custom) {
-      brand.innerHTML = `<img src="${escape(custom)}" style="width:100%;height:100%;border-radius:10px;object-fit:cover" />`;
-      brand.style.background = 'transparent';
-    } else if (presetId) {
-      const preset = ICON_PRESETS.find((p) => p.id === presetId);
-      if (preset) {
-        brand.innerHTML = `<span style="font-size:20px">${preset.emoji}</span>`;
-        brand.style.background = `linear-gradient(135deg, ${preset.bg[0]}, ${preset.bg[1]})`;
-      }
-    } else {
-      brand.innerHTML = 'JAT';
-      brand.style.background = '';
-    }
-  }
-  // AI pill
-  const pill = $('#ai-pill');
-  if (state.aiStatus?.available) pill.className = 'ai-status ok', pill.textContent = `✨ AI: ${state.aiStatus.provider} ready`;
-  else pill.className = 'ai-status bad', pill.textContent = `⚠ AI off — configure in Settings`;
+  const dir = f.dir === 'asc' ? 1 : -1;
+  rows = rows.slice().sort((a, b) => {
+    const k = f.sort;
+    if (k === 'status') return (STATUS_INDEX[a.status] - STATUS_INDEX[b.status]) * dir;
+    if (k === 'fitScore') return ((a.fitScore ?? -1) - (b.fitScore ?? -1)) * dir;
+    const av = String(a[k] ?? ''); const bv = String(b[k] ?? '');
+    return av.localeCompare(bv) * dir;
+  });
 
-  let html;
-  if (state.route === '/') html = pageDashboard();
-  else if (state.route === '/jobs') html = pageJobs();
-  else if (state.route.startsWith('/job/')) html = pageJobDetail();
-  else if (state.route === '/profile') html = pageProfile();
-  else if (state.route === '/settings') html = pageSettings();
-  else if (state.route === '/ai') html = pageAi();
-  else if (state.route === '/documents') html = pageDocuments();
-  else if (state.route === '/sources') html = pageSources();
-  else html = `<div class="empty"><strong>Not found.</strong>${state.route}</div>`;
-  // Global AI-unavailable banner (skip on the AI page itself to avoid duplication)
-  let banner = '';
-  if (state.aiStatus && state.aiStatus.available === false && state.route !== '/ai') {
-    banner = `<a href="#/ai" class="ai-banner">⚠ AI unavailable${state.aiStatus.reason ? ' — ' + escape(state.aiStatus.reason) : ''} — open the AI Setup Wizard →</a>`;
-  }
-  $('#main').innerHTML = banner + html;
-  attach();
-}
+  const allSources = [...new Set((await api('/jobs?limit=500').catch(() => ({ items: rows }))).items?.map((j) => j.source).filter(Boolean) || [])].sort();
 
-function escape(s) { return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]); }
+  const th = (key, label) => {
+    const active = f.sort === key;
+    return `<th data-sort="${key}" style="cursor:pointer">${esc(label)}${active ? (f.dir === 'asc' ? ' ↑' : ' ↓') : ''}</th>`;
+  };
 
-function extensionPromoCard() {
-  // Show until the extension has connected at least once. We track this in
-  // settings.extensionEverConnected which the sync server flips to true on
-  // the first /sync/event POST it receives from a chrome-extension origin.
-  if (state.settings.extensionEverConnected) return '';
-  if (state.settings.dismissedExtensionPromo) return '';
-  return `
-    <div class="card desktop-promo" style="margin-bottom:14px;padding:18px;background:linear-gradient(135deg,rgba(99,102,241,0.10),rgba(139,92,246,0.06));border:1px solid rgba(99,102,241,0.3)">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px">
-        <div style="flex:1">
-          <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:var(--primary);font-weight:700;margin-bottom:6px">🌐 OPTIONAL CHROME EXTENSION</div>
-          <h3 style="margin:0 0 6px;font-size:16px">Capture jobs as you browse</h3>
-          <p style="margin:0 0 10px;color:var(--muted);font-size:13px;line-height:1.5">
-            The desktop app works great alone. The Chrome extension adds: <strong>real-time capture as you apply</strong> on LinkedIn / Indeed / Glassdoor / Greenhouse / Lever / Workday, universal autofill across every supported site, and one-click profile sync from your LinkedIn /in/me page.
-          </p>
-          <div style="font-size:12px;color:var(--muted);margin-bottom:12px"><strong>3-step setup:</strong></div>
-          <ol style="margin:0 0 12px 20px;font-size:13px;line-height:1.7;color:var(--text)">
-            <li>Open <code style="background:var(--bg);padding:2px 6px;border-radius:4px;font-family:ui-monospace,Consolas,monospace">chrome://extensions/</code> in Chrome</li>
-            <li>Toggle <strong>Developer mode</strong> (top-right)</li>
-            <li>Click <strong>Load unpacked</strong> → select <code style="background:var(--bg);padding:2px 6px;border-radius:4px;font-family:ui-monospace,Consolas,monospace">v6/extension/</code></li>
-          </ol>
-          <p style="margin:0 0 10px;color:var(--muted);font-size:12px">Once loaded, the extension auto-detects this app on <code style="background:var(--bg);padding:2px 6px;border-radius:4px">localhost:7733</code> and starts syncing instantly. No restart needed.</p>
-          <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button class="btn primary" id="open-chrome-extensions">Open chrome://extensions/</button>
-            <button class="btn" id="dismiss-extension-promo">Dismiss</button>
-          </div>
-        </div>
-        <div style="font-size:48px;opacity:0.5">🌐</div>
-      </div>
-    </div>
-  `;
-}
+  const bodyRows = rows.length ? rows.map((j) => `
+    <tr data-id="${esc(j.id)}" class="row-link">
+      <td><input type="checkbox" data-sel="${esc(j.id)}" ${state.selection.has(j.id) ? 'checked' : ''} /></td>
+      <td class="title-cell">${esc(j.title || 'Untitled')}${j.needsReview ? ' <span class="muted" title="Needs review">⚠</span>' : ''}</td>
+      <td>${esc(j.company || '')}</td>
+      <td>${statusChip(j.status)}</td>
+      <td>${fitBadgeHtml(j.fitScore)}</td>
+      <td>${esc(j.source || '—')}</td>
+      <td>${dateHtml(j.createdAt)}</td>
+      <td>${relHtml(j.updatedAt)}</td>
+    </tr>`).join('')
+    : `<tr><td colspan="8">${emptyHtml(
+      f.q || f.status !== 'all' || f.source !== 'all' ? 'No matches' : 'No entries',
+      f.q || f.status !== 'all' || f.source !== 'all' ? 'Nothing matches the current filter' : 'The ledger is empty',
+      'Adjust the filters, or hit Apply on a job and JAT will record it.')}</td></tr>`;
 
-function pageDashboard() {
-  const s = state.summary || {};
-  const recent = [...state.jobs].sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || '')).slice(0, 6);
-  const bySource = state.jobs.reduce((acc, j) => { acc[j.source || 'Unknown'] = (acc[j.source || 'Unknown'] || 0) + 1; return acc; }, {});
-  const sources = Object.entries(bySource).sort((a, b) => b[1] - a[1]);
-  const shortcuts = state.settings.dashboardShortcuts || [];
-  const recs = (state.recommendations || []).slice(0, 6);
-
-  return `
-    <div class="page-h">
-      <div><h1>Dashboard</h1><div class="sub">${state.jobs.length} application${state.jobs.length === 1 ? '' : 's'} tracked across ${sources.length} source${sources.length === 1 ? '' : 's'}.</div></div>
-      <div style="display:flex;gap:8px"><button class="btn" id="refresh-recs">🔍 Refresh recommendations</button><button class="btn primary" id="ai-nudges">✨ AI nudges</button></div>
-    </div>
-    ${extensionPromoCard()}
-    <div class="shortcuts">
-      ${shortcuts.map((sh) => `<a class="shortcut-btn" href="${escape(sh.url)}" target="_blank" rel="noreferrer">${escape(sh.label)}<span class="x" data-rm-shortcut="${escape(sh.id)}" title="Remove">×</span></a>`).join('')}
-      <button class="shortcut-btn shortcut-add" id="add-shortcut">+ Add shortcut</button>
-    </div>
-    <div class="grid-3">
-      <div class="card stat"><div class="v">${s.today || 0}</div><div class="l">Today</div></div>
-      <div class="card stat"><div class="v">${s.week || 0}</div><div class="l">This week</div></div>
-      <div class="card stat"><div class="v">${s.total || 0}</div><div class="l">All-time</div></div>
-      <div class="card stat"><div class="v">${s.active || 0}</div><div class="l">Active pipeline</div></div>
-      <div class="card stat"><div class="v">${s.interviews || 0}</div><div class="l">Interviews</div></div>
-      <div class="card stat"><div class="v">${s.offers || 0}</div><div class="l">Offers</div></div>
-    </div>
-    <div class="grid-2">
-      <div class="card">
-        <h3 style="margin-top:0;font-size:14px">Recent activity</h3>
-        ${recent.length === 0 ? `<div class="empty"><strong>Nothing yet.</strong>Visit a job posting on LinkedIn, Indeed, Glassdoor, etc.</div>` : `<div class="list">${recent.map(rowHtml).join('')}</div>`}
-      </div>
-      <div class="card">
-        <h3 style="margin-top:0;font-size:14px">Sources captured from</h3>
-        ${sources.length === 0 ? `<div class="empty">No applications yet.</div>` : sources.map(([src, n]) => `
-          <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border)">
-            <span class="pill source">${escape(src)}</span>
-            <strong>${n}</strong>
-          </div>`).join('')}
-      </div>
-    </div>
-    <div id="nudge-out"></div>
-
-    ${recs.length > 0 ? `
-      <div class="card" style="margin-top:14px">
-        <h3 style="margin-top:0;font-size:14px">🔍 Recommended job searches ${state.recsLoading ? '<span style="font-size:11px;color:var(--muted)">(refreshing…)</span>' : ''}</h3>
-        ${recs.map((r) => `
-          <div class="rec-card">
-            <div>
-              <div class="keys">${escape(r.keywords || '')} ${r.location ? `<span style="font-weight:400;color:var(--muted);font-size:12px">in ${escape(r.location)}</span>` : ''}</div>
-              <div class="why">${escape(r.rationale || '')}</div>
-            </div>
-            <div class="links">
-              <a href="${escape(r.url)}" target="_blank" rel="noreferrer">${escape(r.source)} →</a>
-            </div>
-          </div>
-        `).join('')}
-      </div>` : ''}
-  `;
-}
-
-function rowHtml(j) {
-  return `<div class="list-row" data-job="${escape(j.id)}">
-    <div>
-      <div class="t">${escape(j.title || 'Untitled')}</div>
-      <div class="s">${escape(j.company || '')}${j.location ? ' · ' + escape(j.location) : ''}</div>
-    </div>
-    <span class="pill source">${escape(j.source || 'Manual')}</span>
-    <span class="pill ${j.status}">${STATUS_LABELS[j.status] || j.status}</span>
-  </div>`;
-}
-
-function pageJobs() {
-  const sources = ['all', ...new Set(state.jobs.map((j) => j.source || 'Unknown'))];
-  const filtered = state.jobs.filter((j) => {
-    if (state.filter.status !== 'all' && j.status !== state.filter.status) return false;
-    if (state.filter.source !== 'all' && (j.source || 'Unknown') !== state.filter.source) return false;
-    if (state.filter.search) {
-      const q = state.filter.search.toLowerCase();
-      const hay = `${j.title} ${j.company} ${j.location}`.toLowerCase();
-      if (!hay.includes(q)) return false;
-    }
-    return true;
-  }).sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
-
-  return `
-    <div class="page-h">
-      <div><h1>Applications</h1><div class="sub">${filtered.length} of ${state.jobs.length}</div></div>
-    </div>
-    <div class="toolbar">
-      <input type="text" id="search" placeholder="Search title, company, location…" value="${escape(state.filter.search)}" />
-      <select id="filter-status">
-        <option value="all"${state.filter.status === 'all' ? ' selected' : ''}>All statuses</option>
-        ${STATUSES.map((s) => `<option value="${s}"${state.filter.status === s ? ' selected' : ''}>${STATUS_LABELS[s]}</option>`).join('')}
-      </select>
-      <select id="filter-source">
-        ${sources.map((s) => `<option value="${s}"${state.filter.source === s ? ' selected' : ''}>${s === 'all' ? 'All sources' : s}</option>`).join('')}
-      </select>
-    </div>
-    <div class="card">
-      ${filtered.length === 0 ? `<div class="empty"><strong>No matches.</strong>Try a different filter.</div>` :
-        `<div class="list">${filtered.map(rowHtml).join('')}</div>`}
-    </div>
-  `;
-}
-
-function pageJobDetail() {
-  const j = state.jobs.find((x) => x.id === state.selectedJobId);
-  if (!j) return `<div class="empty"><strong>Job not found.</strong><a href="#/jobs">Back to applications</a></div>`;
-  const order = ['discovered','started','submitted','received','reviewing','recruiter_replied','interview','assessment','offer'];
-  const cur = order.indexOf(j.status);
-  const cache = state.aiResults[j.id] || {};
-  const loading = state.aiLoading[j.id] || {};
-
-  return `
-    <div class="detail-h">
+  const v = el(`<div>
+    <header class="page-header">
       <div>
-        <span class="pill source">${escape(j.source || 'Manual')}</span>
-        <h2>${escape(j.title || 'Untitled')}</h2>
-        <div class="meta">${escape(j.company || '')}${j.location ? ' · ' + escape(j.location) : ''}${j.compensation ? ' · ' + escape(j.compensation) : ''}</div>
+        <div class="page-eyebrow">Ledger</div>
+        <h1 class="page-title">Applications</h1>
+        <div class="page-sub">${rows.length} shown</div>
       </div>
-      <div style="display:flex;gap:8px">
-        ${j.jobUrl ? `<a class="btn" href="${escape(j.jobUrl)}" target="_blank" rel="noreferrer">Open posting</a>` : ''}
-        <button class="btn primary" id="save-detail">Save</button>
-        <button class="btn danger" id="delete">Delete</button>
-        <a class="btn" href="#/jobs">← Back</a>
+      <div class="page-actions">
+        <button class="btn" data-csv>Export CSV</button>
+        <a href="#/applications/new" class="btn primary">+ New application</a>
       </div>
+    </header>
+
+    <div class="toolbar">
+      <input class="input" id="f-q" type="search" placeholder="Search title, company, notes… ( / )" value="${esc(f.q)}" style="max-width:280px" />
+      <select class="select" id="f-status">
+        <option value="all" ${f.status === 'all' ? 'selected' : ''}>All statuses</option>
+        <option value="needs_review" ${f.status === 'needs_review' ? 'selected' : ''}>Needs review ⚠</option>
+        ${STATUSES.map((s) => `<option value="${s.id}" ${f.status === s.id ? 'selected' : ''}>${esc(s.label)}</option>`).join('')}
+      </select>
+      <select class="select" id="f-source">
+        <option value="all">All sources</option>
+        ${allSources.map((s) => `<option value="${esc(s)}" ${f.source === s ? 'selected' : ''}>${esc(s)}</option>`).join('')}
+      </select>
     </div>
 
-    ${(j.aiWarnings && j.aiWarnings.length) ? `
-      <div class="card" style="border-color:rgba(245,158,11,0.4);margin-bottom:14px;background:rgba(245,158,11,0.05)">
-        <strong>⚠ AI flagged ${j.aiWarnings.length} field${j.aiWarnings.length === 1 ? '' : 's'} during capture</strong>
-        <ul style="margin:8px 0 0 18px;font-size:13px">
-          ${j.aiWarnings.map((w) => `<li><strong>${escape(w.field)}</strong>: ${escape(w.issue)}</li>`).join('')}
-        </ul>
-      </div>` : ''}
-
-    <div class="pipeline">
-      ${order.map((s, i) => {
-        const cls = j.status === s ? 'current' : (cur > i && cur >= 0 ? 'passed' : '');
-        return `<button class="${cls}" data-status="${s}">${STATUS_LABELS[s]}</button>`;
-      }).join('')}
+    <div class="bulkbar" id="bulkbar" hidden>
+      <span class="muted" id="bulk-n"></span>
+      <select class="select" id="bulk-status"><option value="">Set status…</option>${statusOptions('')}</select>
+      <button class="btn small" data-bulk-status>Apply</button>
+      <button class="btn small" data-bulk-queue>Queue for auto-apply</button>
+      <span class="right"></span>
+      <button class="btn small" data-bulk-delete>Delete</button>
     </div>
 
-    <div class="grid-2">
-      <div class="card">
-        <h3 style="margin-top:0;font-size:14px">Details</h3>
-        <dl class="dl">
-          <dt>Title</dt><dd><input type="text" id="d-title" value="${escape(j.title)}" /></dd>
-          <dt>Company</dt><dd><input type="text" id="d-company" value="${escape(j.company)}" /></dd>
-          <dt>Location</dt><dd><input type="text" id="d-location" value="${escape(j.location)}" /></dd>
-          <dt>Compensation</dt><dd><input type="text" id="d-comp" value="${escape(j.compensation)}" /></dd>
-          <dt>Work mode</dt><dd><input type="text" id="d-mode" value="${escape(j.workMode)}" /></dd>
-          <dt>Employment</dt><dd><input type="text" id="d-emp" value="${escape(j.employmentType)}" /></dd>
-          <dt>Recruiter</dt><dd><input type="text" id="d-rec" value="${escape(j.recruiterName)}" /></dd>
-          <dt>Source</dt><dd>${escape(j.source || '')}</dd>
-          <dt>External ID</dt><dd style="color:var(--muted);font-size:11px;font-family:ui-monospace,monospace">${escape(j.externalId || j.linkedinJobId || '')}</dd>
-        </dl>
-        <label>Notes</label>
-        <textarea id="d-notes">${escape(j.notes)}</textarea>
-      </div>
+    <section class="section">
+      <div class="table-wrap"><table class="table">
+        <thead><tr>
+          <th style="width:30px"><input type="checkbox" id="sel-all" /></th>
+          ${th('title', 'Title')}${th('company', 'Company')}${th('status', 'Status')}${th('fitScore', 'Fit')}${th('source', 'Source')}${th('createdAt', 'Applied')}${th('updatedAt', 'Updated')}
+        </tr></thead>
+        <tbody>${bodyRows}</tbody>
+      </table></div>
+    </section>
+  </div>`);
 
-      <div class="card">
-        <h3 style="margin-top:0;font-size:14px">✨ AI assistant</h3>
-        ${state.aiStatus?.available ? `
-          <div class="ai-actions">
-            ${aiBtn('summarize', 'Summary', '📋', loading)}
-            ${aiBtn('score', 'Fit score', '🎯', loading)}
-            ${aiBtn('skills', 'Skills', '🧰', loading)}
-            ${aiBtn('coverLetter', 'Cover letter', '✍️', loading)}
-            ${aiBtn('questions', 'Interview Qs', '❓', loading)}
-            ${aiBtn('followup', 'Follow-up', '↩', loading)}
-            ${aiBtn('checklist', 'Checklist', '✅', loading)}
-            ${j.status === 'offer' ? aiBtn('negotiate', 'Negotiate', '💼', loading) : ''}
-          </div>
-          ${aiErrorHtml(j)}
-          ${aiResultHtml(j, cache)}
-        ` : `<div class="empty"><strong>AI not configured.</strong><a href="#/settings">Configure in Settings</a></div>`}
-      </div>
-    </div>
+  // filters
+  const requery = () => { persistFilters(); navigate(); };
+  v.querySelector('#f-q').addEventListener('input', debounce((e) => { f.q = e.target.value.trim(); requery(); }, 350));
+  v.querySelector('#f-status').addEventListener('change', (e) => { f.status = e.target.value; requery(); });
+  v.querySelector('#f-source').addEventListener('change', (e) => { f.source = e.target.value; requery(); });
+  v.querySelectorAll('th[data-sort]').forEach((h) => h.addEventListener('click', () => {
+    const k = h.dataset.sort;
+    if (f.sort === k) f.dir = f.dir === 'asc' ? 'desc' : 'asc';
+    else { f.sort = k; f.dir = k === 'updatedAt' || k === 'createdAt' ? 'desc' : 'asc'; }
+    requery();
+  }));
 
-    ${jobDocumentsSection(j)}
+  // selection / bulk
+  const paintBulk = () => {
+    const bar = v.querySelector('#bulkbar');
+    bar.hidden = state.selection.size === 0;
+    v.querySelector('#bulk-n').textContent = `${state.selection.size} selected`;
+  };
+  v.querySelectorAll('[data-sel]').forEach((cb) => cb.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (cb.checked) state.selection.add(cb.dataset.sel); else state.selection.delete(cb.dataset.sel);
+    paintBulk();
+  }));
+  v.querySelector('#sel-all').addEventListener('click', (e) => {
+    e.stopPropagation();
+    const on = e.target.checked;
+    state.selection = new Set(on ? rows.map((j) => j.id) : []);
+    v.querySelectorAll('[data-sel]').forEach((cb) => { cb.checked = on; });
+    paintBulk();
+  });
+  paintBulk();
 
-    <div class="card" style="margin-top:14px">
-      <h3 style="margin-top:0;font-size:14px">Description</h3>
-      <div style="white-space:pre-wrap;font-size:13px;line-height:1.5;color:var(--muted)">${escape(j.description || '(no description captured)')}</div>
-    </div>
-  `;
-}
+  v.querySelector('[data-bulk-status]').addEventListener('click', async () => {
+    const s = v.querySelector('#bulk-status').value;
+    if (!s || !state.selection.size) return;
+    try {
+      for (const id of state.selection) await api('/jobs/' + encodeURIComponent(id), { method: 'PATCH', body: { status: s, _source: 'manual' } });
+      toast(`Status → ${STATUS_LABEL[s]} for ${state.selection.size}`);
+      state.selection.clear(); navigate();
+    } catch (e) { errToast(e); }
+  });
+  v.querySelector('[data-bulk-queue]').addEventListener('click', async () => {
+    if (!state.selection.size) return;
+    let n = 0;
+    try {
+      for (const id of state.selection) { await api('/queue', { method: 'POST', body: { jobId: id } }); n++; }
+      toast(`Queued ${n} for auto-apply`);
+      state.selection.clear(); navigate();
+    } catch (e) { errToast(e, `Queued ${n}, then failed`); }
+  });
+  v.querySelector('[data-bulk-delete]').addEventListener('click', async () => {
+    if (!state.selection.size) return;
+    const victims = rows.filter((j) => state.selection.has(j.id));
+    try {
+      for (const j of victims) await api('/jobs/' + encodeURIComponent(j.id), { method: 'DELETE' });
+      state.selection.clear();
+      undoToast(`Deleted ${victims.length} application${victims.length === 1 ? '' : 's'}`, async () => {
+        for (const j of victims) await api('/jobs', { method: 'POST', body: { ...j, _manual: true, _source: 'manual' } }).catch(() => {});
+        navigate();
+      });
+      navigate();
+    } catch (e) { errToast(e); }
+  });
 
-function jobDocumentsSection(j) {
-  const linked = state.documents.filter((d) => (d.linkedJobIds || []).includes(j.id));
-  const unlinked = state.documents.filter((d) => !(d.linkedJobIds || []).includes(j.id));
-  const resumeName = j.resumeName || '';
-  const coverName = j.coverLetterName || '';
-  const hasResumeDoc = !resumeName || state.documents.some((d) => d.originalFilename === resumeName || d.name === resumeName);
-  const hasCoverDoc = !coverName || state.documents.some((d) => d.originalFilename === coverName || d.name === coverName);
-  const captured = [];
-  if (resumeName) captured.push({ kind: 'Resume', name: resumeName });
-  if (coverName) captured.push({ kind: 'Cover letter', name: coverName });
-  for (const a of (j.attachments || [])) {
-    if (a.role !== 'resume' && a.role !== 'coverLetter' && a.name && !captured.some((c) => c.name === a.name)) {
-      captured.push({ kind: 'Attachment', name: a.name });
-    }
+  v.querySelector('[data-csv]').addEventListener('click', () => {
+    const cols = ['title', 'company', 'status', 'source', 'location', 'compensation', 'jobUrl', 'fitScore', 'createdAt', 'submittedAt', 'updatedAt', 'notes'];
+    const csv = [cols.join(',')].concat(rows.map((j) =>
+      cols.map((c) => `"${String(j[c] ?? '').replace(/"/g, '""').replace(/\r?\n/g, ' ')}"`).join(','))).join('\n');
+    downloadBlob(new Blob([csv], { type: 'text/csv' }), `jat-applications-${new Date().toISOString().slice(0, 10)}.csv`);
+  });
+
+  v.querySelectorAll('.row-link').forEach((tr) => {
+    tr.style.cursor = 'pointer';
+    tr.addEventListener('click', (e) => {
+      if (e.target.matches('input[type="checkbox"]')) return;
+      location.hash = '#/applications/' + tr.dataset.id;
+    });
+  });
+  return v;
+});
+
+// ============================================================
+// VIEW: Application detail / new (#/applications/:id)
+// ============================================================
+route(/^\/applications\/(?<id>.+)$/, async ({ id }) => {
+  const isNew = id === 'new';
+  let job = null;
+  if (!isNew) {
+    const r = await api('/jobs/' + encodeURIComponent(id));
+    job = r.job;
   }
-  return `
-    <div class="card" style="margin-top:14px">
-      <h3 style="margin-top:0;font-size:14px">📁 Documents</h3>
-      ${captured.length ? `
-        <div style="margin-bottom:10px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:rgba(99,102,241,0.05)">
-          <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted);margin-bottom:6px">Captured from application</div>
-          ${captured.map((c) => `<div style="font-size:13px;display:flex;justify-content:space-between;padding:3px 0">
-            <span><strong>${escape(c.kind)}:</strong> ${escape(c.name)}</span>
-            ${state.documents.some((d) => d.originalFilename === c.name || d.name === c.name) ? `<span style="color:var(--success)">✓ uploaded</span>` : `<span style="color:var(--muted)">filename only</span>`}
+  if (!isNew && !job) {
+    return el(`<div><header class="page-header"><div>
+      <a href="#/applications" class="back-link">← All applications</a>
+      <h1 class="page-title" style="margin-top:10px">Not found</h1>
+    </div></header></div>`);
+  }
+  const events = isNew ? [] : ((await api('/events?jobId=' + encodeURIComponent(id)).catch(() => ({ items: [] }))).items || []);
+  const j = job || {};
+
+  const field = (label, idd, value, ph = '', type = 'text') =>
+    `<div class="form-row"><label class="form-label" for="${idd}">${esc(label)}</label>
+     <div class="form-control"><input class="input" id="${idd}" type="${type}" value="${esc(value ?? '')}" placeholder="${esc(ph)}" /></div></div>`;
+
+  const timelineHtml = events.length ? events.map((e) => `
+    <div class="timeline-item">
+      <div class="timeline-dot"></div>
+      <div>
+        <div class="timeline-title">${esc(e.summary || e.type)}</div>
+        <div class="timeline-sub">${esc(fmtRel(e.timestamp))} · ${esc(e.source || '')}</div>
+      </div>
+    </div>`).join('')
+    : `<div class="empty" style="padding:30px 24px"><div class="empty-sub">${isNew ? 'Save the application to start a timeline.' : 'No events yet.'}</div></div>`;
+
+  const answersRows = Object.entries(j.answers || {}).map(([k, val]) =>
+    `<div class="form-row"><div class="form-label">${esc(k.replace(/_/g, ' '))}</div><div class="form-control muted">${esc(val)}</div></div>`).join('');
+
+  const v = el(`<div>
+    <header class="page-header">
+      <div>
+        <a href="#/applications" class="back-link">← All applications</a>
+        <h1 class="page-title" style="margin-top:10px">${isNew ? 'New application' : esc(j.title || 'Untitled')}</h1>
+        <div class="page-sub">${isNew ? 'Capture the essentials.' : esc(j.company || '') + (j.location ? ' · ' + esc(j.location) : '')}</div>
+      </div>
+      <div class="page-actions">
+        ${isNew ? '' : '<button class="btn" data-delete>Delete</button>'}
+        <button class="btn" data-cancel>Cancel</button>
+        <button class="btn primary" data-save>${isNew ? 'Save application' : 'Save changes'}</button>
+      </div>
+    </header>
+
+    ${j.needsReview ? `<div class="banner"><div class="banner-text">This capture was sparse — check title and company, then mark it reviewed.</div>
+      <button class="btn small" data-reviewed>Looks good</button></div>` : ''}
+
+    <div class="status-line" id="save-status"></div>
+
+    <div class="app-detail">
+      <div>
+        <section class="section">
+          <header class="section-header"><div><div class="section-eyebrow">Job</div><h2 class="section-title">Posting</h2></div></header>
+          ${field('Title', 'f-title', j.title, 'Senior Frontend Engineer')}
+          ${field('Company', 'f-company', j.company, 'Acme Corp')}
+          ${field('Location', 'f-location', j.location, 'Remote · Toronto, ON')}
+          ${field('Compensation', 'f-comp', j.compensation, '$120k–$160k CAD')}
+          ${field('Source', 'f-source', j.source, 'linkedin')}
+          <div class="form-row"><label class="form-label" for="f-url">Job URL</label>
+            <div class="form-control url-row">
+              <input class="input" id="f-url" value="${esc(j.jobUrl || '')}" placeholder="https://…" />
+              ${j.jobUrl ? `<a href="${esc(j.jobUrl)}" target="_blank" rel="noopener" title="Open posting" data-open-url>↗</a>` : ''}
+            </div></div>
+          ${field('Work mode', 'f-mode', j.workMode, 'Remote / Hybrid / On-site')}
+          ${field('Type', 'f-type', j.employmentType, 'Full-time')}
+        </section>
+
+        <section class="section">
+          <header class="section-header"><div><div class="section-eyebrow">Marginalia</div><h2 class="section-title">Notes</h2></div></header>
+          <div class="section-body">
+            <textarea class="input" id="f-notes" rows="6" style="width:100%;resize:vertical" placeholder="Anything worth remembering…">${esc(j.notes || '')}</textarea>
+          </div>
+        </section>
+
+        ${(j.attachments && j.attachments.length) ? `<section class="section">
+          <header class="section-header"><div><div class="section-eyebrow">Files</div><h2 class="section-title">Attachments</h2></div></header>
+          <div class="section-body">
+            ${j.attachments.map((a) => `<div class="kv"><span class="role-badge" data-role="${esc(a.role)}">${esc(a.role)}</span> <strong>${esc(a.name)}</strong> <span class="muted">${a.sizeBytes ? '(' + fmtBytes(a.sizeBytes) + ')' : ''}</span></div>`).join('')}
+          </div>
+        </section>` : ''}
+
+        ${answersRows ? `<section class="section">
+          <header class="section-header"><div><div class="section-eyebrow">Captured</div><h2 class="section-title">Form answers</h2></div></header>
+          ${answersRows}
+        </section>` : ''}
+      </div>
+
+      <div>
+        <section class="section">
+          <header class="section-header"><div><div class="section-eyebrow">Standing</div><h2 class="section-title">Status</h2></div></header>
+          <div class="form-row"><label class="form-label" for="f-status">Status</label>
+            <div class="form-control"><select class="select" id="f-status">${statusOptions(j.status || 'started')}</select></div></div>
+          ${field('Next action', 'f-next', j.nextAction, 'Follow up via email')}
+          ${field('Due', 'f-due', (j.dueAt || '').slice(0, 10), '', 'date')}
+          <div class="form-row"><div class="form-label">Tags</div><div class="form-control" id="f-tags-slot"></div></div>
+          ${j.submittedAt ? `<div class="form-row"><div class="form-label">Submitted</div><div class="form-control muted">${esc(fmtFull(j.submittedAt))}</div></div>` : ''}
+        </section>
+
+        ${isNew ? '' : `<section class="section">
+          <header class="section-header"><div><div class="section-eyebrow">Assistant</div><h2 class="section-title">AI</h2></div></header>
+          <div class="section-body" style="display:flex;flex-wrap:wrap;gap:8px">
+            <button class="btn small" data-ai="fit">Fit score</button>
+            <button class="btn small" data-ai="summarize">Summarize</button>
+            <button class="btn small" data-ai="cover">Cover letter</button>
+            <button class="btn small" data-ai="tailor">Tailor resume</button>
+            <button class="btn small" data-ai="followup">Follow-up draft</button>
+            <button class="btn small" data-ai="queue">Queue auto-apply</button>
+          </div>
+          <div id="fit-slot">${j.fitData ? '' : ''}</div>
+        </section>`}
+
+        <section class="section">
+          <header class="section-header"><div><div class="section-eyebrow">Record</div><h2 class="section-title">Timeline</h2></div></header>
+          <div class="timeline">${timelineHtml}</div>
+        </section>
+      </div>
+    </div>
+  </div>`);
+
+  const tags = chipsInput(j.tags || [], 'Add tag…');
+  v.querySelector('#f-tags-slot').appendChild(tags.node);
+
+  const setStatus = (msg, cls = '') => {
+    const s = v.querySelector('#save-status');
+    s.className = 'status-line ' + cls;
+    s.textContent = msg;
+  };
+
+  const renderFit = (fit, deterministic) => {
+    const slot = v.querySelector('#fit-slot');
+    if (!slot || !fit) return;
+    slot.innerHTML = `<div class="fit-panel">
+      <div class="fit-score-row"><span class="fit-score-big">${esc(fit.score)}</span>
+        <span class="fit-summary">${esc(fit.summary || '')}</span></div>
+      ${fit.strengths?.length ? `<div class="fit-eyebrow">Strengths</div><ul class="fit-list">${fit.strengths.map((s) => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
+      ${fit.gaps?.length ? `<div class="fit-eyebrow">Gaps</div><ul class="fit-list">${fit.gaps.map((s) => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
+      ${deterministic ? `<div class="muted" style="font-size:11px;margin-top:8px">Keyword overlap: ${esc(deterministic.score)}/100</div>` : ''}
+    </div>`;
+  };
+  if (j.fitData?.score != null) renderFit(j.fitData, j.fitData.deterministic);
+
+  if (!isNew) {
+    const reviewed = v.querySelector('[data-reviewed]');
+    if (reviewed) reviewed.addEventListener('click', async () => {
+      try { await api('/jobs/' + encodeURIComponent(id), { method: 'PATCH', body: { needsReview: false } }); navigate(); }
+      catch (e) { errToast(e); }
+    });
+
+    v.querySelector('[data-delete]').addEventListener('click', async () => {
+      try {
+        const snapshot = { ...j };
+        await api('/jobs/' + encodeURIComponent(id), { method: 'DELETE' });
+        location.hash = '#/applications';
+        undoToast('Application deleted', async () => {
+          await api('/jobs', { method: 'POST', body: { ...snapshot, _manual: true, _source: 'manual' } }).catch(() => {});
+          navigate();
+        });
+      } catch (e) { errToast(e); }
+    });
+
+    const aiBusy = async (btn, fn) => {
+      const orig = btn.textContent;
+      btn.disabled = true; btn.textContent = orig + ' …';
+      try { await fn(); } catch (e) { errToast(e); }
+      btn.disabled = false; btn.textContent = orig;
+    };
+    v.querySelectorAll('[data-ai]').forEach((btn) => btn.addEventListener('click', () => aiBusy(btn, async () => {
+      const kind = btn.dataset.ai;
+      if (kind === 'fit') {
+        const r = await api('/ai/fit-score', { method: 'POST', body: { jobId: id }, timeoutMs: 180000 });
+        renderFit(r.result, r.deterministic);
+        toast(`Fit score ${r.result.score} (${r.provider})`);
+      } else if (kind === 'summarize') {
+        const r = await api('/ai/summarize', { method: 'POST', body: { jobId: id }, timeoutMs: 180000 });
+        textModal('Job summary', r.text);
+      } else if (kind === 'cover') {
+        const r = await api('/ai/cover-letter', { method: 'POST', body: { jobId: id }, timeoutMs: 240000 });
+        textModal('Cover letter', r.text, { downloadName: `cover-letter-${(j.company || 'job').replace(/\W+/g, '-')}.txt` });
+      } else if (kind === 'tailor') {
+        const r = await api('/ai/tailor-resume', { method: 'POST', body: { jobId: id }, timeoutMs: 300000 });
+        textModal('Tailored resume', r.text, { downloadName: `resume-${(j.company || 'job').replace(/\W+/g, '-')}.txt` });
+      } else if (kind === 'followup') {
+        const r = await api('/ai/follow-up', { method: 'POST', body: { jobId: id }, timeoutMs: 180000 });
+        textModal('Follow-up email', r.text);
+      } else if (kind === 'queue') {
+        await api('/queue', { method: 'POST', body: { jobId: id } });
+        toast('Queued for auto-apply');
+      }
+    })));
+  }
+
+  v.querySelector('[data-cancel]').addEventListener('click', () => { location.hash = '#/applications'; });
+  v.querySelector('[data-save]').addEventListener('click', async () => {
+    const val = (sel) => v.querySelector(sel).value.trim();
+    const payload = {
+      title: val('#f-title') || null,
+      company: val('#f-company') || null,
+      location: val('#f-location') || null,
+      compensation: val('#f-comp') || null,
+      source: val('#f-source') || null,
+      jobUrl: val('#f-url') || null,
+      workMode: val('#f-mode') || null,
+      employmentType: val('#f-type') || null,
+      notes: v.querySelector('#f-notes').value || null,
+      nextAction: val('#f-next') || null,
+      dueAt: v.querySelector('#f-due').value || null,
+      status: v.querySelector('#f-status').value,
+      tags: tags.get(),
+      _source: 'manual',
+    };
+    if (!payload.title || !payload.company) { setStatus('Title and company are required.', 'bad'); return; }
+    setStatus('Saving…');
+    try {
+      if (isNew) {
+        const r = await api('/jobs', { method: 'POST', body: { ...payload, _manual: true } });
+        location.hash = '#/applications/' + r.job.id;
+      } else {
+        await api('/jobs/' + encodeURIComponent(id), { method: 'PATCH', body: payload });
+        setStatus('Saved ✓', 'ok');
+        setTimeout(navigate, 500);
+      }
+    } catch (e) { setStatus(e.message, 'bad'); }
+  });
+
+  return v;
+});
+
+// ============================================================
+// VIEW: Pipeline kanban (#/pipeline)
+// ============================================================
+route('/pipeline', async () => {
+  const r = await api('/jobs?limit=500');
+  const jobs = r.items || [];
+  const byStatus = {};
+  for (const s of STATUSES) byStatus[s.id] = [];
+  for (const j of jobs) (byStatus[j.status] || (byStatus[j.status] = [])).push(j);
+
+  const GROUPS = { started: 'Pre', submitted: 'Active', contacted: 'Active', interview_1: 'Interviews', interview_2: 'Interviews', interview_final: 'Interviews', offer: 'Closing', hired: 'Closing', rejected: 'Closed', withdrawn: 'Closed', ghosted: 'Closed' };
+
+  const cols = STATUSES.map((s) => `
+    <div class="kb-col" data-status="${s.id}">
+      <div class="kb-group">${esc(GROUPS[s.id] || '')}</div>
+      <div class="kb-head" data-status="${s.id}"><span style="display:flex;align-items:center;gap:8px"><span class="dot"></span>${esc(s.label)}</span><span class="n">${byStatus[s.id].length}</span></div>
+      <div class="kb-body">
+        ${byStatus[s.id].map((j) => `
+          <div class="kb-card" draggable="true" data-id="${esc(j.id)}">
+            <div class="t">${esc(j.title || 'Untitled')}</div>
+            <div class="c">${esc(j.company || '')}</div>
+            <div class="kb-meta">${fitBadgeHtml(j.fitScore)}<span>${esc(daysIn(j.updatedAt))}</span></div>
           </div>`).join('')}
-        </div>
-      ` : ''}
-      ${linked.length === 0 ? `<div class="empty" style="margin-bottom:10px">No documents linked to this application yet.</div>` : `
-        <div class="doc-grid" style="margin-bottom:10px">
-          ${linked.map(docCardHtml).join('')}
-        </div>
-      `}
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <select id="link-doc-select" style="flex:1;min-width:200px">
-          <option value="">— Link existing document… —</option>
-          ${unlinked.map((d) => `<option value="${escape(d.id)}">${escape(d.name)} (${escape(DOC_TYPE_LABEL[d.type] || d.type)})</option>`).join('')}
-        </select>
-        <button class="btn primary" id="link-doc-btn" data-job-id="${escape(j.id)}">Link</button>
-        <a class="btn" href="#/documents">Manage all →</a>
       </div>
-      ${!hasResumeDoc ? `
-        <div style="margin-top:10px;padding:10px;border:1px dashed var(--border);border-radius:8px;display:flex;gap:8px;align-items:center;justify-content:space-between">
-          <div style="font-size:13px">Application references resume <strong>${escape(resumeName)}</strong> but no file is uploaded.</div>
-          <button class="btn small" id="upload-resume-btn" data-job-id="${escape(j.id)}" data-doc-type="resume" data-name="${escape(resumeName)}">Upload this resume</button>
-        </div>
-      ` : ''}
-      ${!hasCoverDoc ? `
-        <div style="margin-top:10px;padding:10px;border:1px dashed var(--border);border-radius:8px;display:flex;gap:8px;align-items:center;justify-content:space-between">
-          <div style="font-size:13px">Application references cover letter <strong>${escape(coverName)}</strong> but no file is uploaded.</div>
-          <button class="btn small" id="upload-cover-btn" data-job-id="${escape(j.id)}" data-doc-type="coverLetter" data-name="${escape(coverName)}">Upload this cover letter</button>
-        </div>
-      ` : ''}
-      <input type="file" id="job-doc-upload" style="display:none" />
-    </div>
-  `;
-}
+    </div>`).join('');
 
-function fmtSize(bytes) {
-  if (!bytes && bytes !== 0) return '—';
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
-}
-function fmtDocDate(iso) {
-  if (!iso) return '';
-  try { return new Date(iso).toLocaleDateString(); } catch { return ''; }
-}
-function fileInitials(d) {
-  const fname = d.originalFilename || d.name || '';
-  const idx = fname.lastIndexOf('.');
-  if (idx >= 0 && idx < fname.length - 1) {
-    const ext = fname.slice(idx + 1).toUpperCase();
-    if (ext.length <= 4) return ext;
-  }
-  return (d.type || 'DOC').slice(0, 3).toUpperCase();
-}
-function docCardHtml(d) {
-  const linkedCount = (d.linkedJobIds || []).length;
-  return `
-    <div class="doc-card" data-doc-id="${escape(d.id)}">
-      <div class="doc-thumb">${escape(fileInitials(d))}</div>
-      <div class="doc-meta">
-        <strong title="${escape(d.name)}">${escape(d.name)}</strong>
-        <div class="row"><span class="pill source">${escape(DOC_TYPE_LABEL[d.type] || d.type || 'other')}</span><span class="muted">${fmtSize(d.sizeBytes)}</span></div>
-        <div class="muted">Uploaded ${escape(fmtDocDate(d.createdAt))}${linkedCount ? ` · linked to ${linkedCount} job${linkedCount === 1 ? '' : 's'}` : ''}</div>
+  const v = el(`<div>
+    <header class="page-header">
+      <div>
+        <div class="page-eyebrow">Board</div>
+        <h1 class="page-title">Pipeline</h1>
+        <div class="page-sub">Drag a card to change its status.</div>
       </div>
-      <div class="doc-actions">
-        <button class="btn small" data-doc-open="${escape(d.id)}">Open</button>
-        <button class="btn small" data-doc-download="${escape(d.id)}">Download</button>
-        <button class="btn small" data-doc-edit="${escape(d.id)}">Edit</button>
-        <button class="btn small danger" data-doc-delete="${escape(d.id)}">Delete</button>
-      </div>
-    </div>
-  `;
-}
+      <div class="page-actions"><button class="btn" data-refresh>Refresh</button></div>
+    </header>
+    <div class="kanban">${cols}</div>
+  </div>`);
 
-function pageDocuments() {
-  const docs = [...state.documents].sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
-  const tracked = new Map();
-  for (const j of state.jobs) {
-    if (j.resumeName) {
-      const exists = state.documents.some((d) => d.originalFilename === j.resumeName || d.name === j.resumeName);
-      if (!exists) {
-        const k = `resume|${j.resumeName}`;
-        if (!tracked.has(k)) tracked.set(k, { name: j.resumeName, type: 'resume', jobs: [] });
-        tracked.get(k).jobs.push(j);
+  v.querySelector('[data-refresh]').addEventListener('click', navigate);
+  v.querySelectorAll('.kb-card').forEach((card) => {
+    card.addEventListener('dragstart', (e) => {
+      e.dataTransfer.setData('text/plain', card.dataset.id);
+      e.dataTransfer.effectAllowed = 'move';
+      card.classList.add('dragging');
+    });
+    card.addEventListener('dragend', () => card.classList.remove('dragging'));
+    card.addEventListener('click', () => { location.hash = '#/applications/' + card.dataset.id; });
+  });
+  v.querySelectorAll('.kb-col').forEach((col) => {
+    col.addEventListener('dragover', (e) => { e.preventDefault(); col.classList.add('dragover'); });
+    col.addEventListener('dragleave', () => col.classList.remove('dragover'));
+    col.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      col.classList.remove('dragover');
+      const jobId = e.dataTransfer.getData('text/plain');
+      const status = col.dataset.status;
+      if (!jobId || !status) return;
+      try {
+        await api('/jobs/' + encodeURIComponent(jobId), { method: 'PATCH', body: { status, _source: 'manual' } });
+        navigate();
+      } catch (err) { errToast(err); }
+    });
+  });
+  return v;
+});
+
+// ============================================================
+// VIEW: Auto-apply queue (#/queue)
+// ============================================================
+route('/queue', async () => {
+  const [settings, queueR] = await Promise.all([getSettings(true), api('/queue')]);
+  const aa = settings.autoApply;
+  const tasks = queueR.items || [];
+  const groups = new Map(QUEUE_STATE_ORDER.map((s) => [s, []]));
+  for (const t of tasks) (groups.get(t.state) || groups.set(t.state, []).get(t.state)).push(t);
+
+  const qc = (label, html) => `<div class="qc-field"><span class="qc-label form-label">${esc(label)}</span>${html}</div>`;
+
+  const taskCard = (t) => `
+    <div class="task-card" data-task="${esc(t.id)}">
+      <div class="task-head">
+        <span class="task-title">${esc(t.job?.title || '?')} <span class="muted">· ${esc(t.job?.company || '')}</span></span>
+        <span class="state-chip" data-state="${esc(t.state)}">${esc(QUEUE_STATE_LABEL[t.state] || t.state)}</span>
+      </div>
+      <div class="task-sub">${esc(t.mode)} mode · ${esc(t.attempts)} attempt${t.attempts === 1 ? '' : 's'} · updated ${esc(fmtRel(t.updatedAt))}</div>
+      ${t.lastError ? `<div class="task-err">${esc(t.lastError)}</div>` : ''}
+      <div class="task-actions">
+        ${['failed', 'skipped', 'awaiting_input'].includes(t.state) ? '<button class="btn small" data-act="retry">Retry</button>' : ''}
+        ${['queued', 'scheduled', 'running'].includes(t.state) ? '<button class="btn small" data-act="cancel">Cancel</button>' : ''}
+        ${t.transcript?.length ? '<button class="btn small" data-act="transcript">Transcript</button>' : ''}
+        ${t.job?.jobUrl ? `<a class="btn small" href="${esc(t.job.jobUrl)}" target="_blank" rel="noopener">Open job</a>` : ''}
+        <button class="btn small" data-act="delete">Remove</button>
+      </div>
+      <div class="transcript" hidden><div class="transcript-entries">
+        ${(t.transcript || []).map((e2) => `<div class="tr-line"><span class="tr-ts">${esc((e2.ts || '').slice(11, 19))}</span><span class="tr-body ${esc(e2.level || '')}">${esc(e2.text || e2.note || JSON.stringify(e2))}</span></div>`).join('')}
+      </div></div>
+    </div>`;
+
+  const groupsHtml = [...groups.entries()]
+    .filter(([, list]) => list.length)
+    .map(([s, list]) => `<div class="queue-group-head"><span>${esc(QUEUE_STATE_LABEL[s] || s)}</span><span class="n">${list.length}</span></div>${list.map(taskCard).join('')}`)
+    .join('') || emptyHtml('Idle', 'Nothing queued', 'Queue a job from its detail page, or select rows in Applications.');
+
+  const v = el(`<div>
+    <header class="page-header">
+      <div>
+        <div class="page-eyebrow">Automate</div>
+        <h1 class="page-title">Auto-apply</h1>
+        <div class="page-sub">Paced, review-first, always stoppable.</div>
+      </div>
+      <div class="page-actions">
+        <button class="btn" data-stop-all>⏹ Stop everything</button>
+        <button class="btn primary" data-save>Save settings</button>
+      </div>
+    </header>
+
+    <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">Engine</div><h2 class="section-title">Pacing</h2></div></header>
+      <div class="queue-controls section-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:16px">
+        ${qc('Master switch', `<label class="toggle"><input type="checkbox" id="aa-enabled" ${aa.enabled ? 'checked' : ''} /><span class="knob"></span></label>`)}
+        ${qc('Mode', `<select class="select" id="aa-mode">
+          <option value="review" ${aa.mode === 'review' ? 'selected' : ''}>Review — stop before submit</option>
+          <option value="auto" ${aa.mode === 'auto' ? 'selected' : ''}>Auto — submit for me</option>
+        </select>`)}
+        ${qc('Max / day', `<input class="input" id="aa-day" type="number" min="1" max="50" value="${aa.maxPerDay}" />`)}
+        ${qc('Max / hour', `<input class="input" id="aa-hour" type="number" min="1" max="10" value="${aa.maxPerHour}" />`)}
+        ${qc('Gap min (min)', `<input class="input" id="aa-gmin" type="number" min="1" max="180" value="${aa.minGapMinutes}" />`)}
+        ${qc('Gap max (min)', `<input class="input" id="aa-gmax" type="number" min="1" max="360" value="${aa.maxGapMinutes}" />`)}
+        ${qc('Window start', `<input class="input" id="aa-ws" type="time" value="${esc(aa.windowStart)}" />`)}
+        ${qc('Window end', `<input class="input" id="aa-we" type="time" value="${esc(aa.windowEnd)}" />`)}
+      </div>
+      <div class="section-footer muted">The extension checks for due tasks about once a minute while Chrome is open. Review mode fills everything and waits for you at the final submit.</div>
+    </section>
+
+    <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">Queue</div><h2 class="section-title">Tasks</h2></div></header>
+      ${groupsHtml}
+    </section>
+  </div>`);
+
+  v.querySelector('[data-save]').addEventListener('click', async () => {
+    try {
+      await api('/settings', {
+        method: 'PATCH',
+        body: { autoApply: {
+          enabled: v.querySelector('#aa-enabled').checked,
+          mode: v.querySelector('#aa-mode').value,
+          maxPerDay: Number(v.querySelector('#aa-day').value) || 5,
+          maxPerHour: Number(v.querySelector('#aa-hour').value) || 2,
+          minGapMinutes: Number(v.querySelector('#aa-gmin').value) || 8,
+          maxGapMinutes: Number(v.querySelector('#aa-gmax').value) || 25,
+          windowStart: v.querySelector('#aa-ws').value || '10:00',
+          windowEnd: v.querySelector('#aa-we').value || '18:00',
+        } },
+      });
+      state.settings = null;
+      toast('Auto-apply settings saved');
+    } catch (e) { errToast(e); }
+  });
+
+  v.querySelector('[data-stop-all]').addEventListener('click', async () => {
+    try {
+      await api('/settings', { method: 'PATCH', body: { autoApply: { enabled: false } } });
+      for (const t of tasks) {
+        if (['queued', 'scheduled', 'running'].includes(t.state)) {
+          await api('/queue/' + encodeURIComponent(t.id), { method: 'PATCH', body: { state: 'skipped', transcriptAppend: { note: 'stop-all from dashboard' } } });
+        }
       }
-    }
-    if (j.coverLetterName) {
-      const exists = state.documents.some((d) => d.originalFilename === j.coverLetterName || d.name === j.coverLetterName);
-      if (!exists) {
-        const k = `coverLetter|${j.coverLetterName}`;
-        if (!tracked.has(k)) tracked.set(k, { name: j.coverLetterName, type: 'coverLetter', jobs: [] });
-        tracked.get(k).jobs.push(j);
-      }
-    }
-  }
-  const trackedList = Array.from(tracked.values());
+      state.settings = null;
+      toast('Auto-apply stopped — master switch off');
+      navigate();
+    } catch (e) { errToast(e); }
+  });
 
-  return `
-    <div class="page-h">
-      <div><h1>📁 Documents</h1><div class="sub">${docs.length} file${docs.length === 1 ? '' : 's'} stored locally. Resumes, cover letters, transcripts, portfolios.</div></div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn primary" id="doc-upload-btn">+ Upload</button>
-        <button class="btn" id="doc-folder-btn" title="Bulk-import every document inside a folder">📂 Import folder</button>
-        ${state.profile?.firstName === 'Pierre' ? `<button class="btn" id="doc-pierre-btn" title="Select C:\\Users\\${escape(state.profile?.firstName || 'pierr')}\\Desktop\\Importing\\Resume — Chrome can't open it directly, you must pick it once.">📁 My resumes (Pierre)</button>` : ''}
-        <input type="file" id="doc-upload-input" multiple style="display:none" />
-        <input type="file" id="doc-folder-upload" webkitdirectory directory multiple style="display:none" />
-      </div>
-    </div>
+  v.querySelectorAll('.task-card').forEach((card) => {
+    const taskId = card.dataset.task;
+    card.querySelectorAll('[data-act]').forEach((btn) => btn.addEventListener('click', async () => {
+      const act = btn.dataset.act;
+      try {
+        if (act === 'transcript') {
+          const t2 = card.querySelector('.transcript');
+          t2.hidden = !t2.hidden;
+          return;
+        }
+        if (act === 'retry') await api('/queue/' + encodeURIComponent(taskId), { method: 'PATCH', body: { state: 'queued', lastError: null } });
+        if (act === 'cancel') await api('/queue/' + encodeURIComponent(taskId), { method: 'PATCH', body: { state: 'skipped' } });
+        if (act === 'delete') await api('/queue/' + encodeURIComponent(taskId), { method: 'DELETE' });
+        navigate();
+      } catch (e) { errToast(e); }
+    }));
+  });
 
-    ${docs.length === 0 ? `
-      <div class="card"><div class="empty"><strong>No documents yet.</strong>Upload your resume, cover letters, transcripts, or portfolio files. They're stored locally in your browser and can be linked to specific applications.</div></div>
-    ` : `
-      <div class="doc-grid">
-        ${docs.map(docCardHtml).join('')}
-      </div>
-    `}
+  return v;
+});
 
-    ${trackedList.length > 0 ? `
-      <div class="card" style="margin-top:14px">
-        <h3 style="margin-top:0;font-size:14px">Auto-tracked from applications</h3>
-        <p style="color:var(--muted);font-size:13px;margin:0 0 10px">These filenames were captured from past applications but aren't uploaded yet. Upload them so you can re-use and version them.</p>
-        ${trackedList.map((t) => `
-          <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;border-bottom:1px solid var(--border);gap:8px">
-            <div>
-              <strong>${escape(t.name)}</strong>
-              <div style="color:var(--muted);font-size:12px">${escape(DOC_TYPE_LABEL[t.type])} · referenced by ${t.jobs.length} application${t.jobs.length === 1 ? '' : 's'}</div>
-            </div>
-            <button class="btn small" data-tracked-upload="${escape(t.name)}" data-tracked-type="${escape(t.type)}">Upload now</button>
-          </div>
-        `).join('')}
-      </div>
-    ` : ''}
-  `;
-}
-
-function aiBtn(feature, label, icon, loading) {
-  return `<button class="ai-action-btn" data-ai="${feature}" ${loading[feature] ? 'disabled' : ''}>
-    <span class="ico">${icon}</span>${loading[feature] ? '…' : label}
-  </button>`;
-}
-
-function aiErrorHtml(j) {
-  const errs = (state.aiErrors || {})[j.id] || {};
-  const last = (state.aiResults[j.id] || {})._last;
-  if (!last || !errs[last]) return '';
-  const msg = errs[last];
-  const isCors = /cors|origin|403/i.test(msg);
-  const isNoModel = /not found|pull /i.test(msg);
-  const isUnreach = /reach|running|cannot/i.test(msg);
-  return `
-    <div style="padding:12px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.4);border-radius:8px;margin-top:8px">
-      <div style="font-size:13px;color:#fca5a5;margin-bottom:6px"><strong>AI failed</strong> on "${escape(last)}":</div>
-      <div style="font-size:12px;font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;line-height:1.4">${escape(msg)}</div>
-      <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">
-        <button class="btn small primary" data-ai-retry="${escape(last)}" data-ai-job="${escape(j.id)}">↻ Retry</button>
-        ${(isCors || isNoModel || isUnreach) ? `<a class="btn small" href="#/ai">Open AI Setup Wizard →</a>` : ''}
-      </div>
-    </div>
-  `;
-}
-
-function aiResultHtml(j, cache) {
-  const last = cache._last;
-  if (!last || !cache[last]) return '';
-  const result = cache[last];
-  if (Array.isArray(result)) {
-    if (last === 'skills') return `<div>${result.map((s) => `<span class="ai-pill">${escape(s)}</span>`).join('')}</div>`;
-    if (last === 'questions') return `<div class="ai-output">${result.map((q, i) => `${i + 1}. ${escape(q)}`).join('\n')}</div>`;
-    if (last === 'checklist') return `<div class="ai-output">${result.map((it, i) => `${i + 1}. ${escape(it.label)}${it.rationale ? '\n   ' + escape(it.rationale) : ''}`).join('\n\n')}</div>`;
-    return `<div class="ai-output">${escape(JSON.stringify(result, null, 2))}</div>`;
-  }
-  if (typeof result === 'object' && result !== null) {
-    if (last === 'score') return `<div class="ai-output"><strong>Score: ${result.score}/100</strong>\n${result.summary || ''}\n\nStrengths:\n${(result.strengths || []).map((s) => '• ' + s).join('\n')}\n\nGaps:\n${(result.gaps || []).map((s) => '• ' + s).join('\n')}</div>`;
-    if (last === 'negotiate') return `<div class="ai-output"><strong>Anchor:</strong> ${result.anchor || ''}\n\n<strong>Talking points:</strong>\n${(result.talkingPoints || []).map((p) => '• ' + p).join('\n')}\n\n<strong>Watch outs:</strong>\n${(result.watchOuts || []).map((p) => '• ' + p).join('\n')}\n\n<strong>Draft email:</strong>\n${result.draftEmail || ''}</div>`;
-    return `<div class="ai-output">${escape(JSON.stringify(result, null, 2))}</div>`;
-  }
-  return `<div class="ai-output">${escape(String(result))}</div>`;
-}
-
+// ============================================================
+// VIEW: Profile (#/profile)
+// ============================================================
 const PROFILE_FIELDS = [
-  { sec: 'Identity', fields: [
-    ['firstName', 'First name'], ['lastName', 'Last name'], ['preferredName', 'Preferred name'], ['pronouns', 'Pronouns'],
-  ]},
-  { sec: 'Contact', fields: [
-    ['email', 'Primary email'], ['secondaryEmail', 'Secondary email'], ['phone', 'Phone'],
-  ]},
-  { sec: 'Address', fields: [
-    ['address1', 'Address 1'], ['address2', 'Address 2'], ['city', 'City'], ['state', 'State / Province'], ['postalCode', 'Postal code'], ['country', 'Country'],
-  ]},
-  { sec: 'Online', fields: [
-    ['linkedinUrl', 'LinkedIn URL'], ['githubUrl', 'GitHub URL'], ['portfolioUrl', 'Portfolio URL'], ['websiteUrl', 'Website'], ['twitterUrl', 'Twitter / X'],
-  ]},
-  { sec: 'Eligibility', fields: [
-    ['workAuthorization', 'Work authorization'], ['sponsorshipRequired', 'Need sponsorship?'], ['citizenship', 'Citizenship'], ['securityClearance', 'Security clearance'],
-  ]},
-  { sec: 'Compensation & availability', fields: [
-    ['salaryExpectation', 'Salary expectation'], ['salaryMin', 'Salary min'], ['salaryMax', 'Salary max'], ['currency', 'Currency'],
-    ['yearsExperience', 'Years experience'], ['noticePeriod', 'Notice period'], ['earliestStartDate', 'Earliest start date'], ['willRelocate', 'Willing to relocate'], ['willTravel', 'Travel %'],
-  ]},
-  { sec: 'Education', fields: [
-    ['highestDegree', 'Highest degree'], ['university', 'University'], ['major', 'Major / field'], ['graduationYear', 'Graduation year'], ['gpa', 'GPA'],
-  ]},
-  { sec: 'Demographics (optional, for EEO forms)', fields: [
-    ['gender', 'Gender'], ['ethnicity', 'Ethnicity'], ['veteranStatus', 'Veteran status'], ['disabilityStatus', 'Disability status'],
-  ]},
-  { sec: 'Resume / cover letter', fields: [
-    ['defaultResumeName', 'Default resume name'], ['defaultCoverLetterName', 'Default cover letter name'],
-  ]},
+  ['firstName', 'First name'], ['lastName', 'Last name'], ['fullName', 'Full name'],
+  ['preferredName', 'Preferred name'], ['pronouns', 'Pronouns'],
+  ['email', 'Email'], ['phone', 'Phone'],
+  ['address1', 'Address'], ['address2', 'Address 2'], ['city', 'City'],
+  ['state', 'Province / State'], ['postalCode', 'Postal code'], ['country', 'Country'],
+  ['linkedinUrl', 'LinkedIn URL'], ['githubUrl', 'GitHub URL'], ['portfolioUrl', 'Portfolio URL'],
+  ['workAuthorization', 'Work authorization'], ['sponsorshipRequired', 'Needs sponsorship'],
+  ['citizenship', 'Citizenship'], ['securityClearance', 'Security clearance'],
+  ['salaryExpectation', 'Salary expectation'], ['yearsExperience', 'Years of experience'],
+  ['noticePeriod', 'Notice period / start date'],
+  ['highestDegree', 'Highest degree'], ['university', 'University'],
+  ['major', 'Field of study'], ['graduationYear', 'Graduation year'],
+  ['headline', 'Headline'],
 ];
 
-function pageProfile() {
-  const p = state.profile;
-  const ans = state.answers || [];
-  return `
-    <div class="page-h">
-      <div><h1>Profile &amp; Answers</h1><div class="sub">Used for AI features and universal autofill across all sites. Your custom answers are auto-learned as you apply.</div></div>
-      <div style="display:flex;gap:8px">
-        <button class="btn primary" id="p-save">Save profile</button>
-        ${state.aiStatus?.available ? `<button class="btn" id="p-resume">✨ Parse resume with AI</button>` : ''}
-      </div>
-    </div>
-    <div class="card">
-      ${PROFILE_FIELDS.map((sec) => `
-        <h3 style="margin:18px 0 4px;font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em">${sec.sec}</h3>
-        <div class="grid-2">
-          ${sec.fields.map(([k, label]) => `
-            <div><label>${escape(label)}</label><input type="text" id="p-${k}" value="${escape(p[k] ?? '')}" /></div>
-          `).join('')}
-        </div>
-      `).join('')}
-      <h3 style="margin:18px 0 4px;font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em">Headline &amp; summary</h3>
-      <label>Headline</label><input type="text" id="p-headline" value="${escape(p.headline || '')}" />
-      <label>Summary (1-3 sentences for AI fit scoring)</label>
-      <textarea id="p-summary">${escape(p.summary || '')}</textarea>
-    </div>
-
-    <div class="card" style="margin-top:14px">
-      <h3 style="margin-top:0;font-size:14px">Learned answers <span style="font-weight:400;color:var(--muted);font-size:12px">(${ans.length} captured)</span></h3>
-      <p style="color:var(--muted);font-size:13px;margin:0 0 12px">When you fill in custom application questions, the answer is saved here so the next time you see a similar question — even on a different site or in another language — autofill will offer it.</p>
-      ${ans.length === 0 ? `<div class="empty">Nothing captured yet. Answers are recorded when you submit applications on supported sites.</div>` : `
-        <div style="max-height:400px;overflow-y:auto">
-          ${ans.slice(0, 50).map((a) => `
-            <div style="padding:10px;border-bottom:1px solid var(--border)">
-              <div style="font-weight:600;font-size:13px">${escape((a.questions && a.questions[0]) || a.key)}</div>
-              <div style="margin-top:4px;color:var(--muted);font-size:12px">→ ${escape(a.answer)}</div>
-              <div style="margin-top:4px;font-size:10px;color:var(--muted)">seen ${a.seenCount}x · sources: ${(a.sources || []).join(', ') || 'unknown'} <button class="btn small" data-del-answer="${escape(a.key)}" style="float:right">Delete</button></div>
-            </div>
-          `).join('')}
-        </div>
-      `}
-    </div>
-  `;
-}
-
-function pageSettings() {
-  const s = state.settings;
-  const currentTheme = s.theme || 'midnight';
-  return `
-    <div class="page-h"><div><h1>Settings</h1><div class="sub">Themes, AI providers, follow-ups, notifications.</div></div></div>
-
-    <div class="card">
-      <h3 style="margin-top:0;font-size:14px">🎨 Theme <span style="font-weight:400;color:var(--muted);font-size:12px">${THEMES.length} built-in</span></h3>
-      <div class="theme-grid">
-        ${THEMES.map((t) => `
-          <div class="theme-card${t.id === currentTheme ? ' active' : ''}" data-theme="${t.id}">
-            <div class="badge-mode">${t.mode}</div>
-            <div class="swatch">
-              <span style="background:${t.vars.bg}"></span>
-              <span style="background:${t.vars.primary}"></span>
-              <span style="background:${t.vars.primary2}"></span>
-              <span style="background:${t.vars.success}"></span>
-            </div>
-            <strong><span class="ico">${t.icon}</span>${escape(t.name)}</strong>
-          </div>
-        `).join('')}
-      </div>
-    </div>
-
-    <div class="card" style="margin-top:14px">
-      <h3 style="margin-top:0;font-size:14px">🖼️ Toolbar icon <span style="font-weight:400;color:var(--muted);font-size:12px">${ICON_PRESETS.length} presets · or upload your own</span></h3>
-      <div class="icon-grid">
-        <div class="icon-card${!s.iconPreset && !s.iconCustomDataUrl ? ' active' : ''}" data-icon-preset="">
-          <div class="icon-thumb" style="background:linear-gradient(135deg,#6366f1,#8b5cf6);display:flex;align-items:center;justify-content:center;color:white;font-weight:700">JAT</div>
-          <strong>Default</strong>
-        </div>
-        ${ICON_PRESETS.map((p) => `
-          <div class="icon-card${s.iconPreset === p.id ? ' active' : ''}" data-icon-preset="${escape(p.id)}" title="${escape(p.name)}">
-            <img class="icon-thumb" src="${presetToSvgDataUrl(p, 64)}" alt="${escape(p.name)}" />
-            <strong>${escape(p.name)}</strong>
-          </div>
-        `).join('')}
-      </div>
-      <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
-        <button class="btn" id="icon-upload-btn">Upload custom icon</button>
-        <input type="file" id="icon-upload" accept="image/*" style="display:none" />
-        ${s.iconCustomDataUrl ? `<img src="${s.iconCustomDataUrl}" style="width:32px;height:32px;border-radius:6px;border:1px solid var(--border)" /> <button class="btn small danger" id="icon-clear">Clear custom</button>` : ''}
-      </div>
-    </div>
-
-    <div class="card" style="margin-top:14px">
-      <h3 style="margin-top:0;font-size:14px">✨ AI provider</h3>
-      <p style="color:var(--muted);font-size:13px;margin:0 0 10px">Default is Ollama with <strong>gemma4:e4b</strong> (local, free, private). To use it: install <a href="https://ollama.com" target="_blank" rel="noreferrer" style="color:var(--primary)">Ollama</a>, then run <code style="background:var(--bg);padding:2px 6px;border-radius:4px">ollama pull gemma4:e4b</code>. The extension will auto-detect when Ollama is running.</p>
-      <div class="field"><label>Provider</label>
-        <select id="s-aiProvider">
-          ${['ollama', 'auto', 'chrome', 'openai', 'none'].map((v) => `<option value="${v}"${s.aiProvider === v ? ' selected' : ''}>${v}${v === 'ollama' ? ' (recommended — local)' : ''}</option>`).join('')}
-        </select>
-      </div>
-      <div class="grid-2">
-        <div><label>Ollama URL</label><input type="url" id="s-ollamaUrl" value="${escape(s.ollamaUrl)}" placeholder="http://localhost:11434" /></div>
-        <div><label>Ollama model</label><input type="text" id="s-ollamaModel" value="${escape(s.ollamaModel)}" placeholder="gemma4:e4b" /></div>
-        <div><label>OpenAI base URL</label><input type="url" id="s-openaiBaseUrl" value="${escape(s.openaiBaseUrl)}" /></div>
-        <div><label>OpenAI model</label><input type="text" id="s-openaiModel" value="${escape(s.openaiModel)}" /></div>
-        <div style="grid-column:1/-1"><label>OpenAI API key</label><input type="text" id="s-openaiKey" value="${escape(s.openaiKey)}" placeholder="sk-…" /></div>
-      </div>
-      <div class="field"><label><input type="checkbox" id="s-aiValidateCaptures" ${s.aiValidateCaptures ? 'checked' : ''}/> AI sanity-checks captured fields</label></div>
-      <button class="btn primary" id="s-save">Save settings</button>
-      <button class="btn" id="s-test-ai" style="margin-left:8px">Test AI connection</button>
-      <span id="s-ai-test-out" style="margin-left:12px;font-size:12px"></span>
-    </div>
-    <div class="card" style="margin-top:14px">
-      <h3 style="margin-top:0;font-size:14px">Follow-ups</h3>
-      <div class="field"><label>Default follow-up after (days)</label><input type="number" id="s-defaultFollowUpDays" value="${s.defaultFollowUpDays}" min="1" max="60" /></div>
-      <div class="field"><label><input type="checkbox" id="s-notificationsEnabled" ${s.notificationsEnabled ? 'checked' : ''}/> Desktop notifications when follow-up due</label></div>
-      <button class="btn primary" id="s-save2">Save</button>
-    </div>
-  `;
-}
-
-function statusPill() {
-  const a = state.aiStatus;
-  if (a?.available) return `<span class="status-pill ok">✓ ${escape(a.provider)} ready</span>`;
-  return `<span class="status-pill bad">✗ ${escape(a?.reason || 'not connected')}</span>`;
-}
-
-function codeBlock(code) {
-  return `<div class="code-block"><code>${escape(code)}</code><button class="btn small copy-btn" data-copy="${escape(code)}">Copy</button></div>`;
-}
-
-function wizSteps(current) {
-  const steps = [
-    { n: 1, label: 'Pick provider' },
-    { n: 2, label: 'Configure' },
-    { n: 3, label: 'Try it' },
-  ];
-  return `<div class="wiz-steps">${steps.map((s) => `
-    <div class="wiz-step${s.n === current ? ' wiz-active' : ''}${s.n < current ? ' wiz-done' : ''}">
-      <div class="wiz-step-num">${s.n < current ? '✓' : s.n}</div>
-      <div class="wiz-step-label">${s.label}</div>
-    </div>${s.n < steps.length ? '<div class="wiz-step-bar"></div>' : ''}`).join('')}</div>`;
-}
-
-function pageAi() {
-  const step = state.aiWizardStep || 1;
-  const provider = state.settings.aiProvider || 'ollama';
-
-  let body = '';
-  if (step === 1) {
-    body = `
-      <div class="card">
-        <h3 style="margin-top:0">Choose an AI provider</h3>
-        <p style="color:var(--muted);font-size:13px;margin:0 0 14px">All AI features run through your chosen provider. You can change this any time.</p>
-        <div class="wiz-cards">
-          <div class="wiz-card${provider === 'ollama' ? ' wiz-card-active' : ''}" data-pick-provider="ollama">
-            <div class="wiz-card-icon">🦙</div>
-            <strong>Ollama</strong>
-            <small>Local · free · private</small>
-            <span class="wiz-badge">Recommended</span>
-            <p>Runs on your machine. No API keys, no data leaves your computer.</p>
-          </div>
-          <div class="wiz-card${provider === 'openai' ? ' wiz-card-active' : ''}" data-pick-provider="openai">
-            <div class="wiz-card-icon">🔌</div>
-            <strong>OpenAI (or compatible)</strong>
-            <small>API key · paid</small>
-            <p>Use OpenAI, Groq, Together, or any OpenAI-compatible endpoint.</p>
-          </div>
-          <div class="wiz-card${provider === 'chrome' ? ' wiz-card-active' : ''}" data-pick-provider="chrome">
-            <div class="wiz-card-icon">🧪</div>
-            <strong>Chrome built-in</strong>
-            <small>Gemini Nano · experimental</small>
-            <p>Uses Chrome's built-in on-device model. Requires recent Chrome and a flag.</p>
-          </div>
-        </div>
-      </div>`;
-  } else if (step === 2) {
-    if (provider === 'ollama') {
-      body = `
-        <div class="card">
-          <h3 style="margin-top:0">Set up Ollama</h3>
-          <ol style="font-size:13px;line-height:1.8;color:var(--text);padding-left:20px">
-            <li>Install Ollama from <a href="https://ollama.com/download" target="_blank" rel="noreferrer" style="color:var(--primary)">ollama.com/download</a>.</li>
-            <li>Pull the recommended model:</li>
-          </ol>
-          ${codeBlock('ollama pull gemma4:e4b')}
-          <div style="margin-top:12px;padding:10px;border:1px dashed var(--border);border-radius:8px">
-            <strong style="font-size:13px">Or run our bundled setup script</strong>
-            <p style="color:var(--muted);font-size:12px;margin:4px 0 8px">It sets <code>OLLAMA_ORIGINS=chrome-extension://*</code> and pulls <code>gemma4:e4b</code> in one go.</p>
-            <div style="display:flex;gap:6px;flex-wrap:wrap">
-              <a class="btn small" id="wiz-download-setup-win" href="https://ollama.com/download" target="_blank" rel="noreferrer">⬇ Windows (.ps1)</a>
-              <a class="btn small" id="wiz-download-setup-mac" href="https://ollama.com/download" target="_blank" rel="noreferrer">⬇ macOS (.sh)</a>
-              <a class="btn small" id="wiz-download-setup-linux" href="https://ollama.com/download" target="_blank" rel="noreferrer">⬇ Linux (.sh)</a>
-            </div>
-          </div>
-          <p style="color:var(--muted);font-size:12px;margin-top:12px">Once installed, no extra setup is needed — the extension already strips the browser Origin header so Ollama accepts requests.</p>
-          <div class="grid-2" style="margin-top:14px">
-            <div><label>Ollama URL</label><input type="url" id="wiz-ollamaUrl" value="${escape(state.settings.ollamaUrl || 'http://localhost:11434')}" /></div>
-            <div><label>Ollama model</label><input type="text" id="wiz-ollamaModel" value="${escape(state.settings.ollamaModel || 'gemma4:e4b')}" /></div>
-          </div>
-          <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
-            <button class="btn primary" id="wiz-save-test">Save & test connection</button>
-            <span id="wiz-test-out" style="font-size:12px"></span>
-          </div>
-        </div>`;
-    } else if (provider === 'openai') {
-      body = `
-        <div class="card">
-          <h3 style="margin-top:0">Configure OpenAI</h3>
-          <p style="color:var(--muted);font-size:13px">Paste your API key. For OpenAI-compatible endpoints (Groq, Together, local llama.cpp), change the base URL.</p>
-          <div class="grid-2">
-            <div style="grid-column:1/-1"><label>API key</label><input type="text" id="wiz-openaiKey" value="${escape(state.settings.openaiKey || '')}" placeholder="sk-…" /></div>
-            <div><label>Base URL</label><input type="url" id="wiz-openaiBaseUrl" value="${escape(state.settings.openaiBaseUrl || 'https://api.openai.com/v1')}" /></div>
-            <div><label>Model</label>
-              <select id="wiz-openaiModel">
-                ${['gpt-4o-mini', 'gpt-4o', 'gpt-4-turbo'].map((m) => `<option value="${m}"${(state.settings.openaiModel || 'gpt-4o-mini') === m ? ' selected' : ''}>${m}</option>`).join('')}
-              </select>
-            </div>
-          </div>
-          <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
-            <button class="btn primary" id="wiz-save-test">Save & test connection</button>
-            <span id="wiz-test-out" style="font-size:12px"></span>
-          </div>
-        </div>`;
-    } else {
-      body = `
-        <div class="card">
-          <h3 style="margin-top:0">Enable Chrome built-in AI</h3>
-          <p style="color:var(--muted);font-size:13px">Chrome's built-in Gemini Nano runs locally with no setup or API keys, but requires a recent Chrome and an enabled flag.</p>
-          <ol style="font-size:13px;line-height:1.8;padding-left:20px">
-            <li>Use Chrome 127 or newer.</li>
-            <li>Open <code>chrome://flags/#prompt-api-for-gemini-nano</code> and set it to <strong>Enabled</strong>.</li>
-            <li>Restart Chrome. The model downloads automatically on first use.</li>
-          </ol>
-          <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
-            <button class="btn primary" id="wiz-save-test">Test connection</button>
-            <span id="wiz-test-out" style="font-size:12px"></span>
-          </div>
-        </div>`;
-    }
-  } else {
-    const tr = state.aiTestResult;
-    body = `
-      <div class="card">
-        <h3 style="margin-top:0">Run a quick test prompt</h3>
-        <p style="color:var(--muted);font-size:13px">This will ask the AI for a short insights summary using your tracked applications.</p>
-        <button class="btn primary" id="wiz-run-test">Run a quick test prompt</button>
-        <div id="wiz-test-prompt-out" style="margin-top:14px">${
-          tr ? (tr.ok
-            ? `<div class="ai-output"><strong style="color:var(--success)">✓ Success</strong>\n\n${escape(typeof tr.result === 'string' ? tr.result : JSON.stringify(tr.result, null, 2))}</div>`
-            : `<div class="empty" style="color:var(--danger)"><strong>Test failed.</strong>${escape(tr.error || '')}</div>`)
-          : ''
-        }</div>
-        ${tr?.ok ? `
-          <div style="margin-top:18px;padding:14px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.3);border-radius:10px">
-            <strong style="color:var(--success)">✓ All set!</strong>
-            <p style="margin:6px 0 10px;font-size:13px;color:var(--muted)">AI features are now active across the app.</p>
-            <a class="btn primary" href="#/">Go to Dashboard</a>
-            <a class="btn" href="#/jobs" style="margin-left:6px">View applications</a>
-          </div>` : ''}
-      </div>`;
+route('/profile', async () => {
+  const [profilesR, qaR] = await Promise.all([api('/profiles'), api('/qa?limit=300').catch(() => ({ items: [] }))]);
+  const profiles = profilesR.items || [];
+  if (!state.profileSel || !profiles.find((p) => p.id === state.profileSel)) {
+    state.profileSel = profiles[0]?.id || 'new';
   }
+  const cur = profiles.find((p) => p.id === state.profileSel) || { name: 'Main', isDefault: !profiles.length, sourceAssignments: [], data: {} };
+  const d = cur.data || {};
+  const qa = qaR.items || [];
 
-  return `
-    <div class="page-h">
-      <div><h1>✨ AI Setup Wizard</h1><div class="sub">Get AI features connected in under a minute.</div></div>
-      <div style="display:flex;gap:8px;align-items:center">
-        ${statusPill()}
-        <button class="btn small" id="wiz-retest">Re-test</button>
+  const fieldRows = PROFILE_FIELDS.map(([k, label]) =>
+    `<div class="form-row"><label class="form-label" for="pf-${k}">${esc(label)}</label>
+     <div class="form-control"><input class="input" id="pf-${k}" value="${esc(d[k] ?? '')}" /></div></div>`).join('');
+
+  const qaRows = qa.length ? qa.map((it) => `
+    <tr data-qa="${esc(it.id)}">
+      <td class="title-cell" title="${esc(it.question)}">${esc(it.question.length > 70 ? it.question.slice(0, 70) + '…' : it.question)}</td>
+      <td><input class="input" data-qa-answer value="${esc(it.answer)}" style="width:100%" /></td>
+      <td class="num">${esc(it.seen_count)}</td>
+      <td><button class="btn small" data-qa-del>✕</button></td>
+    </tr>`).join('')
+    : `<tr><td colspan="4">${emptyHtml('Empty memory', 'No learned answers yet', 'Every application you fill teaches JAT how you answer.')}</td></tr>`;
+
+  const v = el(`<div>
+    <header class="page-header">
+      <div>
+        <div class="page-eyebrow">Material</div>
+        <h1 class="page-title">Profile</h1>
+        <div class="page-sub">What autofill and auto-apply know about you.</div>
+      </div>
+      <div class="page-actions">
+        <button class="btn" data-import>Import from resume</button>
+        ${cur.id ? '<button class="btn" data-del-profile>Delete profile</button>' : ''}
+        <button class="btn primary" data-save>Save profile</button>
+      </div>
+    </header>
+
+    <div class="profile-layout">
+      <div class="profile-list">
+        ${profiles.map((p) => `<button class="profile-item ${p.id === state.profileSel ? 'active' : ''}" data-prof="${esc(p.id)}">${esc(p.name)}${p.isDefault ? ' <span class="muted">· default</span>' : ''}</button>`).join('')}
+        <button class="profile-item ${state.profileSel === 'new' ? 'active' : ''}" data-prof="new">+ New profile</button>
+      </div>
+
+      <div>
+        <section class="section">
+          <header class="section-header"><div><div class="section-eyebrow">Identity</div><h2 class="section-title">${esc(cur.name || 'New profile')}</h2></div></header>
+          <div class="form-row"><label class="form-label" for="pf-name">Profile name</label>
+            <div class="form-control"><input class="input" id="pf-name" value="${esc(cur.name || '')}" /></div></div>
+          <div class="form-row"><span class="form-label">Default profile</span>
+            <div class="form-control"><label class="toggle"><input type="checkbox" id="pf-default" ${cur.isDefault ? 'checked' : ''} /><span class="knob"></span></label></div></div>
+          <div class="form-row"><div class="form-label">Use on sites <div class="form-hint">hostname contains…</div></div>
+            <div class="form-control" id="pf-sources-slot"></div></div>
+          ${fieldRows}
+          <div class="form-row"><label class="form-label" for="pf-summary">Summary</label>
+            <div class="form-control"><textarea class="input" id="pf-summary" rows="4" style="width:100%;resize:vertical">${esc(d.summary || '')}</textarea></div></div>
+          <div class="form-row"><div class="form-label">Skills</div><div class="form-control" id="pf-skills-slot"></div></div>
+        </section>
+
+        <section class="section">
+          <header class="section-header"><div><div class="section-eyebrow">Memory</div><h2 class="section-title">Learned answers</h2></div>
+            <span class="section-link muted">${qa.length} stored</span></header>
+          <div class="table-wrap"><table class="table">
+            <thead><tr><th>Question</th><th>Answer</th><th>Seen</th><th></th></tr></thead>
+            <tbody>${qaRows}</tbody>
+          </table></div>
+        </section>
       </div>
     </div>
-    ${wizSteps(step)}
-    ${body}
-    <div style="margin-top:14px;display:flex;justify-content:space-between">
-      <button class="btn" id="wiz-prev" ${step === 1 ? 'disabled' : ''}>← Back</button>
-      <button class="btn primary" id="wiz-next" ${step === 3 ? 'disabled' : ''}>Next →</button>
-    </div>
-  `;
-}
+  </div>`);
 
-const SOURCE_SYNC_URLS = {
-  LinkedIn: 'https://www.linkedin.com/my-items/saved-jobs/?cardType=APPLIED',
-  Indeed: 'https://myjobs.indeed.com/applied',
-  Glassdoor: 'https://www.glassdoor.com/Profile/myJobs.htm',
-  Greenhouse: 'https://boards.greenhouse.io',
-  Lever: 'https://jobs.lever.co',
-  Workday: 'https://www.workday.com/en-us/products/talent-acquisition.html',
-  Generic: ''
-};
+  const sources = chipsInput(cur.sourceAssignments || [], 'linkedin, indeed…');
+  v.querySelector('#pf-sources-slot').appendChild(sources.node);
+  const skills = chipsInput(d.skills || [], 'Add skill…');
+  v.querySelector('#pf-skills-slot').appendChild(skills.node);
 
-function pageSources() {
-  return `
-    <div class="page-h">
-      <div><h1>Job board sources</h1><div class="sub">v5 watches these sites automatically. Click a row to open it and sync past applications — the universal capture engine will detect them as you scroll.</div></div>
-    </div>
-    <div class="card">
-      ${SOURCES.map((s) => {
-        const url = SOURCE_SYNC_URLS[s.id];
-        const count = state.jobs.filter((j) => (j.source || '') === s.id).length;
-        return `
-          <div class="source-card sync" data-src-url="${escape(url)}">
-            <div class="icon">${s.icon}</div>
-            <div class="info">
-              <strong>${s.id}</strong>
-              <small>${s.host} — ${s.desc}</small>
-            </div>
-            <div>
-              <div style="text-align:right">${count} captured</div>
-              ${url ? `<div class="open" style="text-align:right">Open to sync →</div>` : ''}
-            </div>
-          </div>
-        `;
-      }).join('')}
-    </div>
-    <div class="card" style="margin-top:14px">
-      <h3 style="margin-top:0;font-size:14px">Generic JSON-LD coverage</h3>
-      <p style="color:var(--muted);font-size:13px">The <strong>Generic adapter</strong> activates on any page exposing a JSON-LD <code>JobPosting</code> — covers Ashby, Workable, BambooHR, SmartRecruiters, and most modern career sites. To add a dedicated ATS adapter, drop a new file in <code>content/adapters/</code>.</p>
-    </div>
-  `;
-}
-
-// ============ Event wiring ============
-function attach() {
-  // Dashboard
-  $$('.list-row').forEach((el) => el.addEventListener('click', () => { location.hash = `#/job/${el.dataset.job}`; }));
-
-  $('#ai-nudges')?.addEventListener('click', async () => {
-    if (!state.aiStatus?.available) { toast('Configure AI first.', 'danger'); return; }
-    const out = $('#nudge-out');
-    out.innerHTML = '<div class="card"><div class="empty">AI is reviewing…</div></div>';
-    const r = await aiCall( { feature: 'nudges', jobs: state.jobs });
-    if (!r?.ok) { out.innerHTML = `<div class="card empty">Failed: ${escape(r?.error || '')}</div>`; return; }
-    const nudges = r.result || [];
-    if (nudges.length === 0) { out.innerHTML = `<div class="card empty">Nothing urgent. Nice work.</div>`; return; }
-    out.innerHTML = `<div class="card"><h3 style="margin-top:0;font-size:14px">✨ AI nudges</h3>${nudges.map((n) => {
-      const job = state.jobs.find((j) => j.id === n.jobId);
-      if (!job) return '';
-      return `<div style="padding:10px;border-top:1px solid var(--border)">
-        <strong>${escape(job.title)}</strong> · ${escape(job.company)}<br>
-        <span style="color:var(--muted);font-size:13px">${escape(n.reason || '')} (${n.priority || 'medium'})</span>
-      </div>`;
-    }).join('')}</div>`;
-  });
-
-  // Jobs
-  $('#search')?.addEventListener('input', (e) => { state.filter.search = e.target.value; render(); });
-  $('#filter-status')?.addEventListener('change', (e) => { state.filter.status = e.target.value; render(); });
-  $('#filter-source')?.addEventListener('change', (e) => { state.filter.source = e.target.value; render(); });
-
-  // Detail
-  $$('.pipeline button').forEach((b) => b.addEventListener('click', async () => {
-    const r = await send('patch-job', { id: state.selectedJobId, patch: { status: b.dataset.status } });
-    if (r?.ok) { toast('Status updated.', 'success'); }
+  v.querySelectorAll('[data-prof]').forEach((b) => b.addEventListener('click', () => {
+    state.profileSel = b.dataset.prof;
+    navigate();
   }));
-  $('#save-detail')?.addEventListener('click', async () => {
-    const patch = {
-      title: $('#d-title').value, company: $('#d-company').value, location: $('#d-location').value,
-      compensation: $('#d-comp').value, workMode: $('#d-mode').value, employmentType: $('#d-emp').value,
-      recruiterName: $('#d-rec').value, notes: $('#d-notes').value
-    };
-    const r = await send('patch-job', { id: state.selectedJobId, patch });
-    if (r?.ok) toast('Saved.', 'success');
-  });
-  $('#delete')?.addEventListener('click', async () => {
-    if (!confirm('Delete this application?')) return;
-    await send('delete-job', { id: state.selectedJobId });
-    toast('Deleted.', 'success');
-    location.hash = '#/jobs';
-  });
-  $$('[data-ai]').forEach((b) => b.addEventListener('click', () => runAi(b.dataset.ai, state.selectedJobId)));
-  $$('[data-ai-retry]').forEach((b) => b.addEventListener('click', () => runAi(b.dataset.aiRetry, b.dataset.aiJob)));
 
-  // Profile
-  $('#p-save')?.addEventListener('click', async () => {
-    const patch = {};
-    const allKeys = PROFILE_FIELDS.flatMap((sec) => sec.fields.map(([k]) => k)).concat(['headline', 'summary']);
-    allKeys.forEach((k) => { const el = $('#p-' + k); if (el) patch[k] = el.value; });
-    const r = await send('patch-profile', patch);
-    if (r?.ok) { state.profile = r.profile; toast('Profile saved.', 'success'); }
-  });
-  $$('[data-del-answer]').forEach((b) => b.addEventListener('click', async () => {
-    if (!confirm('Delete this answer?')) return;
-    await send('delete-answer', { key: b.dataset.delAnswer });
-    state.answers = state.answers.filter((a) => a.key !== b.dataset.delAnswer);
-    toast('Deleted.', 'success'); render();
-  }));
-  $('#p-resume')?.addEventListener('click', async () => {
-    const text = prompt('Paste your resume text here:');
-    if (!text) return;
-    toast('AI parsing…', 'info');
-    const r = await aiCall( { feature: 'resume', resumeText: text });
-    if (!r?.ok) { toast('Failed: ' + r?.error, 'danger'); return; }
-    const parsed = r.result || {};
-    const patch = {};
-    for (const k of Object.keys(parsed)) {
-      if (k === 'skills') continue;
-      if (parsed[k] && !state.profile[k]) patch[k] = parsed[k];
+  const collect = () => {
+    const data = {};
+    for (const [k] of PROFILE_FIELDS) {
+      const val = v.querySelector('#pf-' + k).value.trim();
+      if (val) data[k] = val;
     }
-    if (Object.keys(patch).length === 0) { toast('Nothing new to add.', 'info'); return; }
-    const u = await send('patch-profile', patch);
-    if (u?.ok) { state.profile = u.profile; toast(`Updated ${Object.keys(patch).length} field(s).`, 'success'); render(); }
-  });
-
-  // Settings — theme picker
-  $$('.theme-card').forEach((c) => c.addEventListener('click', async () => {
-    const id = c.dataset.theme;
-    applyTheme(id);
-    await send('patch-settings', { theme: id });
-    state.settings.theme = id;
-    toast(`Theme: ${THEMES.find((t) => t.id === id)?.name}`, 'success');
-    render();
-  }));
-
-  // Settings — icon picker (rasterize in page, then ship pre-baked ImageData
-  // to background, which can't decode SVG itself)
-  $$('[data-icon-preset]').forEach((c) => c.addEventListener('click', async () => {
-    const id = c.dataset.iconPreset;
-    try {
-      if (id) {
-        const preset = ICON_PRESETS.find((p) => p.id === id);
-        if (!preset) { toast('Unknown preset.', 'danger'); return; }
-        const bundle = await presetToIconBundle(preset);
-        await applyIconBundle(bundle);
-      } else {
-        await clearIconBundle();
-      }
-      const r = await send('patch-settings', { iconPreset: id, iconCustomDataUrl: '' });
-      if (r?.ok) {
-        state.settings = r.settings;
-        toast(id ? `Icon: ${ICON_PRESETS.find((p) => p.id === id)?.name}` : 'Icon: Default', 'success');
-        render();
-      }
-    } catch (e) {
-      toast(`Failed to apply icon: ${e.message || e}`, 'danger');
-    }
-  }));
-  $('#icon-upload-btn')?.addEventListener('click', () => $('#icon-upload')?.click());
-  $('#icon-upload')?.addEventListener('change', async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!file.type.startsWith('image/')) { toast('Please pick an image file.', 'danger'); return; }
-    if (file.size > 1.5 * 1024 * 1024) { toast('Image too large (max ~1.5MB).', 'danger'); return; }
-    const reader = new FileReader();
-    reader.onload = async () => {
-      const dataUrl = String(reader.result || '');
-      try {
-        const bundle = await imageUrlToIconBundle(dataUrl);
-        await applyIconBundle(bundle);
-        const r = await send('patch-settings', { iconCustomDataUrl: dataUrl, iconPreset: '' });
-        if (r?.ok) { state.settings = r.settings; toast('Custom icon applied.', 'success'); render(); }
-      } catch (err) {
-        toast(`Failed: ${err.message || err}`, 'danger');
-      }
+    const summary = v.querySelector('#pf-summary').value.trim();
+    if (summary) data.summary = summary;
+    const sk = skills.get();
+    if (sk.length) data.skills = sk;
+    return {
+      id: cur.id || undefined,
+      name: v.querySelector('#pf-name').value.trim() || 'Profile',
+      isDefault: v.querySelector('#pf-default').checked,
+      sourceAssignments: sources.get(),
+      data,
     };
-    reader.readAsDataURL(file);
-  });
-  $('#icon-clear')?.addEventListener('click', async () => {
-    await clearIconBundle();
-    const r = await send('patch-settings', { iconCustomDataUrl: '' });
-    if (r?.ok) { state.settings = r.settings; toast('Custom icon cleared.', 'success'); render(); }
-  });
-
-  // Settings
-  $('#s-save')?.addEventListener('click', async () => {
-    const patch = {
-      aiProvider: $('#s-aiProvider').value,
-      ollamaUrl: $('#s-ollamaUrl').value, ollamaModel: $('#s-ollamaModel').value,
-      openaiBaseUrl: $('#s-openaiBaseUrl').value, openaiModel: $('#s-openaiModel').value,
-      openaiKey: $('#s-openaiKey').value,
-      aiValidateCaptures: $('#s-aiValidateCaptures').checked
-    };
-    const r = await send('patch-settings', patch);
-    if (r?.ok) { state.settings = r.settings; toast('Saved.', 'success'); refreshAi(); }
-  });
-  $('#s-save2')?.addEventListener('click', async () => {
-    const patch = {
-      defaultFollowUpDays: Number($('#s-defaultFollowUpDays').value) || 10,
-      notificationsEnabled: $('#s-notificationsEnabled').checked
-    };
-    const r = await send('patch-settings', patch);
-    if (r?.ok) { state.settings = r.settings; toast('Saved.', 'success'); }
-  });
-  $('#s-test-ai')?.addEventListener('click', async () => {
-    $('#s-ai-test-out').textContent = 'Testing…';
-    await refreshAi();
-    $('#s-ai-test-out').innerHTML = state.aiStatus?.available
-      ? `<span style="color:var(--success)">✓ ${state.aiStatus.provider} ready</span>`
-      : `<span style="color:var(--warn)">⚠ ${escape(state.aiStatus?.reason || 'unavailable')}</span>`;
-  });
-
-  // Shortcuts
-  $('#dismiss-extension-promo')?.addEventListener('click', async () => {
-    await send('patch-settings', { dismissedExtensionPromo: true });
-    state.settings.dismissedExtensionPromo = true;
-    toast('Hidden. Re-enable in Settings.', 'info');
-    render();
-  });
-  $('#open-chrome-extensions')?.addEventListener('click', () => {
-    if (window.jat5?.openExternal) window.jat5.openExternal('chrome://extensions/');
-    else window.open('chrome://extensions/', '_blank');
-  });
-
-  $('#add-shortcut')?.addEventListener('click', async () => {
-    const label = prompt('Shortcut label:');
-    if (!label) return;
-    const url = prompt('URL:');
-    if (!url) return;
-    const id = 'sh' + Date.now();
-    const list = [...(state.settings.dashboardShortcuts || []), { id, label, url }];
-    const r = await send('patch-settings', { dashboardShortcuts: list });
-    if (r?.ok) { state.settings = r.settings; toast('Added.', 'success'); render(); }
-  });
-  $$('[data-rm-shortcut]').forEach((el) => el.addEventListener('click', async (e) => {
-    e.preventDefault(); e.stopPropagation();
-    const list = (state.settings.dashboardShortcuts || []).filter((s) => s.id !== el.dataset.rmShortcut);
-    const r = await send('patch-settings', { dashboardShortcuts: list });
-    if (r?.ok) { state.settings = r.settings; render(); }
-  }));
-
-  // Refresh recommendations
-  $('#refresh-recs')?.addEventListener('click', async () => {
-    if (!state.aiStatus?.available) { toast('Configure AI first to generate recommendations.', 'danger'); return; }
-    state.recsLoading = true; render();
-    const aiR = await aiCall({ feature: 'recommend', jobs: state.jobs, profile: state.profile });
-    if (!aiR?.ok) {
-      state.recsLoading = false; render();
-      toast(`AI failed: ${aiR?.error || ''}`, 'danger'); return;
-    }
-    const r = await send('persist-recommendations', { queries: aiR.result || [] });
-    state.recsLoading = false;
-    if (r?.ok) {
-      state.recommendations = r.items || [];
-      toast(`Generated ${r.items.length} recommended search${r.items.length === 1 ? '' : 'es'}.`, 'success');
-    } else toast(`Failed: ${r?.error || ''}`, 'danger');
-    render();
-  });
-
-  // Sources page sync
-  $$('.source-card.sync').forEach((el) => el.addEventListener('click', () => {
-    const url = el.dataset.srcUrl;
-    if (url) window.jat5.openExternal(url);
-  }));
-
-  // ===== Documents page =====
-  $('#doc-upload-btn')?.addEventListener('click', () => $('#doc-upload-input')?.click());
-  $('#doc-upload-input')?.addEventListener('change', async (e) => {
-    const files = Array.from(e.target.files || []);
-    if (files.length === 0) return;
-    toast(`Uploading ${files.length} file${files.length === 1 ? '' : 's'}…`, 'info');
-    let added = 0;
-    for (const file of files) {
-      try {
-        const ab = await file.arrayBuffer();
-        const r = await send('add-document', {
-          name: file.name, originalFilename: file.name, type: 'other',
-          mimeType: file.type, sizeBytes: file.size, buffer: ab
-        });
-        if (r?.ok) added++;
-      } catch (err) { console.warn('upload failed', err); }
-    }
-    const r = await send('list-documents');
-    if (r?.ok) state.documents = r.items || [];
-    toast(`Uploaded ${added} document${added === 1 ? '' : 's'}.`, 'success');
-    render();
-  });
-
-  // Bulk folder import
-  const guessDocType = (name) => {
-    if (/resume|cv|curriculum/i.test(name)) return 'resume';
-    if (/cover/i.test(name)) return 'coverLetter';
-    if (/degree|diploma|transcript/i.test(name)) return 'transcript';
-    if (/portfolio/i.test(name)) return 'portfolio';
-    return 'other';
   };
-  const ALLOWED_DOC_EXT = /\.(pdf|doc|docx|txt|rtf|odt|png|jpg|jpeg)$/i;
-  $('#doc-folder-btn')?.addEventListener('click', () => $('#doc-folder-upload')?.click());
-  $('#doc-pierre-btn')?.addEventListener('click', () => {
-    toast("Pick C:\\Users\\<you>\\Desktop\\Importing\\Resume — Chrome requires you to grant access to the folder once.", 'info');
-    $('#doc-folder-upload')?.click();
+
+  v.querySelector('[data-save]').addEventListener('click', async () => {
+    try {
+      const r = await api('/profiles', { method: 'POST', body: collect() });
+      state.profileSel = r.profile?.id || state.profileSel;
+      toast('Profile saved');
+      navigate();
+    } catch (e) { errToast(e); }
   });
-  $('#doc-folder-upload')?.addEventListener('change', async (e) => {
-    const all = Array.from(e.target.files || []);
-    const files = all.filter((f) => ALLOWED_DOC_EXT.test(f.name));
-    if (files.length === 0) { toast('No supported files found in folder.', 'warn'); return; }
-    toast(`Importing 0 of ${files.length}…`, 'info');
-    let added = 0;
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      try {
-        const ab = await file.arrayBuffer();
-        const r = await send('add-document', {
-          name: file.name, originalFilename: file.name, type: guessDocType(file.name),
-          mimeType: file.type, sizeBytes: file.size, buffer: ab
-        });
-        if (r?.ok) added++;
-      } catch (err) { console.warn('folder import failed', file.name, err); }
-      if ((i + 1) % 5 === 0 || i === files.length - 1) {
-        toast(`Importing ${i + 1} of ${files.length}…`, 'info');
+
+  const delBtn = v.querySelector('[data-del-profile]');
+  if (delBtn) delBtn.addEventListener('click', async () => {
+    try {
+      await api('/profiles/' + encodeURIComponent(cur.id), { method: 'DELETE' });
+      state.profileSel = null;
+      toast('Profile deleted');
+      navigate();
+    } catch (e) { errToast(e); }
+  });
+
+  v.querySelector('[data-import]').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.textContent = 'Reading resume…';
+    try {
+      const r = await api('/ai/resume-parse', { method: 'POST', body: {}, timeoutMs: 240000 });
+      const parsed = r.result || {};
+      let filled = 0;
+      for (const [k] of PROFILE_FIELDS) {
+        const input = v.querySelector('#pf-' + k);
+        if (input && !input.value.trim() && parsed[k]) { input.value = parsed[k]; filled++; }
       }
-    }
-    const r = await send('list-documents');
-    if (r?.ok) state.documents = r.items || [];
-    toast(`Imported ${added} file${added === 1 ? '' : 's'}.`, 'success');
-    render();
+      const sum = v.querySelector('#pf-summary');
+      if (!sum.value.trim() && parsed.summary) { sum.value = parsed.summary; filled++; }
+      if (Array.isArray(parsed.skills) && parsed.skills.length && !skills.get().length) {
+        skills.set(parsed.skills); filled++;
+      }
+      toast(filled ? `Filled ${filled} empty field(s) from your resume (${r.provider})` : 'Nothing new to fill — fields already set');
+    } catch (err) { errToast(err, 'Import failed'); }
+    btn.disabled = false; btn.textContent = 'Import from resume';
   });
 
-  $$('[data-doc-open]').forEach((b) => b.addEventListener('click', async () => {
-    const id = b.dataset.docOpen;
-    const d = state.documents.find((x) => x.id === id);
-    if (!d || !d.data) { toast('No file data.', 'danger'); return; }
-    try {
-      const blob = makeDocBlob(d);
-      const url = URL.createObjectURL(blob);
-      // window.open from THIS document keeps the blob URL in the same realm
-      // (an external-shell open can't reach our blob URL → fails to load)
-      const w = window.open(url, '_blank');
-      if (!w) { toast('Popup blocked. Allow popups for this extension page.', 'danger'); URL.revokeObjectURL(url); return; }
-      // Don't revoke immediately — the new tab needs the URL alive
-      setTimeout(() => URL.revokeObjectURL(url), 60000);
-    } catch (err) { toast('Open failed: ' + (err.message || err), 'danger'); }
-  }));
-  $$('[data-doc-download]').forEach((b) => b.addEventListener('click', async () => {
-    const id = b.dataset.docDownload;
-    const d = state.documents.find((x) => x.id === id);
-    if (!d || !d.data) { toast('No file data.', 'danger'); return; }
-    try {
-      const blob = makeDocBlob(d);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = d.originalFilename || d.name || 'document';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 5000);
-    } catch (err) { toast('Download failed: ' + (err.message || err), 'danger'); }
-  }));
-  $$('[data-doc-edit]').forEach((b) => b.addEventListener('click', async () => {
-    const id = b.dataset.docEdit;
-    const d = state.documents.find((x) => x.id === id);
-    if (!d) return;
-    const newName = prompt('Document name:', d.name);
-    if (newName == null) return;
-    const types = DOC_TYPES.map(([v, l], i) => `${i + 1}. ${l}`).join('\n');
-    const choice = prompt(`Type (current: ${DOC_TYPE_LABEL[d.type] || d.type}):\n${types}\n\nEnter number 1-${DOC_TYPES.length} or leave blank to keep:`, '');
-    let newType = d.type;
-    if (choice && /^\d+$/.test(choice.trim())) {
-      const i = parseInt(choice.trim(), 10) - 1;
-      if (i >= 0 && i < DOC_TYPES.length) newType = DOC_TYPES[i][0];
-    }
-    const r = await send('patch-document', { id, patch: { name: newName.trim() || d.name, type: newType } });
-    if (r?.ok) toast('Updated.', 'success');
-    else toast('Update failed.', 'danger');
-  }));
-  $$('[data-doc-delete]').forEach((b) => b.addEventListener('click', async () => {
-    const id = b.dataset.docDelete;
-    const d = state.documents.find((x) => x.id === id);
-    if (!d) return;
-    if (!confirm(`Delete "${d.name}"? This cannot be undone.`)) return;
-    const r = await send('delete-document', { id });
-    if (r?.ok) toast('Deleted.', 'success');
-  }));
-
-  // Auto-tracked: upload picker pre-typed
-  $$('[data-tracked-upload]').forEach((b) => b.addEventListener('click', () => {
-    const trackedName = b.dataset.trackedUpload;
-    const trackedType = b.dataset.trackedType;
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.style.display = 'none';
-    input.addEventListener('change', async (e) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
+  v.querySelectorAll('tr[data-qa]').forEach((tr) => {
+    const qaId = tr.dataset.qa;
+    const item = qa.find((x) => x.id === qaId);
+    tr.querySelector('[data-qa-answer]').addEventListener('change', async (e2) => {
       try {
-        const ab = await file.arrayBuffer();
-        const r = await send('add-document', {
-          name: trackedName, originalFilename: file.name, type: trackedType,
-          mimeType: file.type, sizeBytes: file.size, buffer: ab
-        });
-        if (r?.ok) toast(`Uploaded "${trackedName}".`, 'success');
-        else toast('Upload failed.', 'danger');
-      } catch (err) { toast('Upload failed: ' + (err.message || err), 'danger'); }
+        await api('/qa', { method: 'POST', body: { question: item.question, answer: e2.target.value } });
+        toast('Answer updated');
+      } catch (err) { errToast(err); }
     });
-    document.body.appendChild(input);
-    input.click();
-    setTimeout(() => input.remove(), 60000);
-  }));
-
-  // ===== Job detail: documents section =====
-  $('#link-doc-btn')?.addEventListener('click', async () => {
-    const sel = $('#link-doc-select');
-    const docId = sel?.value;
-    const jobId = $('#link-doc-btn').dataset.jobId;
-    if (!docId) { toast('Pick a document first.', 'info'); return; }
-    const d = state.documents.find((x) => x.id === docId);
-    if (!d) return;
-    const prev = d.linkedJobIds || [];
-    if (prev.includes(jobId)) { toast('Already linked.', 'info'); return; }
-    const r = await send('patch-document', { id: docId, patch: { linkedJobIds: [...prev, jobId] } });
-    if (r?.ok) toast('Linked.', 'success');
-  });
-  // Inline upload for missing resume/cover
-  ['upload-resume-btn', 'upload-cover-btn'].forEach((btnId) => {
-    const btn = $('#' + btnId);
-    if (!btn) return;
-    btn.addEventListener('click', () => {
-      const jobId = btn.dataset.jobId;
-      const docType = btn.dataset.docType;
-      const presetName = btn.dataset.name;
-      const input = $('#job-doc-upload');
-      if (!input) return;
-      input.onchange = async (e) => {
-        const file = e.target.files?.[0];
-        if (!file) return;
-        try {
-          const ab = await file.arrayBuffer();
-          const r = await send('add-document', {
-            name: presetName || file.name, originalFilename: file.name,
-            type: docType, mimeType: file.type, sizeBytes: file.size,
-            buffer: ab, linkedJobIds: [jobId]
-          });
-          if (r?.ok) toast(`Uploaded "${presetName}".`, 'success');
-          else toast('Upload failed.', 'danger');
-        } catch (err) { toast('Upload failed: ' + (err.message || err), 'danger'); }
-      };
-      input.click();
+    tr.querySelector('[data-qa-del]').addEventListener('click', async () => {
+      try { await api('/qa/' + encodeURIComponent(qaId), { method: 'DELETE' }); tr.remove(); }
+      catch (err) { errToast(err); }
     });
   });
 
-  // AI Setup Wizard
-  $$('[data-pick-provider]').forEach((el) => el.addEventListener('click', async () => {
-    const id = el.dataset.pickProvider;
-    const r = await send('patch-settings', { aiProvider: id });
-    if (r?.ok) state.settings = r.settings;
-    state.aiWizardStep = 2;
-    state.aiTestResult = null;
-    render();
-  }));
-  $('#wiz-prev')?.addEventListener('click', () => {
-    state.aiWizardStep = Math.max(1, (state.aiWizardStep || 1) - 1);
-    render();
-  });
-  $('#wiz-next')?.addEventListener('click', () => {
-    state.aiWizardStep = Math.min(3, (state.aiWizardStep || 1) + 1);
-    render();
-  });
-  $('#wiz-retest')?.addEventListener('click', async () => {
-    await refreshAi();
-  });
-  $('#wiz-save-test')?.addEventListener('click', async () => {
-    const out = $('#wiz-test-out');
-    if (out) out.textContent = 'Testing…';
-    const provider = state.settings.aiProvider || 'ollama';
-    const patch = {};
-    if (provider === 'ollama') {
-      patch.ollamaUrl = $('#wiz-ollamaUrl')?.value || '';
-      patch.ollamaModel = $('#wiz-ollamaModel')?.value || '';
-    } else if (provider === 'openai') {
-      patch.openaiKey = $('#wiz-openaiKey')?.value || '';
-      patch.openaiBaseUrl = $('#wiz-openaiBaseUrl')?.value || '';
-      patch.openaiModel = $('#wiz-openaiModel')?.value || '';
-    }
-    if (Object.keys(patch).length) {
-      const s = await send('patch-settings', patch);
-      if (s?.ok) state.settings = s.settings;
-    }
-    const r = await send('ai-status');
-    if (r?.ok) state.aiStatus = r.status;
-    const o2 = $('#wiz-test-out');
-    if (o2) {
-      o2.innerHTML = state.aiStatus?.available
-        ? `<span style="color:var(--success)">✓ ${escape(state.aiStatus.provider)} ready</span>`
-        : `<span style="color:var(--danger)">✗ ${escape(state.aiStatus?.reason || 'unavailable')}</span>`;
-    }
-  });
-  $('#wiz-run-test')?.addEventListener('click', async () => {
-    const out = $('#wiz-test-prompt-out');
-    if (out) out.innerHTML = '<div class="empty">AI thinking…</div>';
-    const r = await aiCall({ feature: 'insights', jobs: state.jobs });
-    state.aiTestResult = r;
-    render();
-  });
-  $$('.copy-btn').forEach((b) => b.addEventListener('click', async () => {
+  return v;
+});
+
+// ============================================================
+// VIEW: Documents (#/documents)
+// ============================================================
+route('/documents', async () => {
+  const r = await api('/documents');
+  const docs = r.items || [];
+
+  const rows = docs.length ? docs.map((doc) => `
+    <tr data-doc="${esc(doc.id)}">
+      <td><button class="star-btn ${doc.isDefault ? 'on' : ''}" data-star title="Default ${esc(doc.role)}">★</button></td>
+      <td class="title-cell">${esc(doc.name)}</td>
+      <td><span class="role-badge" data-role="${esc(doc.role)}">${esc(doc.role)}</span></td>
+      <td class="num">${fmtBytes(doc.sizeBytes)}</td>
+      <td><span class="text-ind ${doc.hasText ? 'ok' : 'no'}">${doc.hasText ? 'text ✓' : 'no text'}</span></td>
+      <td>${dateHtml(doc.createdAt)}</td>
+      <td class="nowrap">
+        <button class="btn small" data-dl>Download</button>
+        <button class="btn small" data-del>✕</button>
+      </td>
+    </tr>`).join('')
+    : `<tr><td colspan="7">${emptyHtml('Empty drawer', 'No documents yet', 'Drop your resume here — auto-apply and tailoring need it.')}</td></tr>`;
+
+  const v = el(`<div>
+    <header class="page-header">
+      <div>
+        <div class="page-eyebrow">Material</div>
+        <h1 class="page-title">Documents</h1>
+        <div class="page-sub">Resumes and cover letters, with extracted text for the AI.</div>
+      </div>
+      <div class="page-actions">
+        <select class="select" id="up-role"><option value="resume">resume</option><option value="coverLetter">cover letter</option><option value="other">other</option></select>
+        <button class="btn primary" data-pick>Upload…</button>
+        <input type="file" id="up-file" accept=".pdf,.docx,.doc,.txt,.md,.rtf" hidden />
+      </div>
+    </header>
+
+    <div class="dropzone" id="dropzone">Drop a file here, or click Upload</div>
+
+    <section class="section">
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th></th><th>Name</th><th>Role</th><th>Size</th><th>Extraction</th><th>Added</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+    </section>
+  </div>`);
+
+  async function upload(file) {
+    if (!file) return;
+    if (file.size > 10 * 1024 * 1024) { toast('File too large (10 MB max)', 'danger'); return; }
+    const role = v.querySelector('#up-role').value;
+    toast(`Uploading ${file.name}…`, 'info', { ttl: 2500 });
     try {
-      await navigator.clipboard.writeText(b.dataset.copy);
-      const orig = b.textContent;
-      b.textContent = 'Copied!';
-      setTimeout(() => { b.textContent = orig; }, 1200);
-    } catch (e) { toast('Copy failed', 'danger'); }
-  }));
-}
-
-async function refreshAi() {
-  const r = await send('ai-status');
-  if (r?.ok) state.aiStatus = r.status;
-  render();
-}
-
-async function runAi(feature, jobId) {
-  const job = state.jobs.find((j) => j.id === jobId);
-  if (!job) return;
-  state.aiErrors = state.aiErrors || {};
-  state.aiLoading[jobId] = { ...(state.aiLoading[jobId] || {}), [feature]: true };
-  state.aiResults[jobId] = { ...(state.aiResults[jobId] || {}), _last: feature };
-  // Clear previous error for this feature
-  if (state.aiErrors[jobId]) delete state.aiErrors[jobId][feature];
-  render();
-  const t0 = Date.now();
-  try {
-    const r = await aiCall({ feature, job, profile: state.profile });
-    if (!r?.ok) throw new Error(r?.error || 'AI returned no result');
-    state.aiResults[jobId] = { ...(state.aiResults[jobId] || {}), [feature]: r.result, _last: feature };
-    toast(`AI ${feature} ready (${Math.round((Date.now() - t0) / 1000)}s).`, 'success');
-  } catch (e) {
-    const msg = String(e.message || e);
-    state.aiErrors[jobId] = { ...(state.aiErrors[jobId] || {}), [feature]: msg };
-    state.aiResults[jobId] = { ...(state.aiResults[jobId] || {}), _last: feature };
-    toast(`AI failed: ${msg.slice(0, 100)}`, 'danger');
-  } finally {
-    if (state.aiLoading[jobId]) delete state.aiLoading[jobId][feature];
-    render();
+      const dataBase64 = await fileToB64(file);
+      const r2 = await api('/documents', {
+        method: 'POST', timeoutMs: 60000,
+        body: { name: file.name, role, mime: file.type, dataBase64, isDefault: docs.filter((x) => x.role === role).length === 0 },
+      });
+      toast(r2.extractedChars
+        ? `Uploaded — extracted ${r2.extractedChars.toLocaleString()} characters of text ✓`
+        : 'Uploaded — but no text could be extracted from this file', r2.extractedChars ? 'info' : 'danger');
+      navigate();
+    } catch (e) { errToast(e, 'Upload failed'); }
   }
+
+  v.querySelector('[data-pick]').addEventListener('click', () => v.querySelector('#up-file').click());
+  v.querySelector('#up-file').addEventListener('change', (e) => upload(e.target.files[0]));
+  const dz = v.querySelector('#dropzone');
+  dz.addEventListener('click', () => v.querySelector('#up-file').click());
+  dz.addEventListener('dragover', (e) => { e.preventDefault(); dz.classList.add('over'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('over'));
+  dz.addEventListener('drop', (e) => {
+    e.preventDefault(); dz.classList.remove('over');
+    upload(e.dataTransfer.files[0]);
+  });
+
+  v.querySelectorAll('tr[data-doc]').forEach((tr) => {
+    const docId = tr.dataset.doc;
+    const doc = docs.find((x) => x.id === docId);
+    tr.querySelector('[data-star]').addEventListener('click', async () => {
+      try { await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { isDefault: true } }); navigate(); }
+      catch (e) { errToast(e); }
+    });
+    tr.querySelector('[data-dl]').addEventListener('click', async () => {
+      try {
+        const res = await api('/documents/' + encodeURIComponent(docId) + '?raw=1', { raw: true, timeoutMs: 30000 });
+        downloadBlob(await res.blob(), doc.name);
+      } catch (e) { errToast(e); }
+    });
+    tr.querySelector('[data-del]').addEventListener('click', async () => {
+      try { await api('/documents/' + encodeURIComponent(docId), { method: 'DELETE' }); toast('Document deleted'); navigate(); }
+      catch (e) { errToast(e); }
+    });
+  });
+
+  return v;
+});
+
+// ============================================================
+// VIEW: Activity (#/activity)
+// ============================================================
+const EVENT_ICONS = {
+  created: '＋', status_changed: '→', reopened: '↻', email: '✉',
+  progressing: '…', resume_tailored: '✎', note: '·',
+};
+route('/activity', async () => {
+  const [evR, usageR] = await Promise.all([
+    api('/events/recent?limit=120').catch(() => ({ items: [] })),
+    api('/ai/usage').catch(() => null),
+  ]);
+  const events = evR.items || [];
+
+  const feed = events.length ? events.map((e) => `
+    <div class="feed-item">
+      <span class="feed-icon">${esc(EVENT_ICONS[e.type] || '·')}</span>
+      <span class="feed-text">${esc(e.summary || e.type)}</span>
+      <span class="feed-meta">${esc(fmtRel(e.timestamp))} · ${esc(e.source || '')}</span>
+    </div>`).join('')
+    : emptyHtml('Silence', 'No activity yet', 'Events appear as captures, status changes, and syncs happen.');
+
+  const usageRows = (usageR?.usage || []).map((u) => `
+    <tr><td>${esc(u.provider)}</td><td class="num">${esc(u.calls)}</td><td class="num">${esc(u.ok_calls)}</td><td class="num">${u.total_ms ? Math.round(u.total_ms / 1000) + 's' : '—'}</td></tr>`).join('')
+    || '<tr><td colspan="4" class="muted" style="padding:16px 24px">No AI calls yet.</td></tr>';
+
+  const recentAi = (usageR?.recent || []).slice(0, 20).map((l) => `
+    <tr><td>${esc(l.kind)}</td><td>${esc(l.provider)}${l.model ? ' <span class="muted">' + esc(l.model) + '</span>' : ''}</td>
+    <td class="num">${esc(Math.round((l.ms || 0) / 100) / 10)}s</td>
+    <td>${l.ok ? '<span class="text-ind ok">ok</span>' : `<span class="text-ind no" title="${esc(l.error || '')}">failed</span>`}</td>
+    <td>${relHtml(l.ts)}</td></tr>`).join('');
+
+  const v = el(`<div>
+    <header class="page-header">
+      <div>
+        <div class="page-eyebrow">System</div>
+        <h1 class="page-title">Activity</h1>
+        <div class="page-sub">Everything that happened, and what the AI cost you.</div>
+      </div>
+      <div class="page-actions"><button class="btn" data-refresh>Refresh</button></div>
+    </header>
+
+    <div class="app-detail">
+      <section class="section">
+        <header class="section-header"><div><div class="section-eyebrow">Record</div><h2 class="section-title">Event feed</h2></div></header>
+        <div class="feed">${feed}</div>
+      </section>
+
+      <div>
+        <section class="section">
+          <header class="section-header"><div><div class="section-eyebrow">Meter</div><h2 class="section-title">AI usage</h2></div></header>
+          <div class="table-wrap"><table class="table">
+            <thead><tr><th>Provider</th><th>Calls</th><th>OK</th><th>Time</th></tr></thead>
+            <tbody>${usageRows}</tbody>
+          </table></div>
+        </section>
+        <section class="section">
+          <header class="section-header"><div><div class="section-eyebrow">Recent</div><h2 class="section-title">AI calls</h2></div></header>
+          <div class="table-wrap"><table class="table">
+            <thead><tr><th>Kind</th><th>Provider</th><th>Time</th><th>Result</th><th>When</th></tr></thead>
+            <tbody>${recentAi || '<tr><td colspan="5" class="muted" style="padding:16px 24px">—</td></tr>'}</tbody>
+          </table></div>
+        </section>
+      </div>
+    </div>
+  </div>`);
+  v.querySelector('[data-refresh]').addEventListener('click', navigate);
+  return v;
+});
+
+// ============================================================
+// VIEW: Settings (#/settings)
+// ============================================================
+route('/settings', async () => {
+  const [settings, aiSt, gmailSt] = await Promise.all([
+    getSettings(true),
+    api('/ai/status').catch(() => null),
+    api('/gmail/status').catch(() => null),
+  ]);
+  const s = settings;
+  const ollamaModels = aiSt?.ollama?.models?.map((m) => m.name) || [];
+
+  const row = (label, html, hint = '') =>
+    `<div class="form-row"><div class="form-label">${esc(label)}${hint ? `<div class="form-hint">${esc(hint)}</div>` : ''}</div><div class="form-control">${html}</div></div>`;
+  const toggle = (idd, on) => `<label class="toggle"><input type="checkbox" id="${idd}" ${on ? 'checked' : ''} /><span class="knob"></span></label>`;
+  const modelSelect = (idd, current) => ollamaModels.length
+    ? `<select class="select" id="${idd}">${[...new Set([current, ...ollamaModels])].filter(Boolean).map((m) => `<option value="${esc(m)}" ${m === current ? 'selected' : ''}>${esc(m)}</option>`).join('')}</select>`
+    : `<input class="input" id="${idd}" value="${esc(current)}" />`;
+  const provChip = (label, st) => st
+    ? `<span class="sys-chip ${st.available ? 'ok' : 'bad'}" title="${esc(st.reason || '')}">${esc(label)} ${st.available ? '● ready' : '○ ' + esc((st.reason || 'unavailable').slice(0, 40))}</span>`
+    : `<span class="sys-chip">${esc(label)} · unknown</span>`;
+
+  const themeGrid = THEMES.map((t) => `
+    <button class="swatch ${document.body.dataset.theme === t.id ? 'active' : ''}" data-theme-id="${esc(t.id)}" type="button">
+      <span class="swatch-chips">
+        <span class="swatch-chip" style="background:${esc(t.vars.bg)}"></span>
+        <span class="swatch-chip" style="background:${esc(t.vars.panel)}"></span>
+        <span class="swatch-chip" style="background:${esc(t.vars.primary)}"></span>
+        <span class="swatch-chip" style="background:${esc(t.vars.text)}"></span>
+      </span>
+      <span class="swatch-name">${esc(t.name)}</span>
+      <span class="swatch-mode">${esc(t.mode)}</span>
+    </button>`).join('');
+
+  const v = el(`<div>
+    <header class="page-header">
+      <div>
+        <div class="page-eyebrow">System</div>
+        <h1 class="page-title">Settings</h1>
+        <div class="page-sub">Hardcoded defaults, all overridable here.</div>
+      </div>
+    </header>
+
+    <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">General</div><h2 class="section-title">App</h2></div>
+        <button class="btn small primary" data-save-section="app">Save</button></header>
+      ${row('Server port', `<span class="mono muted">${esc(s.server.port)} · restart the app to change</span>`)}
+      ${row('Close to tray', toggle('app-tray', s.app.closeToTray), 'capture keeps running with the window closed')}
+      ${row('Start with Windows', toggle('app-autolaunch', s.app.autoLaunch))}
+      ${row('Global hotkey', toggle('app-hotkey', s.app.globalHotkey), 'Ctrl+Shift+J toggles this window')}
+    </section>
+
+    <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">Assistant</div><h2 class="section-title">AI providers</h2></div>
+        <button class="btn small primary" data-save-section="ai">Save</button></header>
+      <div class="section-body" style="display:flex;gap:10px;flex-wrap:wrap">
+        ${provChip('Codex (ChatGPT)', aiSt?.codex)}
+        ${provChip('Ollama (local)', aiSt?.ollama)}
+        <button class="btn small" data-test="codex">Test codex</button>
+        <button class="btn small" data-test="ollama">Test ollama</button>
+      </div>
+      ${row('Provider order', `<select class="select" id="ai-order">
+        ${['cloud-first', 'local-first', 'cloud-only', 'local-only'].map((o) => `<option value="${o}" ${s.ai.order === o ? 'selected' : ''}>${o}</option>`).join('')}
+      </select>`)}
+      ${row('Cloud model', `<input class="input" id="ai-cloud-model" value="${esc(s.ai.cloud.model)}" />`, 'passed to codex exec -m')}
+      ${row('Local URL', `<input class="input" id="ai-local-url" value="${esc(s.ai.local.url)}" />`)}
+      ${row('Local model (structured)', modelSelect('ai-local-structured', s.ai.local.structuredModel), 'JSON extraction, answers')}
+      ${row('Local model (prose)', modelSelect('ai-local-prose', s.ai.local.proseModel), 'cover letters, follow-ups')}
+    </section>
+
+    <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">Capture</div><h2 class="section-title">In-page behaviour</h2></div>
+        <button class="btn small primary" data-save-section="capture">Save</button></header>
+      ${row('Panel on detection', toggle('cap-panel', s.capture.panelOnDetect), 'off = silent until you click Apply')}
+      ${row('Ask when unsure', toggle('cap-ask', s.capture.askWhenUnsure), 'mid-confidence pages ask once; “Not a job” silences the site forever')}
+    </section>
+
+    <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">Mail</div><h2 class="section-title">Gmail status sync</h2></div>
+        <button class="btn small primary" data-save-section="gmail">Save</button></header>
+      <div class="section-body">
+        <span class="sys-chip ${gmailSt?.authorized ? 'ok' : ''}">${gmailSt?.authorized ? '● connected' : '○ not connected'}</span>
+        ${gmailSt?.lastResult?.at ? `<span class="muted" style="font-size:12px;margin-left:8px">last sync ${esc(fmtRel(gmailSt.lastResult.at))} · ${esc(gmailSt.lastResult.updated ?? 0)} updated</span>` : ''}
+      </div>
+      ${row('Enabled', toggle('gm-enabled', s.gmail.enabled))}
+      ${row('Search query', `<input class="input" id="gm-query" value="${esc(s.gmail.query)}" />`, 'Gmail search syntax')}
+      ${row('Interval (minutes)', `<input class="input" id="gm-interval" type="number" min="5" value="${esc(s.gmail.intervalMinutes)}" />`)}
+      ${row('OAuth Client ID', `<input class="input" id="gm-cid" value="${esc(s.gmail.clientId)}" />`, 'Google Cloud Console → OAuth desktop app')}
+      ${row('OAuth Client Secret', `<input class="input" id="gm-secret" type="password" value="${esc(s.gmail.clientSecret)}" />`)}
+      <div class="section-footer">
+        <button class="btn small" data-gmail-connect>Connect Gmail…</button>
+        <button class="btn small" data-gmail-sync>Sync now</button>
+        <span class="muted" id="gm-status"></span>
+      </div>
+    </section>
+
+    <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">Signals</div><h2 class="section-title">Notifications</h2></div>
+        <button class="btn small primary" data-save-section="notifications">Save</button></header>
+      ${row('Status changes', toggle('nt-status', s.notifications.statusChanges))}
+      ${row('Auto-apply events', toggle('nt-aa', s.notifications.autoApply))}
+      ${row('Updates', toggle('nt-upd', s.notifications.updates))}
+      ${row('Follow-up reminders', toggle('nt-fu', s.notifications.followUps))}
+    </section>
+
+    <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">Appearance</div><h2 class="section-title">Theme</h2></div></header>
+      <div class="theme-grid section-body">${themeGrid}</div>
+    </section>
+
+    <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">Data</div><h2 class="section-title">Backup & portability</h2></div></header>
+      <div class="section-body" style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn small" data-backup>Back up database now</button>
+        <button class="btn small" data-export>Export everything (JSON)</button>
+        <button class="btn small" data-import-data>Import JSON…</button>
+        <input type="file" id="import-file" accept=".json" hidden />
+        ${state.host === 'desktop' ? '<button class="btn small" data-logs>Open logs folder</button>' : ''}
+      </div>
+      <div class="section-footer muted">Daily backups rotate automatically in the app's data folder.</div>
+    </section>
+  </div>`);
+
+  // section saves
+  const sections = {
+    app: () => ({ app: {
+      closeToTray: v.querySelector('#app-tray').checked,
+      autoLaunch: v.querySelector('#app-autolaunch').checked,
+      globalHotkey: v.querySelector('#app-hotkey').checked,
+    } }),
+    ai: () => ({ ai: {
+      order: v.querySelector('#ai-order').value,
+      cloud: { model: v.querySelector('#ai-cloud-model').value.trim() || 'gpt-5.4' },
+      local: {
+        url: v.querySelector('#ai-local-url').value.trim() || 'http://localhost:11434',
+        structuredModel: v.querySelector('#ai-local-structured').value.trim(),
+        proseModel: v.querySelector('#ai-local-prose').value.trim(),
+      },
+    } }),
+    capture: () => ({ capture: {
+      panelOnDetect: v.querySelector('#cap-panel').checked,
+      askWhenUnsure: v.querySelector('#cap-ask').checked,
+    } }),
+    gmail: () => ({ gmail: {
+      enabled: v.querySelector('#gm-enabled').checked,
+      query: v.querySelector('#gm-query').value.trim(),
+      intervalMinutes: Number(v.querySelector('#gm-interval').value) || 30,
+      clientId: v.querySelector('#gm-cid').value.trim(),
+      clientSecret: v.querySelector('#gm-secret').value,
+    } }),
+    notifications: () => ({ notifications: {
+      statusChanges: v.querySelector('#nt-status').checked,
+      autoApply: v.querySelector('#nt-aa').checked,
+      updates: v.querySelector('#nt-upd').checked,
+      followUps: v.querySelector('#nt-fu').checked,
+    } }),
+  };
+  v.querySelectorAll('[data-save-section]').forEach((btn) => btn.addEventListener('click', async () => {
+    const name = btn.dataset.saveSection;
+    try {
+      await api('/settings', { method: 'PATCH', body: sections[name]() });
+      state.settings = null;
+      toast(`${name[0].toUpperCase() + name.slice(1)} settings saved`);
+      if ((name === 'app' || name === 'gmail') && window.jatDesktop) window.jatDesktop.settingsChanged();
+    } catch (e) { errToast(e); }
+  }));
+
+  // AI tests
+  v.querySelectorAll('[data-test]').forEach((btn) => btn.addEventListener('click', async () => {
+    const prov = btn.dataset.test;
+    const orig = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Testing…';
+    try {
+      const r = await api('/ai/generate', {
+        method: 'POST', timeoutMs: 180000,
+        body: { prompt: 'Reply with exactly: OK', kind: 'test', provider: prov },
+      });
+      toast(`${prov}: "${(r.text || '').slice(0, 40)}" (${r.model || ''})`);
+    } catch (e) { errToast(e, prov + ' test failed'); }
+    btn.disabled = false; btn.textContent = orig;
+  }));
+
+  // Gmail actions
+  v.querySelector('[data-gmail-connect]').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const st = v.querySelector('#gm-status');
+    btn.disabled = true;
+    st.textContent = 'A browser window will open — approve access, then come back…';
+    try {
+      const r = await api('/gmail/auth-url', { method: 'POST', timeoutMs: 320000 });
+      st.textContent = r.ok ? 'Connected ✓' : (r.error || 'failed');
+      if (r.ok) toast('Gmail connected ✓');
+    } catch (err) { st.textContent = err.message; }
+    btn.disabled = false;
+  });
+  v.querySelector('[data-gmail-sync]').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const st = v.querySelector('#gm-status');
+    btn.disabled = true;
+    st.textContent = 'Syncing…';
+    try {
+      const r = await api('/gmail/sync', { method: 'POST', timeoutMs: 180000 });
+      st.textContent = r.ok === false ? (r.error || 'failed')
+        : `scanned ${r.scanned ?? 0} · matched ${r.matched ?? 0} · updated ${r.updated ?? 0}`;
+    } catch (err) { st.textContent = err.message; }
+    btn.disabled = false;
+  });
+
+  // theme swatches
+  v.querySelectorAll('[data-theme-id]').forEach((sw) => sw.addEventListener('click', () => {
+    setTheme(sw.dataset.themeId);
+    v.querySelectorAll('.swatch').forEach((x) => x.classList.toggle('active', x === sw));
+  }));
+
+  // data section
+  v.querySelector('[data-backup]').addEventListener('click', async () => {
+    try {
+      const r = await api('/backup', { method: 'POST', timeoutMs: 30000 });
+      toast(r.path ? 'Backed up → ' + r.path : 'Backup done');
+    } catch (e) { errToast(e); }
+  });
+  v.querySelector('[data-export]').addEventListener('click', async () => {
+    try {
+      const r = await api('/export', { timeoutMs: 60000 });
+      downloadBlob(new Blob([JSON.stringify(r.data, null, 2)], { type: 'application/json' }),
+        `jat-export-${new Date().toISOString().slice(0, 10)}.json`);
+    } catch (e) { errToast(e); }
+  });
+  v.querySelector('[data-import-data]').addEventListener('click', () => v.querySelector('#import-file').click());
+  v.querySelector('#import-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const data = JSON.parse(await file.text());
+      const r = await api('/import', { method: 'POST', body: { data }, timeoutMs: 120000 });
+      toast(`Imported ${r.jobs} jobs, ${r.events} events, ${r.qa} answers`);
+      navigate();
+    } catch (err) { errToast(err, 'Import failed'); }
+  });
+  const logsBtn = v.querySelector('[data-logs]');
+  if (logsBtn) logsBtn.addEventListener('click', () => window.jatDesktop.openLogs());
+
+  return v;
+});
+
+// ============================================================
+// Boot
+// ============================================================
+async function boot(reauth = false) {
+  // Instant theme from cache (settings refine it later)
+  try { applyTheme(localStorage.getItem(LS_THEME) || DEFAULT_THEME); } catch {}
+
+  if (!state.host || state.host === 'web' || reauth) {
+    if (typeof chrome !== 'undefined' && chrome.runtime?.id) {
+      state.host = 'extension';
+      try {
+        const r = await new Promise((res) => chrome.runtime.sendMessage({ type: 'get-token' }, (x) => {
+          void chrome.runtime.lastError; res(x);
+        }));
+        state.token = r?.token || null;
+        state.version = chrome.runtime.getManifest().version;
+      } catch {}
+    } else if (window.jatDesktop) {
+      state.host = 'desktop';
+      try {
+        const b = await window.jatDesktop.boot();
+        state.token = b?.token || null;
+        state.version = b?.version || '';
+        if (b?.port) state.base = `http://localhost:${b.port}`;
+      } catch {}
+    }
+  }
+  const bv = $('#brand-version');
+  if (bv && state.version) bv.textContent = 'v' + state.version;
+
+  if (state.token) {
+    connectSSE();
+    getSettings(true).then((s) => {
+      const t = s.appearance?.theme;
+      if (t) { applyTheme(t); try { localStorage.setItem(LS_THEME, t); } catch {} }
+    }).catch(() => {});
+  }
+
+  paintRuntime();
+  navigate();
 }
 
-function toast(msg, kind = 'info') {
-  const el = document.createElement('div');
-  el.className = `toast ${kind}`;
-  el.textContent = msg;
-  $('#toast').appendChild(el);
-  setTimeout(() => el.remove(), 3000);
-}
-
-setRoute();
-load();
+// global listeners (registered once)
+window.addEventListener('hashchange', navigate);
+$('#refresh-pill')?.addEventListener('click', () => { hideRefreshPill(); navigate(); });
+document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openPalette(); return; }
+  if (e.key === 'Escape') { if (closeTopOverlay()) e.preventDefault(); return; }
+  if (e.key === '/' && !e.ctrlKey && !e.metaKey) {
+    const a = document.activeElement;
+    if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable)) return;
+    const q = $('#f-q');
+    if (q) { e.preventDefault(); q.focus(); }
+  }
+});
+setInterval(paintRuntime, 30000);
+if (!location.hash) location.hash = '#/';
+boot();

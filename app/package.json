@@ -1,35 +1,39 @@
 {
-  "name": "jat9-app",
-  "version": "9.0.4",
-  "description": "Desktop companion for the Job Application Tracker v9 Chrome extension. System tray, native notifications, global hotkey, real-time sync on :7733.",
+  "name": "jat11-app",
+  "version": "11.0.1",
+  "description": "Desktop companion for the Job Application Tracker v11 Chrome extension. SQLite store, token-guarded REST + SSE on localhost:7744, AI layer (Codex CLI cloud / Ollama local), auto-apply queue, Gmail status sync.",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "rebuild": "electron-rebuild -f -w better-sqlite3",
-    "build": "electron-builder",
-    "build:win": "electron-builder --win",
-    "build:mac": "electron-builder --mac",
-    "build:linux": "electron-builder --linux"
+    "mirror": "node ../tools/mirror.mjs",
+    "test": "node --test \"../tests/*.test.mjs\"",
+    "build": "electron-builder --publish never",
+    "build:win": "electron-builder --win --publish never",
+    "build:mac": "electron-builder --mac --publish never",
+    "build:linux": "electron-builder --linux --publish never",
+    "publish:win": "electron-builder --win --publish always"
   },
   "dependencies": {
-    "better-sqlite3": "^11.3.0",
-    "electron-updater": "^6.3.9"
+    "electron-log": "^5.2.0",
+    "electron-updater": "^6.3.9",
+    "mammoth": "^1.8.0",
+    "node-sqlite3-wasm": "^0.8.45",
+    "pdf-parse": "^1.1.1"
   },
   "devDependencies": {
-    "@electron/rebuild": "^3.7.2",
     "electron": "^32.0.0",
     "electron-builder": "^24.13.3"
   },
   "build": {
-    "appId": "com.pierre.jat9",
+    "appId": "com.pierre.jat11",
     "productName": "Job Application Tracker",
-    "files": [
-      "src/**/*",
-      "package.json"
-    ],
+    "files": ["src/**/*", "package.json"],
+    "artifactName": "JAT-v11-${ext}",
+    "protocols": [{ "name": "Job Application Tracker", "schemes": ["jat11"] }],
     "win": {
       "target": "nsis",
-      "icon": "src/icons/icon.ico"
+      "icon": "src/icons/icon.ico",
+      "artifactName": "JAT-v11-setup.${ext}"
     },
     "nsis": {
       "installerIcon": "src/icons/icon.ico",
@@ -46,7 +50,7 @@
     },
     "linux": {
       "target": "AppImage",
-      "icon": "src/icons/icon512.png",
+      "icon": "src/icons/icon128.png",
       "category": "Office"
     },
     "publish": [{

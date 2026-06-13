@@ -1,63 +1,65 @@
-# Job Application Tracker v9
+# JAT v11 — Job Application Tracker
 
-Chrome extension + Electron desktop app that captures every job application across LinkedIn, Indeed, Glassdoor, Greenhouse, Lever, Workday, Ashby, Workable, BambooHR, and SmartRecruiters — with AI-augmented analysis, a unified pipeline, and real-time desktop sync.
+Ground-up rebuild (2026-06-11) on the v10 architecture with the full production
+feature set: reliable capture, token-secured local API, AI layer (Codex CLI
+cloud + Ollama local), paced auto-apply engine, Gmail status sync, themed
+dashboard, and lockstep auto-updates.
 
-## For end users
-
-1. Install the extension from `extension/` (Load unpacked in `chrome://extensions`).
-2. Open the extension, click **Install desktop app**.
-3. Click **⚡ Install with one click**. The native installer for your OS downloads automatically.
-4. Double-click to install. The app launches and the extension auto-pairs.
-
-No Node.js. No source code. No terminal.
-
-## For developers
-
-This repo is set up to release cross-platform installers via GitHub Actions.
-
-### Cutting a release
-
-```bash
-git tag v8.0.X
-git push origin v8.0.X
+```
+v11/
+  extension/    Chrome MV3 extension (load this folder unpacked)
+  app/          Electron desktop companion (SQLite + REST/SSE on :7744)
+  tools/        mirror.mjs (dashboard mirror + CI gate), release.ps1
+  tests/        node --test unit tests (pure modules)
+  docs/         ARCHITECTURE.md, VALIDATION.md, audit + master plan
+  .github/      release workflow (tag v11.x.y → installers on GitHub Releases)
 ```
 
-GitHub Actions (`.github/workflows/release.yml`) automatically:
+## Quick start
 
-- Spins up Windows, macOS, and Linux runners in parallel
-- Builds the Electron desktop app on each platform (`npm run build`)
-- Renames artifacts to `JAT-v9-setup.exe`, `JAT-v9.dmg`, `JAT-v9.AppImage`
-- Attaches them to a GitHub Release named after the tag
+1. **Desktop app** (dev): `cd app && npm install && npm start`
+2. **Extension**: `chrome://extensions` → Developer mode → Load unpacked →
+   select `v11\extension\`. **Disable all older JAT versions.**
+3. Click the JAT toolbar icon → **Connect to app** → click **Allow** in the
+   app's dialog. Done — captures flow into the app's SQLite ledger.
 
-The extension always fetches from `releases/latest/download/<file>`, so new tags instantly update the installer for every existing extension install — no extension re-deploy needed.
+## The rules of this codebase
 
-See `RELEASING.md` for the full pipeline + rationale.
+- **Dashboard mirror**: the SPA is authored in `extension/app/**` ONLY.
+  `npm run mirror` (root) copies it to `app/src/app/**`; CI fails if they
+  diverge. Never hand-edit `app/src/app`.
+- **Lockstep versions**: `extension/manifest.json` and `app/package.json`
+  always carry the same `11.x.y`. `tools/release.ps1` enforces this.
+- **Silent mode**: no in-page UI appears before an Apply click (or an explicit
+  user action). New surfaces ship behind a `settings.*` flag defaulting off.
+- **Status FSM** lives in `extension/lib/status.js` and is mirrored in
+  `app/src/db.js` — change both or change neither.
+- **AI lives in the app** (`app/src/ai/*`), never in the extension. The
+  extension talks to `/ai/*` REST routes through the service worker.
 
-### Local development
+## Releasing
 
-```bash
-# Extension — load extension/ as unpacked in chrome://extensions
-# Desktop app
-cd app
-npm install
-npm start
+```powershell
+.\tools\release.ps1 -Version 11.0.1 -Message "what changed"
 ```
 
-### Tests
+Bumps both versions, mirrors the dashboard, syncs into `..\.v10-publish`,
+commits, tags `v11.0.1`, pushes → CI builds `JAT-v11-setup.exe` (+ mac/linux
+best-effort) and publishes the GitHub Release. The installed app self-updates
+via electron-updater; the extension popup offers the installer download and
+flags its own updates with a badge.
 
-```bash
-cd extension
-node test/runner.mjs
-```
+## Docs
 
-161 tests cover schema, sanitization, themes, sidebar logic, page registry, and audit chain integrity.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — ports, message types, REST
+  contract, AI chain, auto-apply queue states.
+- [docs/VALIDATION.md](docs/VALIDATION.md) — Pierre's per-site manual test
+  script for capture + auto-apply.
+- [docs/AUDIT-2026-06-11.md](docs/AUDIT-2026-06-11.md) +
+  [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) — why v11 exists and what it fixes.
 
-## Architecture
+## Previous versions
 
-- `extension/` — Chrome MV3 extension. 48 page modules under `app/pages/`, IndexedDB v4, AI provider abstraction (`lib/ai.js`) supporting Ollama, OpenAI, and Chrome built-in AI.
-- `app/` — Electron desktop companion. SQLite via `better-sqlite3`, WebSocket sync server on `localhost:7733`, system tray, global hotkey `Ctrl+Shift+J`.
-- `.github/workflows/release.yml` — automated cross-platform installer builds.
-
-## License
-
-MIT — see `LICENSE.txt`.
+`v1/`–`v10/` sit beside this folder, inactive. v11 is the active line. If a bug
+is reported, verify the loaded extension's version in `chrome://extensions`
+before editing anything.

@@ -1,0 +1,102 @@
+/* JAT v11 — onboarding (atelier, full-page guided setup). */
+:root {
+  --bg: #0a0a0a; --bg2: #141210; --panel: #1c1a18; --border: #3a342d;
+  --text: #f4efe6; --body: #d9d2c6; --muted: #8b8378;
+  --primary: #b08a5a; --primary2: #c9a373;
+  --ok: #7fae7f; --bad: #c25b5b;
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  font: 400 15px/1.55 "Inter", -apple-system, "Segoe UI", system-ui, sans-serif;
+  color: var(--body);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  display: flex; align-items: center; justify-content: center;
+  min-height: 100vh; padding: 40px 20px;
+}
+.bg {
+  position: fixed; inset: 0; z-index: -1;
+  background:
+    radial-gradient(ellipse 70% 50% at 50% -10%, color-mix(in srgb, var(--primary) 12%, transparent), transparent 70%),
+    radial-gradient(ellipse 60% 50% at 50% 120%, color-mix(in srgb, var(--primary) 6%, transparent), transparent 70%),
+    var(--bg);
+}
+.wrap {
+  width: 100%; max-width: 620px;
+  background: color-mix(in srgb, var(--bg2) 70%, transparent);
+  border: 1px solid var(--border);
+  box-shadow: 0 40px 80px rgba(0,0,0,0.5);
+  backdrop-filter: blur(6px);
+}
+
+/* header */
+.hd { padding: 22px 32px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.brand { display: flex; align-items: baseline; gap: 10px; }
+.brand-mark { font-size: 20px; font-weight: 600; color: var(--text); letter-spacing: 0.06em; }
+.brand-name { font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--muted); }
+.steps { display: flex; gap: 16px; }
+.step { display: flex; align-items: center; gap: 7px; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); transition: color 300ms var(--ease); }
+.step i { width: 18px; height: 18px; display: grid; place-items: center; border: 1px solid var(--border); font-style: normal; font-size: 10px; color: var(--muted); transition: all 300ms var(--ease); }
+.step.active { color: var(--primary2); }
+.step.active i { border-color: var(--primary); color: var(--primary); background: color-mix(in srgb, var(--primary) 12%, transparent); }
+.step.done i { border-color: var(--ok); color: var(--ok); }
+
+/* stages */
+.stage { padding: 36px 32px 32px; animation: fade 320ms var(--ease); }
+@keyframes fade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+.eyebrow { font-size: 10px; letter-spacing: 0.3em; text-transform: uppercase; color: var(--primary); margin-bottom: 14px; }
+.eyebrow.ok { color: var(--ok); }
+h1 { font-size: 26px; line-height: 1.25; font-weight: 500; color: var(--text); letter-spacing: -0.01em; margin-bottom: 14px; }
+.lead { font-size: 15px; color: var(--body); margin-bottom: 22px; max-width: 52ch; }
+.lead b, .lead strong { color: var(--text); font-weight: 600; }
+
+.facts { list-style: none; display: grid; gap: 10px; margin-bottom: 26px; }
+.facts li { position: relative; padding-left: 22px; font-size: 14px; color: var(--body); }
+.facts li::before { content: ""; position: absolute; left: 2px; top: 8px; width: 6px; height: 6px; background: var(--primary); }
+.facts li b { color: var(--text); }
+
+/* buttons */
+.actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.btn {
+  font: inherit; font-size: 12px; font-weight: 500; letter-spacing: 0.14em; text-transform: uppercase;
+  padding: 12px 18px; border: 1px solid var(--border); background: transparent; color: var(--muted); cursor: pointer;
+  transition: color 180ms var(--ease), border-color 180ms var(--ease), background 180ms var(--ease), transform 120ms var(--ease);
+}
+.btn:hover { color: var(--primary); border-color: var(--primary); }
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: 0.45; cursor: default; }
+.btn.lg { padding: 15px 26px; font-size: 13px; }
+.btn.primary { color: var(--primary); border-color: var(--primary); background: color-mix(in srgb, var(--primary) 8%, transparent); }
+.btn.primary:hover { color: var(--primary2); border-color: var(--primary2); background: color-mix(in srgb, var(--primary) 15%, transparent); }
+.btn.ghost { border-color: transparent; }
+.btn.ghost:hover { border-color: var(--border); color: var(--body); }
+
+/* download box */
+.dl-box { border: 1px solid var(--border); background: var(--panel); padding: 26px; margin-bottom: 18px; display: grid; gap: 16px; justify-items: start; }
+.progress { width: 100%; height: 4px; background: #241f1a; position: relative; overflow: hidden; }
+.progress > i { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: linear-gradient(90deg, var(--primary), var(--primary2)); transition: width 300ms var(--ease); }
+.dl-status { font-size: 13px; color: var(--muted); min-height: 18px; }
+.dl-status.ok { color: var(--ok); }
+.dl-status.bad { color: var(--bad); }
+.dl-run { display: flex; gap: 12px; flex-wrap: wrap; }
+.fallback { border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border)); background: color-mix(in srgb, var(--primary) 6%, transparent); padding: 16px 18px; margin-bottom: 18px; font-size: 14px; }
+.fallback a { color: var(--primary2); }
+
+/* waiter */
+.waiter { display: flex; align-items: center; gap: 18px; padding: 30px 26px; border: 1px solid var(--border); background: var(--panel); margin-bottom: 22px; }
+.spinner { width: 28px; height: 28px; border: 2px solid var(--border); border-top-color: var(--primary); border-radius: 50%; animation: spin 0.9s linear infinite; flex-shrink: 0; }
+.spinner.ok { border-color: var(--ok); border-top-color: var(--ok); animation: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.waiter-text { font-size: 15px; color: var(--text); }
+
+/* footer */
+.ft { padding: 16px 32px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 9px; font-size: 12px; color: var(--muted); }
+.ft .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.ft .dot.ok { background: var(--ok); box-shadow: 0 0 8px color-mix(in srgb, var(--ok) 60%, transparent); }
+.ft .dot.bad { background: var(--bad); }
+
+@media (prefers-reduced-motion: reduce) {
+  .stage, .spinner { animation: none; }
+}

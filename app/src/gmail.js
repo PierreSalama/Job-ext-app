@@ -1,0 +1,308 @@
+// JAT v11 — Gmail status sync.
+// Dependency-free port of the proven Python design from
+// ai-pc-assistant/src/integrations/{gmail_service.py, job_tracker_service.py}:
+//   • Google OAuth desktop flow via loopback redirect (shell.openExternal)
+//   • incremental sync with an internalDate watermark
+//   • LinkedIn notification-email parsers (subject/body regexes)
+//   • ordered keyword classifier (rejection checked FIRST — "congratulations"
+//     appears in interview invites too)
+//   • forward-only status ladder: emails can never demote a job
+// Optional second stage: non-LinkedIn recruiter mail → /ai/classify-email.
+//
+// Requires user-supplied Google OAuth desktop-app credentials in settings
+// (gmail.clientId / gmail.clientSecret) — one-time setup in Google Cloud
+// Console with the gmail.readonly scope.
+
+const http = require('http');
+const crypto = require('crypto');
+const db = require('./db');
+const { scope } = require('./logger');
+
+const log = scope('gmail');
+
+const SCOPE = 'https://www.googleapis.com/auth/gmail.readonly';
+const TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
+const API = 'https://gmail.googleapis.com/gmail/v1/users/me';
+
+let lastResult = null;
+let syncing = false;
+
+// ---------- OAuth ----------
+function tokens() { return db.kvGet('gmailTokens'); }
+
+async function refreshAccessToken() {
+  const t = tokens();
+  const s = db.getSettings().gmail;
+  if (!t?.refresh_token || !s.clientId || !s.clientSecret) return null;
+  const r = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: s.clientId, client_secret: s.clientSecret,
+      refresh_token: t.refresh_token, grant_type: 'refresh_token',
+    }),
+  });
+  if (!r.ok) { log.warn('token refresh failed', r.status); return null; }
+  const body = await r.json();
+  const next = { ...t, access_token: body.access_token, expires_at: Date.now() + (body.expires_in - 60) * 1000 };
+  db.kvSet('gmailTokens', next);
+  return next.access_token;
+}
+
+async function accessToken() {
+  const t = tokens();
+  if (!t) return null;
+  if (t.expires_at && Date.now() < t.expires_at) return t.access_token;
+  return refreshAccessToken();
+}
+
+// Open the consent page in the default browser and catch the loopback redirect.
+async function startAuth() {
+  const s = db.getSettings().gmail;
+  if (!s.clientId || !s.clientSecret) {
+    return { ok: false, error: 'Set gmail.clientId and gmail.clientSecret in Settings first (Google Cloud Console → OAuth desktop app).' };
+  }
+  return new Promise((resolve) => {
+    const state = crypto.randomBytes(16).toString('hex');
+    const srv = http.createServer(async (req, res) => {
+      const u = new URL(req.url, 'http://127.0.0.1');
+      if (u.pathname !== '/callback') { res.writeHead(404); res.end(); return; }
+      const code = u.searchParams.get('code');
+      const gotState = u.searchParams.get('state');
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<html><body style="font-family:sans-serif"><h2>JAT connected to Gmail ✓</h2>You can close this tab.</body></html>');
+      srv.close();
+      clearTimeout(timer);
+      if (!code || gotState !== state) return resolve({ ok: false, error: 'auth was cancelled or invalid' });
+      try {
+        const port = srv.address()?.port || boundPort;
+        const r = await fetch(TOKEN_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            client_id: s.clientId, client_secret: s.clientSecret,
+            code, grant_type: 'authorization_code',
+            redirect_uri: `http://127.0.0.1:${boundPort}/callback`,
+          }),
+        });
+        const body = await r.json();
+        if (!r.ok || !body.access_token) return resolve({ ok: false, error: body.error_description || 'token exchange failed' });
+        db.kvSet('gmailTokens', {
+          access_token: body.access_token,
+          refresh_token: body.refresh_token || tokens()?.refresh_token,
+          expires_at: Date.now() + (body.expires_in - 60) * 1000,
+        });
+        log.info('gmail authorized');
+        resolve({ ok: true });
+      } catch (e) { resolve({ ok: false, error: e.message }); }
+    });
+    let boundPort = 0;
+    const timer = setTimeout(() => { try { srv.close(); } catch {} resolve({ ok: false, error: 'auth timed out (5 min)' }); }, 300000);
+    srv.listen(0, '127.0.0.1', () => {
+      boundPort = srv.address().port;
+      const url = AUTH_URL + '?' + new URLSearchParams({
+        client_id: s.clientId,
+        redirect_uri: `http://127.0.0.1:${boundPort}/callback`,
+        response_type: 'code',
+        scope: SCOPE,
+        access_type: 'offline',
+        prompt: 'consent',
+        state,
+      });
+      try { require('electron').shell.openExternal(url); } catch { log.warn('open browser manually:', url); }
+    });
+  });
+}
+
+// ---------- message fetch ----------
+async function gmailGet(pathAndQuery, token) {
+  const r = await fetch(`${API}${pathAndQuery}`, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(20000),
+  });
+  if (r.status === 401) throw Object.assign(new Error('gmail unauthorized'), { code: 'GMAIL_AUTH' });
+  if (!r.ok) throw new Error(`gmail HTTP ${r.status}`);
+  return r.json();
+}
+
+function header(msg, name) {
+  return (msg.payload?.headers || []).find((h) => h.name.toLowerCase() === name.toLowerCase())?.value || '';
+}
+
+function bodyText(payload) {
+  if (!payload) return '';
+  if (payload.mimeType === 'text/plain' && payload.body?.data) {
+    return Buffer.from(payload.body.data, 'base64url').toString('utf8');
+  }
+  for (const part of payload.parts || []) {
+    const t = bodyText(part);
+    if (t) return t;
+  }
+  // fall back to html stripped
+  if (payload.mimeType === 'text/html' && payload.body?.data) {
+    return Buffer.from(payload.body.data, 'base64url').toString('utf8')
+      .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+  }
+  return '';
+}
+
+// ---------- parsing & classification (ported from Python, order matters) ----------
+const SUBJ_APPLIED_RX = /your application (?:to|for) (.+?) at (.+?)\s*$/i;
+const SUBJ_UPDATE_RX = /your update from (.+?)\s*$/i;
+
+const BUCKETS = [
+  ['rejected', /not (?:be )?moving forward|unfortunately|not selected|decided to (?:pursue|proceed with) other|no longer under consideration|position has been filled/i],
+  ['offer', /\boffer\b|we are pleased to (?:offer|extend)|congratulations.*offer/i],
+  ['interview_1', /\binterview\b|schedule a (?:call|chat|conversation)|next round|meet the team|phone screen/i],
+  ['interview_1_assessment', /\bassessment\b|coding challenge|take[- ]home|online test|hackerrank|codility/i],
+  ['contacted', /reviewing your application|application is being reviewed|recruiter|talent (?:team|partner)/i],
+  ['submitted', /application (?:was )?(?:sent|submitted|received)|applied on/i],
+];
+
+function classify(subject, body) {
+  const text = `${subject}\n${body}`.toLowerCase();
+  for (const [status, rx] of BUCKETS) {
+    if (rx.test(text)) return status === 'interview_1_assessment' ? 'interview_1' : status;
+  }
+  return null;
+}
+
+function parseLinkedIn(subject, body) {
+  let m = subject.match(SUBJ_APPLIED_RX);
+  if (m) return { title: m[1].trim(), company: m[2].trim() };
+  m = subject.match(SUBJ_UPDATE_RX);
+  if (m) {
+    const company = m[1].trim();
+    const bm = body.match(/(.+?)\n.*applied on/i);
+    return { title: bm ? bm[1].trim() : '', company };
+  }
+  return null;
+}
+
+function matchJob({ title, company }) {
+  if (!company) return null;
+  const all = db.listJobs({ limit: 2000 });
+  const ck = db.normKey(company);
+  const tk = db.normKey(title);
+  // exact title+company → company + fuzzy title → company only if unique
+  let hit = all.find((j) => db.normKey(j.company) === ck && db.normKey(j.title) === tk && tk);
+  if (hit) return hit;
+  const sameCo = all.filter((j) => db.normKey(j.company) === ck);
+  if (tk) {
+    hit = sameCo.find((j) => db.normKey(j.title).includes(tk) || tk.includes(db.normKey(j.title)));
+    if (hit) return hit;
+  }
+  return sameCo.length === 1 ? sameCo[0] : null;
+}
+
+// ---------- sync ----------
+async function syncNow() {
+  if (syncing) return { ok: false, error: 'sync already running' };
+  const s = db.getSettings().gmail;
+  if (!s.enabled) return { ok: false, error: 'gmail sync is disabled in Settings' };
+  const token = await accessToken();
+  if (!token) return { ok: false, error: 'not authorized — connect Gmail in Settings', needsAuth: true };
+
+  syncing = true;
+  const started = Date.now();
+  let scanned = 0, matched = 0, updated = 0;
+  try {
+    const watermark = db.kvGet('gmailWatermark') || 0;   // internalDate ms
+    const afterSec = watermark ? Math.floor(watermark / 1000) : Math.floor((Date.now() - 30 * 86400000) / 1000);
+    const q = `${s.query} after:${afterSec}`;
+
+    let pageToken = '';
+    let newWatermark = watermark;
+    const ids = [];
+    do {
+      const page = await gmailGet(`/messages?q=${encodeURIComponent(q)}&maxResults=50${pageToken ? `&pageToken=${pageToken}` : ''}`, token);
+      for (const m of page.messages || []) ids.push(m.id);
+      pageToken = page.nextPageToken || '';
+    } while (pageToken && ids.length < 300);
+
+    for (const id of ids) {
+      const msg = await gmailGet(`/messages/${id}?format=full`, token);
+      const internal = Number(msg.internalDate || 0);
+      if (internal <= watermark) continue;      // already processed
+      newWatermark = Math.max(newWatermark, internal);
+      scanned++;
+
+      const subject = header(msg, 'Subject');
+      const from = header(msg, 'From');
+      const body = bodyText(msg.payload).slice(0, 8000);
+
+      let parsed = parseLinkedIn(subject, body);
+      let status = classify(subject, body);
+
+      // Second stage: AI classification for non-LinkedIn recruiter mail.
+      if ((!parsed || !status) && s.includeRecruiterMail) {
+        try {
+          const provider = require('./ai/provider');
+          const prompts = require('./ai/prompts');
+          const r = await provider.run(prompts.classifyEmail({ subject, from, body }));
+          const c = r.json;
+          if (c.confidence >= 0.7 && c.company) {
+            parsed = parsed || { title: c.jobTitle || '', company: c.company };
+            status = status || ({
+              application_confirmation: 'submitted', recruiter_reply: 'contacted',
+              interview_request: 'interview_1', assessment_request: 'interview_1',
+              offer: 'offer', rejection: 'rejected', status_update: null,
+            })[c.category] || null;
+          }
+        } catch (e) { log.warn('ai classify failed:', e.message); }
+      }
+
+      if (!parsed || !status) continue;
+      const job = matchJob(parsed);
+      if (!job) continue;
+      matched++;
+
+      // Forward-only: upsert path enforces elevation; never demote via email.
+      const cur = db.STATUS_ORDER[job.status] || 0;
+      const inc = db.STATUS_ORDER[status] || 0;
+      if (inc > cur && !db.TERMINAL.has(job.status) || (status === 'rejected' && !db.TERMINAL.has(job.status))) {
+        const r = db.patchJob(job.id, { status });
+        if (r?.statusChanged) {
+          updated++;
+          db.recordEvent({
+            jobId: job.id, type: 'status_changed', source: 'gmail',
+            summary: `${r.previousStatus} → ${status} (email: "${subject.slice(0, 80)}")`,
+            data: { from: r.previousStatus, to: status, emailSubject: subject.slice(0, 200), emailFrom: from.slice(0, 120) },
+          });
+        }
+      } else {
+        db.recordEvent({
+          jobId: job.id, type: 'email', source: 'gmail',
+          summary: `Email: "${subject.slice(0, 80)}"`,
+          data: { classified: status, emailFrom: from.slice(0, 120) },
+        });
+      }
+    }
+
+    if (newWatermark > (db.kvGet('gmailWatermark') || 0)) db.kvSet('gmailWatermark', newWatermark);
+    lastResult = { at: new Date().toISOString(), scanned, matched, updated, ms: Date.now() - started };
+    db.kvSet('gmailLastResult', lastResult);
+    log.info('sync done', lastResult);
+    return { ok: true, ...lastResult };
+  } catch (e) {
+    log.error('sync failed', e.message);
+    lastResult = { at: new Date().toISOString(), error: e.message };
+    return { ok: false, error: e.message, needsAuth: e.code === 'GMAIL_AUTH' };
+  } finally {
+    syncing = false;
+  }
+}
+
+function status() {
+  const s = db.getSettings().gmail;
+  return {
+    enabled: s.enabled,
+    configured: !!(s.clientId && s.clientSecret),
+    authorized: !!tokens()?.refresh_token,
+    lastResult: lastResult || db.kvGet('gmailLastResult'),
+    watermark: db.kvGet('gmailWatermark'),
+  };
+}
+
+module.exports = { startAuth, syncNow, status };

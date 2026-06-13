@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Set up Job Application Tracker</title>
+  <link rel="stylesheet" href="onboarding.css" />
+</head>
+<body>
+  <div class="bg"></div>
+  <main class="wrap">
+    <header class="hd">
+      <div class="brand"><span class="brand-mark">JAT</span><span class="brand-name">Job Application Tracker</span></div>
+      <div class="steps" id="steps">
+        <span class="step" data-step="1"><i>1</i> Get the app</span>
+        <span class="step" data-step="2"><i>2</i> Install</span>
+        <span class="step" data-step="3"><i>3</i> Connect</span>
+      </div>
+    </header>
+
+    <!-- STAGE: welcome -->
+    <section class="stage" id="stage-welcome">
+      <div class="eyebrow">Welcome</div>
+      <h1>Let's get you set up — it takes about a minute.</h1>
+      <p class="lead">The extension captures your job applications, but it keeps your data on a tiny
+        <strong>desktop companion app</strong> that runs privately on your computer. Nothing leaves
+        your machine. You just need to install it once.</p>
+      <ul class="facts">
+        <li><b>Private</b> — your applications, resumes, and answers stay on your PC.</li>
+        <li><b>Quiet</b> — it lives in your system tray and captures jobs in the background.</li>
+        <li><b>Smart</b> — fit scores, cover letters, and paced auto-apply, all local.</li>
+      </ul>
+      <div class="actions">
+        <button class="btn primary lg" id="go-download">Get the app →</button>
+        <button class="btn ghost" id="already-have">I already installed it</button>
+      </div>
+    </section>
+
+    <!-- STAGE: download / install -->
+    <section class="stage" id="stage-download" hidden>
+      <div class="eyebrow">Step 1 — Download &amp; install</div>
+      <h1 id="dl-title">Download the desktop app</h1>
+      <p class="lead" id="dl-sub">One click downloads the installer. When it finishes, hit
+        <b>Run installer</b> and click through it (Next → Install → Finish).</p>
+
+      <div class="dl-box" id="dl-box">
+        <button class="btn primary lg" id="btn-download">⬇ Download the app</button>
+        <div class="progress" id="dl-progress" hidden><i id="dl-bar"></i></div>
+        <div class="dl-status" id="dl-status"></div>
+        <div class="dl-run" id="dl-run" hidden>
+          <button class="btn primary lg" id="btn-run">▶ Run installer</button>
+          <button class="btn ghost" id="btn-show">Show in folder</button>
+        </div>
+      </div>
+
+      <div class="fallback" id="dl-fallback" hidden>
+        <p>Couldn't fetch the installer automatically. <a href="#" id="fallback-link" target="_blank" rel="noopener">Open the downloads page</a>,
+           grab the latest <b>setup</b> file, and run it. This page connects automatically once it's installed.</p>
+      </div>
+
+      <div class="actions">
+        <button class="btn ghost" id="dl-back">← Back</button>
+      </div>
+    </section>
+
+    <!-- STAGE: waiting / connect -->
+    <section class="stage" id="stage-wait" hidden>
+      <div class="eyebrow">Step 2 — Connect</div>
+      <h1 id="wait-title">Waiting for the app to start…</h1>
+      <p class="lead" id="wait-sub">Run the installer if you haven't yet — this page will detect the app
+        the moment it's running, then connect automatically.</p>
+
+      <div class="waiter" id="waiter">
+        <div class="spinner" id="spinner"></div>
+        <div class="waiter-text" id="waiter-text">Looking for the desktop app…</div>
+      </div>
+
+      <div class="actions" id="wait-actions">
+        <button class="btn ghost" id="wait-run" hidden>▶ Run installer again</button>
+        <button class="btn ghost" id="wait-launch" hidden>Open the app</button>
+      </div>
+    </section>
+
+    <!-- STAGE: done -->
+    <section class="stage" id="stage-done" hidden>
+      <div class="eyebrow ok">All set</div>
+      <h1>🎉 You're connected.</h1>
+      <p class="lead">The desktop app is running and paired with your extension. From now on, JAT
+        captures every application automatically — just apply to jobs like you normally would.</p>
+      <ul class="facts">
+        <li>Apply to a job on <b>LinkedIn / Indeed</b> → it shows up in your dashboard.</li>
+        <li>Click the JAT toolbar icon anytime to see status and recent captures.</li>
+        <li>Open the dashboard to add your profile &amp; resume (powers AI + auto-apply).</li>
+      </ul>
+      <div class="actions">
+        <button class="btn primary lg" id="open-dash">Open the dashboard →</button>
+        <button class="btn ghost" id="go-linkedin">Go apply to a job</button>
+      </div>
+    </section>
+
+    <footer class="ft">
+      <span class="dot" id="ft-dot"></span>
+      <span id="ft-text">Setting up…</span>
+    </footer>
+  </main>
+  <script src="onboarding.js"></script>
+</body>
+</html>

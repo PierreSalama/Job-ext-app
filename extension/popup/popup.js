@@ -1,196 +1,234 @@
-// v6 popup. Coexists with sidebar-agent's HTML overhaul: every DOM access is
-// optional/defensive so a missing element never throws. Adds three things on
-// top of the redesigned popup: theme application, sync-status pill, and
-// theme-picker dropdown (footer).
-import { applyTheme, subscribeThemeChanges, THEMES } from '../lib/themes.js';
+// JAT v11 popup — mission control.
+// One popup-state fetch paints connection/queue/auto-apply; in parallel it
+// queries the active tab's content script for what JAT sees on THIS page, and
+// (when paired) pulls /stats + recent jobs through the SW api-call proxy.
 
-const send = (type, data) => new Promise((res) => chrome.runtime.sendMessage({ type, data }, res));
 const $ = (s) => document.querySelector(s);
+const send = (msg) => new Promise((res) => chrome.runtime.sendMessage(msg, (r) => { void chrome.runtime.lastError; res(r); }));
+const SNOOZE_KEY = 'jat11.updateSnoozeVersion';
 
-function paintSync(status) {
-  const pill = $('#sync-pill');
-  const label = $('#sync-label');
-  if (pill && label) {
-    if (status?.connected) { pill.className = 'pill ok'; label.textContent = 'Desktop: connected'; }
-    else if (status?.healthy) { pill.className = 'pill ok'; label.textContent = 'Desktop: online'; }
-    else { pill.className = 'pill bad'; label.textContent = 'Desktop: offline'; }
+const STAGE_LABEL = { detected: 'Detected', started: 'Apply opened', progressing: 'In progress', submitted: 'Submitted' };
+const STATUS_LABEL = {
+  started: 'Started', submitted: 'Submitted', contacted: 'Contacted',
+  interview_1: 'First interview', interview_2: 'Second interview', interview_final: 'Final interview',
+  offer: 'Offer', hired: 'Hired', rejected: 'Rejected', withdrawn: 'Withdrawn', ghosted: 'Ghosted',
+};
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const relTime = (iso) => {
+  if (!iso) return '';
+  const m = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
+  if (m < 1) return 'now'; if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60); if (h < 24) return h + 'h';
+  return Math.floor(h / 24) + 'd';
+};
+function setHint(el, msg, cls = '') { el.className = 'hint ' + cls; el.textContent = msg; }
+function openDashboard(hash = '') {
+  chrome.tabs.create({ url: chrome.runtime.getURL('app/app.html') + hash });
+  window.close();
+}
+
+let suppressedHost = null;
+
+async function paintConnection() {
+  $('#ext-version').textContent = 'v' + chrome.runtime.getManifest().version;
+  const st = await send({ type: 'popup-state' });
+  if (!st?.ok) return null;
+
+  const dot = $('#conn-dot');
+  if (st.health?.ok) {
+    dot.className = 'conn-dot ok';
+    $('#conn-text').textContent = `app v${st.health.app?.version || '?'}${st.queueN ? ' · ' + st.queueN + ' queued' : ''}`;
+    $('#pair-row').hidden = st.paired || st.setupNeeded;
   } else {
-    // No dedicated pill — append into the header subtitle when present
-    const sub = document.querySelector('.h .sub');
-    if (sub && !sub.querySelector('#sync-pill')) {
-      const span = document.createElement('span');
-      span.id = 'sync-pill';
-      span.className = 'pill bad';
-      span.innerHTML = '<span id="sync-label">Desktop: offline</span>';
-      sub.appendChild(span);
-      paintSync(status);
+    dot.className = 'conn-dot bad';
+    $('#conn-text').textContent = 'app offline';
+    $('#pair-row').hidden = true;
+  }
+
+  // Not connected yet → show the guided-setup card and hide the data sections
+  // (they're meaningless without a paired app).
+  if (st.setupNeeded) {
+    $('#setup-row').hidden = false;
+    $('#page-card').hidden = true;
+    if (st.appInstalledButClosed) {
+      $('#setup-title').textContent = 'Your app isn\'t running';
+      $('#setup-sub').textContent = 'Open the desktop app to keep capturing and syncing.';
+      $('#btn-setup').textContent = 'Open the app';
+      $('#btn-setup').dataset.mode = 'launch';
+    } else if (st.health?.ok) {
+      $('#setup-title').textContent = 'Almost there';
+      $('#setup-sub').textContent = 'The app is running — connect to finish setup.';
+      $('#btn-setup').textContent = 'Connect →';
+      $('#btn-setup').dataset.mode = 'onboard';
+    } else {
+      $('#btn-setup').dataset.mode = 'onboard';
+    }
+  } else {
+    $('#setup-row').hidden = true;
+    $('#page-card').hidden = false;
+  }
+
+  if (st.autoApply) {
+    $('#aa-row').hidden = false;
+    const a = $('#aa-state');
+    a.textContent = st.autoApply.enabled ? `on · ${st.autoApply.mode} mode` : 'off';
+    a.className = 'aa-state' + (st.autoApply.enabled ? ' on' : '');
+  }
+
+  if (st.extUpdate?.hasUpdate) {
+    $('#ext-mine').textContent = 'v' + st.extUpdate.mine;
+    $('#ext-latest').textContent = 'v' + st.extUpdate.latest;
+    $('#ext-update-banner').hidden = false;
+  }
+  return st;
+}
+
+async function paintPage() {
+  const body = $('#page-body');
+  const hint = $('#capture-hint');
+  let tab;
+  try { [tab] = await chrome.tabs.query({ active: true, currentWindow: true }); } catch {}
+  if (!tab?.id || !/^https?:/.test(tab.url || '')) {
+    body.innerHTML = '<div class="page-line muted">JAT doesn\'t run on this page.</div>';
+    $('#btn-capture').disabled = true;
+    return;
+  }
+
+  let ps = null;
+  try { ps = await chrome.tabs.sendMessage(tab.id, { type: 'jat11.page-state' }); } catch { ps = null; }
+
+  if (ps?.suppressed) {
+    suppressedHost = new URL(tab.url).hostname;
+    body.innerHTML = `<div class="page-line warn">JAT is silenced on ${esc(suppressedHost)}.</div>`;
+    setHint(hint, 'Tracking here is off. Re-enable it, or track this one page anyway.');
+    $('#capture-hint').insertAdjacentHTML('beforeend', ' <a href="#" id="reenable" style="color:var(--primary)">Re-enable</a>');
+    $('#reenable')?.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const cur = (await chrome.storage.local.get('jat11.suppressHosts'))['jat11.suppressHosts'] || [];
+      await chrome.storage.local.set({ 'jat11.suppressHosts': cur.filter((h) => h !== suppressedHost) });
+      paintPage();
+    });
+    return;
+  }
+
+  if (ps?.detected && ps.title) {
+    const captured = ps.persisted || ps.stage === 'submitted';
+    body.innerHTML = `
+      ${ps.stage ? `<div class="page-stage"><span class="dot"></span>${esc(STAGE_LABEL[ps.stage] || ps.stage)}</div>` : ''}
+      <div class="page-title">${esc(ps.title)}</div>
+      ${ps.company ? `<div class="page-co">${esc(ps.company)}${ps.source ? ' · ' + esc(ps.source) : ''}</div>` : ''}`;
+    if (captured) setHint(hint, ps.saveState === 'queued' ? 'Captured — queued until the app is back.' : 'Saved to your tracker ✓', ps.saveState === 'queued' ? 'warn' : 'ok');
+    else setHint(hint, 'Detected. It saves automatically once you apply — or track it now.');
+    $('#btn-capture').textContent = captured ? '📌 Update this entry' : '📌 Track this page';
+  } else if (ps && ps.loaded === false && ps.plausible) {
+    body.innerHTML = '<div class="page-line">This looks like a job page.</div>';
+    setHint(hint, 'JAT is watching. Track it now if you want it saved immediately.');
+  } else {
+    body.innerHTML = '<div class="page-line muted">No job detected on this page.</div>';
+    setHint(hint, 'You can still track it manually — handy for ATS pages JAT didn\'t recognize.');
+  }
+}
+
+async function paintStatsAndRecent(st) {
+  if (!st?.health?.ok || !st.paired) return;
+  const [statsR, jobsR] = await Promise.all([
+    send({ type: 'api-call', method: 'GET', path: '/stats' }),
+    send({ type: 'api-call', method: 'GET', path: '/jobs?limit=4' }),
+  ]);
+  if (statsR?.ok) {
+    $('#stats').hidden = false;
+    $('#st-total').textContent = statsR.total ?? 0;
+    $('#st-week').textContent = statsR.thisWeek ?? 0;
+    const rv = $('#st-review');
+    rv.textContent = statsR.needsReview ?? 0;
+    if (statsR.needsReview) rv.classList.add('warn');
+  }
+  if (jobsR?.ok && jobsR.items?.length) {
+    $('#recent').hidden = false;
+    const list = $('#recent-list');
+    list.replaceChildren();
+    for (const j of jobsR.items) {
+      const b = document.createElement('button');
+      b.className = 'rec-item';
+      b.innerHTML = `<span class="rec-dot" data-status="${esc(j.status)}"></span>
+        <span class="rec-main"><span class="rec-title">${esc(j.title || 'Untitled')}</span>
+        <span class="rec-co">${esc(j.company || '')} · ${esc(STATUS_LABEL[j.status] || j.status)}</span></span>
+        <span class="rec-when">${esc(relTime(j.updatedAt))}</span>`;
+      b.addEventListener('click', () => openDashboard('#/applications/' + j.id));
+      list.appendChild(b);
     }
   }
-  // Install banner when desktop offline
-  paintInstallBanner(status?.connected || status?.healthy);
 }
 
-function paintInstallBanner(isOnline) {
-  let bnr = $('#install-app-banner');
-  if (isOnline) { if (bnr) bnr.remove(); return; }
-  if (bnr) return;
-  const root = $('.b') || document.body;
-  if (!root) return;
-  bnr = document.createElement('div');
-  bnr.id = 'install-app-banner';
-  bnr.style.cssText = 'background:linear-gradient(135deg,rgba(99,102,241,0.18),rgba(139,92,246,0.10));border:1px solid rgba(99,102,241,0.3);border-radius:8px;padding:10px;margin-top:10px;font-size:11px;cursor:pointer';
-  bnr.innerHTML = `<strong style="color:var(--primary,#6366f1)">🖥️ Want more power?</strong><div style="margin-top:3px;color:var(--muted,#94a3b8)">Install the optional desktop app for real-time sync and folder watching.</div>`;
-  bnr.addEventListener('click', () => chrome.tabs.create({ url: chrome.runtime.getURL('app/app.html#/install-app') }));
-  root.insertBefore(bnr, root.firstChild?.nextSibling || null);
-}
-
-function paintThemePicker(currentId) {
-  const sel = $('#theme-pick');
-  if (!sel) return;
-  if (!sel.options.length) {
-    sel.innerHTML = THEMES.map((t) => `<option value="${t.id}">${t.icon} ${t.name}</option>`).join('');
-  }
-  sel.value = currentId;
-  sel.onchange = async () => {
-    const id = sel.value;
-    applyTheme(id);
-    await send('patch-settings', { theme: id });
-  };
-}
-
-(async () => {
-  const settingsRes = await send('get-settings');
-  const themeId = settingsRes?.settings?.theme || 'midnight';
-  applyTheme(themeId);
-  subscribeThemeChanges((id) => { applyTheme(id); paintThemePicker(id); });
-  paintThemePicker(themeId);
-
-  const sum = await send('status-summary');
-  if (sum?.ok) {
-    if ($('#s-today'))  $('#s-today').textContent  = sum.summary.today;
-    if ($('#s-week'))   $('#s-week').textContent   = sum.summary.week;
-    if ($('#s-total'))  $('#s-total').textContent  = sum.summary.total;
-    if ($('#s-active')) $('#s-active').textContent = sum.summary.active || 0;
-  }
-  const list = await send('list-jobs');
-  if (list?.ok && $('#recent')) {
-    const recent = (list.items || []).sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || '')).slice(0, 5);
-    $('#recent').innerHTML = recent.length === 0
-      ? '<div class="empty">No applications yet.</div>'
-      : recent.map((j) => `<div class="row"><div class="label"><strong>${escapeHtml(j.title || 'Untitled')}</strong><small>${escapeHtml(j.company || '')} · ${j.status}</small></div></div>`).join('');
-  }
-
-  const ss = await send('sync.status');
-  paintSync(ss?.status || { healthy: false, connected: false });
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg?.type === 'jat-event' && msg.name === 'sync.status') paintSync(msg.data);
-  });
-
-  $('#open')?.addEventListener('click', () => send('open-app'));
-  // v9.0.1: Auto-apply trigger on the active tab — sends a message to the
-  // running content script which launches the RPA overlay in the page.
-  $('#auto-apply')?.addEventListener('click', async (e) => {
-    const btn = e.currentTarget; const orig = btn.textContent;
-    btn.disabled = true; btn.textContent = '🤖 Starting…';
-    try {
-      const r = await send('start-auto-apply-current-tab');
-      if (r?.ok === false && r?.error) {
-        btn.textContent = '⚠ ' + (r.error.length > 24 ? r.error.slice(0, 24) + '…' : r.error);
-        setTimeout(() => { btn.disabled = false; btn.textContent = orig; }, 4000);
-      } else {
-        btn.textContent = '🤖 Running…';
-        setTimeout(() => window.close(), 700);
-      }
-    } catch (err) {
-      btn.disabled = false; btn.textContent = orig;
-    }
-  });
-  $('#ai')?.addEventListener('click', () => chrome.tabs.create({ url: chrome.runtime.getURL('app/app.html#/settings') }));
-  $('#add')?.addEventListener('click', () => chrome.tabs.create({ url: chrome.runtime.getURL('app/app.html#/jobs') }));
-  $('#tour')?.addEventListener('click', () => chrome.tabs.create({ url: chrome.runtime.getURL('app/app.html#/tour') }));
-  $('#sync')?.addEventListener('click', () => chrome.tabs.create({ url: 'https://www.linkedin.com/my-items/saved-jobs/' }));
-})();
-
-function escapeHtml(s) {
-  return String(s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-}
-
-// ---------- Greeting + AI status pill + due/overdue + AI nudge ----------
-function _greetingPart() {
-  const h = new Date().getHours();
-  return h < 5 ? 'Good night' : h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : h < 21 ? 'Good evening' : 'Good night';
-}
-
-(async () => {
-  // Greeting
+async function paintAppUpdate() {
   try {
-    const pr = await send('get-profile');
-    const name = pr?.profile?.firstName || pr?.profile?.preferredName || '';
-    if ($('#greet')) $('#greet').textContent = name ? `${_greetingPart()}, ${name}` : _greetingPart();
-  } catch {}
+    const r = await send({ type: 'check-app-update', force: true });
+    const snoozed = (await chrome.storage.local.get(SNOOZE_KEY))[SNOOZE_KEY];
+    const show = r?.ok && r.appRunning && r.hasUpdate && r.current && r.latest && r.current !== r.latest && snoozed !== r.latest;
+    if (!show) { $('#update-banner').hidden = true; return; }
+    $('#update-current').textContent = 'v' + r.current;
+    $('#update-latest').textContent = 'v' + r.latest;
+    $('#update-banner').hidden = false;
+    $('#update-now').addEventListener('click', async () => {
+      const s = $('#update-status');
+      $('#update-now').disabled = true; $('#update-later').disabled = true;
+      setHint(s, 'finding installer…');
+      const d = await send({ type: 'download-app-installer' });
+      if (d?.ok) setHint(s, `downloading ${d.fileName} — run it when done`, 'ok');
+      else { setHint(s, d?.error || 'download failed', 'bad'); $('#update-now').disabled = false; $('#update-later').disabled = false; }
+    });
+    $('#update-later').addEventListener('click', async () => {
+      await chrome.storage.local.set({ [SNOOZE_KEY]: r.latest });
+      $('#update-banner').hidden = true;
+    });
+  } catch { $('#update-banner').hidden = true; }
+}
 
-  // AI status pill
-  try {
-    const aiR = await send('ai-status');
-    const pill = $('#ai-pill');
-    if (pill) {
-      if (aiR?.status?.available) { pill.className = 'pill ok'; pill.textContent = `AI: ${aiR.status.provider} ready`; }
-      else { pill.className = 'pill bad'; pill.textContent = 'AI: off'; }
-    }
-  } catch {}
+// ---- actions ----
+$('#btn-setup').addEventListener('click', async () => {
+  const mode = $('#btn-setup').dataset.mode;
+  if (mode === 'launch') { await send({ type: 'launch-app' }); window.close(); return; }
+  await send({ type: 'open-onboarding' });
+  window.close();
+});
 
-  // Due / overdue (jobs follow-ups + reminders + events) - if list-due section exists
-  if ($('#due-list')) {
-    try {
-      const [jobsR, evR, remR] = await Promise.all([
-        send('list-jobs'),
-        send('list-events').catch(() => null),
-        send('list-reminders').catch(() => null)
-      ]);
-      const jobs = jobsR?.items || [];
-      const events = evR?.items || [];
-      const reminders = remR?.items || [];
-      const now = Date.now();
-      const due = [];
-      for (const j of jobs) {
-        if (j.followUpDueAt && new Date(j.followUpDueAt).getTime() <= now + 86400000 && !['offer','rejected','withdrawn','archived'].includes(j.status)) {
-          due.push({ label: `Follow up: ${j.title}`, sub: `${j.company} · ${new Date(j.followUpDueAt).toLocaleDateString()}` });
-        }
-      }
-      for (const r of reminders) {
-        if (r.done) continue;
-        const t = r.fireAt ? new Date(r.fireAt).getTime() : 0;
-        if (t && t <= now + 86400000) due.push({ label: r.title || 'Reminder', sub: r.fireAt ? new Date(r.fireAt).toLocaleString() : '' });
-      }
-      for (const e of events) {
-        const t = e.startsAt ? new Date(e.startsAt).getTime() : 0;
-        if (t && t >= now - 3600000 && t <= now + 86400000) due.push({ label: e.title || 'Interview', sub: e.startsAt ? new Date(e.startsAt).toLocaleString() : '' });
-      }
-      if (due.length > 0) {
-        $('#due-list').innerHTML = due.slice(0, 4).map((d) => `<div class="row"><div class="label"><strong>${escapeHtml(d.label)}</strong><small>${escapeHtml(d.sub)}</small></div></div>`).join('');
-      }
-    } catch {}
-  }
+$('#btn-pair').addEventListener('click', async () => {
+  const s = $('#action-status');
+  setHint(s, 'check the app window — click Allow…');
+  const r = await send({ type: 'pair-app' });
+  if (r?.ok) { setHint(s, 'connected ✓', 'ok'); boot(); }
+  else setHint(s, r?.error || 'pairing failed', 'bad');
+});
 
-  // AI nudge of the day — only when AI is available
-  if ($('#nudge-section') && $('#nudge')) {
-    try {
-      const aiR = await send('ai-status');
-      if (aiR?.status?.available) {
-        const jobsR = await send('list-jobs');
-        const jobs = jobsR?.items || [];
-        if (jobs.length > 0) {
-          const r = await send('ai-call', { feature: 'nudges', jobs: jobs.slice(0, 30) });
-          if (r?.ok && Array.isArray(r.result) && r.result.length > 0) {
-            const top = r.result.find((n) => n.priority === 'high') || r.result[0];
-            const job = jobs.find((j) => j.id === top.jobId);
-            if (job) {
-              $('#nudge-section').hidden = false;
-              $('#nudge').innerHTML = `<strong>${escapeHtml(job.title)} · ${escapeHtml(job.company)}</strong>${escapeHtml(top.reason || '')}`;
-            }
-          }
-        }
-      }
-    } catch {}
-  }
-})();
+$('#btn-capture').addEventListener('click', async () => {
+  const hint = $('#capture-hint');
+  setHint(hint, 'capturing…');
+  const r = await send({ type: 'capture-now' });
+  if (r?.ok) setHint(hint, `tracked: ${r.title || 'this page'} ✓`, 'ok');
+  else if (r?.queued) setHint(hint, 'captured — app offline, queued ⏳', 'warn');
+  else setHint(hint, r?.error || 'capture failed', 'bad');
+  setTimeout(() => { paintPage(); boot(); }, 700);
+});
+
+$('#open-dashboard').addEventListener('click', () => openDashboard());
+$('#download-app').addEventListener('click', async () => {
+  const s = $('#action-status');
+  const btn = $('#download-app');
+  btn.disabled = true;
+  setHint(s, 'finding latest installer…');
+  const r = await send({ type: 'download-app-installer' });
+  if (r?.ok) setHint(s, `downloading ${r.fileName} (${r.tag})`, 'ok');
+  else setHint(s, r?.error || 'download failed', 'bad');
+  btn.disabled = false;
+});
+document.querySelectorAll('.stat[data-go]').forEach((b) => b.addEventListener('click', () => openDashboard(b.dataset.go)));
+
+// ---- boot ----
+async function boot() {
+  const st = await paintConnection();
+  await paintStatsAndRecent(st);
+}
+paintConnection().then((st) => paintStatsAndRecent(st));
+paintPage();
+paintAppUpdate();
+send({ type: 'check-ext-update' });
