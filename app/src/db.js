@@ -273,6 +273,14 @@ const MIGRATIONS = [
       UPDATE documents SET source = 'upload' WHERE source IS NULL;
     `);
   },
+
+  // v3 — document designations + index ranking
+  () => {
+    exec(`
+      ALTER TABLE documents ADD COLUMN label      TEXT;                       -- user designation ("Master CV")
+      ALTER TABLE documents ADD COLUMN importance INTEGER NOT NULL DEFAULT 0; -- index ranking (folder scan)
+    `);
+  },
 ];
 
 function userVersion() {
@@ -930,6 +938,27 @@ function harvestAnswersToProfile(answers, { jobId, source } = {}) {
   return n;
 }
 
+// One-shot backfill: harvest answers from EVERY past application into the
+// profile store. Oldest first so the newest answer to a repeated question wins.
+// Bypasses the harvest setting — this is an explicit user action.
+function backfillProfileFromJobs() {
+  let fields = 0, jobs = 0;
+  const allJobs = listJobs({});
+  allJobs.sort((a, b) => new Date(a.updatedAt || 0) - new Date(b.updatedAt || 0));
+  for (const j of allJobs) {
+    const ans = j.answers;
+    if (!ans || typeof ans !== 'object' || !Object.keys(ans).length) continue;
+    let got = 0;
+    for (const [key, raw] of Object.entries(ans)) {
+      const value = Array.isArray(raw) ? raw.join(', ') : raw;
+      if (value == null || String(value).trim() === '') continue;
+      try { if (profileFieldUpsert({ question: humanizeKey(key), value, sourceJobId: j.id, source: j.source, confidence: 0.6 })) got++; } catch {}
+    }
+    if (got) { fields += got; jobs++; }
+  }
+  return { jobs, fields };
+}
+
 // ============================================================
 // Profiles
 // ============================================================
@@ -994,6 +1023,8 @@ function docRow(r, { withText } = {}) {
     indexedAt: r.indexed_at || null,
     folderId: r.folder_id || null,
     source: r.source || 'upload',
+    label: r.label || '',
+    importance: r.importance || 0,
     sizeBytes: r.size_bytes, mime: r.mime, isDefault: !!r.is_default, createdAt: r.created_at,
   };
 }
@@ -1005,7 +1036,7 @@ function listDocuments(filter = {}) {
   if (filter.folderId) { where.push('folder_id = ?'); params.push(filter.folderId); }
   let sql = 'SELECT * FROM documents';
   if (where.length) sql += ' WHERE ' + where.join(' AND ');
-  sql += ' ORDER BY is_default DESC, created_at DESC';
+  sql += ' ORDER BY is_default DESC, importance DESC, created_at DESC';
   let rows = all(sql, params).map((r) => docRow(r));
   if (filter.q) {
     const q = String(filter.q).toLowerCase();
@@ -1020,31 +1051,32 @@ function getDocument(id, opts = {}) {
 function documentByPath(filePath) {
   return docRow(get('SELECT * FROM documents WHERE file_path = ?', [filePath]));
 }
-function addDocument({ name, role, filePath, textContent, sizeBytes, mime, isDefault, source, keywords, lastModified, folderId }) {
+function addDocument({ name, role, filePath, textContent, sizeBytes, mime, isDefault, source, keywords, lastModified, folderId, importance, label }) {
   const id = uid('doc');
   const ts = now();
   role = canonRole(role);
   transaction(() => {
     if (isDefault) run('UPDATE documents SET is_default = 0 WHERE role = ?', [role]);
-    run(`INSERT INTO documents (id, name, role, file_path, text_content, size_bytes, mime, is_default, created_at, keywords, last_modified, indexed_at, folder_id, source)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    run(`INSERT INTO documents (id, name, role, file_path, text_content, size_bytes, mime, is_default, created_at, keywords, last_modified, indexed_at, folder_id, source, importance, label)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [id, name, role, filePath, textContent || null,
          sizeBytes || 0, mime || '', isDefault ? 1 : 0, ts,
          keywords ? JSON.stringify(keywords) : null, lastModified || null,
-         textContent ? ts : null, folderId || null, source || 'upload']);
+         textContent ? ts : null, folderId || null, source || 'upload', importance || 0, label || null]);
   });
   return getDocument(id);
 }
-function patchDocument(id, { name, role, isDefault, textContent }) {
+function patchDocument(id, { name, role, isDefault, textContent, label }) {
   const cur = get('SELECT * FROM documents WHERE id = ?', [id]);
   if (!cur) return null;
   role = role !== undefined ? canonRole(role) : cur.role;
   transaction(() => {
     if (isDefault) run('UPDATE documents SET is_default = 0 WHERE role = ?', [role]);
-    run('UPDATE documents SET name=?, role=?, is_default=?, text_content=? WHERE id=?',
+    run('UPDATE documents SET name=?, role=?, is_default=?, text_content=?, label=? WHERE id=?',
         [name ?? cur.name, role,
          isDefault !== undefined ? (isDefault ? 1 : 0) : cur.is_default,
-         textContent !== undefined ? textContent : cur.text_content, id]);
+         textContent !== undefined ? textContent : cur.text_content,
+         label !== undefined ? label : cur.label, id]);
   });
   return getDocument(id);
 }
@@ -1103,7 +1135,7 @@ function folderAdd({ path: p, label, roleHint }) {
   if (ex) return folderRow(ex);
   const id = uid('fold');
   run('INSERT INTO document_folders (id, path, label, role_hint, file_count, enabled, created_at) VALUES (?, ?, ?, ?, 0, 1, ?)',
-      [id, p, label || '', roleHint || 'other', now()]);
+      [id, p, label || '', roleHint || 'auto', now()]);
   return folderGet(id);
 }
 function folderTouch(id, fileCount) {
@@ -1119,17 +1151,27 @@ function folderDelete(id, { pruneDocs } = {}) {
 }
 // Insert-or-update a folder-indexed file, deduped by its real path so re-scans
 // don't duplicate. Never sets is_default.
-function upsertFolderDocument({ folderId, name, filePath, role, textContent, sizeBytes, mime, lastModified, keywords }) {
+function upsertFolderDocument({ folderId, name, filePath, role, textContent, sizeBytes, mime, lastModified, keywords, importance }) {
   const ex = get('SELECT * FROM documents WHERE file_path = ?', [filePath]);
   const ts = now();
   role = canonRole(role || 'other');
   if (ex) {
-    run(`UPDATE documents SET name=?, role=?, text_content=?, size_bytes=?, mime=?, keywords=?, last_modified=?, indexed_at=?, folder_id=?, source='folder' WHERE id=?`,
+    run(`UPDATE documents SET name=?, role=?, text_content=?, size_bytes=?, mime=?, keywords=?, last_modified=?, indexed_at=?, folder_id=?, importance=?, source='folder' WHERE id=?`,
         [name, role, textContent || null, sizeBytes || 0, mime || '',
-         keywords ? JSON.stringify(keywords) : null, lastModified || null, ts, folderId || ex.folder_id, ex.id]);
+         keywords ? JSON.stringify(keywords) : null, lastModified || null, ts, folderId || ex.folder_id, importance || 0, ex.id]);
     return getDocument(ex.id);
   }
-  return addDocument({ name, role, filePath, textContent, sizeBytes, mime, source: 'folder', keywords, lastModified, folderId });
+  return addDocument({ name, role, filePath, textContent, sizeBytes, mime, source: 'folder', keywords, lastModified, folderId, importance });
+}
+
+// Remove all folder-indexed docs whose source file no longer exists on disk
+// (so an auto-rescan after a delete/rename prunes stale entries).
+function pruneMissingFolderDocs(folderId) {
+  let removed = 0;
+  for (const r of all('SELECT id, file_path FROM documents WHERE folder_id = ? AND source = ?', [folderId, 'folder'])) {
+    try { if (!fs.existsSync(r.file_path)) { run('DELETE FROM documents WHERE id = ?', [r.id]); removed++; } } catch {}
+  }
+  return removed;
 }
 
 // ============================================================
@@ -1268,10 +1310,11 @@ module.exports = {
   listEvents, listRecentEvents, recordEvent,
   qaRecord, qaLookup, qaList, qaDelete, normalizeQuestion, guessLocale,
   profileFieldUpsert, profileFieldList, profileFieldSet, profileFieldDelete,
-  profileFieldLookup, profileAutofillBundle, harvestAnswersToProfile,
+  profileFieldLookup, profileAutofillBundle, harvestAnswersToProfile, backfillProfileFromJobs,
   listProfiles, saveProfile, deleteProfile, profileForSource,
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,
-  extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument, documentByPath,
+  extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,
+  documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
   queueList, queueAdd, queuePatch, queueDelete, queueRunStats,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll,

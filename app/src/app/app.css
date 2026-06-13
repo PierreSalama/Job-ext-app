@@ -1371,3 +1371,80 @@ details.fold .fold-body {
 }
 .lang-badge.fr { color: var(--primary2); border-color: color-mix(in srgb, var(--primary2) 40%, transparent); }
 tr.pf-locked td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
+
+/* ============================================================
+   PROFILE redesign — dense grouped grid + autofill strip
+   ============================================================ */
+.autofill-strip {
+  display: flex; align-items: center; gap: 14px;
+  padding: 12px 18px; margin-bottom: 18px;
+  border: 1px solid var(--border); background: var(--panel-veil);
+}
+.autofill-strip.on { border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); background: var(--wash-04); }
+.autofill-strip .as-text { font-size: 12px; color: var(--body-text); flex: 1; min-width: 0; }
+.autofill-strip .as-text strong { color: var(--text); font-weight: 600; }
+.pf-main { padding: 18px 22px; }
+.pf-idrow { display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap; padding-bottom: 16px; margin-bottom: 8px; border-bottom: 1px solid var(--border); }
+.pf-idrow .pf-field { min-width: 180px; }
+.pf-grow { flex: 1; min-width: 220px; }
+.pf-default { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--body-text); white-space: nowrap; padding-bottom: 8px; cursor: pointer; }
+.pf-group { margin-top: 18px; }
+.pf-group-title {
+  font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: var(--muted);
+  margin-bottom: 10px; display: flex; align-items: center; gap: 10px;
+}
+.pf-group-title::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+.pf-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(178px, 1fr)); gap: 10px 14px; }
+.pf-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.pf-flabel { font-size: 10px; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pf-inwrap { display: flex; gap: 4px; align-items: center; }
+.pf-inwrap .input { width: 100%; }
+.pf-rm { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 12px; padding: 2px 4px; flex-shrink: 0; }
+.pf-rm:hover { color: var(--danger); }
+.pf-field.custom .pf-flabel { color: var(--primary2); }
+
+/* ============================================================
+   DOCUMENTS redesign — active banner, designations, resume picker
+   ============================================================ */
+.active-docs {
+  display: flex; align-items: center; gap: 22px; flex-wrap: wrap;
+  padding: 12px 18px; margin-bottom: 14px;
+  border: 1px solid var(--border); background: var(--panel-veil);
+}
+.ad-item { display: flex; flex-direction: column; gap: 2px; }
+.ad-k { font-size: 8px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--muted); }
+.ad-v { font-size: 13px; color: var(--text); }
+.ad-v.muted { color: var(--muted); font-size: 12px; }
+.ad-hint { margin-left: auto; font-size: 11px; color: var(--muted); }
+.doc-label {
+  display: inline-block; font-size: 9px; letter-spacing: 0.04em; padding: 1px 7px; margin-left: 4px;
+  color: var(--primary); border: 1px solid color-mix(in srgb, var(--primary) 40%, transparent);
+}
+.doc-rename { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 11px; padding: 0 4px; opacity: 0; transition: opacity 160ms; }
+tr[data-doc]:hover .doc-rename { opacity: 1; }
+.doc-rename:hover { color: var(--primary); }
+.doc-role { font-size: 11px; padding: 4px 6px; min-width: 110px; }
+tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
+.fc-live { color: var(--success); }
+.doc-pick-list { display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow: auto; }
+.doc-pick {
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  padding: 10px 12px; border: 1px solid var(--border); background: var(--bg2); cursor: pointer; font-family: inherit;
+  transition: border-color 160ms var(--ease-firm), background 160ms var(--ease-firm);
+}
+.doc-pick:hover { border-color: var(--primary); background: var(--wash-04); }
+.doc-pick .dp-name { color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ============================================================
+   PIPELINE card polish — company avatar
+   ============================================================ */
+.kb-card-top { display: flex; align-items: flex-start; gap: 9px; }
+.kb-avatar {
+  flex-shrink: 0; width: 28px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  background: hsl(var(--hue, 220) 42% 42%); color: #fff;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.02em;
+}
+.kb-card-id { flex: 1; min-width: 0; }
+.kb-card-top .fit-badge { flex-shrink: 0; }
+.kb-loc { color: var(--muted); }

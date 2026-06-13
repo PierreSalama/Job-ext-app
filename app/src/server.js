@@ -152,10 +152,36 @@ async function queueNext() {
 }
 
 // ============================================================
-// Document-folder indexing (read-only crawl of a user-linked directory)
+// Document-folder indexing (read-only crawl of a user-linked directory).
+// Smart: classifies each file by its name AND the folders above it, scores how
+// likely it's a real/current application document, skips junk, and auto-rescans
+// on startup + on filesystem changes (debounced fs.watch).
 // ============================================================
 const FOLDER_EXT_RX = /\.(pdf|docx?|txt|md|rtf|odt)$/i;
 const MAX_INDEX_FILE_BYTES = 15 * 1024 * 1024;
+const IGNORE_FILE_RX = /(^~\$|^\.~|\.tmp$|\.bak$|^thumbs\.db$|^desktop\.ini$|\(conflicted copy| - copy|backup of )/i;
+const SKIP_DIR_RX = /^(node_modules|\$recycle\.bin|system volume information|\.git|appdata)$/i;
+const RESUME_RX = /\b(resumes?|résumés?|cv|cvs|curriculum)\b/i;
+const COVER_RX  = /\b(cover\s*letters?|coverletters?|lettres?\s*de\s*motivation|motivation)\b/i;
+
+// High-precision deterministic resume fields — merged with the AI parse so the
+// import still fills the obvious things (contacts, links) even when AI is slow,
+// unavailable, or returns little.
+function deterministicResumeFields(text) {
+  const t = String(text || '');
+  const out = {};
+  const email = t.match(/[\w.+-]+@[\w-]+\.[\w.-]+\.?\w+/);
+  if (email) out.email = email[0].replace(/\.$/, '');
+  const phone = t.match(/(?:\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/);
+  if (phone) out.phone = phone[0].trim();
+  const li = t.match(/(?:https?:\/\/)?(?:www\.)?linkedin\.com\/[\w\-/%]+/i);
+  if (li) out.linkedinUrl = li[0];
+  const gh = t.match(/(?:https?:\/\/)?(?:www\.)?github\.com\/[\w\-/%]+/i);
+  if (gh) out.githubUrl = gh[0];
+  const site = t.match(/https?:\/\/(?!.*(?:linkedin|github)\.com)[\w.-]+\.[a-z]{2,}(?:\/[\w\-/%.#?=&]*)?/i);
+  if (site) out.portfolioUrl = site[0];
+  return out;
+}
 
 function isUnsafeFolder(p) {
   const r = path.resolve(p);
@@ -168,15 +194,37 @@ function isUnsafeFolder(p) {
   return banned.some((b) => lower === b || lower.startsWith(b + path.sep));
 }
 
-function roleForFile(name, roleHint) {
-  if (roleHint && roleHint !== 'auto') return roleHint;
-  if (/cover|lettre|motivation/i.test(name)) return 'cover_letter';
-  if (/resume|cv|curriculum/i.test(name)) return 'resume';
-  return 'other';
+// Classify a file from its name + the folder names above it. Returns
+// { role, importance } where importance ranks how likely it's a real, current
+// application document (drives ordering + which docs surface as candidates).
+function classifyDoc(relDir, name, mtimeMs) {
+  const fileHay = ' ' + name.toLowerCase() + ' ';
+  const dirHay = ' ' + relDir.toLowerCase().replace(/[\\/]+/g, ' ') + ' ';
+  let role = 'other', importance = 10;
+
+  if (COVER_RX.test(fileHay)) { role = 'cover_letter'; importance = 60; }
+  else if (RESUME_RX.test(fileHay)) { role = 'resume'; importance = 75; }
+  // A file living in a "Resumes"/"Cover letters" folder takes that role even if
+  // the filename is generic, and gets a confidence boost.
+  if (RESUME_RX.test(dirHay)) { if (role === 'other') role = 'resume'; importance += 25; }
+  if (COVER_RX.test(dirHay)) { if (role === 'other') role = 'cover_letter'; importance += 22; }
+
+  if (/\b(application|applications|job|jobs|career|careers|postul)/.test(fileHay + dirHay)) importance += 15;
+  if (/\b(final|current|latest|master|active|signed|20\d\d)\b/.test(fileHay)) importance += 18;
+  if (/\b(old|older|archive|archived|draft|drafts|backup|copy|previous|outdated|sample|example|test)\b/.test(fileHay + dirHay)) importance -= 28;
+  if (/\b(template|templates|boilerplate)\b/.test(fileHay + dirHay)) importance -= 8;   // useful but not "current"
+
+  const ageDays = (Date.now() - mtimeMs) / 86400000;
+  if (ageDays < 90) importance += 15;
+  else if (ageDays < 540) importance += 6;
+  else if (ageDays > 1460) importance -= 12;
+
+  return { role, importance: Math.max(0, importance) };
 }
 
-// Walk a linked folder, extract text + keywords per supported file, and upsert
-// each into the library (deduped by path; unchanged files skip re-extraction).
+// Walk a linked folder, classify + extract text + keywords per supported file,
+// upsert into the library (deduped by path; unchanged files skip re-extraction),
+// and prune entries whose source file vanished. Returns { indexed, summary }.
 async function scanFolder(folder) {
   const s = db.getSettings().documents;
   const maxFiles = s.maxFolderFiles || 2000;
@@ -190,37 +238,75 @@ async function scanFolder(folder) {
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
       if (found.length >= maxFiles) break;
-      if (e.name.startsWith('.')) continue;
+      if (e.name.startsWith('.') || SKIP_DIR_RX.test(e.name)) continue;
       if (e.isSymbolicLink && e.isSymbolicLink()) continue;
       const full = path.join(dir, e.name);
       if (e.isDirectory()) walk(full, depth + 1);
-      else if (e.isFile() && FOLDER_EXT_RX.test(e.name)) found.push(full);
+      else if (e.isFile() && FOLDER_EXT_RX.test(e.name) && !IGNORE_FILE_RX.test(e.name)) found.push(full);
     }
   };
   walk(folder.path, 0);
 
+  const summary = { resume: 0, cover_letter: 0, other: 0, skipped: 0, total: found.length };
   let indexed = 0, processed = 0;
   for (const full of found) {
     // Yield to the event loop every few files so a big index doesn't starve SSE
     // keep-alives / other REST requests on this single-threaded process.
     if (processed++ % 6 === 0) await new Promise((r) => setImmediate(r));
     let st; try { st = fs.statSync(full); } catch { continue; }
-    if (st.size > MAX_INDEX_FILE_BYTES) continue;
+    if (st.size > MAX_INDEX_FILE_BYTES || st.size < 16) { summary.skipped++; continue; }
     const mtime = st.mtime.toISOString();
-    const role = roleForFile(path.basename(full), folder.roleHint);
+    const rel = path.relative(folder.path, path.dirname(full));
+    let { role, importance } = classifyDoc(rel, path.basename(full), st.mtime.getTime());
+    if (folder.roleHint && folder.roleHint !== 'auto') role = folder.roleHint;   // explicit override
     const prev = db.documentByPath(full);
-    if (prev && prev.lastModified === mtime && prev.hasText) { indexed++; continue; }  // unchanged → skip extract
+    if (prev && prev.lastModified === mtime && prev.hasText) { summary[role] = (summary[role] || 0) + 1; indexed++; continue; }
     let text = '';
     try { text = await extractText(full, ''); } catch {}
     db.upsertFolderDocument({
       folderId: folder.id, name: path.basename(full), filePath: full, role,
       textContent: text, sizeBytes: st.size, mime: '', lastModified: mtime,
-      keywords: db.extractKeywords(text, topN),
+      keywords: db.extractKeywords(text, topN), importance,
     });
+    summary[role] = (summary[role] || 0) + 1;
     indexed++;
   }
+  summary.removed = db.pruneMissingFolderDocs(folder.id);
   db.folderTouch(folder.id, indexed);
-  return indexed;
+  return { indexed, summary };
+}
+
+// ---- auto-index: rescan on startup + a debounced fs.watch per linked folder ----
+const folderWatchers = new Map();
+const folderRescanTimers = new Map();
+
+async function rescanAllFolders() {
+  for (const f of db.folderList()) {
+    if (!f.enabled) continue;
+    try { await scanFolder(f); broadcast('documents.updated', { folderId: f.id }); }
+    catch (e) { log.warn('folder rescan failed', f.path, e.message); }
+  }
+}
+
+function scheduleFolderRescan(folder) {
+  clearTimeout(folderRescanTimers.get(folder.id));
+  folderRescanTimers.set(folder.id, setTimeout(async () => {
+    try { await scanFolder(db.folderGet(folder.id) || folder); broadcast('documents.updated', { folderId: folder.id }); }
+    catch (e) { log.warn('folder auto-rescan failed', e.message); }
+  }, 4000));
+}
+
+function startFolderWatchers() {
+  for (const w of folderWatchers.values()) { try { w.close(); } catch {} }
+  folderWatchers.clear();
+  for (const f of db.folderList()) {
+    if (!f.enabled) continue;
+    try {
+      const w = fs.watch(f.path, { recursive: true, persistent: false }, () => scheduleFolderRescan(f));
+      w.on('error', () => {});
+      folderWatchers.set(f.id, w);
+    } catch (e) { log.warn('folder watch unavailable', f.path, e.message); }
+  }
 }
 
 // ============================================================
@@ -426,6 +512,12 @@ async function handle(req, res, parsed) {
     broadcast('profileFields.updated', {});
     return sendJson(res, okDel ? 200 : 404, { ok: okDel });
   }
+  // Build the profile store from EVERY past application's answers.
+  if (req.method === 'POST' && pathname === '/profile-fields/backfill') {
+    const r = db.backfillProfileFromJobs();
+    broadcast('profileFields.updated', {});
+    return sendJson(res, 200, { ok: true, ...r });
+  }
 
   // Everything the extension needs to pre-fill a new application (gated by the
   // autofill setting — returns disabled:true when off so the client no-ops).
@@ -511,19 +603,21 @@ async function handle(req, res, parsed) {
     if (!st.isDirectory()) return sendJson(res, 400, { ok: false, error: 'not a folder' });
     if (isUnsafeFolder(dir)) return sendJson(res, 400, { ok: false, error: 'that folder is not allowed (system directory)' });
     const folder = db.folderAdd({ path: dir, label: body.label, roleHint: body.roleHint });
-    const indexed = await scanFolder(folder);
+    const { indexed, summary } = await scanFolder(folder);
+    startFolderWatchers();
     broadcast('documents.updated', { folderId: folder.id });
-    return sendJson(res, 200, { ok: true, folder: db.folderGet(folder.id), indexed });
+    return sendJson(res, 200, { ok: true, folder: db.folderGet(folder.id), indexed, summary });
   }
   if (req.method === 'POST' && (jm = m(/^\/document-folders\/([^/]+)\/scan$/))) {
     const folder = db.folderGet(jm[1]);
     if (!folder) return sendJson(res, 404, { ok: false, error: 'not found' });
-    const indexed = await scanFolder(folder);
+    const { indexed, summary } = await scanFolder(folder);
     broadcast('documents.updated', { folderId: folder.id });
-    return sendJson(res, 200, { ok: true, folder: db.folderGet(folder.id), indexed });
+    return sendJson(res, 200, { ok: true, folder: db.folderGet(folder.id), indexed, summary });
   }
   if (req.method === 'DELETE' && (jm = m(/^\/document-folders\/([^/]+)$/))) {
     const okDel = db.folderDelete(jm[1], { pruneDocs: parsed.searchParams.get('prune') === '1' });
+    startFolderWatchers();
     broadcast('documents.updated', { folderId: jm[1] });
     return sendJson(res, okDel ? 200 : 404, { ok: okDel });
   }
@@ -650,7 +744,12 @@ async function handle(req, res, parsed) {
     const doc = body.documentId ? db.getDocument(body.documentId, { withText: true }) : db.defaultDocument('resume');
     if (!doc?.textContent) return sendJson(res, 400, { ok: false, error: 'no extractable text in that document' });
     const r = await provider.run(prompts.resumeParse({ resumeText: doc.textContent }));
-    return sendJson(res, 200, { ok: true, result: r.json, provider: r.provider });
+    // Merge: AI result wins where it has a value; deterministic extraction fills
+    // the gaps so contacts/links always come through.
+    const result = { ...(r.json || {}) };
+    const det = deterministicResumeFields(doc.textContent);
+    for (const [k, val] of Object.entries(det)) if (!result[k]) result[k] = val;
+    return sendJson(res, 200, { ok: true, result, provider: r.provider });
   }
   if (req.method === 'POST' && pathname === '/ai/validate-capture') {
     const ctx = await aiFeature(); if (!ctx) return;
@@ -736,4 +835,4 @@ function stopServer() {
   if (server) { try { server.close(); } catch {} server = null; }
 }
 
-module.exports = { startServer, stopServer, broadcast, getToken };
+module.exports = { startServer, stopServer, broadcast, getToken, rescanAllFolders, startFolderWatchers };

@@ -1155,19 +1155,27 @@ route('/pipeline', async () => {
   const TERMINAL_S = ['hired', 'rejected', 'withdrawn', 'ghosted'];
   const STALE_DAYS = 14;
 
+  const initials = (s) => (String(s || '?').trim().match(/\b\w/g) || ['?']).slice(0, 2).join('').toUpperCase();
+  const avatarHue = (s) => { let h = 0; for (const c of String(s || '')) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h % 360; };
   const cardHtml = (j) => {
     const stale = j.updatedAt && (Date.now() - new Date(j.updatedAt).getTime()) > STALE_DAYS * 86400000 && !TERMINAL_S.includes(j.status);
     const fitCls = j.fitScore == null ? '' : (j.fitScore >= 70 ? 'fit-good' : j.fitScore >= 45 ? 'fit-mid' : 'fit-low');
     const tags = (j.tags || []).slice(0, 3).map((t) => `<span class="kb-tag">${esc(t)}</span>`).join('');
     const sub = [];
     if (j.source) sub.push(`<span class="kb-source">${esc(j.source)}</span>`);
-    if (j.location) sub.push(`<span>${esc(j.location)}</span>`);
+    if (j.location) sub.push(`<span class="kb-loc">${esc(j.location)}</span>`);
     return `<div class="kb-card ${fitCls} ${stale ? 'stale' : ''}" draggable="true" data-id="${esc(j.id)}">
-      <div class="t">${j.needsReview ? '<span class="kb-warn" title="Needs review">⚠</span> ' : ''}${esc(j.title || 'Untitled')}</div>
-      <div class="c">${esc(j.company || '')}</div>
+      <div class="kb-card-top">
+        <span class="kb-avatar" style="--hue:${avatarHue(j.company || j.title)}">${esc(initials(j.company || j.title))}</span>
+        <div class="kb-card-id">
+          <div class="t">${j.needsReview ? '<span class="kb-warn" title="Needs review">⚠</span> ' : ''}${esc(j.title || 'Untitled')}</div>
+          <div class="c">${esc(j.company || '')}</div>
+        </div>
+        ${fitBadgeHtml(j.fitScore)}
+      </div>
       ${sub.length ? `<div class="kb-sub">${sub.join('')}</div>` : ''}
       ${tags ? `<div class="kb-tags">${tags}</div>` : ''}
-      <div class="kb-meta">${fitBadgeHtml(j.fitScore)}<span class="${stale ? 'stale-txt' : ''}">${esc(daysIn(j.updatedAt))}</span></div>
+      <div class="kb-meta"><span class="${stale ? 'stale-txt' : ''}">${esc(daysIn(j.updatedAt))}</span></div>
     </div>`;
   };
 
@@ -1439,6 +1447,15 @@ const PROFILE_FIELDS = [
   ['major', 'Field of study'], ['graduationYear', 'Graduation year'],
   ['headline', 'Headline'],
 ];
+const PF_LABEL = Object.fromEntries(PROFILE_FIELDS);
+const FIELD_GROUPS = [
+  { title: 'Identity', keys: ['firstName', 'lastName', 'fullName', 'preferredName', 'pronouns'] },
+  { title: 'Contact & location', keys: ['email', 'phone', 'address1', 'address2', 'city', 'state', 'postalCode', 'country'] },
+  { title: 'Links', keys: ['linkedinUrl', 'githubUrl', 'portfolioUrl'] },
+  { title: 'Work eligibility', keys: ['workAuthorization', 'sponsorshipRequired', 'citizenship', 'securityClearance'] },
+  { title: 'Compensation & experience', keys: ['salaryExpectation', 'yearsExperience', 'noticePeriod'] },
+  { title: 'Education', keys: ['highestDegree', 'university', 'major', 'graduationYear', 'headline'] },
+];
 
 route('/profile', async () => {
   const [profilesR, fieldsR, settings] = await Promise.all([
@@ -1456,20 +1473,27 @@ route('/profile', async () => {
   const cur = profiles.find((p) => p.id === state.profileSel) || { name: 'Main', isDefault: !profiles.length, sourceAssignments: [], data: {} };
   const d = cur.data || {};
 
-  // Dynamic structured fields = the seed list ∪ any custom keys already saved in
-  // this profile's data — so harvested/custom questions become first-class,
-  // editable fields with no hardcoding.
+  // Dynamic structured fields: grouped seed fields + any custom keys already
+  // saved in this profile's data, rendered as a DENSE multi-column grid so many
+  // fields are visible at once.
   const seedKeys = new Set(PROFILE_FIELDS.map(([k]) => k));
   const humanize = (k) => k.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').replace(/^\w/, (c) => c.toUpperCase());
   const extraKeys = Object.keys(d).filter((k) => !seedKeys.has(k) && k !== 'skills' && k !== 'summary' && !k.startsWith('_'));
-  const fieldDefs = [
-    ...PROFILE_FIELDS.map(([k, label]) => ({ k, label, custom: false })),
-    ...extraKeys.map((k) => ({ k, label: humanize(k), custom: true })),
-  ];
-  const fieldRowHtml = (f) => `
-    <div class="form-row" data-fieldrow="${esc(f.k)}"><label class="form-label" for="pf-${esc(f.k)}">${esc(f.label)}${f.custom ? ' <span class="muted">· custom</span>' : ''}</label>
-      <div class="form-control field-control"><input class="input pf-input" id="pf-${esc(f.k)}" data-key="${esc(f.k)}" value="${esc(d[f.k] ?? '')}" />${f.custom ? '<button class="btn small" data-rmfield title="Remove field">✕</button>' : ''}</div></div>`;
-  const fieldRows = fieldDefs.map(fieldRowHtml).join('');
+  const fieldCard = (k, label, custom) => `
+    <div class="pf-field ${custom ? 'custom' : ''}" data-fieldrow="${esc(k)}">
+      <label class="pf-flabel" for="pf-${esc(k)}">${esc(label)}</label>
+      <div class="pf-inwrap"><input class="input pf-input" id="pf-${esc(k)}" data-key="${esc(k)}" value="${esc(d[k] ?? '')}" />${custom ? '<button class="pf-rm" data-rmfield title="Remove field">✕</button>' : ''}</div>
+    </div>`;
+  const groupsHtml = FIELD_GROUPS.map((g) => `
+    <div class="pf-group">
+      <div class="pf-group-title">${esc(g.title)}</div>
+      <div class="pf-grid">${g.keys.map((k) => fieldCard(k, PF_LABEL[k] || humanize(k), false)).join('')}</div>
+    </div>`).join('');
+  const customHtml = `
+    <div class="pf-group">
+      <div class="pf-group-title">Custom fields <button class="btn small" data-addfield>+ Add</button></div>
+      <div class="pf-grid" id="pf-custom">${extraKeys.map((k) => fieldCard(k, humanize(k), true)).join('')}</div>
+    </div>`;
 
   const langBadge = (loc) => loc === 'fr' ? '<span class="lang-badge fr">FR</span>' : '<span class="lang-badge">EN</span>';
   const harvestRows = harvested.length ? harvested.map((it) => `
@@ -1482,7 +1506,7 @@ route('/profile', async () => {
         <button class="btn small" data-pf-del title="Forget">✕</button>
       </td>
     </tr>`).join('')
-    : `<tr><td colspan="4">${emptyHtml('Empty memory', 'No learned answers yet', 'Every application you fill teaches JAT how you answer — in English or French.')}</td></tr>`;
+    : `<tr><td colspan="4">${emptyHtml('Empty memory', 'No learned answers yet', 'Apply to jobs (or “Build from past applications”) and JAT learns how you answer — EN + FR.')}</td></tr>`;
 
   const v = el(`<div>
     <header class="page-header">
@@ -1492,25 +1516,19 @@ route('/profile', async () => {
         <div class="page-sub">What autofill and auto-apply know about you — self-populating as you apply.</div>
       </div>
       <div class="page-actions">
-        <button class="btn" data-import>Import from resume</button>
-        ${cur.id ? '<button class="btn" data-del-profile>Delete profile</button>' : ''}
+        <button class="btn" data-import>Import from résumé</button>
+        ${cur.id ? '<button class="btn" data-del-profile>Delete</button>' : ''}
         <button class="btn primary" data-save>Save profile</button>
       </div>
     </header>
 
-    <section class="section autofill-card">
-      <div class="af-row">
-        <div>
-          <div class="section-eyebrow">Autofill</div>
-          <h2 class="section-title">Pre-fill new applications from this profile</h2>
-          <div class="form-hint">${af.enabled
-            ? 'On — empty fields are filled automatically when you open an application. It never submits for you.'
-            : 'Off — turn on to have JAT fill matching fields on new applications. Empty fields only; never submits.'}</div>
-        </div>
-        <label class="toggle"><input type="checkbox" id="af-enabled" ${af.enabled ? 'checked' : ''} /><span class="knob"></span></label>
-      </div>
-      <div class="form-hint" style="margin-top:6px">More options in <a href="#/settings" class="section-link">Settings → Autofill</a>.</div>
-    </section>
+    <div class="autofill-strip ${af.enabled ? 'on' : ''}">
+      <label class="toggle"><input type="checkbox" id="af-enabled" ${af.enabled ? 'checked' : ''} /><span class="knob"></span></label>
+      <div class="as-text"><strong>Autofill new applications</strong> — ${af.enabled
+        ? 'on. Empty fields fill automatically when you open an application; it never submits.'
+        : 'off. Turn on to pre-fill matching fields on new applications (empty fields only, never submits).'}</div>
+      <a href="#/settings" class="section-link">Options →</a>
+    </div>
 
     <div class="profile-layout">
       <div class="profile-list">
@@ -1519,25 +1537,30 @@ route('/profile', async () => {
       </div>
 
       <div>
-        <section class="section">
-          <header class="section-header"><div><div class="section-eyebrow">Identity</div><h2 class="section-title">${esc(cur.name || 'New profile')}</h2></div></header>
-          <div class="form-row"><label class="form-label" for="pf-name">Profile name</label>
-            <div class="form-control"><input class="input" id="pf-name" value="${esc(cur.name || '')}" /></div></div>
-          <div class="form-row"><span class="form-label">Default profile</span>
-            <div class="form-control"><label class="toggle"><input type="checkbox" id="pf-default" ${cur.isDefault ? 'checked' : ''} /><span class="knob"></span></label></div></div>
-          <div class="form-row"><div class="form-label">Use on sites <div class="form-hint">hostname contains…</div></div>
-            <div class="form-control" id="pf-sources-slot"></div></div>
-          <div id="pf-fields">${fieldRows}</div>
-          <div class="form-row"><div class="form-label"></div><div class="form-control"><button class="btn small" data-addfield>+ Add custom field</button></div></div>
-          <div class="form-row"><label class="form-label" for="pf-summary">Summary</label>
-            <div class="form-control"><textarea class="input" id="pf-summary" rows="4" style="width:100%;resize:vertical">${esc(d.summary || '')}</textarea></div></div>
-          <div class="form-row"><div class="form-label">Skills</div><div class="form-control" id="pf-skills-slot"></div></div>
+        <section class="section pf-main">
+          <div class="pf-idrow">
+            <div class="pf-field"><label class="pf-flabel" for="pf-name">Profile name</label>
+              <input class="input" id="pf-name" value="${esc(cur.name || '')}" /></div>
+            <label class="pf-default"><input type="checkbox" id="pf-default" ${cur.isDefault ? 'checked' : ''} /> <span>Default profile</span></label>
+            <div class="pf-field pf-grow"><label class="pf-flabel">Use on sites <span class="muted">(hostname contains)</span></label>
+              <div id="pf-sources-slot"></div></div>
+          </div>
+          ${groupsHtml}
+          ${customHtml}
+          <div class="pf-group">
+            <div class="pf-group-title">Summary</div>
+            <textarea class="input" id="pf-summary" rows="3" style="width:100%;resize:vertical">${esc(d.summary || '')}</textarea>
+          </div>
+          <div class="pf-group">
+            <div class="pf-group-title">Skills</div>
+            <div id="pf-skills-slot"></div>
+          </div>
         </section>
 
         <section class="section">
           <header class="section-header"><div><div class="section-eyebrow">Memory</div><h2 class="section-title">Learned answers</h2>
-            <div class="form-hint">Auto-captured from your applications (EN + FR). Edit a value to override it — that locks it so future applications won’t change it. Otherwise the newest answer wins.</div></div>
-            <span class="section-link muted">${harvested.length} stored</span></header>
+            <div class="form-hint">Auto-captured from your applications (EN + FR). Edit a value to override + lock it; otherwise the newest answer wins.</div></div>
+            <div class="nowrap"><button class="btn small" data-backfill title="Harvest answers from every past application">Build from past applications</button> <span class="section-link muted">${harvested.length} stored</span></div></header>
           <div class="table-wrap"><table class="table">
             <thead><tr><th>Question</th><th>Answer</th><th>Seen</th><th></th></tr></thead>
             <tbody>${harvestRows}</tbody>
@@ -1558,6 +1581,7 @@ route('/profile', async () => {
     try {
       await api('/settings', { method: 'PATCH', body: { autofill: { enabled: on } } });
       state.settings = null;
+      v.querySelector('.autofill-strip').classList.toggle('on', on);
       toast(on ? 'Autofill on — new applications will be pre-filled' : 'Autofill off');
     } catch (err) { errToast(err); e.target.checked = !on; }
   });
@@ -1574,11 +1598,79 @@ route('/profile', async () => {
     const name = window.prompt('Field name (e.g. “Years of AutoCAD”, “Preferred shift”):');
     if (!name || !name.trim()) return;
     const key = (name.trim().replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 60)) || ('field_' + Date.now());
-    if (v.querySelector('#pf-fields [data-key="' + key + '"]')) { toast('That field already exists', 'danger'); return; }
-    const row = el(fieldRowHtml({ k: key, label: name.trim(), custom: true }));
-    wireRemove(row.querySelector('[data-rmfield]'));
-    v.querySelector('#pf-fields').appendChild(row);
-    row.querySelector('input').focus();
+    if (v.querySelector('[data-key="' + key + '"]')) { toast('That field already exists', 'danger'); return; }
+    const card = el(fieldCard(key, name.trim(), true));
+    wireRemove(card.querySelector('[data-rmfield]'));
+    v.querySelector('#pf-custom').appendChild(card);
+    card.querySelector('input').focus();
+  });
+
+  // Build the profile from every past application's answers.
+  v.querySelector('[data-backfill]').addEventListener('click', async (e) => {
+    const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Building…';
+    try {
+      const r = await api('/profile-fields/backfill', { method: 'POST', timeoutMs: 120000 });
+      toast(r.fields ? `Learned ${r.fields} answer(s) from ${r.jobs} past application(s)` : 'No new answers found in past applications');
+      navigate();
+    } catch (err) { errToast(err); btn.disabled = false; btn.textContent = 'Build from past applications'; }
+  });
+
+  // Import from a résumé — pick from uploaded documents or upload a new one.
+  const fillFromParse = (parsed) => {
+    let filled = 0;
+    for (const input of v.querySelectorAll('.pf-input')) {
+      const k = input.dataset.key;
+      if (!input.value.trim() && parsed[k]) { input.value = parsed[k]; filled++; }
+    }
+    const sum = v.querySelector('#pf-summary');
+    if (sum && !sum.value.trim() && parsed.summary) { sum.value = parsed.summary; filled++; }
+    if (Array.isArray(parsed.skills) && parsed.skills.length && !skills.get().length) { skills.set(parsed.skills); filled++; }
+    return filled;
+  };
+  const importFromDoc = async (documentId, name) => {
+    const done = toast(`Reading ${name || 'résumé'}…`, 'info', { ttl: 0 });
+    try {
+      const r = await api('/ai/resume-parse', { method: 'POST', body: { documentId }, timeoutMs: 240000 });
+      const filled = fillFromParse(r.result || {});
+      done();
+      toast(filled ? `Filled ${filled} empty field(s) from your résumé (${r.provider}). Review, then Save profile.` : 'Nothing new to fill — those fields are already set.');
+    } catch (err) { done(); errToast(err, 'Import failed'); }
+  };
+  v.querySelector('[data-import]').addEventListener('click', async () => {
+    let docs = [];
+    try { docs = ((await api('/documents')).items || []).filter((dd) => dd.hasText); } catch {}
+    const m = el(`<div class="modal">
+      <div class="modal-head"><h3 class="modal-title">Import from a document</h3><button class="toast-x" data-close aria-label="Close">×</button></div>
+      <div class="modal-body">
+        <p class="muted" style="font-size:12px;margin:0 0 12px">Pick a résumé/CV to pull your details from, or upload a new one — it's also saved to Documents.</p>
+        <div class="doc-pick-list">${docs.length ? docs.map((dd) => `
+          <button class="doc-pick" data-pick-doc="${esc(dd.id)}" data-pick-name="${esc(dd.name)}">
+            <span class="role-badge" data-role="${esc(dd.role)}">${esc(DOC_ROLE_LABEL[dd.role] || dd.role)}</span>
+            <span class="dp-name">${esc(dd.label || dd.name)}</span>
+          </button>`).join('') : '<div class="muted" style="padding:8px 2px">No documents with extractable text yet — upload one below.</div>'}</div>
+      </div>
+      <div class="modal-foot">
+        <input type="file" id="rp-file" accept=".pdf,.docx,.doc,.txt,.md,.rtf" hidden />
+        <button class="btn small primary" data-upload-new>Upload new résumé…</button>
+      </div>
+    </div>`);
+    const close = openOverlay(m);
+    m.querySelector('[data-close]').addEventListener('click', close);
+    m.querySelectorAll('[data-pick-doc]').forEach((b) => b.addEventListener('click', () => { close(); importFromDoc(b.dataset.pickDoc, b.dataset.pickName); }));
+    m.querySelector('[data-upload-new]').addEventListener('click', () => m.querySelector('#rp-file').click());
+    m.querySelector('#rp-file').addEventListener('change', async (e) => {
+      const file = e.target.files[0]; if (!file) return;
+      if (file.size > 10 * 1024 * 1024) { toast('File too large (10 MB max)', 'danger'); return; }
+      close();
+      const done = toast(`Uploading ${file.name}…`, 'info', { ttl: 0 });
+      try {
+        const dataBase64 = await fileToB64(file);
+        const up = await api('/documents', { method: 'POST', timeoutMs: 60000, body: { name: file.name, role: 'resume', mime: file.type, dataBase64, isDefault: false } });
+        done();
+        toast('Saved to Documents ✓');
+        importFromDoc(up.document.id, file.name);
+      } catch (err) { done(); errToast(err, 'Upload failed'); }
+    });
   });
 
   const collect = () => {
@@ -1617,27 +1709,6 @@ route('/profile', async () => {
       toast('Profile deleted');
       navigate();
     } catch (e) { errToast(e); }
-  });
-
-  v.querySelector('[data-import]').addEventListener('click', async (e) => {
-    const btn = e.currentTarget;
-    btn.disabled = true; btn.textContent = 'Reading resume…';
-    try {
-      const r = await api('/ai/resume-parse', { method: 'POST', body: {}, timeoutMs: 240000 });
-      const parsed = r.result || {};
-      let filled = 0;
-      for (const input of v.querySelectorAll('.pf-input')) {
-        const k = input.dataset.key;
-        if (!input.value.trim() && parsed[k]) { input.value = parsed[k]; filled++; }
-      }
-      const sum = v.querySelector('#pf-summary');
-      if (!sum.value.trim() && parsed.summary) { sum.value = parsed.summary; filled++; }
-      if (Array.isArray(parsed.skills) && parsed.skills.length && !skills.get().length) {
-        skills.set(parsed.skills); filled++;
-      }
-      toast(filled ? `Filled ${filled} empty field(s) from your resume (${r.provider})` : 'Nothing new to fill — fields already set');
-    } catch (err) { errToast(err, 'Import failed'); }
-    btn.disabled = false; btn.textContent = 'Import from resume';
   });
 
   // Harvested answers: edit (override + lock), lock toggle, forget.
@@ -1699,14 +1770,21 @@ route('/documents', async () => {
   };
   const srcTag = (dd) => dd.source === 'folder' ? '<span class="doc-src">folder</span>'
     : dd.source === 'application' ? '<span class="doc-src">from application</span>' : '';
+  const labelChip = (dd) => dd.label ? `<span class="doc-label" title="Designation">${esc(dd.label)}</span>` : '';
   const kwHtml = (dd) => (dd.keywords && dd.keywords.length)
     ? `<div class="kw-row">${dd.keywords.slice(0, 8).map((k) => `<span class="kw">${esc(k)}</span>`).join('')}</div>` : '<span class="muted">—</span>';
+  const sumTxt = (s) => s ? ` — ${s.resume || 0} résumé · ${s.cover_letter || 0} cover · ${s.other || 0} other` : '';
+
+  // Active (default) document per role — what autofill / auto-apply / tailoring use.
+  const actRes = docs.find((dd) => dd.role === 'resume' && dd.isDefault);
+  const actCov = docs.find((dd) => dd.role === 'cover_letter' && dd.isDefault);
+  const adVal = (doc) => doc ? `<span class="ad-v">${esc(doc.label || doc.name)}</span>` : '<span class="ad-v muted">none — star a row</span>';
 
   const rowsHtml = (list) => list.length ? list.map((doc) => `
-    <tr data-doc="${esc(doc.id)}">
-      <td><button class="star-btn ${doc.isDefault ? 'on' : ''}" data-star title="Default ${esc(DOC_ROLE_LABEL[doc.role] || doc.role)}">★</button></td>
-      <td class="title-cell">${esc(doc.name)} ${srcTag(doc)}</td>
-      <td><span class="role-badge" data-role="${esc(doc.role)}">${esc(DOC_ROLE_LABEL[doc.role] || doc.role)}</span></td>
+    <tr data-doc="${esc(doc.id)}" class="${doc.isDefault ? 'doc-active' : ''}">
+      <td><button class="star-btn ${doc.isDefault ? 'on' : ''}" data-star title="${doc.isDefault ? 'Active ' + esc(DOC_ROLE_LABEL[doc.role] || doc.role) + ' — used by autofill, auto-apply & tailoring' : 'Set as active ' + esc(DOC_ROLE_LABEL[doc.role] || doc.role)}">★</button></td>
+      <td class="title-cell">${esc(doc.name)} ${labelChip(doc)} ${srcTag(doc)} <button class="doc-rename" data-label title="Set a designation (e.g. Master CV)">✎</button></td>
+      <td><select class="select doc-role" data-role-sel>${DOC_ROLES.map((r) => `<option value="${r.id}" ${doc.role === r.id ? 'selected' : ''}>${esc(r.label)}</option>`).join('')}</select></td>
       <td>${kwHtml(doc)}</td>
       <td class="num">${fmtBytes(doc.sizeBytes)}</td>
       <td>${dateHtml(doc.lastModified || doc.createdAt)}</td>
@@ -1722,7 +1800,7 @@ route('/documents', async () => {
     <div class="folder-card" data-folder="${esc(f.id)}">
       <div class="fc-main">
         <div class="fc-path" title="${esc(f.path)}">${esc(f.label || f.path)}</div>
-        <div class="fc-meta">${esc(f.fileCount)} file(s) · ${f.lastScanAt ? 'scanned ' + esc(fmtRel(f.lastScanAt)) : 'not scanned yet'}</div>
+        <div class="fc-meta">${esc(f.fileCount)} file(s) · ${f.lastScanAt ? 'scanned ' + esc(fmtRel(f.lastScanAt)) : 'not scanned yet'} · <span class="fc-live">auto-updates</span></div>
       </div>
       <div class="fc-actions">
         <button class="btn small" data-rescan>Re-index</button>
@@ -1746,7 +1824,7 @@ route('/documents', async () => {
 
     <section class="section">
       <header class="section-header"><div><div class="section-eyebrow">Folders</div><h2 class="section-title">Linked local folders</h2>
-        <div class="form-hint">Indexed read-only — JAT reads filename, modified date, text and keywords. Your files are never moved or changed.</div></div></header>
+        <div class="form-hint">Indexed read-only & smartly — folders/files named “résumé”, “cover letter” etc. are recognised, junk is skipped, and changes are picked up automatically. Your files are never moved or changed.</div></div></header>
       <div class="folder-list">${folderCards}</div>
       <div class="folder-add">
         <input class="input" id="fold-path" placeholder="C:\\Users\\you\\Documents\\Job applications" style="flex:1" />
@@ -1755,6 +1833,12 @@ route('/documents', async () => {
         <button class="btn small primary" data-link>Link &amp; index</button>
       </div>
     </section>
+
+    <div class="active-docs">
+      <span class="ad-item"><span class="ad-k">Active résumé</span>${adVal(actRes)}</span>
+      <span class="ad-item"><span class="ad-k">Active cover letter</span>${adVal(actCov)}</span>
+      <span class="ad-hint">★ a row to set the document autofill, auto-apply &amp; tailoring use.</span>
+    </div>
 
     <div class="doc-toolbar">
       <div class="doc-tabs">${tabs}</div>
@@ -1778,8 +1862,18 @@ route('/documents', async () => {
       const docId = tr.dataset.doc;
       const doc = docs.find((x) => x.id === docId);
       tr.querySelector('[data-star]')?.addEventListener('click', async () => {
-        try { await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { isDefault: true } }); navigate(); }
+        try { await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { isDefault: true } }); toast(`Set as active ${DOC_ROLE_LABEL[doc.role] || doc.role}`); navigate(); }
         catch (e) { errToast(e); }
+      });
+      tr.querySelector('[data-role-sel]')?.addEventListener('change', async (e) => {
+        try { await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { role: e.target.value } }); toast('Role updated'); navigate(); }
+        catch (err) { errToast(err); }
+      });
+      tr.querySelector('[data-label]')?.addEventListener('click', async () => {
+        const val = window.prompt('Designation for this document (e.g. “Master CV”, “Short résumé”):', doc.label || '');
+        if (val === null) return;
+        try { await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { label: val.trim() } }); navigate(); }
+        catch (err) { errToast(err); }
       });
       tr.querySelector('[data-dl]')?.addEventListener('click', async () => {
         try {
@@ -1852,7 +1946,7 @@ route('/documents', async () => {
     const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Indexing…';
     try {
       const r2 = await api('/document-folders', { method: 'POST', timeoutMs: 300000, body: { path, roleHint: v.querySelector('#fold-role').value } });
-      toast(`Linked & indexed ${r2.indexed} file(s)`);
+      toast(`Linked & indexed ${r2.indexed} file(s)${sumTxt(r2.summary)}`);
       navigate();
     } catch (err) { errToast(err, 'Link failed'); btn.disabled = false; btn.textContent = 'Link & index'; }
   });
@@ -1860,7 +1954,7 @@ route('/documents', async () => {
     const fid = card.dataset.folder;
     card.querySelector('[data-rescan]').addEventListener('click', async (e) => {
       const btn = e.currentTarget; btn.disabled = true; btn.textContent = '…';
-      try { const r2 = await api('/document-folders/' + encodeURIComponent(fid) + '/scan', { method: 'POST', timeoutMs: 300000 }); toast(`Re-indexed ${r2.indexed} file(s)`); navigate(); }
+      try { const r2 = await api('/document-folders/' + encodeURIComponent(fid) + '/scan', { method: 'POST', timeoutMs: 300000 }); toast(`Re-indexed ${r2.indexed} file(s)${sumTxt(r2.summary)}`); navigate(); }
       catch (err) { errToast(err); btn.disabled = false; btn.textContent = 'Re-index'; }
     });
     card.querySelector('[data-unlink]').addEventListener('click', async () => {

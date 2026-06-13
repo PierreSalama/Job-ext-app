@@ -8,7 +8,7 @@ const {
   Notification, ipcMain, nativeImage, shell,
 } = require('electron');
 const path = require('path');
-const { startServer, stopServer, getToken, broadcast } = require('./server');
+const { startServer, stopServer, getToken, broadcast, rescanAllFolders, startFolderWatchers } = require('./server');
 const db = require('./db');
 const { autoUpdater } = require('electron-updater');
 const { scope, log: rootLog } = require('./logger');
@@ -338,6 +338,13 @@ app.whenReady().then(async () => {
   createWindow();
   createTray();
   applyAppSettings();
+
+  // Auto-index linked document folders: catch up on changes since last run, then
+  // watch for live edits. Fire-and-forget so it never blocks startup.
+  Promise.resolve()
+    .then(() => rescanAllFolders())
+    .then(() => startFolderWatchers())
+    .catch((e) => log.warn('folder auto-index setup failed', e.message));
 
   db.dailyBackup();
   backupInterval = setInterval(() => db.dailyBackup(), 24 * 3600 * 1000);

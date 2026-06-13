@@ -52,9 +52,9 @@ const DEFAULTS = {
   },
 
   // Reverse direction: pre-fill new applications from the harvested profile.
-  // SAFETY: OFF by default and NEVER auto-submits — it only fills empty fields.
+  // ON by default (user requested); still NEVER auto-submits — empty fields only.
   autofill: {
-    enabled: false,          // master switch — opt-in
+    enabled: true,           // master switch — fills new applications automatically
     autoSubmit: false,       // hard invariant: filling never clicks submit
     fillProfile: true,       // use structured profile fields
     fillLearned: true,       // use harvested learned answers
