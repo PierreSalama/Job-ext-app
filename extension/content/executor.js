@@ -32,7 +32,7 @@ const ADVANCE_KEYWORDS = [
   /^review your application$/i, /^review$/i,
   /^next$/i, /^continue$/i, /^continue to/i, /^proceed/i,
   /^save and continue$/i, /^save & continue$/i,
-  /^finish$/i, /^apply now$/i, /^apply$/i, /^easy apply$/i,
+  /^finish$/i, /^apply now$/i, /^apply$/i, /^easy apply/i,
   /^send application$/i, /^suivant$/i, /^continuer$/i, /^soumettre$/i, /^postuler$/i,
 ];
 const FINAL_SUBMIT_RX = /^(submit( application)?|send( application)?|soumettre|envoyer( ma candidature)?|confirm and submit)$/i;
@@ -255,20 +255,20 @@ export async function run(task, context, helpers) {
   S.running = true; S.cancelled = false; S.paused = false; S.step = 0;
   S.task = task; S.context = context;
 
-  const { job, profile, resume, aiConfidenceMin = 0.7 } = context || {};
+  const { job, profile, resume, harvested, aiConfidenceMin = 0.7 } = context || {};
   const mode = task.mode || 'review';
   showOverlay(`${mode === 'review' ? 'Filling for your review' : 'Applying'} — ${job?.title || ''}`);
-  logLine('ok', `start mode=${mode} profile=${profile ? 'loaded' : 'MISSING'} resume=${resume?.name || 'none'}`);
 
-  if (!profile) {
-    logLine('err', 'no profile configured — set one up in the dashboard first');
-    report({ state: 'failed', lastError: 'no profile configured', attemptsDelta: 1 });
-    S.running = false; hideOverlay();
-    return { ok: false, error: 'no profile' };
-  }
+  // A structured profile is OPTIONAL — we also fill from harvested/learned
+  // answers (qa store) and the AI ladder. Build a data object that merges the
+  // structured profile with any harvested fields that map to known profile keys
+  // so the autofill engine has the most to work with even with no saved profile.
+  const profileData = { ...(profile?.data || {}) };
+  const learnedCount = Array.isArray(harvested) ? harvested.length : 0;
+  logLine('ok', `start mode=${mode} · profile=${profile ? 'loaded' : 'none'} · learned=${learnedCount} · resume=${resume?.name || 'none'}`);
 
   const engine = new AutofillEngine({
-    getProfile: async () => profile.data || profile,
+    getProfile: async () => profileData,
     lookupAnswer: async (label) => {
       const r = await send({ type: 'api-call', method: 'POST', path: '/qa/lookup', body: { question: label } });
       return (r?.ok && r.match && typeof r.match.answer === 'string') ? { answer: r.match.answer } : null;
@@ -314,22 +314,29 @@ export async function run(task, context, helpers) {
     }
 
     const formProbe = detectApplyForm();
-    const root = formProbe?.form || document;
+    // An open Easy-Apply / apply modal is the form even if generic scoring misses
+    // it (LinkedIn/Indeed render the apply UI in a dialog).
+    const dialog = document.querySelector('.jobs-easy-apply-modal, [data-test-modal][role="dialog"], [role="dialog"][aria-modal="true"], .ia-Modal, [data-testid="smartapply-container"]');
+    const root = formProbe?.form || (dialog && isProbablyVisible(dialog) ? dialog : document);
+    // No apply form yet (e.g. a LinkedIn job-view page) → don't fill page fields
+    // like the global search bar; just go find the Easy-Apply button below to
+    // OPEN the form. We only fill once a real apply form/modal exists.
+    const haveForm = !!(formProbe || (dialog && isProbablyVisible(dialog)));
 
     // ---- fill from profile + learned answers ----
-    setStatus(`Step ${S.step}: filling fields…`);
-    const suggestions = (await engine.scanFillable(root)).filter((s) => {
+    setStatus(`Step ${S.step}: ${haveForm ? 'filling fields…' : 'opening the application…'}`);
+    const suggestions = haveForm ? (await engine.scanFillable(root)).filter((s) => {
       if (NEVER_AUTOFILL_RX.test(s.label)) {
         logLine('warn', `left sensitive field for you: "${s.label.slice(0, 40)}"`);
         return false;
       }
       return true;
-    });
+    }) : [];
     const filled = engine.fill(suggestions);
     if (filled) logLine('ok', `filled ${filled} field(s) from profile/history`);
 
     // ---- resume upload ----
-    const att = await tryAttachResume(root, resume);
+    const att = haveForm ? await tryAttachResume(root, resume) : { attempted: false, attached: 0 };
     if (resume?.id && att.attempted && att.attached === 0) {
       logLine('err', 'resume could not be attached — stopping for you to upload it');
       report({ state: 'awaiting_input', lastError: 'resume attachment failed' });
@@ -338,7 +345,7 @@ export async function run(task, context, helpers) {
     }
 
     // ---- unknown questions → AI ladder ----
-    const unknown = (await engine.scanUnknown(root)).slice(0, 5);
+    const unknown = haveForm ? (await engine.scanUnknown(root)).slice(0, 5) : [];
     for (const u of unknown) {
       if (S.cancelled) break;
       if (LEGAL_RX.test(u.label)) {
@@ -371,7 +378,7 @@ export async function run(task, context, helpers) {
     }
 
     // learn everything currently on the form
-    await engine.captureCurrentAnswers(root, { source: job?.source, jobId: job?.id });
+    if (haveForm) await engine.captureCurrentAnswers(root, { source: job?.source, jobId: job?.id });
 
     await untilUnpaused();
     if (S.cancelled) break;

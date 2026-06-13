@@ -296,6 +296,43 @@ function closeAllOverlays() {
   document.querySelectorAll('#overlay-root .overlay').forEach((o) => o.remove());
 }
 
+// ---------- Right-click context menu (per-page actions) ----------
+// items: [{ label, danger?, run() } | { sep:true }]. Falsy items are skipped.
+function contextMenu(e, items) {
+  e.preventDefault();
+  e.stopPropagation();
+  document.querySelectorAll('.ctx-menu').forEach((m) => m.remove());
+  const list = (items || []).filter(Boolean);
+  if (!list.length) return;
+  const menu = el('<div class="ctx-menu"></div>');
+  for (const it of list) {
+    if (it.sep) { menu.appendChild(el('<div class="ctx-sep"></div>')); continue; }
+    const b = document.createElement('button');
+    b.className = 'ctx-item' + (it.danger ? ' danger' : '');
+    b.textContent = it.label;
+    b.addEventListener('click', async () => { menu.remove(); try { await it.run(); } catch (err) { errToast(err); } });
+    menu.appendChild(b);
+  }
+  document.body.appendChild(menu);
+  let x = e.clientX, y = e.clientY;
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  if (x + mw > window.innerWidth - 8) x = window.innerWidth - mw - 8;
+  if (y + mh > window.innerHeight - 8) y = Math.max(8, window.innerHeight - mh - 8);
+  menu.style.left = x + 'px'; menu.style.top = y + 'px';
+  const close = (ev) => {
+    if (menu.contains(ev.target)) return;
+    menu.remove();
+    document.removeEventListener('mousedown', close, true);
+    document.removeEventListener('scroll', close, true);
+    window.removeEventListener('blur', close);
+  };
+  setTimeout(() => {
+    document.addEventListener('mousedown', close, true);
+    document.addEventListener('scroll', close, true);
+    window.addEventListener('blur', close);
+  }, 0);
+}
+
 function textModal(title, text, opts = {}) {
   const m = el(`<div class="modal">
     <div class="modal-head"><h3 class="modal-title"></h3><button class="toast-x" data-close aria-label="Close">×</button></div>
@@ -710,6 +747,14 @@ route('/', async () => {
   v.querySelectorAll('.row-link').forEach((tr) => {
     tr.style.cursor = 'pointer';
     tr.addEventListener('click', () => { location.hash = '#/applications/' + tr.dataset.id; });
+    tr.addEventListener('contextmenu', (e) => contextMenu(e, [
+      { label: 'Open', run: () => { location.hash = '#/applications/' + tr.dataset.id; } },
+      { sep: true },
+      ...STATUSES.map((s) => ({ label: `→ ${s.label}`, run: async () => { await api('/jobs/' + encodeURIComponent(tr.dataset.id), { method: 'PATCH', body: { status: s.id, _source: 'manual' } }); navigate(); } })),
+      { sep: true },
+      { label: 'Queue auto-apply', run: async () => { await api('/queue', { method: 'POST', body: { jobId: tr.dataset.id } }); toast('Queued for auto-apply'); } },
+      { label: 'Delete', danger: true, run: async () => { if (!window.confirm('Delete this application?')) return; await api('/jobs/' + encodeURIComponent(tr.dataset.id), { method: 'DELETE' }); navigate(); } },
+    ]));
   });
   return v;
 });
@@ -1271,6 +1316,14 @@ route('/pipeline', async () => {
     });
     card.addEventListener('dragend', () => card.classList.remove('dragging'));
     card.addEventListener('click', () => { location.hash = '#/applications/' + card.dataset.id; });
+    card.addEventListener('contextmenu', (e) => contextMenu(e, [
+      { label: 'Open', run: () => { location.hash = '#/applications/' + card.dataset.id; } },
+      { sep: true },
+      ...STATUSES.map((s) => ({ label: `→ ${s.label}`, run: async () => { await api('/jobs/' + encodeURIComponent(card.dataset.id), { method: 'PATCH', body: { status: s.id, _source: 'manual' } }); navigate(); } })),
+      { sep: true },
+      { label: 'Queue auto-apply', run: async () => { await api('/queue', { method: 'POST', body: { jobId: card.dataset.id } }); toast('Queued for auto-apply'); } },
+      { label: 'Delete', danger: true, run: async () => { if (!window.confirm('Delete this application?')) return; await api('/jobs/' + encodeURIComponent(card.dataset.id), { method: 'DELETE' }); navigate(); } },
+    ]));
   });
 
   v.querySelectorAll('.kb-col').forEach((col) => {
@@ -1325,6 +1378,10 @@ route('/queue', async () => {
 
   const qc = (label, html) => `<div class="qc-field"><span class="qc-label form-label">${esc(label)}</span>${html}</div>`;
 
+  const lastLogOf = (t) => {
+    const e = (t.transcript || []).filter((x) => x && (x.text || x.note)).slice(-1)[0];
+    return e ? (e.text || e.note || '') : '';
+  };
   const taskCard = (t) => `
     <div class="task-card" data-task="${esc(t.id)}">
       <div class="task-head">
@@ -1334,6 +1391,7 @@ route('/queue', async () => {
       <div class="task-sub">${esc(t.mode)} mode · ${esc(t.attempts)} attempt${t.attempts === 1 ? '' : 's'} · updated ${esc(fmtRel(t.updatedAt))}</div>
       ${t.parkReason ? `<div class="task-park">⚑ ${esc(t.parkReason)}${(t.pendingQuestions || []).length ? ' — answer below to retry' : ''}</div>` : ''}
       ${t.lastError ? `<div class="task-err">${esc(t.lastError)}</div>` : ''}
+      ${(['failed', 'awaiting_input'].includes(t.state) && lastLogOf(t)) ? `<div class="task-last">last step: ${esc(lastLogOf(t).slice(0, 140))}</div>` : ''}
       <div class="task-actions">
         ${['failed', 'skipped', 'awaiting_input'].includes(t.state) ? '<button class="btn small" data-act="retry">Retry</button>' : ''}
         ${['queued', 'scheduled', 'running'].includes(t.state) ? '<button class="btn small" data-act="cancel">Cancel</button>' : ''}
@@ -1515,6 +1573,15 @@ route('/queue', async () => {
 
   v.querySelectorAll('.task-card').forEach((card) => {
     const taskId = card.dataset.task;
+    const t = tasks.find((x) => x.id === taskId);
+    card.addEventListener('contextmenu', (e) => contextMenu(e, [
+      t && ['failed', 'skipped', 'awaiting_input'].includes(t.state) && { label: 'Retry', run: async () => { await api('/queue/' + encodeURIComponent(taskId), { method: 'PATCH', body: { state: 'queued', lastError: null } }); navigate(); } },
+      t && ['queued', 'scheduled', 'running'].includes(t.state) && { label: 'Cancel', run: async () => { await api('/queue/' + encodeURIComponent(taskId), { method: 'PATCH', body: { state: 'skipped' } }); navigate(); } },
+      t?.transcript?.length && { label: 'Show transcript', run: () => { const tr = card.querySelector('.transcript'); tr.hidden = !tr.hidden; } },
+      t?.job?.jobUrl && { label: 'Open job posting', run: () => window.open(t.job.jobUrl, '_blank', 'noopener') },
+      { sep: true },
+      { label: 'Remove', danger: true, run: async () => { await api('/queue/' + encodeURIComponent(taskId), { method: 'DELETE' }); navigate(); } },
+    ]));
     card.querySelectorAll('[data-act]').forEach((btn) => btn.addEventListener('click', async () => {
       const act = btn.dataset.act;
       try {
@@ -1966,6 +2033,17 @@ route('/documents', async () => {
     v.querySelectorAll('tr[data-doc]').forEach((tr) => {
       const docId = tr.dataset.doc;
       const doc = docs.find((x) => x.id === docId);
+      tr.addEventListener('contextmenu', (e) => contextMenu(e, [
+        { label: doc.isDefault ? `Active ${DOC_ROLE_LABEL[doc.role] || doc.role} ✓` : `Set as active ${DOC_ROLE_LABEL[doc.role] || doc.role}`, run: async () => { await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { isDefault: true } }); toast('Set as active'); navigate(); } },
+        { label: 'Set designation…', run: async () => { const val = window.prompt('Designation (e.g. “Master CV”):', doc.label || ''); if (val === null) return; await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { label: val.trim() } }); navigate(); } },
+        { sep: true },
+        ...DOC_ROLES.map((r) => ({ label: `Role → ${r.label}${doc.role === r.id ? ' ✓' : ''}`, run: async () => { await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { role: r.id } }); toast('Role updated'); navigate(); } })),
+        { sep: true },
+        doc.hasText && { label: 'View text', run: async () => { const r2 = await api('/documents/' + encodeURIComponent(docId) + '?text=1'); textModal(doc.name, r2.document?.textContent || '(no text)', { downloadName: doc.name + '.txt' }); } },
+        doc.source !== 'folder' && { label: 'Download', run: async () => { const res = await api('/documents/' + encodeURIComponent(docId) + '?raw=1', { raw: true, timeoutMs: 30000 }); downloadBlob(await res.blob(), doc.name); } },
+        { sep: true },
+        { label: 'Remove', danger: true, run: async () => { const permanent = doc.source !== 'folder'; if (!window.confirm(permanent ? `Delete “${doc.name}”? The file is permanently removed.` : 'Remove this entry? Your file is untouched.')) return; await api('/documents/' + encodeURIComponent(docId), { method: 'DELETE' }); toast('Removed'); navigate(); } },
+      ]));
       tr.querySelector('[data-star]')?.addEventListener('click', async () => {
         try { await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { isDefault: true } }); toast(`Set as active ${DOC_ROLE_LABEL[doc.role] || doc.role}`); navigate(); }
         catch (e) { errToast(e); }
