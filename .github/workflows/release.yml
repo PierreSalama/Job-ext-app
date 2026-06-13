@@ -23,7 +23,9 @@ jobs:
       - name: Dashboard mirror gate
         run: node tools/mirror.mjs --check
       - name: Unit tests
-        run: node --test "tests/*.test.mjs"
+        # Explicit files (not a glob) so it works on Node 20 too — the test
+        # runner only expands globs on Node 21+.
+        run: node --test tests/status.test.mjs tests/fit.test.mjs tests/prompts.test.mjs
 
   build:
     needs: checks
