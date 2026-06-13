@@ -27,29 +27,50 @@ function targetText(el) {
   return parts.join(' ');
 }
 
+// The button's VISIBLE label, separate from its attributes. Anchored patterns
+// (^submit$, ^apply$, …) must test this — testing the text+attrs blob means a
+// plain "Submit" button with a data-automation-id never matches ^submit$.
+function visibleText(el) {
+  return compactText(el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '');
+}
+function compactText(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+function automationId(el) {
+  return ((el?.getAttribute?.('data-automation-id') || '') + ' ' + (el?.getAttribute?.('data-testid') || '') + ' ' + (el?.id || '')).toLowerCase();
+}
+
 export function isApplyClick(el) {
   if (!el) return false;
-  const txt = targetText(el);
-  if (ACCOUNT_RX.test(txt) && !APPLY_RX.test(txt)) return false;
-  if (APPLY_RX.test(txt)) return true;
+  const vt = visibleText(el);
+  const blob = targetText(el);
+  if (ACCOUNT_RX.test(vt) && !APPLY_RX.test(vt)) return false;
+  if (APPLY_RX.test(vt)) return true;
+  if (APPLY_RX.test(blob) && !ACCOUNT_RX.test(vt)) return true;
   if (APPLY_CLASS_RX.test((el.className || '').toString())) return true;
   return false;
 }
 
 export function isSubmitClick(el) {
   if (!el) return false;
-  const txt = targetText(el);
-  if (ACCOUNT_RX.test(txt) && !SUBMIT_RX.test(txt)) return false;
-  if (SUBMIT_RX.test(txt)) return true;
+  const vt = visibleText(el);
+  const blob = targetText(el);
+  if (ACCOUNT_RX.test(vt) && !SUBMIT_RX.test(vt)) return false;
+  if (SUBMIT_RX.test(vt) || SUBMIT_RX.test(blob)) return true;
   if (SUBMIT_CLASS_RX.test((el.className || '').toString())) return true;
+  // ATS submit controls (Workday bottom-navigation-submit-button, etc.) whose
+  // visible label is just "Submit"/"Send"/"Finish".
+  if (/submit/.test(automationId(el)) && /^(submit|send|finish|done|apply)$/i.test(vt)) return true;
   return false;
 }
 
 export function isStepAdvanceClick(el) {
   if (!el) return false;
-  const txt = targetText(el);
-  if (ACCOUNT_RX.test(txt)) return false;
-  return STEP_RX.test(txt);
+  const vt = visibleText(el);
+  const blob = targetText(el);
+  if (ACCOUNT_RX.test(vt)) return false;
+  if (STEP_RX.test(vt)) return true;
+  if (STEP_RX.test(blob)) return true;
+  if (/(next|continue|advance)-button|bottom-navigation-next/.test(automationId(el))) return true;
+  return false;
 }
 
 export function hasApplyAction(root = document) {

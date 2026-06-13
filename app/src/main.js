@@ -99,8 +99,21 @@ function createTray() {
     { label: 'Open dashboard', click: showWindow },
     { type: 'separator' },
     {
-      label: 'Check for updates',
-      click: () => { if (app.isPackaged) autoUpdater.checkForUpdates().catch(() => {}); },
+      label: 'Check for updates…',
+      click: async () => {
+        const r = await manualCheckForUpdates();
+        if (r.status === 'dev') {
+          dialog.showMessageBox(mainWindow, { type: 'info', title: 'Dev build', message: 'Updates are only checked in the installed app.', noLink: true });
+        } else if (r.status === 'current') {
+          dialog.showMessageBox(mainWindow, { type: 'info', title: 'Up to date', message: `You're on the latest version (v${r.current}).`, noLink: true });
+        } else if (r.status === 'available' || r.status === 'downloaded') {
+          dialog.showMessageBox(mainWindow, { type: 'info', title: 'Update found', message: `v${r.version} is downloading. You'll be asked to restart when it's ready.`, noLink: true });
+        } else if (r.status === 'error') {
+          dialog.showMessageBox(mainWindow, { type: 'warning', title: 'Update check failed', message: r.error || 'Could not check for updates.', noLink: true });
+        } else {
+          dialog.showMessageBox(mainWindow, { type: 'info', title: 'Checking…', message: 'Still checking — try again in a moment.', noLink: true });
+        }
+      },
     },
     {
       label: 'Back up database now',
@@ -162,28 +175,64 @@ async function confirmPair(info) {
 }
 
 // ---------- auto-updater ----------
+const RELEASES_URL = 'https://github.com/PierreSalama/Job-ext-app/releases';
+let updateState = { status: 'idle', current: null, version: null, percent: 0 };
+
 function setupAutoUpdater() {
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
   autoUpdater.logger = rootLog;
+  updateState.current = app.getVersion();
 
-  autoUpdater.on('error', (err) => log.warn('[updater] error:', err?.message || err));
-  autoUpdater.on('update-available', (info) => log.info('[updater] update available:', info?.version));
+  autoUpdater.on('error', (err) => {
+    log.warn('[updater] error:', err?.message || err);
+    updateState = { ...updateState, status: 'error', error: String(err?.message || err) };
+  });
+  autoUpdater.on('checking-for-update', () => { updateState = { ...updateState, status: 'checking' }; });
+  autoUpdater.on('update-available', (info) => {
+    log.info('[updater] update available:', info?.version);
+    updateState = { ...updateState, status: 'downloading', version: info?.version, percent: 0 };
+    // Prompt the moment an update is detected (it downloads in the background).
+    notify('updates', 'Update available', `Job Application Tracker v${info?.version} is downloading — you'll be asked to restart when it's ready.`);
+  });
+  autoUpdater.on('update-not-available', () => { updateState = { ...updateState, status: 'current' }; });
+  autoUpdater.on('download-progress', (p) => { updateState = { ...updateState, status: 'downloading', percent: Math.round(p.percent || 0) }; });
   autoUpdater.on('update-downloaded', (info) => {
+    updateState = { ...updateState, status: 'downloaded', version: info?.version };
     notify('updates', 'Update ready', `v${info?.version} downloaded — restart to apply.`);
-    const result = dialog.showMessageBoxSync({
-      type: 'info',
-      title: 'Update ready',
-      message: `Job Application Tracker v${info?.version} is ready to install.`,
-      detail: 'Restart now to apply the update, or it will install the next time you quit.',
-      buttons: ['Restart now', 'Later'],
-      defaultId: 0, cancelId: 1, noLink: true,
-    });
-    if (result === 0) { isQuitting = true; autoUpdater.quitAndInstall(true, true); }
+    promptRestart(info?.version);
   });
 
   autoUpdater.checkForUpdates().catch((e) => log.warn('[updater] initial check failed:', e?.message || e));
   updateInterval = setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), UPDATE_CHECK_INTERVAL_MS);
+}
+
+function promptRestart(version) {
+  showWindow();
+  const result = dialog.showMessageBoxSync({
+    type: 'info',
+    title: 'Update ready',
+    message: `Job Application Tracker v${version} is ready to install.`,
+    detail: 'Restart now to apply the update, or it will install the next time you quit.',
+    buttons: ['Restart now', 'Later'],
+    defaultId: 0, cancelId: 1, noLink: true,
+  });
+  if (result === 0) { isQuitting = true; autoUpdater.quitAndInstall(true, true); }
+}
+
+// Manual check that resolves with a user-facing result (tray + dashboard).
+function manualCheckForUpdates() {
+  if (!app.isPackaged) return Promise.resolve({ status: 'dev', current: app.getVersion() });
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (r) => { if (!settled) { settled = true; resolve({ current: app.getVersion(), ...r }); } };
+    autoUpdater.once('update-available', (info) => finish({ status: 'available', version: info?.version }));
+    autoUpdater.once('update-not-available', () => finish({ status: 'current' }));
+    autoUpdater.once('update-downloaded', (info) => finish({ status: 'downloaded', version: info?.version }));
+    autoUpdater.once('error', (e) => finish({ status: 'error', error: String(e?.message || e) }));
+    setTimeout(() => finish({ status: 'timeout' }), 30000);
+    autoUpdater.checkForUpdates().catch((e) => finish({ status: 'error', error: String(e?.message || e) }));
+  });
 }
 
 // ---------- gmail scheduler ----------
@@ -238,6 +287,13 @@ ipcMain.handle('jat:open-logs', () => {
   } catch {}
 });
 ipcMain.handle('jat:settings-changed', () => { applyAppSettings(); });
+ipcMain.handle('jat:check-updates', () => manualCheckForUpdates());
+ipcMain.handle('jat:update-state', () => updateState);
+ipcMain.handle('jat:open-releases', () => shell.openExternal(RELEASES_URL));
+ipcMain.handle('jat:restart-to-update', () => {
+  if (updateState.status === 'downloaded') { isQuitting = true; autoUpdater.quitAndInstall(true, true); return true; }
+  return false;
+});
 
 // ---------- lifecycle ----------
 app.whenReady().then(async () => {

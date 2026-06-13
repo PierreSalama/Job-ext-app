@@ -213,10 +213,13 @@ async function handlePipelineEvent({ stage, job, eventType, summary }, sender) {
   if (result.queued) { await paintBadge(); return { ok: false, queued: true, error: 'app offline; queued' }; }
 
   const jobId = result.job?.id;
-  if (jobId && (eventType === 'progressing' || eventType === 'attached')) {
+  // Only record a timeline event when a resume/attachment is newly attached —
+  // NOT on every 'progressing' form mutation (that produced dozens of noise
+  // events). Created / status-change events come from the server on upsert.
+  if (jobId && eventType === 'attached') {
     await api.recordEvent({
-      jobId, type: eventType, source: 'extension',
-      summary: summary || eventType,
+      jobId, type: 'attached', source: 'extension',
+      summary: summary || 'Resume attached',
       data: { resumeName: job.attachments?.find((a) => a.role === 'resume')?.name },
     });
   }

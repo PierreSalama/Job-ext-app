@@ -1747,6 +1747,22 @@ route('/settings', async () => {
     </section>
 
     <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">About</div><h2 class="section-title">Version & updates</h2></div></header>
+      <div class="section-body">
+        <div class="kv"><span class="muted">App version</span> <strong id="upd-version">v${esc(state.version || '?')}</strong></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+          <button class="btn small" data-check-updates>Check for updates</button>
+          <button class="btn small" data-restart-update hidden>Restart to apply update</button>
+          <button class="btn small" data-releases>Releases &amp; downloads</button>
+        </div>
+        <div class="status-line" id="upd-status" style="margin-top:8px"></div>
+        <div class="section-footer muted">${state.host === 'desktop'
+          ? 'The app checks automatically on launch and every 4 hours, downloads in the background, and prompts you to restart.'
+          : 'The desktop app self-updates; you can also re-download the installer from the toolbar popup or the releases page.'}</div>
+      </div>
+    </section>
+
+    <section class="section">
       <header class="section-header"><div><div class="section-eyebrow">Data</div><h2 class="section-title">Backup & portability</h2></div></header>
       <div class="section-body" style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn small" data-backup>Back up database now</button>
@@ -1758,6 +1774,41 @@ route('/settings', async () => {
       <div class="section-footer muted">Daily backups rotate automatically in the app's data folder.</div>
     </section>
   </div>`);
+
+  // updates
+  const updStatus = (msg, cls = '') => { const el = v.querySelector('#upd-status'); el.className = 'status-line ' + cls; el.textContent = msg; };
+  v.querySelector('[data-releases]').addEventListener('click', () => {
+    if (window.jatDesktop) window.jatDesktop.openReleases();
+    else window.open('https://github.com/PierreSalama/Job-ext-app/releases', '_blank');
+  });
+  v.querySelector('[data-check-updates]').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; updStatus('Checking…');
+    try {
+      if (window.jatDesktop) {
+        const r = await window.jatDesktop.checkUpdates();
+        if (r.status === 'current') updStatus(`You're on the latest version (v${r.current}).`, 'ok');
+        else if (r.status === 'available' || r.status === 'downloaded') {
+          updStatus(`Update v${r.version} found — downloading. You'll be prompted to restart.`, 'ok');
+          if (r.status === 'downloaded') v.querySelector('[data-restart-update]').hidden = false;
+        } else if (r.status === 'dev') updStatus('Dev build — updates only run in the installed app.');
+        else if (r.status === 'error') updStatus(r.error || 'Update check failed.', 'bad');
+        else updStatus('Still checking — try again shortly.');
+      } else {
+        // Extension host: it can't drive the app's updater; route to the popup/releases.
+        updStatus('Open the toolbar popup to download/update the app, or use “Releases & downloads”.');
+      }
+    } catch (err) { updStatus(String(err.message || err), 'bad'); }
+    btn.disabled = false;
+  });
+  v.querySelector('[data-restart-update]').addEventListener('click', () => { if (window.jatDesktop) window.jatDesktop.restartToUpdate(); });
+  // Reflect a pending downloaded-update on load.
+  if (window.jatDesktop) {
+    window.jatDesktop.updateState().then((u) => {
+      if (u?.status === 'downloaded') { v.querySelector('[data-restart-update]').hidden = false; updStatus(`Update v${u.version} downloaded — restart to apply.`, 'ok'); }
+      else if (u?.status === 'downloading') updStatus(`Downloading update v${u.version || ''}… ${u.percent || 0}%`);
+    }).catch(() => {});
+  }
 
   // section saves
   const sections = {

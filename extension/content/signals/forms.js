@@ -41,18 +41,40 @@ function headingText(root) {
   return collectText(root.querySelector?.('h1, h2, h3, legend, [role="heading"]'), 300);
 }
 
+// Containers that wrap an application without being a <form> — Workday,
+// SuccessFactors, Oracle, iCIMS, etc. render fields in custom component divs.
+const APP_CONTAINER_SELECTOR = [
+  'form',
+  '[data-automation-id="applyFlowPage"]', '[data-automation-id*="application"]',
+  '[data-automation-id="jobApplication"]', '[data-automation-id="pageContent"]',
+  '[data-test*="application"]', '[data-testid*="application"]', '[data-testid*="apply"]',
+  '[id*="application"]', '[id*="apply"]', '[class*="application-form"]',
+  '[class*="apply-form"]', '[aria-label*="application" i]',
+].join(', ');
+
 // Survey candidate containers; return the most apply-form-looking one or null.
 export function detectApplyForm() {
   const candidates = new Set(qsa('form'));
   for (const root of qsa(DIALOG_SELECTOR)) {
     if (containsApplySignals(root)) candidates.add(root);
   }
+  // ATS containers (Workday data-automation-id, iCIMS ids, …) — no <form> tag.
+  for (const root of qsa(APP_CONTAINER_SELECTOR)) {
+    if (containsApplySignals(root) && countInteractiveFields(root) >= 2) candidates.add(root);
+  }
   if (!candidates.size) {
     let scanned = 0;
-    for (const root of qsa('section, article')) {
-      if (scanned++ > 40) break;
+    for (const root of qsa('section, article, main')) {
+      if (scanned++ > 60) break;
       if (containsApplySignals(root) && countInteractiveFields(root) >= 3) candidates.add(root);
     }
+  }
+  // Last resort: the page body itself (Workday-style SPAs put fields in bare
+  // divs anywhere). The discriminating scorer below still rejects login/signup/
+  // contact/newsletter, so this stays safe.
+  if (!candidates.size && document.body
+      && containsApplySignals(document.body) && countInteractiveFields(document.body) >= 3) {
+    candidates.add(document.body);
   }
 
   let best = null;
@@ -100,12 +122,23 @@ function scoreContainer(root) {
   const hasPasswordField = qsa('input[type="password"]', root).length > 0;
   const hasSearchField = !!root.querySelector?.('input[type="search"], [role="search"]');
 
+  // A "submit/finish application" or apply control inside the container.
+  const hasSubmitButton = qsa('button, input[type="submit"], [role="button"]', root)
+    .some((b) => {
+      const vt = compactText(b.textContent || b.value || b.getAttribute?.('aria-label') || '');
+      return /^(submit|submit application|send application|finish|finish application|apply|apply now|review)$/i.test(vt)
+        || /submit/i.test((b.getAttribute?.('data-automation-id') || '') + (b.id || ''));
+    });
+
   if (hasRealFileInput) score += 0.34;
   if (hasUploadWidget) score += 0.18;
   score += Math.min(labelHits, 5) * 0.08;
   score += Math.min(interactiveFields, 6) * 0.03;
   score += Math.min(actionButtons, 2) * 0.12;
+  if (hasSubmitButton) score += 0.14;
   if (heading && APPLY_SURFACE_RX.test(heading)) score += 0.10;
+  // Strong application phrasing anywhere in the body (review/submit pages).
+  if (/\b(your application|submit your application|review your application|application form|complete your application)\b/i.test(fullText)) score += 0.10;
   if (hasRequiredFields) score += 0.05;
 
   if (hasPasswordField && !hasUploadWidget && labelHits < 2) score -= 0.35;
@@ -300,7 +333,14 @@ export function findCompanyLink(root = document) {
 }
 
 // ----- Generic resume filename recovery -----
-const FILENAME_RX = /\b([\w()&,'\-.+ ]{3,120}?\.(pdf|docx?|rtf|odt|txt|pages))\b/i;
+// A real filename never contains long whitespace runs — keep the class tight so
+// a match can't splice unrelated page text (the cause of the garbled "Stage
+// Detected…Resume.pdf" value) into a bogus filename.
+const FILENAME_RX = /\b([\w()&,'\-.+]{2,100}(?:\s[\w()&,'\-.+]{1,40}){0,3}\.(pdf|docx?|rtf|odt|txt|pages))\b/i;
+
+// Skip JAT's own injected UI so scans never read the panel/overlay text.
+function isJatUi(el) { return !!el?.closest?.('#jat11-panel, #jat11-aa'); }
+
 export function findResumeFilename(root) {
   const scopes = [];
   if (root && root !== document) {
@@ -316,15 +356,17 @@ export function findResumeFilename(root) {
     }
   }
   for (const d of qsa('[role="dialog"], [aria-modal="true"]')) {
-    if (!scopes.includes(d)) scopes.push(d);
+    if (!scopes.includes(d) && !isJatUi(d)) scopes.push(d);
   }
-  scopes.push(document.body || document.documentElement);
 
   for (const scope of scopes) {
-    if (!scope) continue;
+    if (!scope || isJatUi(scope)) continue;
     const nearCue = findFilenameNearUploadCue(scope);
     if (nearCue) return nearCue;
-    const text = collectText(scope, 20000);
+    // Focused-scope text match only — NEVER the whole page body (that spliced in
+    // JAT's own panel text and produced garbage). The element-walk above already
+    // covers the upload-cue case in any scope.
+    const text = collectText(scope, 8000);
     const textMatch = text.match(FILENAME_RX);
     if (textMatch) return textMatch[1].trim();
     const attrMatch = scanAttributesForFilename(scope);
@@ -337,6 +379,7 @@ function findFilenameNearUploadCue(root) {
   let scanned = 0;
   for (const el of qsa('*', root)) {
     if (scanned++ > 2500) break;
+    if (isJatUi(el)) continue;
     const signal = elementSignalText(el);
     if (!signal) continue;
     if (!/(resume|cv|cover\s*letter|upload|attach)/i.test(signal)) continue;
@@ -361,11 +404,13 @@ function elementSignalText(el) {
 }
 
 function scanAttributesForFilename(root) {
+  if (isJatUi(root)) return '';
   const selfMatch = matchFilenameInAttrs(root);
   if (selfMatch) return selfMatch;
   let scanned = 0;
   for (const el of qsa('*', root)) {
     if (scanned++ > 5000) break;
+    if (isJatUi(el)) continue;
     const match = matchFilenameInAttrs(el);
     if (match) return match;
   }

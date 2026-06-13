@@ -3,7 +3,7 @@
 // French and a structural detector (apply form vanished + confirmation
 // container appeared) that detector.js drives with its own state.
 
-const SUCCESS_TEXT_RX = /(your\s*application\s*(was|has\s*been)\s*(sent|submitted)|application\s*(sent|submitted|received|complete)|application\s*successful|thank\s*you\s*for\s*applying|thanks?\s*for\s*(your\s*)?(application|interest)|you['\s]?re\s*all\s*set|we['\s]?ve\s*received\s*your\s*application|your\s*application\s*is\s*on\s*its\s*way|candidature\s*(envoy[ée]e|soumise|re[çc]ue|transmise)|votre\s*candidature\s*a\s*(bien\s*)?[ée]t[ée]\s*(envoy[ée]e|soumise|re[çc]ue)|merci\s*(d['e]\s*)?(avoir\s*postul[ée]|pour\s*votre\s*candidature))/i;
+const SUCCESS_TEXT_RX = /(your\s*application\s*(was|has\s*been)\s*(sent|submitted|received)|application\s*(sent|submitted|received|complete|successful)|(have|'ve|has\s*been)\s*submitted\s*your\s*application|submitted\s*your\s*application|successfully\s*(submitted|applied|completed)|thank\s*you\s*for\s*(your\s*)?(applying|interest|application|consideration|submission)|thanks?\s*for\s*(your\s*)?(application|interest|applying|submission)|you['\s]?re\s*all\s*set|we['\s]?ve\s*received\s*your\s*application|we\s*have\s*received\s*your\s*application|your\s*application\s*(is\s*on\s*its\s*way|has\s*been\s*received)|application\s*(confirmation|complete)|candidature\s*(envoy[ée]e|soumise|re[çc]ue|transmise)|votre\s*candidature\s*a\s*(bien\s*)?[ée]t[ée]\s*(envoy[ée]e|soumise|re[çc]ue)|merci\s*(d['e]\s*)?(avoir\s*postul[ée]|pour\s*votre\s*candidature))/i;
 
 const SUCCESS_URL_RX = /\/(confirmation|thank[-_]?you|merci|applied|success|submitted|post[-_]?apply|apply[-_]?complete|application[-_]?(complete|received|sent|success))(\/|\?|$|#)/i;
 

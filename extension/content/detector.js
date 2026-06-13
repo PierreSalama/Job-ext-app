@@ -34,9 +34,15 @@ const UNSURE_FLOOR = 0.20;
 const HANDOFF_KEY = 'jat11.handoff';
 const HANDOFF_TTL_MS = 10 * 60 * 1000;
 const SUPPRESS_KEY = 'jat11.suppressHosts';
-const PLATFORM_LABEL_RX = /^(linkedin|indeed|glassdoor|greenhouse|lever|workday|myworkdayjobs|ashby|workable|bamboohr|smartrecruiters|ziprecruiter)$/i;
+// Third-party ATS hosts a board's "Apply" hands off to. On these, the on-page
+// company/title is usually the VENDOR (or a tenant alias), not the employer —
+// so the job identity carried over from the board (the handoff) is canonical.
+const ATS_HOST_RX = /(myworkdayjobs|myworkdaysite|greenhouse\.io|boards\.greenhouse|lever\.co|ashbyhq|smartrecruiters|workable|bamboohr|icims|taleo|jobvite|breezy\.hr|recruitee|teamtailor|jazzhr|paylocity|dayforcehcm|successfactors|brassring|avature|eightfold|phenom|oraclecloud|wd\d?\.myworkday)/i;
+const PLATFORM_LABEL_RX = /^(linkedin|indeed|glassdoor|greenhouse|lever|workday|myworkdayjobs|ashby|workable|bamboohr|smartrecruiters|ziprecruiter|talentmanagementsolution|workforcenow|icims|taleo)$/i;
 const JOB_HEADING_RX = /\b(engineer|developer|designer|manager|analyst|specialist|coordinator|director|administrator|consultant|architect|scientist|recruiter|writer|producer|lead|intern|associate|technician|job|position|role|opening)\b/i;
 const JOB_DETAIL_TEXT_RX = /\b(job description|responsibilit(?:y|ies)|qualifications?|requirements?|preferred qualifications|benefits|compensation|salary|pay range|employment type|work authorization|visa sponsorship|remote|hybrid|on-site|hours per week|description du poste|exigences)\b/i;
+// URL shapes that mean "this is an application page" (vs. a job posting).
+const APPLY_URL_RX = /(\/apply(\/|$|\?|manually)|\/application(s)?(\/|$|\?|\/new)|applymanually|smartapply|indeedapply|easy-?apply|\/candidate|submit-application|gh_src=|\/postings?\/[\w-]+\/(apply|application)|workday.*\/apply)/i;
 
 const log = (...args) => console.log(TAG, ...args);
 const send = (type, data) => new Promise((res) => {
@@ -65,6 +71,9 @@ const state = {
   settings: { panelOnDetect: false, askWhenUnsure: true, successRescanMs: 2000 },
   asked: false,
   initialized: false,
+  lastProgressAt: 0,
+  recognitionDone: false,      // true once the page is classified (stop re-trying)
+  recognitionAttempts: 0,      // bounded re-recognition while a SPA hydrates
 };
 
 // ============================================================
@@ -268,6 +277,17 @@ async function persist(stage, extra = {}) {
   if (!state.ctx) return;
 
   paintPanel();
+
+  // Throttle 'progressing' re-posts — typing into a form fires many mutations,
+  // and each distinct field value is a new fingerprint. The final state is
+  // always captured on submit (unthrottled), so a 4s floor here just trims the
+  // timeline/network spam without losing the outcome.
+  if (stage === 'progressing') {
+    const now = Date.now();
+    if (now - (state.lastProgressAt || 0) < 4000) { paintPanel(); return; }
+    state.lastProgressAt = now;
+  }
+
   const fingerprint = buildFingerprint(stage);
   if (fingerprint === state.lastPersistFingerprint || fingerprint === state.inflight) {
     return;
@@ -413,7 +433,14 @@ function fireSubmitted(summary) {
 // Evaluation / lifecycle
 // ============================================================
 async function evaluate(reason) {
-  // Mid-flow: never reset (intra-application navigation).
+  // Different job on the same board → reset before anything else.
+  if (switchedToDifferentJob()) {
+    const p = recognizePage();
+    if (p) { resetForNewJob(p); return; }
+    hardReset();   // navigated off jobs entirely → fall through to fresh detection
+  }
+
+  // Mid-flow: never reset (intra-application navigation within the SAME job).
   if (state.fired.started || state.persisted) {
     const cap = captureFormState('re-eval-mid-flow');
     if (!state.fired.submitted && (pageTextLooksLikeSuccess() || urlLooksLikeSuccess())) {
@@ -422,7 +449,7 @@ async function evaluate(reason) {
     }
     if (state.persisted && cap.hasProgress) {
       state.stage = 'progressing';
-      persist('progressing', { summary: 'Navigated within application' });
+      persistFnf('progressing', { summary: 'Navigated within application' });
     } else {
       paintPanel();
     }
@@ -431,25 +458,42 @@ async function evaluate(reason) {
 
   let probe = recognizePage();
 
-  // Cross-domain handoff (smartapply.indeed.com etc.)
+  // Cross-domain / ATS handoff. The board's "Apply" hands off to a third-party
+  // ATS (Workday, Greenhouse, Lever, …) whose on-page metadata is the vendor or
+  // a tenant alias — NOT the employer. So when we land on an ATS host (or the
+  // probe lacks a real title/company), the job identity carried from the board
+  // (the handoff) is the source of truth.
   const applyFormHere = detectApplyForm();
   const hasApplySignal = (
     urlLooksJobby() > 0 || hasApplyAction() || pageTextLooksLikeSuccess()
     || urlLooksLikeSuccess() || !!applyFormHere
   );
-  if ((!probe || !probe.ctx.title || !probe.ctx.company) && hasApplySignal) {
+  const weakCompany = !probe?.ctx?.company || isPlatformLabel(probe.ctx.company)
+    || (onAtsHost() && normalizeKey(probe.ctx.company) === normalizeKey(hostCompanyFallback()));
+  if ((!probe || !probe.ctx.title || weakCompany) && hasApplySignal) {
     const handoff = await loadHandoff();
     if (handoff) {
       const header = inferFromApplyHeader();
-      const enriched = {
-        ...handoff.ctx,
-        title: probe?.ctx?.title || header?.title || handoff.ctx.title,
-        company: probe?.ctx?.company || header?.company || handoff.ctx.company,
-      };
+      let crossDomain = true;
+      try { crossDomain = new URL(handoff.url).hostname !== location.hostname; } catch {}
+      // Cross-domain (board → ATS): trust the board's job identity first.
+      const enriched = crossDomain
+        ? {
+            ...(probe?.ctx || ctxFromMeta()),
+            ...handoff.ctx,
+            title: handoff.ctx.title || probe?.ctx?.title || header?.title || '',
+            company: handoff.ctx.company || probe?.ctx?.company || header?.company || '',
+            jobUrl: handoff.ctx.jobUrl || probe?.ctx?.jobUrl || location.href,
+          }
+        : {
+            ...handoff.ctx,
+            title: probe?.ctx?.title || header?.title || handoff.ctx.title,
+            company: probe?.ctx?.company || header?.company || handoff.ctx.company,
+          };
       probe = { score: 0.6, ctx: enriched };
       state.source = handoff.source;
       state.externalId = handoff.externalId;
-      log('using handoff from', handoff.url);
+      log('using handoff from', handoff.url, '(crossDomain=' + crossDomain + ')');
     } else if (!probe) {
       const header = inferFromApplyHeader();
       if (header?.title) {
@@ -459,6 +503,14 @@ async function evaluate(reason) {
   }
 
   if (!probe) { log('not a job page (', reason, ')'); return; }
+
+  // Active application FORM on this page → create the entry now and track it
+  // through to submit. Works on any ATS/board, in a fresh tab opened by a
+  // board's "Apply", with no Apply-click required on this page.
+  if (await isApplyPageNow()) {
+    enterApplyFlow(probe);
+    return;
+  }
 
   // Mid-confidence: ask once instead of silently tracking or silently missing.
   if (probe.score < MIN_PAGE_SCORE) {
@@ -489,7 +541,8 @@ function acceptContext(probe) {
   if (!state.source) state.source = detectSource();
   if (!state.externalId) state.externalId = detectExternalId();
   if (!state.stage) state.stage = 'detected';
-  log('detected', { source: state.source, externalId: state.externalId, title: state.ctx.title, company: state.ctx.company });
+  state.recognitionDone = true;
+  log('detected (posting)', { source: state.source, externalId: state.externalId, title: state.ctx.title, company: state.ctx.company });
   storeHandoff();
   paintPanel();   // silent unless panelOnDetect or stage>=started
 
@@ -499,8 +552,55 @@ function acceptContext(probe) {
   }
 }
 
+// Is THIS page an active application form (vs. just a job posting we view)?
+// Generic across every ATS/board: a real apply form present, or an apply URL
+// plus a form, or a board-referred apply URL (fresh handoff).
+async function isApplyPageNow() {
+  const form = detectApplyForm();
+  const onApplyUrl = APPLY_URL_RX.test((location.pathname + location.search + location.hash).toLowerCase());
+  if (form && (form.confidence >= 0.5 || (onApplyUrl && form.confidence >= 0.34))) return true;
+  if (onApplyUrl) {
+    // Board's Apply handed off here recently → trust it even before the SPA
+    // form is detectable.
+    const h = await loadHandoff();
+    if (h && Date.now() - h.ts < 5 * 60 * 1000) return true;
+  }
+  return false;
+}
+
+// Landed on an application page (commonly a fresh tab opened by a board's
+// "Apply", e.g. LinkedIn → Workday). There was no Apply click on THIS tab, so
+// treat arrival itself as "started" and create the entry immediately — then
+// keep capturing through to submit. This is the fix for external-site capture.
+function enterApplyFlow(probe) {
+  state.ctx = probe.ctx;
+  if (!state.source) state.source = detectSource();
+  if (!state.externalId) state.externalId = detectExternalId();
+  state.recognitionDone = true;
+
+  if (!state.fired.started) {
+    state.fired.started = true;
+    state.stage = 'started';
+    startSuccessTicker();
+    storeHandoff();
+  }
+  log('apply page → entering flow', { source: state.source, externalId: state.externalId, title: state.ctx.title, company: state.ctx.company });
+
+  // Already on a confirmation page?
+  if (!state.fired.submitted && (pageTextLooksLikeSuccess() || urlLooksLikeSuccess())) {
+    fireSubmitted('Loaded on success page');
+    return;
+  }
+  // Snapshot whatever's already filled, then create/update the entry now.
+  const cap = captureFormState('apply-arrival');
+  state.stage = cap.hasProgress ? 'progressing' : 'started';
+  persistFnf(state.stage, { summary: 'Application page opened' });
+  paintPanel();
+}
+
 function resetForNewJob(probe) {
   dismissPanel();
+  stopSuccessTicker();
   Object.assign(state, {
     ctx: probe.ctx,
     jobId: null,
@@ -516,9 +616,40 @@ function resetForNewJob(probe) {
     lastPersistFingerprint: null,
     inflight: null,
     saveState: null,
+    lastProgressAt: 0,
+    asked: false,
+    recognitionDone: true,        // already recognized the new job
+    recognitionAttempts: 0,
   });
   storeHandoff();
   paintPanel();
+}
+
+// Clear all state back to dormant (e.g. navigated off jobs entirely).
+function hardReset() {
+  dismissPanel();
+  stopSuccessTicker();
+  Object.assign(state, {
+    ctx: null, jobId: null, externalId: null, source: null, stage: null,
+    resumeName: null, attachments: [], answers: {}, answersCount: 0,
+    persisted: false, fired: { started: false, submitted: false },
+    lastPersistFingerprint: null, inflight: null, saveState: null,
+    lastProgressAt: 0, asked: false,
+    recognitionDone: false, recognitionAttempts: 0,
+  });
+}
+
+function onAtsHost() { return ATS_HOST_RX.test(location.hostname); }
+
+// True when the URL now points at a DIFFERENT job on the SAME board (e.g. a
+// different LinkedIn/Indeed search-result card). This is the fix for the
+// "latched onto the first job and never let go" bug — switching cards must
+// reset even mid-application, or the new job (and any external apply page it
+// opens) gets misfiled under the old one.
+function switchedToDifferentJob() {
+  if (!state.externalId) return false;
+  const newId = detectExternalId();
+  return !!newId && newId !== state.externalId && detectSource() === state.source;
 }
 
 // ============================================================
@@ -604,8 +735,22 @@ function installWatchers() {
 
   // ---- mutations ----
   let debounce = null;
+  let reEvalDebounce = null;
   const obs = new MutationObserver((records) => {
-    if (!state.ctx) return;
+    if (!state.ctx) {
+      // Page not classified yet — an ATS SPA may still be rendering its form.
+      // Re-attempt recognition as content appears (bounded). This is what lets
+      // us catch Workday/Greenhouse/etc. that hydrate after initial load.
+      if (!state.recognitionDone && state.recognitionAttempts < 80) {
+        clearTimeout(reEvalDebounce);
+        reEvalDebounce = setTimeout(() => {
+          if (state.ctx || state.recognitionDone) return;
+          state.recognitionAttempts++;
+          evaluate('mutation-hydrate');
+        }, 400);
+      }
+      return;
+    }
     for (const r of records) {
       for (const node of r.addedNodes || []) {
         if (nodeLooksLikeSuccess(node) && !state.fired.submitted && state.fired.started) {
@@ -667,17 +812,32 @@ function onUrlChanged() {
     fireSubmitted('URL → success pattern');
     return;
   }
+
+  // Switched to a different job on the same board → reset, even if we'd already
+  // started the previous one (it's saved server-side). Without this, browsing
+  // from job A to job B on LinkedIn keeps A's identity and misfiles B (and any
+  // external apply page B opens) under A.
+  if (switchedToDifferentJob()) {
+    log('switched to a different job on the board — resetting', { from: state.externalId, to: detectExternalId() });
+    const probe = recognizePage();
+    if (probe) { resetForNewJob(probe); }
+    else { hardReset(); evaluate('switched-job'); }
+    return;
+  }
+
   if (state.fired.started || state.persisted) {
+    // Same job, or an apply sub-page with no distinct id → intra-application nav.
     const cap = captureFormState('url-mid-flow');
     if (state.persisted && cap.hasProgress) {
       state.stage = 'progressing';
-      persist('progressing', { summary: 'Navigated within application' });
+      persistFnf('progressing', { summary: 'Navigated within application' });
     } else {
       paintPanel();
     }
     return;
   }
-  // Only 'detected' so far → maybe a different job now.
+
+  // Only 'detected' so far → maybe a different job now (no distinct id case).
   const probe = recognizePage();
   if (!probe || probe.score < MIN_PAGE_SCORE) return;
   const oldKey = normalizeKey(state.ctx?.title) + '|' + normalizeKey(state.ctx?.company);
@@ -697,6 +857,15 @@ export async function init() {
   await loadSettings();
   installWatchers();
   await evaluate('init');
+  // ATS/job SPAs render their form AFTER document_idle. Re-attempt recognition
+  // on a backoff until the page is classified (bounded by recognitionDone).
+  for (const delay of [600, 1300, 2600, 5000, 9000, 14000]) {
+    setTimeout(() => {
+      if (state.ctx || state.recognitionDone) return;
+      state.recognitionAttempts++;
+      evaluate('retry');
+    }, delay);
+  }
 }
 
 export async function reboot(reason) {
