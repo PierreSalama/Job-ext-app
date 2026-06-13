@@ -1305,12 +1305,14 @@ route('/pipeline', async () => {
 // VIEW: Auto-apply queue (#/queue)
 // ============================================================
 route('/queue', async () => {
-  const [settings, queueR, profilesR, docsR, parkedR] = await Promise.all([
+  const [settings, queueR, profilesR, docsR, parkedR, discR] = await Promise.all([
     getSettings(true), api('/queue'),
     api('/profiles').catch(() => ({ items: [] })),
     api('/documents').catch(() => ({ items: [] })),
     api('/queue/parked').catch(() => ({ items: [] })),
+    api('/auto-apply/discovery-status').catch(() => ({ status: null })),
   ]);
+  const disc = discR.status || null;
   const aa = settings.autoApply;
   const tasks = queueR.items || [];
   const profiles = profilesR.items || [];
@@ -1367,13 +1369,26 @@ route('/queue', async () => {
         <h1 class="page-title">Auto-apply</h1>
         <div class="page-sub">Searches Easy-Apply jobs and applies — paced, review-first, always stoppable.</div>
       </div>
-      <div class="page-actions">
-        <button class="btn" data-stop-all>⏹ Stop everything</button>
+      <div class="page-actions aa-master">
+        <label class="aa-switch ${aa.enabled ? 'on' : ''}">
+          <span class="aa-switch-label">${aa.enabled ? 'ON' : 'OFF'}</span>
+          <label class="toggle"><input type="checkbox" id="aa-master" ${aa.enabled ? 'checked' : ''} /><span class="knob"></span></label>
+        </label>
+        <button class="btn danger" data-stop-all>⏹ Stop everything</button>
         <button class="btn primary" data-save>Save settings</button>
       </div>
     </header>
 
     ${working ? '<div class="aa-running"><span class="aa-pulse"></span> Auto-apply is working in a background tab — <strong>don\'t touch that window</strong>. It\'s paced and you can Stop any time.</div>' : ''}
+
+    <div class="aa-disco">
+      <div class="aa-disco-main">
+        <span class="aa-disco-eyebrow">Last search</span>
+        ${disc ? `<span class="aa-disco-txt">${esc(disc.board || '?')} · "${esc(disc.keyword || '')}" — found <strong>${esc(disc.found ?? 0)}</strong>, queued <strong>${esc(disc.enqueued ?? 0)}</strong>${disc.note ? ` · <span class="aa-disco-note">${esc(disc.note)}</span>` : ''} <span class="muted">(${esc(fmtRel(disc.at))})</span></span>`
+          : '<span class="muted">No search yet — turn it on (and keep Chrome open). It searches about once a minute when the queue is low.</span>'}
+      </div>
+      ${state.host === 'extension' ? '<button class="btn small" data-run-disco>Search now</button>' : '<span class="muted" style="font-size:11px">Search runs in the Chrome extension</span>'}
+    </div>
 
     ${intakeHtml}
 
@@ -1392,7 +1407,6 @@ route('/queue', async () => {
     <section class="section">
       <header class="section-header"><div><div class="section-eyebrow">Engine</div><h2 class="section-title">Pacing &amp; safety</h2></div></header>
       <div class="queue-controls section-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:16px">
-        ${qc('Master switch', `<label class="toggle"><input type="checkbox" id="aa-enabled" ${aa.enabled ? 'checked' : ''} /><span class="knob"></span></label>`)}
         ${qc('Mode', `<select class="select" id="aa-mode">
           <option value="review" ${aa.mode === 'review' ? 'selected' : ''}>Review — stop before submit</option>
           <option value="auto" ${aa.mode === 'auto' ? 'selected' : ''}>Auto — submit for me</option>
@@ -1426,7 +1440,7 @@ route('/queue', async () => {
       await api('/settings', {
         method: 'PATCH',
         body: { autoApply: {
-          enabled: v.querySelector('#aa-enabled').checked,
+          enabled: v.querySelector('#aa-master').checked,
           mode: v.querySelector('#aa-mode').value,
           keywords: kw.get(),
           locations: locs.get(),
@@ -1443,8 +1457,33 @@ route('/queue', async () => {
         } },
       });
       state.settings = null;
-      toast(v.querySelector('#aa-enabled').checked ? 'Auto-apply on — it will search & apply, paced' : 'Auto-apply settings saved');
+      toast(v.querySelector('#aa-master').checked ? 'Auto-apply on — it will search & apply, paced' : 'Auto-apply settings saved');
     } catch (e) { errToast(e); }
+  });
+
+  // Header master ON/OFF — flips + saves immediately (no need to hit Save).
+  v.querySelector('#aa-master').addEventListener('change', async (e) => {
+    const on = e.target.checked;
+    try {
+      await api('/settings', { method: 'PATCH', body: { autoApply: { enabled: on } } });
+      state.settings = null;
+      const sw = v.querySelector('.aa-switch');
+      sw.classList.toggle('on', on);
+      sw.querySelector('.aa-switch-label').textContent = on ? 'ON' : 'OFF';
+      toast(on ? 'Auto-apply ON — searching & applying, paced' : 'Auto-apply OFF');
+    } catch (err) { errToast(err); e.target.checked = !on; }
+  });
+
+  // Manual "Search now" (extension host only — the search runs in the SW).
+  v.querySelector('[data-run-disco]')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Searching…';
+    try {
+      const r = await new Promise((res) => chrome.runtime.sendMessage({ type: 'run-discovery' }, (x) => { void chrome.runtime.lastError; res(x); }));
+      const st = r?.status || {};
+      toast(st.ok === false && st.note ? `Search: ${st.note}` : `Search: found ${st.found ?? 0}, queued ${st.enqueued ?? 0}${st.note ? ' — ' + st.note : ''}`, st.enqueued ? 'info' : 'danger', { ttl: 9000 });
+      navigate();
+    } catch (err) { errToast(err); }
+    btn.disabled = false; btn.textContent = 'Search now';
   });
 
   v.querySelector('[data-intake-save]')?.addEventListener('click', async (e) => {

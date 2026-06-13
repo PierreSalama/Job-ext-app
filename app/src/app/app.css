@@ -1489,3 +1489,22 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
 .task-park { color: var(--warn); font-size: 12px; margin-top: 6px; }
 .state-chip[data-state="parked"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
 .state-chip[data-state="running"] { color: var(--primary); }
+.aa-master { display: flex; align-items: center; gap: 12px; }
+.aa-switch {
+  display: flex; align-items: center; gap: 8px; padding: 6px 12px;
+  border: 1px solid var(--border); cursor: pointer;
+}
+.aa-switch.on { border-color: var(--success); background: color-mix(in srgb, var(--success) 10%, transparent); }
+.aa-switch-label { font-size: 11px; letter-spacing: 0.18em; font-weight: 600; color: var(--muted); }
+.aa-switch.on .aa-switch-label { color: var(--success); }
+.btn.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
+.btn.danger:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); }
+.aa-disco {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 10px 16px; margin-bottom: 16px;
+  border: 1px solid var(--border); background: var(--panel-veil);
+}
+.aa-disco-main { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.aa-disco-eyebrow { font-size: 8px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--muted); }
+.aa-disco-txt { font-size: 12px; color: var(--body-text); }
+.aa-disco-note { color: var(--warn); }

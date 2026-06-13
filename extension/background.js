@@ -139,6 +139,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return { ok: true };
       })());
       return true;
+    case 'run-discovery':
+      // Manual "Run discovery now" from the extension dashboard (bypasses the
+      // queue-low + window gates so the user can shake it out on demand).
+      respond(discoverTick(true).then((s) => ({ ok: true, status: s })));
+      return true;
     case 'pipeline-event':
       respond(handlePipelineEvent(msg.data, sender));
       return true;
@@ -493,46 +498,56 @@ function buildSearchUrl(board, keyword, location) {
   return `https://www.linkedin.com/jobs/search/?f_AL=true&keywords=${kw}&sortBy=DD` + (loc ? `&location=${loc}` : '');
 }
 
-async function discoverTick() {
-  if (dispatching) return;
-  if (!(await api.isPaired())) return;
+async function discoverTick(force = false) {
+  if (dispatching) return { ok: false, note: 'busy' };
+  if (!(await api.isPaired())) return { ok: false, note: 'not paired' };
   const h = await api.health();
-  if (!h?.ok) return;
+  if (!h?.ok) return { ok: false, note: 'app offline' };
   const sres = await api.call('GET', '/settings', null, 6000);
   const aa = sres?.ok ? sres.settings?.autoApply : null;
-  if (!aa || !aa.enabled || !aa.discovery?.enabled) return;
+  if (!aa || !aa.enabled || !aa.discovery?.enabled) return { ok: false, note: 'auto-apply is off' };
   const keywords = (aa.keywords || []).filter(Boolean);
   const boards = (aa.boards || []).filter(Boolean);
-  if (!keywords.length || !boards.length) return;
-  if (!withinWindow(aa)) return;   // respect the daytime window (no 3am search tabs)
+  if (!keywords.length || !boards.length) return { ok: false, note: 'add keywords + a board first' };
+  if (!force && !withinWindow(aa)) return { ok: false, note: 'outside the time window' };
 
-  // Only discover when the queue is running low — never over-enqueue.
-  const q = await api.call('GET', '/queue?state=queued', null, 6000);
-  if ((q?.items || []).length >= (aa.discovery.refillBelow || 3)) return;
+  // Only auto-discover when the queue is low — never over-enqueue. A manual run
+  // (force) bypasses this.
+  if (!force) {
+    const q = await api.call('GET', '/queue?state=queued', null, 6000);
+    if ((q?.items || []).length >= (aa.discovery.refillBelow || 3)) return { ok: false, note: 'queue already full' };
+  }
 
   dispatching = true;
   let tab = null;
+  const board = boards[lastBoardIdx++ % boards.length];
+  const keyword = keywords[Math.floor(Math.random() * keywords.length)];
+  const location = (aa.locations || [])[0] || '';
+  const url = buildSearchUrl(board, keyword, location);
+  let resp = null, enqueued = 0;
   try {
-    const board = boards[lastBoardIdx++ % boards.length];
-    const keyword = keywords[Math.floor(Math.random() * keywords.length)];
-    const location = (aa.locations || [])[0] || '';
-    const url = buildSearchUrl(board, keyword, location);
     tab = await chrome.tabs.create({ url, active: false });
     await waitTabComplete(tab.id, 30000);
-    await new Promise((r2) => setTimeout(r2, 3000));
-    let resp = null;
+    await new Promise((r2) => setTimeout(r2, 2000));
     try {
       resp = await chrome.tabs.sendMessage(tab.id, { type: 'jat11.discover-search', source: board, max: aa.discovery.perRunLimit || 8 });
-    } catch {}
+    } catch (e) {
+      resp = { ok: false, error: String(e?.message || e), jobs: [], found: 0, note: 'could not reach the search page (content script not ready?)' };
+    }
     const jobs = (resp && resp.jobs) || [];
     if (jobs.length) {
       const r3 = await api.call('POST', '/queue/discover', { source: board, jobs }, 15000);
-      console.log('[JAT] discovered', jobs.length, 'on', board, '→ enqueued', r3?.enqueued ?? '?');
+      enqueued = r3?.enqueued ?? 0;
     }
   } catch (e) {
-    console.warn('[JAT] discoverTick failed', e?.message || e);
+    resp = { ok: false, error: String(e?.message || e), jobs: [], found: 0, note: 'discovery failed: ' + String(e?.message || e) };
   } finally {
     if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} }
     dispatching = false;
   }
+  // Report what this search saw so the dashboard can show it (and we can tune).
+  const status = { board, keyword, url, found: resp?.found ?? 0, enqueued, note: resp?.note || resp?.error || '', ok: resp?.ok !== false };
+  await api.call('POST', '/auto-apply/discovery-status', status, 6000).catch(() => {});
+  console.log('[JAT] discovery', board, '"' + keyword + '" found', status.found, 'enqueued', enqueued, status.note || '');
+  return status;
 }

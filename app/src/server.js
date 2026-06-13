@@ -127,8 +127,10 @@ async function queueNext() {
     return { task: null, reason: 'bad-task' };
   }
 
-  const profile = db.profileForSource(job.source);
-  const resume = db.defaultDocument('resume');
+  // Honour the explicit picks from the Auto-apply page; fall back to the
+  // source-matched profile and the active (starred-in-Documents) résumé.
+  const profile = (s.profileId && db.listProfiles().find((p) => p.id === s.profileId)) || db.profileForSource(job.source);
+  const resume = (s.resumeDocId && db.getDocument(s.resumeDocId, { withText: true })) || db.defaultDocument('resume');
   const harvested = db.profileFieldList().filter((f) => f.value);
   const siteCfg = s.sites?.[String(job.source || '').toLowerCase()] || {};
   const mode = siteCfg.mode || task.mode || s.mode;
@@ -701,6 +703,17 @@ async function handle(req, res, parsed) {
     broadcast('profileFields.updated', {});
     broadcast('queue.updated', { action: 'intake' });
     return sendJson(res, 200, { ok: true, saved, requeued });
+  }
+  // Discovery telemetry — the extension SW reports what each search saw so the
+  // dashboard can show it (found N, enqueued N, any note) and we can tune.
+  if (req.method === 'GET' && pathname === '/auto-apply/discovery-status') {
+    return sendJson(res, 200, { ok: true, status: db.kvGet('discoveryStatus') || null });
+  }
+  if (req.method === 'POST' && pathname === '/auto-apply/discovery-status') {
+    const body = await readJson(req);
+    db.kvSet('discoveryStatus', { ...body, at: new Date().toISOString() });
+    broadcast('queue.updated', { action: 'discovery-status' });
+    return sendJson(res, 200, { ok: true });
   }
 
   // ---- AI ----
