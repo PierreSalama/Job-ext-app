@@ -32,9 +32,10 @@ const STATUS_LABEL = Object.fromEntries(STATUSES.map((s) => [s.id, s.label]));
 const STATUS_INDEX = Object.fromEntries(STATUSES.map((s, i) => [s.id, i]));
 const PIPELINE_ACTIVE = ['submitted', 'contacted', 'interview_1', 'interview_2', 'interview_final', 'offer'];
 
-const QUEUE_STATE_ORDER = ['running', 'awaiting_review', 'awaiting_input', 'queued', 'scheduled', 'done', 'failed', 'skipped'];
+const QUEUE_STATE_ORDER = ['running', 'awaiting_review', 'parked', 'awaiting_input', 'queued', 'scheduled', 'done', 'failed', 'skipped'];
 const QUEUE_STATE_LABEL = {
-  running: 'Running', awaiting_review: 'Awaiting review', awaiting_input: 'Awaiting input',
+  running: 'Running', awaiting_review: 'Awaiting review', parked: 'Set aside — needs input',
+  awaiting_input: 'Awaiting input',
   queued: 'Queued', scheduled: 'Scheduled', done: 'Done', failed: 'Failed', skipped: 'Skipped',
 };
 
@@ -1304,9 +1305,19 @@ route('/pipeline', async () => {
 // VIEW: Auto-apply queue (#/queue)
 // ============================================================
 route('/queue', async () => {
-  const [settings, queueR] = await Promise.all([getSettings(true), api('/queue')]);
+  const [settings, queueR, profilesR, docsR, parkedR] = await Promise.all([
+    getSettings(true), api('/queue'),
+    api('/profiles').catch(() => ({ items: [] })),
+    api('/documents').catch(() => ({ items: [] })),
+    api('/queue/parked').catch(() => ({ items: [] })),
+  ]);
   const aa = settings.autoApply;
   const tasks = queueR.items || [];
+  const profiles = profilesR.items || [];
+  const resumes = (docsR.items || []).filter((d) => d.role === 'resume');
+  const parked = parkedR.items || [];
+  const boards = aa.boards || ['linkedin', 'indeed'];
+  const working = tasks.some((t) => t.state === 'running' || t.state === 'scheduled');
   const groups = new Map(QUEUE_STATE_ORDER.map((s) => [s, []]));
   for (const t of tasks) (groups.get(t.state) || groups.set(t.state, []).get(t.state)).push(t);
 
@@ -1319,6 +1330,7 @@ route('/queue', async () => {
         <span class="state-chip" data-state="${esc(t.state)}">${esc(QUEUE_STATE_LABEL[t.state] || t.state)}</span>
       </div>
       <div class="task-sub">${esc(t.mode)} mode · ${esc(t.attempts)} attempt${t.attempts === 1 ? '' : 's'} · updated ${esc(fmtRel(t.updatedAt))}</div>
+      ${t.parkReason ? `<div class="task-park">⚑ ${esc(t.parkReason)}${(t.pendingQuestions || []).length ? ' — answer below to retry' : ''}</div>` : ''}
       ${t.lastError ? `<div class="task-err">${esc(t.lastError)}</div>` : ''}
       <div class="task-actions">
         ${['failed', 'skipped', 'awaiting_input'].includes(t.state) ? '<button class="btn small" data-act="retry">Retry</button>' : ''}
@@ -1335,14 +1347,25 @@ route('/queue', async () => {
   const groupsHtml = [...groups.entries()]
     .filter(([, list]) => list.length)
     .map(([s, list]) => `<div class="queue-group-head"><span>${esc(QUEUE_STATE_LABEL[s] || s)}</span><span class="n">${list.length}</span></div>${list.map(taskCard).join('')}`)
-    .join('') || emptyHtml('Idle', 'Nothing queued', 'Queue a job from its detail page, or select rows in Applications.');
+    .join('') || emptyHtml('Idle', 'Nothing queued', 'Add keywords above and flip the master switch — it searches Easy-Apply jobs and applies, paced.');
+
+  const intakeHtml = parked.length ? `
+    <section class="section aa-intake">
+      <header class="section-header"><div><div class="section-eyebrow">Self-healing</div><h2 class="section-title">Needs your input</h2>
+        <div class="form-hint">${parked.length} question(s) auto-apply couldn't answer confidently. Answer them — they're saved to your profile and the set-aside jobs retry automatically.</div></div></header>
+      ${parked.map((q) => `<div class="form-row"><div class="form-label">${esc(q.question)}${q.reason ? `<div class="form-hint">${esc(q.reason)}</div>` : ''}</div>
+        <div class="form-control">${(q.options && q.options.length)
+          ? `<select class="select aa-intake-a" data-q="${esc(q.question)}" data-ft="${esc(q.fieldType || '')}"><option value="">—</option>${q.options.map((o) => `<option>${esc(o)}</option>`).join('')}</select>`
+          : `<input class="input aa-intake-a" data-q="${esc(q.question)}" data-ft="${esc(q.fieldType || '')}" />`}</div></div>`).join('')}
+      <div class="section-footer"><button class="btn small primary" data-intake-save>Save answers & retry jobs</button></div>
+    </section>` : '';
 
   const v = el(`<div>
     <header class="page-header">
       <div>
         <div class="page-eyebrow">Automate</div>
         <h1 class="page-title">Auto-apply</h1>
-        <div class="page-sub">Paced, review-first, always stoppable.</div>
+        <div class="page-sub">Searches Easy-Apply jobs and applies — paced, review-first, always stoppable.</div>
       </div>
       <div class="page-actions">
         <button class="btn" data-stop-all>⏹ Stop everything</button>
@@ -1350,8 +1373,24 @@ route('/queue', async () => {
       </div>
     </header>
 
+    ${working ? '<div class="aa-running"><span class="aa-pulse"></span> Auto-apply is working in a background tab — <strong>don\'t touch that window</strong>. It\'s paced and you can Stop any time.</div>' : ''}
+
+    ${intakeHtml}
+
     <section class="section">
-      <header class="section-header"><div><div class="section-eyebrow">Engine</div><h2 class="section-title">Pacing</h2></div></header>
+      <header class="section-header"><div><div class="section-eyebrow">Target</div><h2 class="section-title">What to apply to</h2></div></header>
+      <div class="queue-controls section-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px">
+        ${qc('Keywords', '<div id="aa-keywords-slot"></div>')}
+        ${qc('Locations', '<div id="aa-locations-slot"></div>')}
+        ${qc('Job boards', `<label class="aa-chk"><input type="checkbox" id="aa-li" ${boards.includes('linkedin') ? 'checked' : ''}/> LinkedIn</label> <label class="aa-chk"><input type="checkbox" id="aa-in" ${boards.includes('indeed') ? 'checked' : ''}/> Indeed</label>`)}
+        ${qc('Easy Apply only', '<label class="toggle"><input type="checkbox" checked disabled /><span class="knob"></span></label><div class="form-hint">locked — other applies aren\'t supported yet</div>')}
+        ${qc('Apply with profile', `<select class="select" id="aa-profile"><option value="">Default</option>${profiles.map((p) => `<option value="${esc(p.id)}" ${aa.profileId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>`)}
+        ${qc('Attach résumé', `<select class="select" id="aa-resume"><option value="">Active résumé</option>${resumes.map((d) => `<option value="${esc(d.id)}" ${aa.resumeDocId === d.id ? 'selected' : ''}>${esc(d.label || d.name)}</option>`).join('')}</select>`)}
+      </div>
+    </section>
+
+    <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">Engine</div><h2 class="section-title">Pacing &amp; safety</h2></div></header>
       <div class="queue-controls section-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:16px">
         ${qc('Master switch', `<label class="toggle"><input type="checkbox" id="aa-enabled" ${aa.enabled ? 'checked' : ''} /><span class="knob"></span></label>`)}
         ${qc('Mode', `<select class="select" id="aa-mode">
@@ -1365,7 +1404,7 @@ route('/queue', async () => {
         ${qc('Window start', `<input class="input" id="aa-ws" type="time" value="${esc(aa.windowStart)}" />`)}
         ${qc('Window end', `<input class="input" id="aa-we" type="time" value="${esc(aa.windowEnd)}" />`)}
       </div>
-      <div class="section-footer muted">The extension checks for due tasks about once a minute while Chrome is open. Review mode fills everything and waits for you at the final submit.</div>
+      <div class="section-footer muted">Very cautious by default (low caps, long random gaps, daytime only) — LinkedIn/Indeed flag bots, so go slow. Review mode fills everything and waits for you at the final submit; nothing is sent unless you switch to Auto.</div>
     </section>
 
     <section class="section">
@@ -1374,24 +1413,51 @@ route('/queue', async () => {
     </section>
   </div>`);
 
+  const kw = chipsInput(aa.keywords || [], 'software engineer, data analyst…');
+  v.querySelector('#aa-keywords-slot').appendChild(kw.node);
+  const locs = chipsInput(aa.locations || [], 'Toronto, Remote…');
+  v.querySelector('#aa-locations-slot').appendChild(locs.node);
+
   v.querySelector('[data-save]').addEventListener('click', async () => {
     try {
+      const boardsSel = [];
+      if (v.querySelector('#aa-li').checked) boardsSel.push('linkedin');
+      if (v.querySelector('#aa-in').checked) boardsSel.push('indeed');
       await api('/settings', {
         method: 'PATCH',
         body: { autoApply: {
           enabled: v.querySelector('#aa-enabled').checked,
           mode: v.querySelector('#aa-mode').value,
-          maxPerDay: Number(v.querySelector('#aa-day').value) || 5,
-          maxPerHour: Number(v.querySelector('#aa-hour').value) || 2,
-          minGapMinutes: Number(v.querySelector('#aa-gmin').value) || 8,
-          maxGapMinutes: Number(v.querySelector('#aa-gmax').value) || 25,
+          keywords: kw.get(),
+          locations: locs.get(),
+          boards: boardsSel,
+          easyApplyOnly: true,
+          profileId: v.querySelector('#aa-profile').value,
+          resumeDocId: v.querySelector('#aa-resume').value,
+          maxPerDay: Number(v.querySelector('#aa-day').value) || 3,
+          maxPerHour: Number(v.querySelector('#aa-hour').value) || 1,
+          minGapMinutes: Number(v.querySelector('#aa-gmin').value) || 12,
+          maxGapMinutes: Number(v.querySelector('#aa-gmax').value) || 40,
           windowStart: v.querySelector('#aa-ws').value || '10:00',
           windowEnd: v.querySelector('#aa-we').value || '18:00',
         } },
       });
       state.settings = null;
-      toast('Auto-apply settings saved');
+      toast(v.querySelector('#aa-enabled').checked ? 'Auto-apply on — it will search & apply, paced' : 'Auto-apply settings saved');
     } catch (e) { errToast(e); }
+  });
+
+  v.querySelector('[data-intake-save]')?.addEventListener('click', async (e) => {
+    const answers = [...v.querySelectorAll('.aa-intake-a')]
+      .map((el2) => ({ question: el2.dataset.q, value: (el2.value || '').trim(), fieldType: el2.dataset.ft }))
+      .filter((a) => a.value);
+    if (!answers.length) { toast('Answer at least one question', 'danger'); return; }
+    const btn = e.currentTarget; btn.disabled = true;
+    try {
+      const r = await api('/auto-apply/intake', { method: 'POST', body: { answers } });
+      toast(`Saved ${r.saved} answer(s) · ${r.requeued} job(s) re-queued`);
+      navigate();
+    } catch (err) { errToast(err); btn.disabled = false; }
   });
 
   v.querySelector('[data-stop-all]').addEventListener('click', async () => {

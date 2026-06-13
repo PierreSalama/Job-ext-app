@@ -645,7 +645,7 @@ async function handle(req, res, parsed) {
     const task = db.queuePatch(jm[1], body);
     if (!task) return sendJson(res, 404, { ok: false, error: 'not found' });
     broadcast('queue.updated', { taskId: task.id, state: task.state });
-    if (opts.notify && ['awaiting_review', 'awaiting_input', 'done', 'failed'].includes(task.state)) {
+    if (opts.notify && ['awaiting_review', 'awaiting_input', 'parked', 'done', 'failed'].includes(task.state)) {
       opts.notify('autoApply', task);
     }
     return sendJson(res, 200, { ok: true, task });
@@ -654,6 +654,53 @@ async function handle(req, res, parsed) {
     const okDel = db.queueDelete(jm[1]);
     broadcast('queue.updated', { taskId: jm[1], state: 'deleted' });
     return sendJson(res, okDel ? 200 : 404, { ok: okDel });
+  }
+
+  // ---- auto-apply: discovery enqueue + self-healing intake ----
+  // Driver hands over jobs found via a keyword/Easy-Apply search → upsert each
+  // (tagged auto-apply) and enqueue, deduped.
+  if (req.method === 'POST' && pathname === '/queue/discover') {
+    const body = await readJson(req);
+    const jobs = Array.isArray(body.jobs) ? body.jobs : [];
+    const s = db.getSettings().autoApply;
+    let enqueued = 0;
+    for (const jd of jobs.slice(0, 50)) {
+      if (!jd || !jd.jobUrl) continue;
+      const r = db.transaction(() => {
+        const up = db.upsertJob({
+          externalId: jd.externalId, source: body.source || jd.source || null,
+          title: jd.title, company: jd.company, location: jd.location,
+          jobUrl: jd.jobUrl, status: 'started', tags: ['auto-apply'],
+        });
+        if (up.action === 'created') {
+          db.recordEvent({ jobId: up.job.id, type: 'created', source: 'auto-apply', summary: 'Discovered via auto-apply', data: {} });
+        }
+        return { job: up.job, task: db.queueAdd(up.job.id, { mode: s.mode }) };
+      });
+      if (r.task) enqueued++;
+    }
+    broadcast('queue.updated', { action: 'discover' });
+    broadcast('jobs.updated', { action: 'discover' });
+    return sendJson(res, 200, { ok: true, enqueued });
+  }
+  // The deduped list of questions parked jobs are waiting on (the intake form).
+  if (req.method === 'GET' && pathname === '/queue/parked') {
+    return sendJson(res, 200, { ok: true, items: db.queueParkedQuestions() });
+  }
+  // User answers the parked questions → saved to the profile (locked) → parked
+  // jobs whose questions are now all answerable flip back to 'queued'.
+  if (req.method === 'POST' && pathname === '/auto-apply/intake') {
+    const body = await readJson(req);
+    const answers = Array.isArray(body.answers) ? body.answers : [];
+    let saved = 0;
+    for (const a of answers) {
+      if (!a || !a.question || a.value == null || String(a.value).trim() === '') continue;
+      if (db.profileFieldUpsert({ question: a.question, value: a.value, fieldType: a.fieldType, fromUser: true, confidence: 1 })) saved++;
+    }
+    const requeued = db.queueRetryParked();
+    broadcast('profileFields.updated', {});
+    broadcast('queue.updated', { action: 'intake' });
+    return sendJson(res, 200, { ok: true, saved, requeued });
   }
 
   // ---- AI ----

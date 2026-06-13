@@ -279,6 +279,25 @@ export async function run(task, context, helpers) {
   let finished = false;
   let finalState = null;
 
+  // Self-healing park: questions we couldn't answer with HIGH confidence. We
+  // NEVER submit a job with these outstanding — instead we park it (with the
+  // reason) so the next run can ask the user and grow the knowledge base.
+  const parked = [];
+  const parkSeen = new Set();
+  const onJobBoard = /linkedin|indeed/i.test(location.hostname);
+  const park = (label, fieldType, options, reason) => {
+    const key = String(label || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    if (!key || parkSeen.has(key)) return;
+    parkSeen.add(key);
+    parked.push({ question: String(label).slice(0, 300), fieldType: fieldType || 'text', options: options || null, reason: reason || 'missing answer' });
+  };
+  const reportParked = (where) => {
+    logLine('warn', `parked — ${parked.length} unanswered question(s); set aside for your input`);
+    setStatus(`Set aside — needs ${parked.length} answer(s) from you`);
+    report({ state: 'parked', parkReason: `needs ${parked.length} answer(s)`, pendingQuestions: parked, transcriptAppend: { note: `parked at ${where}: ` + parked.map((p) => p.question.slice(0, 40)).join('; ') } });
+    finalState = 'parked';
+  };
+
   while (S.step < MAX_STEPS && !S.cancelled && !finished) {
     S.step++;
     await untilUnpaused();
@@ -324,6 +343,7 @@ export async function run(task, context, helpers) {
       if (S.cancelled) break;
       if (LEGAL_RX.test(u.label)) {
         logLine('warn', `legal/eligibility question not in profile: "${u.label.slice(0, 60)}" — leaving for you`);
+        if (u.required || onJobBoard) park(u.label, u.fieldType, u.options, 'legal/eligibility — needs your answer');
         continue;
       }
       setStatus(`Step ${S.step}: thinking about "${u.label.slice(0, 40)}…"`);
@@ -338,6 +358,9 @@ export async function run(task, context, helpers) {
                  && typeof r.result.confidence === 'number') ? r.result : null;
       if (!a || a.refuse || a.confidence < aiConfidenceMin || !a.answer.trim()) {
         logLine('warn', `no grounded answer for "${u.label.slice(0, 50)}" (${a ? 'conf ' + a.confidence : 'ai failed/malformed'})`);
+        // Not highly confident → park it (don't guess). Required fields and any
+        // job-board screening question must be answered before we submit.
+        if (u.required || onJobBoard) park(u.label, u.fieldType, u.options, a && a.reason ? a.reason : 'no confident answer');
         continue;
       }
       const ok = engine.fill([{ input: u.input, value: a.answer }]);
@@ -366,6 +389,9 @@ export async function run(task, context, helpers) {
         if (found) break;
       }
       if (!found) {
+        // If we're stuck because of unanswered questions, park (self-heal) rather
+        // than a generic "needs input" — so the next run can ask + retry.
+        if (parked.length) { reportParked('no-advance'); break; }
         report({ state: 'awaiting_input', lastError: 'no advance button found' });
         finalState = 'awaiting_input';
         break;
@@ -374,6 +400,8 @@ export async function run(task, context, helpers) {
     }
 
     if (isFinalSubmit(btn)) {
+      // SAFETY NET: never submit a job that still has unanswered questions.
+      if (parked.length) { reportParked('final-submit'); break; }
       if (mode === 'review') {
         logLine('ok', 'reached the final submit — stopping for your review');
         setStatus('Ready for your review — press submit yourself when happy.');
@@ -412,12 +440,15 @@ export async function run(task, context, helpers) {
   }
 
   if (!finalState && !S.cancelled && S.step >= MAX_STEPS) {
-    logLine('warn', 'max steps reached — stopping for safety');
-    report({ state: 'awaiting_input', lastError: 'max steps reached' });
-    finalState = 'awaiting_input';
+    if (parked.length) { reportParked('max-steps'); }
+    else {
+      logLine('warn', 'max steps reached — stopping for safety');
+      report({ state: 'awaiting_input', lastError: 'max steps reached' });
+      finalState = 'awaiting_input';
+    }
   }
 
   S.running = false;
-  hideOverlay(finalState === 'awaiting_review' || finalState === 'awaiting_input' ? 60000 : 4000);
+  hideOverlay(finalState === 'awaiting_review' || finalState === 'awaiting_input' || finalState === 'parked' ? 60000 : 4000);
   return { ok: true, state: finalState || (S.cancelled ? 'skipped' : 'unknown'), steps: S.step };
 }

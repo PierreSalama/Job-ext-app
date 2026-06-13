@@ -36,7 +36,7 @@ const TERMINAL = new Set(['hired', 'rejected', 'withdrawn', 'ghosted']);
 
 const QUEUE_STATES = new Set([
   'queued', 'scheduled', 'running', 'awaiting_review', 'awaiting_input',
-  'done', 'failed', 'skipped',
+  'parked', 'done', 'failed', 'skipped',
 ]);
 
 function uid(prefix) { return `${prefix}_${crypto.randomUUID()}`; }
@@ -279,6 +279,14 @@ const MIGRATIONS = [
     exec(`
       ALTER TABLE documents ADD COLUMN label      TEXT;                       -- user designation ("Master CV")
       ALTER TABLE documents ADD COLUMN importance INTEGER NOT NULL DEFAULT 0; -- index ranking (folder scan)
+    `);
+  },
+
+  // v4 — auto-apply self-healing: park metadata on a task
+  () => {
+    exec(`
+      ALTER TABLE auto_apply_tasks ADD COLUMN park_reason       TEXT;   -- why it didn't go through
+      ALTER TABLE auto_apply_tasks ADD COLUMN pending_questions TEXT;   -- JSON [{question,fieldType,options,reason}]
     `);
   },
 ];
@@ -625,7 +633,7 @@ function upsertJob(input, opts = {}) {
     incoming.nextAction !== undefined ? incoming.nextAction : prev.nextAction,
     incoming.dueAt !== undefined ? incoming.dueAt : prev.dueAt,
     incoming.needsReview ? 1 : (prev.needsReview ? 1 : 0),
-    incoming.tags ? JSON.stringify(incoming.tags)
+    incoming.tags ? JSON.stringify([...new Set([...(prev.tags || []), ...incoming.tags])])
                   : (prev.tags?.length ? JSON.stringify(prev.tags) : null),
     ts,
     prev.submittedAt || (crossedSubmitted(prev.status, nextStatus) ? ts : null),
@@ -1183,6 +1191,8 @@ function rowToTask(r) {
     id: r.id, jobId: r.job_id, state: r.state, mode: r.mode,
     scheduledAt: r.scheduled_at, attempts: r.attempts, lastError: r.last_error,
     transcript: safeParse(r.transcript, []),
+    parkReason: r.park_reason || null,
+    pendingQuestions: safeParse(r.pending_questions, []),
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }
@@ -1203,7 +1213,7 @@ function queueAdd(jobId, { mode } = {}) {
   if (!getJob(jobId)) return null;
   const dup = get(
     `SELECT id FROM auto_apply_tasks WHERE job_id = ?
-     AND state IN ('queued','scheduled','running','awaiting_review','awaiting_input') LIMIT 1`,
+     AND state IN ('queued','scheduled','running','awaiting_review','awaiting_input','parked') LIMIT 1`,
     [jobId]);
   if (dup) return rowToTask(get('SELECT * FROM auto_apply_tasks WHERE id = ?', [dup.id]));
   const id = uid('task');
@@ -1214,7 +1224,7 @@ function queueAdd(jobId, { mode } = {}) {
   return rowToTask(get('SELECT * FROM auto_apply_tasks WHERE id = ?', [id]));
 }
 
-function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attemptsDelta, mode }) {
+function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attemptsDelta, mode, parkReason, pendingQuestions }) {
   const cur = get('SELECT * FROM auto_apply_tasks WHERE id = ?', [id]);
   if (!cur) return null;
   if (state && !QUEUE_STATES.has(state)) return null;
@@ -1225,15 +1235,52 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
   }
   run(`UPDATE auto_apply_tasks SET
        state = ?, mode = ?, scheduled_at = ?, attempts = attempts + ?, last_error = ?,
-       transcript = ?, updated_at = ? WHERE id = ?`,
+       transcript = ?, park_reason = ?, pending_questions = ?, updated_at = ? WHERE id = ?`,
       [state || cur.state,
        mode || cur.mode,
        scheduledAt !== undefined ? scheduledAt : cur.scheduled_at,
        attemptsDelta || 0,
        lastError !== undefined ? lastError : cur.last_error,
        JSON.stringify(transcript.slice(-200)),
+       parkReason !== undefined ? parkReason : cur.park_reason,
+       pendingQuestions !== undefined ? JSON.stringify((pendingQuestions || []).slice(0, 40)) : cur.pending_questions,
        now(), id]);
   return rowToTask(get('SELECT * FROM auto_apply_tasks WHERE id = ?', [id]));
+}
+
+// ---- self-healing intake ----
+// Distinct outstanding questions across all parked tasks, dropping any the
+// knowledge base can now answer (so the intake only asks what's truly missing).
+function queueParkedQuestions() {
+  const out = [];
+  const seen = new Set();
+  for (const t of all("SELECT * FROM auto_apply_tasks WHERE state = 'parked'").map(rowToTask)) {
+    for (const q of t.pendingQuestions || []) {
+      if (!q || !q.question) continue;
+      const key = normalizeQuestion(q.question);
+      if (!key || seen.has(key)) continue;
+      // already learned it? then it's not outstanding.
+      if (profileFieldLookup(q.question) || qaLookup(q.question)) continue;
+      seen.add(key);
+      out.push({ question: q.question, fieldType: q.fieldType || 'text', options: q.options || null, reason: q.reason || 'missing answer', taskId: t.id, jobId: t.jobId });
+    }
+  }
+  return out;
+}
+
+// Re-check every parked task; if the KB now answers ALL its pending questions,
+// flip it back to 'queued' so the next paced tick retries it. Returns count.
+function queueRetryParked() {
+  let requeued = 0;
+  for (const t of all("SELECT * FROM auto_apply_tasks WHERE state = 'parked'").map(rowToTask)) {
+    const pend = t.pendingQuestions || [];
+    const stillMissing = pend.filter((q) => q && q.question && !profileFieldLookup(q.question) && !qaLookup(q.question));
+    if (pend.length && stillMissing.length === 0) {
+      run("UPDATE auto_apply_tasks SET state = 'queued', park_reason = NULL, pending_questions = NULL, updated_at = ? WHERE id = ?", [now(), t.id]);
+      requeued++;
+    }
+  }
+  return requeued;
 }
 
 function queueDelete(id) {
@@ -1315,7 +1362,7 @@ module.exports = {
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,
   extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
-  queueList, queueAdd, queuePatch, queueDelete, queueRunStats,
+  queueList, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueRetryParked,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll,
   STATUS_ORDER, TERMINAL, normJobUrl, normKey,

@@ -72,7 +72,10 @@ chrome.alarms.onAlarm.addListener(async (a) => {
     await paintBadge();
   }
   if (a.name === 'jat11-autoapply') {
-    await autoApplyTick();
+    // Apply one paced job; if there was nothing to apply, use the tick to top up
+    // the queue via a discovery search instead. Never both in one tick.
+    const dispatched = await autoApplyTick();
+    if (!dispatched) await discoverTick().catch(() => {});
   }
   if (a.name === 'jat11-extupdate') {
     await checkExtUpdate().catch(() => {});
@@ -391,13 +394,13 @@ async function launchApp() {
 let dispatching = false;
 
 async function autoApplyTick() {
-  if (dispatching) return;
-  if (!(await api.isPaired())) return;
+  if (dispatching) return false;
+  if (!(await api.isPaired())) return false;
   const h = await api.health();
-  if (!h?.ok) return;
+  if (!h?.ok) return false;
 
   const r = await api.call('GET', '/queue/next', null, 8000);
-  if (!r?.ok || !r.task) return;
+  if (!r?.ok || !r.task) return false;
 
   dispatching = true;
   try {
@@ -418,23 +421,118 @@ async function autoApplyTick() {
     });
     await new Promise((r2) => setTimeout(r2, 2500));
 
+    // Mark running up front, then hand over. IMPORTANT: 'jat11.run-task' awaits
+    // the ENTIRE executor run, so this resolves with the run's FINAL result —
+    // the executor has already report()-ed its terminal state. We reconcile to
+    // that authoritative state and must NEVER clobber it back to 'running'.
+    await api.call('PATCH', '/queue/' + task.id, {
+      state: 'running', transcriptAppend: { note: `executor started in tab ${tab.id}` },
+    });
+    let result = null;
     try {
-      const started = await chrome.tabs.sendMessage(tab.id, {
-        type: 'jat11.run-task', task, context,
-      });
-      if (!started?.ok) throw new Error(started?.error || 'executor did not start');
-      await api.call('PATCH', '/queue/' + task.id, {
-        state: 'running', transcriptAppend: { note: `executor started in tab ${tab.id}` },
-      });
+      result = await chrome.tabs.sendMessage(tab.id, { type: 'jat11.run-task', task, context });
     } catch (e) {
       await api.call('PATCH', '/queue/' + task.id, {
-        state: 'failed', attemptsDelta: 1,
-        lastError: String(e?.message || e),
-        transcriptAppend: { note: 'failed to start executor: ' + String(e?.message || e) },
+        state: 'failed', attemptsDelta: 1, lastError: String(e?.message || e),
+        transcriptAppend: { note: 'executor error: ' + String(e?.message || e) },
       });
+      try { await chrome.tabs.remove(tab.id); } catch {}
+      return true;
+    }
+    const finalState = (result && typeof result.state === 'string') ? result.state : null;
+    if (!result || result.ok === false || !finalState) {
+      await api.call('PATCH', '/queue/' + task.id, {
+        state: 'failed', attemptsDelta: 1, lastError: String(result?.error || 'executor returned no state'),
+        transcriptAppend: { note: 'executor failed: ' + String(result?.error || 'no state') },
+      });
+      try { await chrome.tabs.remove(tab.id); } catch {}
+      return true;
+    }
+    if (finalState !== 'running') {
+      await api.call('PATCH', '/queue/' + task.id, { state: finalState });   // idempotent reconcile
+    }
+    // Close the apply tab on terminal/parked outcomes; KEEP it open for
+    // awaiting_review / awaiting_input — the user finishes those IN that tab.
+    if (['done', 'skipped', 'failed', 'parked'].includes(finalState)) {
       try { await chrome.tabs.remove(tab.id); } catch {}
     }
   } finally {
+    dispatching = false;
+  }
+  return true;
+}
+
+// ---- discovery: search a board for Easy-Apply jobs + enqueue them ----
+let lastBoardIdx = 0;
+
+function waitTabComplete(tabId, timeoutMs) {
+  return new Promise((resolve) => {
+    const done = (id, info) => { if (id === tabId && info.status === 'complete') { chrome.tabs.onUpdated.removeListener(done); resolve(); } };
+    chrome.tabs.onUpdated.addListener(done);
+    setTimeout(() => { chrome.tabs.onUpdated.removeListener(done); resolve(); }, timeoutMs);
+  });
+}
+
+// Same daytime-window check the server applies to applies — so discovery never
+// opens LinkedIn/Indeed search tabs in the middle of the night.
+function withinWindow(aa) {
+  const [sh, sm] = String(aa.windowStart || '00:00').split(':').map(Number);
+  const [eh, em] = String(aa.windowEnd || '23:59').split(':').map(Number);
+  const d = new Date();
+  const mins = d.getHours() * 60 + d.getMinutes();
+  return mins >= sh * 60 + (sm || 0) && mins <= eh * 60 + (em || 0);
+}
+
+function buildSearchUrl(board, keyword, location) {
+  const kw = encodeURIComponent(keyword);
+  const loc = location ? encodeURIComponent(location) : '';
+  if (board === 'indeed') {
+    return `https://www.indeed.com/jobs?q=${kw}&sort=date&fromage=7` + (loc ? `&l=${loc}` : '');
+  }
+  // linkedin (default) — f_AL=true is the Easy-Apply filter; DD = sort by date
+  return `https://www.linkedin.com/jobs/search/?f_AL=true&keywords=${kw}&sortBy=DD` + (loc ? `&location=${loc}` : '');
+}
+
+async function discoverTick() {
+  if (dispatching) return;
+  if (!(await api.isPaired())) return;
+  const h = await api.health();
+  if (!h?.ok) return;
+  const sres = await api.call('GET', '/settings', null, 6000);
+  const aa = sres?.ok ? sres.settings?.autoApply : null;
+  if (!aa || !aa.enabled || !aa.discovery?.enabled) return;
+  const keywords = (aa.keywords || []).filter(Boolean);
+  const boards = (aa.boards || []).filter(Boolean);
+  if (!keywords.length || !boards.length) return;
+  if (!withinWindow(aa)) return;   // respect the daytime window (no 3am search tabs)
+
+  // Only discover when the queue is running low — never over-enqueue.
+  const q = await api.call('GET', '/queue?state=queued', null, 6000);
+  if ((q?.items || []).length >= (aa.discovery.refillBelow || 3)) return;
+
+  dispatching = true;
+  let tab = null;
+  try {
+    const board = boards[lastBoardIdx++ % boards.length];
+    const keyword = keywords[Math.floor(Math.random() * keywords.length)];
+    const location = (aa.locations || [])[0] || '';
+    const url = buildSearchUrl(board, keyword, location);
+    tab = await chrome.tabs.create({ url, active: false });
+    await waitTabComplete(tab.id, 30000);
+    await new Promise((r2) => setTimeout(r2, 3000));
+    let resp = null;
+    try {
+      resp = await chrome.tabs.sendMessage(tab.id, { type: 'jat11.discover-search', source: board, max: aa.discovery.perRunLimit || 8 });
+    } catch {}
+    const jobs = (resp && resp.jobs) || [];
+    if (jobs.length) {
+      const r3 = await api.call('POST', '/queue/discover', { source: board, jobs }, 15000);
+      console.log('[JAT] discovered', jobs.length, 'on', board, '→ enqueued', r3?.enqueued ?? '?');
+    }
+  } catch (e) {
+    console.warn('[JAT] discoverTick failed', e?.message || e);
+  } finally {
+    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} }
     dispatching = false;
   }
 }

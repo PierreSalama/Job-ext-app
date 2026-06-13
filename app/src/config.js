@@ -85,15 +85,28 @@ const DEFAULTS = {
   },
 
   autoApply: {
-    enabled: false,          // master switch — OFF until Pierre flips it
+    enabled: false,          // master switch — OFF until the user Starts it
     mode: 'review',          // 'review' (stop before final submit) | 'auto'
-    maxPerDay: 5,
-    maxPerHour: 2,
-    minGapMinutes: 8,
-    maxGapMinutes: 25,
+    // Very cautious by default (LinkedIn/Indeed flag bots): low caps, long
+    // randomized gaps, a daytime window. Raise only if you accept the risk.
+    maxPerDay: 3,
+    maxPerHour: 1,
+    minGapMinutes: 12,
+    maxGapMinutes: 40,
     windowStart: '10:00',
     windowEnd: '18:00',
-    aiAnswerConfidenceMin: 0.7,
+    aiAnswerConfidenceMin: 0.8,   // AI answers a screening question ONLY when highly confident
+    easyApplyOnly: true,          // ON + locked in the UI (non-Easy-Apply isn't supported yet)
+    keywords: [],                 // e.g. ['software engineer', 'data analyst']
+    locations: [],                // e.g. ['Toronto', 'Remote']
+    boards: ['linkedin', 'indeed'],
+    profileId: '',                // which profile to apply with ('' = default)
+    resumeDocId: '',              // which résumé to attach ('' = default)
+    discovery: {
+      enabled: true,
+      perRunLimit: 8,             // max jobs grabbed per search pass (kept small)
+      refillBelow: 3,             // top up the queue when it drops below this
+    },
     sites: {},               // per-host overrides: { 'linkedin.com': { mode: 'auto' } }
   },
 

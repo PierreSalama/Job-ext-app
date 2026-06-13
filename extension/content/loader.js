@@ -85,6 +85,14 @@
       });
       return true;
     }
+    if (msg?.type === 'jat11.discover-search') {
+      if (!IS_TOP) { sendResponse({ ok: false, error: 'not top frame' }); return; }
+      ensureEngine().then(async (engine) => {
+        if (!engine || !engine.runDiscover) return sendResponse({ ok: false, error: 'engine failed to load', jobs: [] });
+        sendResponse(await engine.runDiscover({ source: msg.source, max: msg.max }));
+      });
+      return true;
+    }
   });
 
   // ---- URL watcher (belt-and-braces beside webNavigation) ----

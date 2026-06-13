@@ -1140,3 +1140,13 @@ export async function runTask(task, context) {
     return { ok: false, error: String(e?.message || e) };
   }
 }
+
+// Auto-apply discovery — scrape an Easy-Apply search-results page for jobs.
+export async function runDiscover(opts) {
+  try {
+    const mod = await import(chrome.runtime.getURL('content/discover.js'));
+    return await mod.run(opts);
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e), jobs: [] };
+  }
+}
