@@ -346,6 +346,18 @@ app.whenReady().then(async () => {
     .then(() => startFolderWatchers())
     .catch((e) => log.warn('folder auto-index setup failed', e.message));
 
+  // Local-AI auto-setup (only if the user opted in) — downloads Ollama + the
+  // hardware-recommended models in the background; progress shows in Settings.
+  try {
+    const lc = db.getSettings().ai.local;
+    if (lc && lc.autoSetup) {
+      const ls = require('./localsetup');
+      const rec = require('./hardware').probe().recommend;
+      ls.setup({ models: [lc.structuredModel || rec.structured, lc.proseModel || rec.prose], cfg: lc })
+        .catch((e) => log.warn('local AI auto-setup failed', e.message));
+    }
+  } catch (e) { log.warn('local AI auto-setup skipped', e.message); }
+
   db.dailyBackup();
   backupInterval = setInterval(() => db.dailyBackup(), 24 * 3600 * 1000);
 

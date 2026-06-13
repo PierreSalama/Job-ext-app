@@ -167,4 +167,16 @@ async function generate({ prompt, system, schema, model, timeoutMs = 120000 }) {
   });
 }
 
-module.exports = { discoverCli, status, generate, name: 'codex' };
+// Kick off the interactive CLI login (opens a browser to sign into ChatGPT).
+// Detached — the user completes it in the browser, then re-checks status.
+function login() {
+  const cli = discoverCli();
+  if (!cli) return { ok: false, error: 'Codex CLI not found — install it or sign into the Codex desktop app first.' };
+  try {
+    const child = spawn(cli, ['login'], { env: { ...process.env, CODEX_HOME }, detached: true, stdio: 'ignore', windowsHide: false });
+    child.unref();
+    return { ok: true, message: 'Complete the sign-in in your browser, then click Re-check.' };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+module.exports = { discoverCli, status, generate, login, name: 'codex' };

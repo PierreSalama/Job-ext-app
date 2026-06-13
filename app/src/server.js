@@ -17,7 +17,10 @@ const path = require('path');
 const db = require('./db');
 const provider = require('./ai/provider');
 const prompts = require('./ai/prompts');
+const codexProvider = require('./ai/codex');
 const { extractText } = require('./ai/extract');
+const hardware = require('./hardware');
+const localsetup = require('./localsetup');
 const fit = require('./fit');
 const { scope } = require('./logger');
 
@@ -660,6 +663,31 @@ async function handle(req, res, parsed) {
   if (req.method === 'GET' && pathname === '/ai/usage') {
     return sendJson(res, 200, { ok: true, usage: db.aiUsage(), recent: db.aiLogList(50) });
   }
+
+  // ---- AI providers: hardware probe, local setup, subscription connect ----
+  if (req.method === 'GET' && pathname === '/hardware') {
+    return sendJson(res, 200, { ok: true, ...hardware.probe() });
+  }
+  if (req.method === 'GET' && pathname === '/ai/local/state') {
+    return sendJson(res, 200, { ok: true, state: localsetup.getState() });
+  }
+  if (req.method === 'POST' && pathname === '/ai/local/detect') {
+    return sendJson(res, 200, { ok: true, ...(await localsetup.detect(db.getSettings().ai.local)) });
+  }
+  if (req.method === 'POST' && pathname === '/ai/local/setup') {
+    const body = await readJson(req);
+    const lc = db.getSettings().ai.local;
+    const rec = hardware.probe().recommend;
+    const models = (Array.isArray(body.models) && body.models.length)
+      ? body.models
+      : [lc.structuredModel || rec.structured, lc.proseModel || rec.prose];
+    localsetup.setup({ models, cfg: lc }).catch(() => {});   // background; progress streams over SSE 'ai.local'
+    return sendJson(res, 200, { ok: true, state: localsetup.getState() });
+  }
+  if (req.method === 'POST' && pathname === '/ai/connect/codex') {
+    const r = codexProvider.login ? codexProvider.login() : { ok: false, error: 'not supported' };
+    return sendJson(res, 200, { ...r, ok: !!r.ok });
+  }
   if (req.method === 'POST' && pathname === '/ai/generate') {
     const body = await readJson(req);
     if (!body.prompt) return sendJson(res, 400, { ok: false, error: 'prompt required' });
@@ -797,6 +825,7 @@ async function handle(req, res, parsed) {
 // ============================================================
 function startServer(port, options) {
   opts = options;
+  localsetup.setEmitter((st) => broadcast('ai.local', st));   // stream setup progress to the dashboard
   return new Promise((resolve, reject) => {
     server = http.createServer(async (req, res) => {
       // DNS-rebinding guard

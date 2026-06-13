@@ -18,24 +18,39 @@ const DEFAULTS = {
   },
 
   ai: {
-    // Provider order: 'cloud-first' | 'local-first' | 'cloud-only' | 'local-only'
-    order: 'cloud-first',
-    cloud: {
-      provider: 'codex',          // Codex CLI, authenticated via ChatGPT subscription
+    // Priority order — tried top to bottom, first one that's configured wins.
+    // Reorder freely in Settings. Default: Claude → ChatGPT → local.
+    order: ['claude', 'chatgpt', 'local'],
+
+    // Claude (Anthropic). API key ONLY — Anthropic blocks subscription tokens
+    // outside Claude Code (server-side, since Jan 2026).
+    claude: {
+      apiKey: '',
+      model: 'claude-sonnet-4-6',
+      timeoutMs: 120000,
+    },
+
+    // ChatGPT (OpenAI). Two ways: your ChatGPT subscription via the Codex CLI
+    // (personal use), or an OpenAI API key. Subscription is tried first when on.
+    chatgpt: {
+      useSubscription: true,        // use the logged-in Codex CLI (ChatGPT sub)
+      apiKey: '',                   // OpenAI API key (alternative / fallback)
       model: 'gpt-5.4',
       timeoutMs: 120000,
     },
+
     local: {
       provider: 'ollama',
       url: 'http://localhost:11434',
-      structuredModel: 'qwen2.5-coder:7b',   // JSON extraction / classification
-      proseModel: 'llama3.1:8b',             // cover letters, free-text answers
+      autoPick: true,               // pick the model that fits this machine
+      autoSetup: false,             // auto-download Ollama + models in the background
+      structuredModel: '',          // '' = use the hardware recommendation
+      proseModel: '',               // '' = use the hardware recommendation
       timeoutMs: 90000,
       numCtx: 8192,
       keepAlive: '15m',
-      // If the server is down, try `ollama serve` once before giving up.
-      trySpawn: true,
-      exePath: '',                           // '' = resolve from PATH
+      trySpawn: true,               // try `ollama serve` if it's down
+      exePath: '',                  // '' = resolve from PATH
     },
   },
 

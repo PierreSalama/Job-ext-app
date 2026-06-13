@@ -1448,3 +1448,27 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
 .kb-card-id { flex: 1; min-width: 0; }
 .kb-card-top .fit-badge { flex-shrink: 0; }
 .kb-loc { color: var(--muted); }
+
+/* ============================================================
+   SETTINGS — AI providers (priority list, provider cards, setup bar)
+   ============================================================ */
+.ai-order { display: flex; flex-direction: column; gap: 6px; padding: 14px 24px; }
+.ai-rank {
+  display: flex; align-items: center; gap: 12px;
+  border: 1px solid var(--border); background: var(--bg2); padding: 9px 12px;
+}
+.ai-rank-n {
+  flex-shrink: 0; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center;
+  background: var(--wash-06); color: var(--primary); font-size: 11px; font-variant-numeric: tabular-nums;
+}
+.ai-rank-label { flex: 1; color: var(--text); font-size: 13px; }
+.ai-rank-moves { display: flex; gap: 4px; flex-shrink: 0; }
+.ai-prov { border-top: 1px solid var(--border); margin-top: 4px; }
+.ai-prov-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 24px 4px; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--body-text);
+}
+.setup-bar { display: flex; align-items: center; gap: 10px; margin-top: 8px; width: 100%; }
+.setup-track { flex: 1; height: 6px; background: var(--wash-06); overflow: hidden; max-width: 320px; }
+.setup-fill { height: 100%; width: 0; background: var(--primary); transition: width 300ms var(--ease-firm); }
+.setup-msg { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 280px; }

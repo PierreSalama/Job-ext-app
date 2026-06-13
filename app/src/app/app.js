@@ -2041,13 +2041,30 @@ route('/activity', async () => {
 // VIEW: Settings (#/settings)
 // ============================================================
 route('/settings', async () => {
-  const [settings, aiSt, gmailSt] = await Promise.all([
+  const [settings, aiSt, gmailSt, hw] = await Promise.all([
     getSettings(true),
     api('/ai/status').catch(() => null),
     api('/gmail/status').catch(() => null),
+    api('/hardware').catch(() => null),
   ]);
   const s = settings;
   const ollamaModels = aiSt?.ollama?.models?.map((m) => m.name) || [];
+
+  // AI provider priority (defensive: bridge legacy string order, ensure all 3).
+  const aiOrder = (() => {
+    const base = Array.isArray(s.ai.order) ? s.ai.order.filter((k) => ['claude', 'chatgpt', 'local'].includes(k)) : [];
+    for (const k of ['claude', 'chatgpt', 'local']) if (!base.includes(k)) base.push(k);
+    return base;
+  })();
+  const PROV_LABEL = { claude: 'Claude · Sonnet 4.6', chatgpt: 'ChatGPT · GPT-5.4', local: 'Local · Ollama' };
+  const provStatusOf = (k) => (k === 'claude' ? aiSt?.claude : k === 'chatgpt' ? aiSt?.chatgpt : aiSt?.local);
+  const aiDot = (st) => st?.available ? '<span class="sys-chip ok">● ready</span>' : '<span class="sys-chip">○ not set up</span>';
+  const claude = s.ai.claude || {};
+  const chatgpt = (() => {     // bridge new ai.chatgpt over legacy ai.cloud field-by-field
+    const cg = s.ai.chatgpt || {}, old = s.ai.cloud || {};
+    return { useSubscription: cg.useSubscription, apiKey: cg.apiKey || old.apiKey || '', model: cg.model || old.model || 'gpt-5.4' };
+  })();
+  const localAi = s.ai.local || {};
 
   const row = (label, html, hint = '') =>
     `<div class="form-row"><div class="form-label">${esc(label)}${hint ? `<div class="form-hint">${esc(hint)}</div>` : ''}</div><div class="form-control">${html}</div></div>`;
@@ -2090,21 +2107,51 @@ route('/settings', async () => {
     </section>
 
     <section class="section">
-      <header class="section-header"><div><div class="section-eyebrow">Assistant</div><h2 class="section-title">AI providers</h2></div>
+      <header class="section-header"><div><div class="section-eyebrow">Assistant</div><h2 class="section-title">AI providers</h2>
+        <div class="form-hint">Used by every AI feature. Tried top-to-bottom; first one that's set up wins. Drag-free reorder with ↑ ↓.</div></div>
         <button class="btn small primary" data-save-section="ai">Save</button></header>
-      <div class="section-body" style="display:flex;gap:10px;flex-wrap:wrap">
-        ${provChip('Codex (ChatGPT)', aiSt?.codex)}
-        ${provChip('Ollama (local)', aiSt?.ollama)}
-        <button class="btn small" data-test="codex">Test codex</button>
-        <button class="btn small" data-test="ollama">Test ollama</button>
+
+      <div class="ai-order" id="ai-order-list">
+        ${aiOrder.map((k, i) => `<div class="ai-rank" data-prov="${k}">
+          <span class="ai-rank-n">${i + 1}</span>
+          <span class="ai-rank-label">${esc(PROV_LABEL[k])}</span>
+          ${aiDot(provStatusOf(k))}
+          <span class="ai-rank-moves"><button class="btn small" data-up title="Move up">↑</button><button class="btn small" data-down title="Move down">↓</button></span>
+        </div>`).join('')}
       </div>
-      ${row('Provider order', `<select class="select" id="ai-order">
-        ${['cloud-first', 'local-first', 'cloud-only', 'local-only'].map((o) => `<option value="${o}" ${s.ai.order === o ? 'selected' : ''}>${o}</option>`).join('')}
-      </select>`)}
-      ${row('Cloud model', `<input class="input" id="ai-cloud-model" value="${esc(s.ai.cloud.model)}" />`, 'passed to codex exec -m')}
-      ${row('Local URL', `<input class="input" id="ai-local-url" value="${esc(s.ai.local.url)}" />`)}
-      ${row('Local model (structured)', modelSelect('ai-local-structured', s.ai.local.structuredModel), 'JSON extraction, answers')}
-      ${row('Local model (prose)', modelSelect('ai-local-prose', s.ai.local.proseModel), 'cover letters, follow-ups')}
+
+      <div class="ai-prov">
+        <div class="ai-prov-head">Claude (Anthropic) ${aiDot(aiSt?.claude)}</div>
+        ${row('API key', `<input class="input" id="ai-claude-key" type="password" placeholder="sk-ant-…" value="${esc(claude.apiKey || '')}" />`, 'from console.anthropic.com — Claude can only run via an API key (subscriptions are blocked outside Claude Code)')}
+        ${row('Model', `<input class="input" id="ai-claude-model" value="${esc(claude.model || 'claude-sonnet-4-6')}" />`)}
+        <div class="section-body"><button class="btn small" data-test="claude">Test Claude</button></div>
+      </div>
+
+      <div class="ai-prov">
+        <div class="ai-prov-head">ChatGPT (OpenAI) ${aiDot(aiSt?.chatgpt)}</div>
+        ${row('Use my ChatGPT subscription', toggle('ai-cg-sub', chatgpt.useSubscription !== false), 'via the official Codex CLI (personal use)')}
+        <div class="form-row"><div class="form-label">Subscription</div><div class="form-control">${aiDot(aiSt?.chatgpt?.subscription)}
+          <button class="btn small" data-connect-codex>Connect / sign in</button> <button class="btn small" data-recheck>Re-check</button></div></div>
+        ${row('OpenAI API key', `<input class="input" id="ai-oai-key" type="password" placeholder="sk-…" value="${esc(chatgpt.apiKey || '')}" />`, 'alternative to the subscription')}
+        ${row('Model', `<input class="input" id="ai-cg-model" value="${esc(chatgpt.model || 'gpt-5.4')}" />`)}
+        <div class="section-body"><button class="btn small" data-test="chatgpt">Test ChatGPT</button></div>
+      </div>
+
+      <div class="ai-prov">
+        <div class="ai-prov-head">Local (Ollama) ${aiDot(aiSt?.local)}</div>
+        ${row('This machine', `<span class="muted">${hw ? esc(hw.ramGb + ' GB RAM · ' + (hw.gpuName ? hw.gpuName + ' (' + hw.vramGb + ' GB)' : 'no GPU detected')) : 'detecting…'}</span>`)}
+        ${row('Recommended', hw ? `<span>${esc(hw.recommend.label)} — <span class="mono">${esc(hw.recommend.structured)}</span></span>` : '—', hw ? '~' + hw.recommend.approxGb + ' GB download' : '')}
+        ${row('Auto-pick for hardware', toggle('ai-local-autopick', localAi.autoPick !== false))}
+        ${row('Auto-download in background', toggle('ai-local-autosetup', !!localAi.autoSetup), 'set up local AI automatically on launch (off = set up here on demand)')}
+        <div class="form-row"><div class="form-label">Set up local AI<div class="form-hint">downloads Ollama + models</div></div><div class="form-control">
+          <button class="btn small primary" data-setup-local>Set up / update</button>
+          <div class="setup-bar" id="setup-bar" hidden><div class="setup-track"><div class="setup-fill"></div></div><span class="setup-msg"></span></div>
+        </div></div>
+        ${row('Server URL', `<input class="input" id="ai-local-url" value="${esc(localAi.url || 'http://localhost:11434')}" />`)}
+        ${row('Structured model', `<input class="input" id="ai-local-structured" value="${esc(localAi.structuredModel || '')}" placeholder="(use recommendation)" />`, 'blank = recommended')}
+        ${row('Prose model', `<input class="input" id="ai-local-prose" value="${esc(localAi.proseModel || '')}" placeholder="(use recommendation)" />`, 'blank = recommended')}
+        <div class="section-body"><button class="btn small" data-test="local">Test local</button></div>
+      </div>
     </section>
 
     <section class="section">
@@ -2231,10 +2278,20 @@ route('/settings', async () => {
       globalHotkey: v.querySelector('#app-hotkey').checked,
     } }),
     ai: () => ({ ai: {
-      order: v.querySelector('#ai-order').value,
-      cloud: { model: v.querySelector('#ai-cloud-model').value.trim() || 'gpt-5.4' },
+      order: [...v.querySelectorAll('#ai-order-list .ai-rank')].map((el2) => el2.dataset.prov),
+      claude: {
+        apiKey: v.querySelector('#ai-claude-key').value.trim(),
+        model: v.querySelector('#ai-claude-model').value.trim() || 'claude-sonnet-4-6',
+      },
+      chatgpt: {
+        useSubscription: v.querySelector('#ai-cg-sub').checked,
+        apiKey: v.querySelector('#ai-oai-key').value.trim(),
+        model: v.querySelector('#ai-cg-model').value.trim() || 'gpt-5.4',
+      },
       local: {
         url: v.querySelector('#ai-local-url').value.trim() || 'http://localhost:11434',
+        autoPick: v.querySelector('#ai-local-autopick').checked,
+        autoSetup: v.querySelector('#ai-local-autosetup').checked,
         structuredModel: v.querySelector('#ai-local-structured').value.trim(),
         proseModel: v.querySelector('#ai-local-prose').value.trim(),
       },
@@ -2292,6 +2349,44 @@ route('/settings', async () => {
     } catch (e) { errToast(e, prov + ' test failed'); }
     btn.disabled = false; btn.textContent = orig;
   }));
+
+  // AI provider priority reorder (↑ ↓)
+  const renumberAi = () => v.querySelectorAll('#ai-order-list .ai-rank .ai-rank-n').forEach((n, i) => { n.textContent = i + 1; });
+  v.querySelectorAll('#ai-order-list .ai-rank').forEach((rank) => {
+    rank.querySelector('[data-up]')?.addEventListener('click', () => { const p = rank.previousElementSibling; if (p) { rank.parentNode.insertBefore(rank, p); renumberAi(); } });
+    rank.querySelector('[data-down]')?.addEventListener('click', () => { const n = rank.nextElementSibling; if (n) { rank.parentNode.insertBefore(n, rank); renumberAi(); } });
+  });
+
+  // Connect ChatGPT subscription (Codex) + re-check
+  v.querySelector('[data-connect-codex]')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget; btn.disabled = true;
+    try {
+      const r = await api('/ai/connect/codex', { method: 'POST', body: {} });
+      toast(r.ok ? (r.message || 'Sign-in started — finish it in your browser, then Re-check.') : (r.error || 'Could not start sign-in'), r.ok ? 'info' : 'danger', { ttl: 8000 });
+    } catch (err) { errToast(err); }
+    btn.disabled = false;
+  });
+  v.querySelector('[data-recheck]')?.addEventListener('click', () => { state.settings = null; navigate(); });
+
+  // Set up local AI (download Ollama + models) with a live progress bar
+  v.querySelector('[data-setup-local]')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget; btn.disabled = true;
+    const bar = v.querySelector('#setup-bar'); bar.hidden = false;
+    const fill = bar.querySelector('.setup-fill'); const msg = bar.querySelector('.setup-msg');
+    msg.textContent = 'Starting…';
+    try {
+      await api('/ai/local/setup', { method: 'POST', body: {} });
+      const poll = setInterval(async () => {
+        let st; try { st = (await api('/ai/local/state')).state; } catch { return; }
+        fill.style.width = (st.progress || 0) + '%';
+        msg.textContent = st.message || st.step || '';
+        if (st.step === 'ready' || st.step === 'error') {
+          clearInterval(poll); btn.disabled = false;
+          if (st.step === 'ready') toast('Local AI is ready ✓'); else toast(st.error || 'Local setup failed', 'danger');
+        }
+      }, 1500);
+    } catch (err) { errToast(err); btn.disabled = false; }
+  });
 
   // Gmail actions
   v.querySelector('[data-gmail-connect]').addEventListener('click', async (e) => {
