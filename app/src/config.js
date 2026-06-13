@@ -85,16 +85,16 @@ const DEFAULTS = {
   },
 
   autoApply: {
-    enabled: false,          // master switch — OFF until the user Starts it
-    mode: 'review',          // 'review' (stop before final submit) | 'auto'
-    // Very cautious by default (LinkedIn/Indeed flag bots): low caps, long
-    // randomized gaps, a daytime window. Raise only if you accept the risk.
-    maxPerDay: 3,
-    maxPerHour: 1,
-    minGapMinutes: 12,
-    maxGapMinutes: 40,
-    windowStart: '10:00',
-    windowEnd: '18:00',
+    enabled: false,          // master switch — just ON/OFF
+    mode: 'auto',            // default: submit for me. 'review' stops before submit
+    // Generous defaults (user asked) — the Advanced area lets you tighten these.
+    // Empty window = run any time of day. Gaps are auto-managed but adjustable.
+    maxPerDay: 50,
+    maxPerHour: 10,
+    minGapMinutes: 2,
+    maxGapMinutes: 6,
+    windowStart: '',         // '' = no daytime window (runs any time)
+    windowEnd: '',
     aiAnswerConfidenceMin: 0.8,   // AI answers a screening question ONLY when highly confident
     easyApplyOnly: true,          // ON + locked in the UI (non-Easy-Apply isn't supported yet)
     keywords: [],                 // e.g. ['software engineer', 'data analyst']

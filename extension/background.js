@@ -74,8 +74,8 @@ chrome.alarms.onAlarm.addListener(async (a) => {
   if (a.name === 'jat11-autoapply') {
     // Apply one paced job; if there was nothing to apply, use the tick to top up
     // the queue via a discovery search instead. Never both in one tick.
-    const dispatched = await autoApplyTick();
-    if (!dispatched) await discoverTick().catch(() => {});
+    const r = await autoApplyTick();
+    if (!r.dispatched) await discoverTick().catch(() => {});
   }
   if (a.name === 'jat11-extupdate') {
     await checkExtUpdate().catch(() => {});
@@ -143,6 +143,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // Manual "Run discovery now" from the extension dashboard (bypasses the
       // queue-low + window gates so the user can shake it out on demand).
       respond(discoverTick(true).then((s) => ({ ok: true, status: s })));
+      return true;
+    case 'run-autoapply-now':
+      // TEST button: apply the next queued job RIGHT NOW (skips window/cap/gap).
+      respond(autoApplyTick(true).then((s) => ({ ok: true, ...s })));
       return true;
     case 'pipeline-event':
       respond(handlePipelineEvent(msg.data, sender));
@@ -398,20 +402,38 @@ async function launchApp() {
 // ---------- auto-apply dispatcher ----------
 let dispatching = false;
 
-async function autoApplyTick() {
-  if (dispatching) return false;
-  if (!(await api.isPaired())) return false;
-  const h = await api.health();
-  if (!h?.ok) return false;
+// Keep every auto-apply / discovery tab in ONE labelled Chrome tab group so the
+// user can see + manage them together (and they're not scattered everywhere).
+let aaGroupId = null;
+async function groupTab(tabId) {
+  try {
+    if (!chrome.tabs.group) return;
+    if (aaGroupId != null) {
+      try { await chrome.tabs.group({ tabIds: [tabId], groupId: aaGroupId }); return; }
+      catch { aaGroupId = null; }   // group was closed — fall through to make a new one
+    }
+    aaGroupId = await chrome.tabs.group({ tabIds: [tabId] });
+    if (chrome.tabGroups?.update) {
+      try { await chrome.tabGroups.update(aaGroupId, { title: 'JAT Auto-apply', color: 'yellow' }); } catch {}
+    }
+  } catch {}
+}
 
-  const r = await api.call('GET', '/queue/next', null, 8000);
-  if (!r?.ok || !r.task) return false;
+async function autoApplyTick(force = false) {
+  if (dispatching) return { dispatched: false, reason: 'busy' };
+  if (!(await api.isPaired())) return { dispatched: false, reason: 'not paired' };
+  const h = await api.health();
+  if (!h?.ok) return { dispatched: false, reason: 'app offline' };
+
+  const r = await api.call('GET', '/queue/next' + (force ? '?force=1' : ''), null, 8000);
+  if (!r?.ok || !r.task) return { dispatched: false, reason: r?.reason || 'nothing queued' };
 
   dispatching = true;
   try {
     const { task, context } = r;
     const url = context.job.jobUrl;
     const tab = await chrome.tabs.create({ url, active: false });
+    await groupTab(tab.id);
 
     // Wait for the page (and content script) to settle, then hand over the task.
     await new Promise((resolve) => {
@@ -435,14 +457,17 @@ async function autoApplyTick() {
     });
     let result = null;
     try {
-      result = await chrome.tabs.sendMessage(tab.id, { type: 'jat11.run-task', task, context });
+      // Target the TOP frame ONLY — otherwise an iframe (ads/embeds on
+      // LinkedIn/Indeed) answers "not top frame" first and the race kills the
+      // task while the real executor is still running. This was ~58% of failures.
+      result = await chrome.tabs.sendMessage(tab.id, { type: 'jat11.run-task', task, context }, { frameId: 0 });
     } catch (e) {
       await api.call('PATCH', '/queue/' + task.id, {
         state: 'failed', attemptsDelta: 1, lastError: String(e?.message || e),
         transcriptAppend: { note: 'executor error: ' + String(e?.message || e) },
       });
       try { await chrome.tabs.remove(tab.id); } catch {}
-      return true;
+      return { dispatched: true, state: 'failed' };
     }
     const finalState = (result && typeof result.state === 'string') ? result.state : null;
     if (!result || result.ok === false || !finalState) {
@@ -451,20 +476,21 @@ async function autoApplyTick() {
         transcriptAppend: { note: 'executor failed: ' + String(result?.error || 'no state') },
       });
       try { await chrome.tabs.remove(tab.id); } catch {}
-      return true;
+      return { dispatched: true, state: 'failed' };
     }
     if (finalState !== 'running') {
       await api.call('PATCH', '/queue/' + task.id, { state: finalState });   // idempotent reconcile
     }
-    // Close the apply tab on terminal/parked outcomes; KEEP it open for
-    // awaiting_review / awaiting_input — the user finishes those IN that tab.
+    // Close the apply tab on terminal/parked outcomes (the dashboard is the
+    // surface for those); KEEP it open for awaiting_review / awaiting_input —
+    // the user finishes those IN that tab.
     if (['done', 'skipped', 'failed', 'parked'].includes(finalState)) {
       try { await chrome.tabs.remove(tab.id); } catch {}
     }
+    return { dispatched: true, state: finalState, title: r.context?.job?.title };
   } finally {
     dispatching = false;
   }
-  return true;
 }
 
 // ---- discovery: search a board for Easy-Apply jobs + enqueue them ----
@@ -478,11 +504,11 @@ function waitTabComplete(tabId, timeoutMs) {
   });
 }
 
-// Same daytime-window check the server applies to applies — so discovery never
-// opens LinkedIn/Indeed search tabs in the middle of the night.
+// Same window check the server applies — empty window = run any time.
 function withinWindow(aa) {
-  const [sh, sm] = String(aa.windowStart || '00:00').split(':').map(Number);
-  const [eh, em] = String(aa.windowEnd || '23:59').split(':').map(Number);
+  if (!aa.windowStart || !aa.windowEnd) return true;
+  const [sh, sm] = String(aa.windowStart).split(':').map(Number);
+  const [eh, em] = String(aa.windowEnd).split(':').map(Number);
   const d = new Date();
   const mins = d.getHours() * 60 + d.getMinutes();
   return mins >= sh * 60 + (sm || 0) && mins <= eh * 60 + (em || 0);
@@ -527,10 +553,11 @@ async function discoverTick(force = false) {
   let resp = null, enqueued = 0;
   try {
     tab = await chrome.tabs.create({ url, active: false });
+    await groupTab(tab.id);
     await waitTabComplete(tab.id, 30000);
     await new Promise((r2) => setTimeout(r2, 2000));
     try {
-      resp = await chrome.tabs.sendMessage(tab.id, { type: 'jat11.discover-search', source: board, max: aa.discovery.perRunLimit || 8 });
+      resp = await chrome.tabs.sendMessage(tab.id, { type: 'jat11.discover-search', source: board, max: aa.discovery.perRunLimit || 8 }, { frameId: 0 });
     } catch (e) {
       resp = { ok: false, error: String(e?.message || e), jobs: [], found: 0, note: 'could not reach the search page (content script not ready?)' };
     }

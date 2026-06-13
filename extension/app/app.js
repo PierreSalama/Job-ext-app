@@ -480,13 +480,26 @@ function resolve(path) {
   }
   return null;
 }
+// Find the actual scrolling element so a soft refresh can keep your place.
+function getScroller() {
+  let el = $('#main');
+  while (el && el !== document.body) {
+    const oy = getComputedStyle(el).overflowY;
+    if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 4) return el;
+    el = el.parentElement;
+  }
+  return document.scrollingElement || document.documentElement;
+}
 let navSeq = 0;
-async function navigate() {
+async function navigate(opts = {}) {
+  // soft = an SSE-driven refresh, not a real navigation: keep scroll, skip the
+  // skeleton + entrance animation so the page doesn't flash/reload abruptly.
+  const soft = opts && opts.soft === true;
   const path = (location.hash.replace(/^#/, '') || '/').replace(/\/+$/, '') || '/';
   state.route = { path };
   state.selection = new Set();
   hideRefreshPill();
-  closeAllOverlays();
+  if (!soft) closeAllOverlays();
   document.querySelectorAll('.nav-item').forEach((n) => {
     const r = n.dataset.route;
     n.classList.toggle('active', r === path || (r !== '/' && path.startsWith(r + '/')));
@@ -495,14 +508,21 @@ async function navigate() {
   const seq = ++navSeq;
   const match = resolve(path) || resolve('/');
   const main = $('#main');
-  const loadT = setTimeout(() => {
+  const scroller = soft ? getScroller() : null;
+  const savedTop = scroller ? scroller.scrollTop : 0;
+  const loadT = soft ? null : setTimeout(() => {
     if (seq === navSeq) main.innerHTML = skeletonHtml();
   }, 130);
   try {
     const node = await match.render(match.params);
-    clearTimeout(loadT);
+    if (loadT) clearTimeout(loadT);
     if (seq !== navSeq) return;
+    if (soft) main.classList.add('no-anim');
     main.replaceChildren(node);
+    if (soft) {
+      if (scroller) scroller.scrollTop = savedTop;
+      requestAnimationFrame(() => main.classList.remove('no-anim'));
+    }
   } catch (e) {
     clearTimeout(loadT);
     if (seq !== navSeq) return;
@@ -583,13 +603,14 @@ function canAutoRefresh() {
   const a = document.activeElement;
   if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable)) return false;
   if (document.querySelector('#overlay-root .overlay')) return false;
+  if (document.querySelector('.ctx-menu')) return false;   // don't yank a right-click menu away
   return true;
 }
 
 const softRefresh = debounce(() => {
-  if (canAutoRefresh()) { hideRefreshPill(); navigate(); }
+  if (canAutoRefresh()) { hideRefreshPill(); navigate({ soft: true }); }
   else showRefreshPill();
-}, 350);
+}, 700);
 
 function connectSSE() {
   if (state.sse) { try { state.sse.close(); } catch {} state.sse = null; }
@@ -1445,7 +1466,9 @@ route('/queue', async () => {
         ${disc ? `<span class="aa-disco-txt">${esc(disc.board || '?')} · "${esc(disc.keyword || '')}" — found <strong>${esc(disc.found ?? 0)}</strong>, queued <strong>${esc(disc.enqueued ?? 0)}</strong>${disc.note ? ` · <span class="aa-disco-note">${esc(disc.note)}</span>` : ''} <span class="muted">(${esc(fmtRel(disc.at))})</span></span>`
           : '<span class="muted">No search yet — turn it on (and keep Chrome open). It searches about once a minute when the queue is low.</span>'}
       </div>
-      ${state.host === 'extension' ? '<button class="btn small" data-run-disco>Search now</button>' : '<span class="muted" style="font-size:11px">Search runs in the Chrome extension</span>'}
+      ${state.host === 'extension'
+        ? '<button class="btn small" data-run-disco>🔍 Search now</button> <button class="btn small" data-test-apply title="TEST: apply the next queued job right now, skipping pacing. (Removed later.)">⚡ Apply next now</button>'
+        : '<span class="muted" style="font-size:11px">Search &amp; test run from the Chrome extension</span>'}
     </div>
 
     ${intakeHtml}
@@ -1455,6 +1478,10 @@ route('/queue', async () => {
       <div class="queue-controls section-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px">
         ${qc('Keywords', '<div id="aa-keywords-slot"></div>')}
         ${qc('Locations', '<div id="aa-locations-slot"></div>')}
+        ${qc('Mode', `<select class="select" id="aa-mode">
+          <option value="auto" ${aa.mode === 'auto' ? 'selected' : ''}>Auto — submit for me</option>
+          <option value="review" ${aa.mode === 'review' ? 'selected' : ''}>Review — stop before submit</option>
+        </select>`)}
         ${qc('Job boards', `<label class="aa-chk"><input type="checkbox" id="aa-li" ${boards.includes('linkedin') ? 'checked' : ''}/> LinkedIn</label> <label class="aa-chk"><input type="checkbox" id="aa-in" ${boards.includes('indeed') ? 'checked' : ''}/> Indeed</label>`)}
         ${qc('Easy Apply only', '<label class="toggle"><input type="checkbox" checked disabled /><span class="knob"></span></label><div class="form-hint">locked — other applies aren\'t supported yet</div>')}
         ${qc('Apply with profile', `<select class="select" id="aa-profile"><option value="">Default</option>${profiles.map((p) => `<option value="${esc(p.id)}" ${aa.profileId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>`)}
@@ -1462,22 +1489,18 @@ route('/queue', async () => {
       </div>
     </section>
 
-    <section class="section">
-      <header class="section-header"><div><div class="section-eyebrow">Engine</div><h2 class="section-title">Pacing &amp; safety</h2></div></header>
-      <div class="queue-controls section-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:16px">
-        ${qc('Mode', `<select class="select" id="aa-mode">
-          <option value="review" ${aa.mode === 'review' ? 'selected' : ''}>Review — stop before submit</option>
-          <option value="auto" ${aa.mode === 'auto' ? 'selected' : ''}>Auto — submit for me</option>
-        </select>`)}
-        ${qc('Max / day', `<input class="input" id="aa-day" type="number" min="1" max="50" value="${aa.maxPerDay}" />`)}
-        ${qc('Max / hour', `<input class="input" id="aa-hour" type="number" min="1" max="10" value="${aa.maxPerHour}" />`)}
-        ${qc('Gap min (min)', `<input class="input" id="aa-gmin" type="number" min="1" max="180" value="${aa.minGapMinutes}" />`)}
-        ${qc('Gap max (min)', `<input class="input" id="aa-gmax" type="number" min="1" max="360" value="${aa.maxGapMinutes}" />`)}
-        ${qc('Window start', `<input class="input" id="aa-ws" type="time" value="${esc(aa.windowStart)}" />`)}
-        ${qc('Window end', `<input class="input" id="aa-we" type="time" value="${esc(aa.windowEnd)}" />`)}
+    <details class="section aa-advanced" ${(aa.windowStart || aa.maxPerDay < 50) ? 'open' : ''}>
+      <summary><span class="section-eyebrow">Advanced</span> Pacing &amp; limits</summary>
+      <div class="queue-controls section-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px">
+        ${qc('Max / day', `<input class="input" id="aa-day" type="number" min="1" max="500" value="${aa.maxPerDay}" />`)}
+        ${qc('Max / hour', `<input class="input" id="aa-hour" type="number" min="1" max="100" value="${aa.maxPerHour}" />`)}
+        ${qc('Gap min (min)', `<input class="input" id="aa-gmin" type="number" min="0" max="180" value="${aa.minGapMinutes}" />`)}
+        ${qc('Gap max (min)', `<input class="input" id="aa-gmax" type="number" min="0" max="360" value="${aa.maxGapMinutes}" />`)}
+        ${qc('Window start', `<input class="input" id="aa-ws" type="time" value="${esc(aa.windowStart || '')}" />`)}
+        ${qc('Window end', `<input class="input" id="aa-we" type="time" value="${esc(aa.windowEnd || '')}" />`)}
       </div>
-      <div class="section-footer muted">Very cautious by default (low caps, long random gaps, daytime only) — LinkedIn/Indeed flag bots, so go slow. Review mode fills everything and waits for you at the final submit; nothing is sent unless you switch to Auto.</div>
-    </section>
+      <div class="section-footer muted">Defaults are generous. Leave the window blank to run any time. LinkedIn/Indeed flag bots — if you push the volume up, expect more risk to your account. Auto mode submits real applications.</div>
+    </details>
 
     <section class="section">
       <header class="section-header"><div><div class="section-eyebrow">Queue</div><h2 class="section-title">Tasks</h2></div></header>
@@ -1506,12 +1529,12 @@ route('/queue', async () => {
           easyApplyOnly: true,
           profileId: v.querySelector('#aa-profile').value,
           resumeDocId: v.querySelector('#aa-resume').value,
-          maxPerDay: Number(v.querySelector('#aa-day').value) || 3,
-          maxPerHour: Number(v.querySelector('#aa-hour').value) || 1,
-          minGapMinutes: Number(v.querySelector('#aa-gmin').value) || 12,
-          maxGapMinutes: Number(v.querySelector('#aa-gmax').value) || 40,
-          windowStart: v.querySelector('#aa-ws').value || '10:00',
-          windowEnd: v.querySelector('#aa-we').value || '18:00',
+          maxPerDay: Number(v.querySelector('#aa-day').value) || 50,
+          maxPerHour: Number(v.querySelector('#aa-hour').value) || 10,
+          minGapMinutes: Math.max(0, Number(v.querySelector('#aa-gmin').value) || 0),
+          maxGapMinutes: Math.max(0, Number(v.querySelector('#aa-gmax').value) || 0),
+          windowStart: v.querySelector('#aa-ws').value || '',
+          windowEnd: v.querySelector('#aa-we').value || '',
         } },
       });
       state.settings = null;
@@ -1541,7 +1564,19 @@ route('/queue', async () => {
       toast(st.ok === false && st.note ? `Search: ${st.note}` : `Search: found ${st.found ?? 0}, queued ${st.enqueued ?? 0}${st.note ? ' — ' + st.note : ''}`, st.enqueued ? 'info' : 'danger', { ttl: 9000 });
       navigate();
     } catch (err) { errToast(err); }
-    btn.disabled = false; btn.textContent = 'Search now';
+    btn.disabled = false; btn.textContent = '🔍 Search now';
+  });
+
+  // TEST: apply the next queued job right now (skips pacing). Removed later.
+  v.querySelector('[data-test-apply]')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Applying…';
+    try {
+      const r = await new Promise((res) => chrome.runtime.sendMessage({ type: 'run-autoapply-now' }, (x) => { void chrome.runtime.lastError; res(x); }));
+      if (!r?.dispatched) toast('Nothing to apply: ' + (r?.reason || 'no queued jobs') + (r?.reason === 'disabled' ? ' (turn auto-apply ON first)' : ''), 'danger', { ttl: 8000 });
+      else toast(`Applied "${r.title || 'job'}" → ${QUEUE_STATE_LABEL[r.state] || r.state}`, r.state === 'failed' ? 'danger' : 'info', { ttl: 8000 });
+      navigate();
+    } catch (err) { errToast(err); }
+    btn.disabled = false; btn.textContent = '⚡ Apply next now';
   });
 
   v.querySelector('[data-intake-save]')?.addEventListener('click', async (e) => {

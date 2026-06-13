@@ -921,6 +921,48 @@ function profileFieldLookup(question) {
   return best;
 }
 
+// Build a structured profile.data from harvested learned answers (so the
+// PROFILE_PATTERNS autofill path works even when the user never saved a
+// structured profile). Used as the last fallback in queueNext.
+const LEARNED_TO_PROFILE = [
+  [/first.?name|given.?name|prenom|firstname/, 'firstName'],
+  [/last.?name|surname|family.?name|lastname/, 'lastName'],
+  [/full.?name|legal.?name|^name$/, 'fullName'],
+  [/preferred.?name|nickname/, 'preferredName'],
+  [/email|courriel/, 'email'],
+  [/phone|mobile|telephone|cell/, 'phone'],
+  [/address.?2|apartment|unit|suite/, 'address2'],
+  [/address|street/, 'address1'],
+  [/^city$|\bcity\b|ville/, 'city'],
+  [/province|state\b|region/, 'state'],
+  [/postal|zip/, 'postalCode'],
+  [/country|pays/, 'country'],
+  [/linkedin/, 'linkedinUrl'],
+  [/github/, 'githubUrl'],
+  [/portfolio|website/, 'portfolioUrl'],
+  [/work.?authoriz|authorized.?work/, 'workAuthorization'],
+  [/sponsor|visa/, 'sponsorshipRequired'],
+  [/salary|compensation|remuneration/, 'salaryExpectation'],
+  [/years?.*experience|experience.*years?/, 'yearsExperience'],
+  [/notice|start.?date|availab/, 'noticePeriod'],
+  [/degree|diploma/, 'highestDegree'],
+  [/university|college|school/, 'university'],
+  [/major|field.?of.?study/, 'major'],
+  [/graduation/, 'graduationYear'],
+  [/citizen/, 'citizenship'],
+];
+function deriveProfileFromLearned() {
+  const data = {};
+  for (const f of profileFieldList()) {
+    if (!f.value) continue;
+    const hay = (f.label || f.keyNorm || '').toLowerCase();
+    for (const [rx, key] of LEARNED_TO_PROFILE) {
+      if (!data[key] && rx.test(hay)) { data[key] = f.value; break; }
+    }
+  }
+  return Object.keys(data).length ? { id: 'derived', name: 'From learned answers', data } : null;
+}
+
 // Everything the extension needs to pre-fill a new application: harvested
 // fields with values + the source-matched structured profile.
 function profileAutofillBundle(source) {
@@ -1357,7 +1399,7 @@ module.exports = {
   listEvents, listRecentEvents, recordEvent,
   qaRecord, qaLookup, qaList, qaDelete, normalizeQuestion, guessLocale,
   profileFieldUpsert, profileFieldList, profileFieldSet, profileFieldDelete,
-  profileFieldLookup, profileAutofillBundle, harvestAnswersToProfile, backfillProfileFromJobs,
+  profileFieldLookup, profileAutofillBundle, harvestAnswersToProfile, backfillProfileFromJobs, deriveProfileFromLearned,
   listProfiles, saveProfile, deleteProfile, profileForSource,
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,
   extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,

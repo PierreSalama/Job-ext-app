@@ -177,9 +177,14 @@ function captchaOrLoginPresent() {
   return null;
 }
 
+function btnText(el) {
+  // LinkedIn's modal Next/Review/Submit buttons are often icon-only with the
+  // real label in aria-label, so include it.
+  return compactText(el?.getAttribute?.('aria-label') || el?.textContent || el?.value || '');
+}
 function looksLikeAdvance(el) {
   if (!el || el.disabled || !isProbablyVisible(el)) return false;
-  const text = compactText(el.textContent || el.value || '');
+  const text = btnText(el);
   if (!text || text.length > 40) return false;
   return ADVANCE_KEYWORDS.some((re) => re.test(text));
 }
@@ -192,8 +197,7 @@ function findAdvanceButton(root) {
 }
 
 function isFinalSubmit(el) {
-  const text = compactText(el?.textContent || el?.value || '');
-  return FINAL_SUBMIT_RX.test(text) || isSubmitClick(el);
+  return FINAL_SUBMIT_RX.test(btnText(el)) || isSubmitClick(el);
 }
 
 function syntheticClick(el) {

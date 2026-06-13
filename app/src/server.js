@@ -92,28 +92,31 @@ function broadcast(type, data) {
 
 // ---------- auto-apply pacing ----------
 function withinWindow(settings) {
-  const [sh, sm] = String(settings.windowStart || '00:00').split(':').map(Number);
-  const [eh, em] = String(settings.windowEnd || '23:59').split(':').map(Number);
+  if (!settings.windowStart || !settings.windowEnd) return true;   // no window = any time
+  const [sh, sm] = String(settings.windowStart).split(':').map(Number);
+  const [eh, em] = String(settings.windowEnd).split(':').map(Number);
   const nowD = new Date();
   const mins = nowD.getHours() * 60 + nowD.getMinutes();
   return mins >= sh * 60 + (sm || 0) && mins <= eh * 60 + (em || 0);
 }
 
 // Decide whether a task may run now. Returns { task, context } or { wait }.
-async function queueNext() {
+// force=true (the dashboard "Test: apply now" button) skips the window/cap/gap
+// pacing so the user can shake it out immediately — but still needs enabled.
+async function queueNext(force = false) {
   const s = db.getSettings().autoApply;
   if (!s.enabled) return { task: null, reason: 'disabled' };
-  if (!withinWindow(s)) return { task: null, reason: 'outside-window' };
-
-  const stats = db.queueRunStats();
-  if (stats.doneDay >= s.maxPerDay) return { task: null, reason: 'daily-cap' };
-  if (stats.doneHour >= s.maxPerHour) return { task: null, reason: 'hourly-cap' };
-
-  if (stats.lastRun) {
-    const gapMin = s.minGapMinutes + Math.random() * Math.max(0, s.maxGapMinutes - s.minGapMinutes);
-    const eligibleAt = new Date(stats.lastRun).getTime() + gapMin * 60000;
-    if (Date.now() < eligibleAt) {
-      return { task: null, reason: 'gap', nextEligibleAt: new Date(eligibleAt).toISOString() };
+  if (!force) {
+    if (!withinWindow(s)) return { task: null, reason: 'outside-window' };
+    const stats = db.queueRunStats();
+    if (stats.doneDay >= s.maxPerDay) return { task: null, reason: 'daily-cap' };
+    if (stats.doneHour >= s.maxPerHour) return { task: null, reason: 'hourly-cap' };
+    if (stats.lastRun) {
+      const gapMin = s.minGapMinutes + Math.random() * Math.max(0, s.maxGapMinutes - s.minGapMinutes);
+      const eligibleAt = new Date(stats.lastRun).getTime() + gapMin * 60000;
+      if (Date.now() < eligibleAt) {
+        return { task: null, reason: 'gap', nextEligibleAt: new Date(eligibleAt).toISOString() };
+      }
     }
   }
 
@@ -128,8 +131,10 @@ async function queueNext() {
   }
 
   // Honour the explicit picks from the Auto-apply page; fall back to the
-  // source-matched profile and the active (starred-in-Documents) résumé.
-  const profile = (s.profileId && db.listProfiles().find((p) => p.id === s.profileId)) || db.profileForSource(job.source);
+  // source-matched profile, then to one DERIVED from learned answers (so it
+  // works even with no saved profile), then the active résumé.
+  const profile = (s.profileId && db.listProfiles().find((p) => p.id === s.profileId))
+    || db.profileForSource(job.source) || db.deriveProfileFromLearned();
   const resume = (s.resumeDocId && db.getDocument(s.resumeDocId, { withText: true })) || db.defaultDocument('resume');
   const harvested = db.profileFieldList().filter((f) => f.value);
   const siteCfg = s.sites?.[String(job.source || '').toLowerCase()] || {};
@@ -632,7 +637,7 @@ async function handle(req, res, parsed) {
     return sendJson(res, 200, { ok: true, items: db.queueList({ state: parsed.searchParams.get('state') || undefined }) });
   }
   if (req.method === 'GET' && pathname === '/queue/next') {
-    return sendJson(res, 200, { ok: true, ...(await queueNext()) });
+    return sendJson(res, 200, { ok: true, ...(await queueNext(parsed.searchParams.get('force') === '1')) });
   }
   if (req.method === 'POST' && pathname === '/queue') {
     const body = await readJson(req);

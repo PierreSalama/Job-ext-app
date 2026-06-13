@@ -1528,3 +1528,17 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
 .ctx-item.danger { color: color-mix(in srgb, var(--danger) 85%, var(--body-text)); }
 .ctx-item.danger:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
 .ctx-sep { height: 1px; background: var(--border); margin: 4px 0; }
+
+.aa-advanced { padding: 0; }
+.aa-advanced > summary {
+  cursor: pointer; padding: 14px 24px; list-style: none; user-select: none;
+  display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text);
+}
+.aa-advanced > summary::-webkit-details-marker { display: none; }
+.aa-advanced > summary::before { content: '▸'; color: var(--muted); font-size: 11px; }
+.aa-advanced[open] > summary::before { content: '▾'; }
+.aa-advanced > summary .section-eyebrow { display: inline; }
+/* Soft-refresh: skip the entrance animation so SSE updates don't flash/reload. */
+#main.no-anim > * { animation: none; }
+@keyframes row-new-pulse { 0% { background: var(--wash-25); } 100% { background: transparent; } }
+.row-new { animation: row-new-pulse 1.6s var(--ease-firm); }
