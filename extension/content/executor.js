@@ -318,14 +318,19 @@ export async function run(task, context, helpers) {
     }
 
     const formProbe = detectApplyForm();
-    // An open Easy-Apply / apply modal is the form even if generic scoring misses
-    // it (LinkedIn/Indeed render the apply UI in a dialog).
-    const dialog = document.querySelector('.jobs-easy-apply-modal, [data-test-modal][role="dialog"], [role="dialog"][aria-modal="true"], .ia-Modal, [data-testid="smartapply-container"]');
-    const root = formProbe?.form || (dialog && isProbablyVisible(dialog) ? dialog : document);
-    // No apply form yet (e.g. a LinkedIn job-view page) → don't fill page fields
-    // like the global search bar; just go find the Easy-Apply button below to
-    // OPEN the form. We only fill once a real apply form/modal exists.
-    const haveForm = !!(formProbe || (dialog && isProbablyVisible(dialog)));
+    // Scope the field scan STRICTLY to the apply modal/form. Prefer the tight
+    // Easy-Apply dialog over detectApplyForm()'s container — the latter can fall
+    // back to document.body (Workday-style SPAs), and on LinkedIn that let the scan
+    // reach the page's global "Search" box, parking every job at submit with a
+    // phantom "search search" question. Require the dialog to actually contain
+    // fields so a cookie/consent dialog isn't mistaken for the form. NEVER fall
+    // back to `document`: with no real apply container we don't scan at all — we
+    // just go find the Easy-Apply button below to OPEN the form (findAdvanceButton
+    // defaults to document when root is null).
+    const dialog = Array.from(document.querySelectorAll('.jobs-easy-apply-modal, [data-test-modal][role="dialog"], [role="dialog"][aria-modal="true"], .ia-Modal, [data-testid="smartapply-container"]'))
+      .find((d) => isProbablyVisible(d) && d.querySelector('input, textarea, select, [role="combobox"], [contenteditable="true"]')) || null;
+    const root = dialog || formProbe?.form || null;
+    const haveForm = !!root;
 
     // ---- fill from profile + learned answers ----
     setStatus(`Step ${S.step}: ${haveForm ? 'filling fields…' : 'opening the application…'}`);

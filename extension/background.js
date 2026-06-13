@@ -405,6 +405,27 @@ let dispatching = false;
 // Keep every auto-apply / discovery tab in ONE labelled Chrome tab group so the
 // user can see + manage them together (and they're not scattered everywhere).
 let aaGroupId = null;
+let aaWindowId = null;
+
+// Pin the whole auto-apply / discovery operation to ONE Chrome window so its tab
+// group never splits across windows when the user switches focus mid-run. Prefer a
+// normal window that ISN'T currently focused (on screen but idle) so the apply tabs
+// don't pop up in the window the user is actively working in. Once chosen, it sticks
+// for the whole run regardless of which window is focused — only re-picking if that
+// window gets closed.
+async function pickAutoApplyWindow() {
+  try {
+    if (aaWindowId != null) {
+      try { await chrome.windows.get(aaWindowId); return aaWindowId; }
+      catch { aaWindowId = null; aaGroupId = null; }   // window closed — reset the group too
+    }
+    const wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
+    const pick = wins.find((w) => !w.focused) || wins[0];
+    if (pick) aaWindowId = pick.id;
+  } catch { aaWindowId = null; }
+  return aaWindowId;
+}
+
 async function groupTab(tabId) {
   try {
     if (!chrome.tabs.group) return;
@@ -432,7 +453,8 @@ async function autoApplyTick(force = false) {
   try {
     const { task, context } = r;
     const url = context.job.jobUrl;
-    const tab = await chrome.tabs.create({ url, active: false });
+    const winId = await pickAutoApplyWindow();
+    const tab = await chrome.tabs.create({ url, active: false, ...(winId ? { windowId: winId } : {}) });
     await groupTab(tab.id);
 
     // Wait for the page (and content script) to settle, then hand over the task.
@@ -552,7 +574,8 @@ async function discoverTick(force = false) {
   const url = buildSearchUrl(board, keyword, location);
   let resp = null, enqueued = 0;
   try {
-    tab = await chrome.tabs.create({ url, active: false });
+    const winId = await pickAutoApplyWindow();
+    tab = await chrome.tabs.create({ url, active: false, ...(winId ? { windowId: winId } : {}) });
     await groupTab(tab.id);
     await waitTabComplete(tab.id, 30000);
     await new Promise((r2) => setTimeout(r2, 2000));

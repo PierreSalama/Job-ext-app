@@ -58,7 +58,12 @@ export function fieldLabel(input) {
     input.name,
   ];
   const raw = sources.filter(Boolean).join(' ').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 300);
-  return raw + ' ' + stripAccents(raw);
+  // Return the clean label only. (Previously returned `raw + ' ' + stripAccents(raw)`,
+  // which doubled every label — "search" became "search search" — making parked
+  // questions read as gibberish to the user AND lowering the AI's answer confidence
+  // on real questions. Accent-insensitive matching now happens at the match site,
+  // profileFieldFor(), instead of being baked into the label string.)
+  return raw;
 }
 
 function idRefText(root, ids) {
@@ -72,8 +77,11 @@ function cssEscape(s) {
 }
 
 function profileFieldFor(label, profile) {
+  // Match against both the raw and accent-folded label so French fields (e.g.
+  // "prénom") still hit patterns even where only the unaccented form is listed.
+  const folded = stripAccents(label);
   for (const [rx, field] of PROFILE_PATTERNS) {
-    if (rx.test(label) && profile[field] != null && profile[field] !== '') {
+    if ((rx.test(label) || rx.test(folded)) && profile[field] != null && profile[field] !== '') {
       return { field, value: profile[field] };
     }
   }
@@ -176,6 +184,11 @@ export class AutofillEngine {
       }
       const label = fieldLabel(input);
       if (!label || label.length < 4) continue;
+      // Skip generic site-search / typeahead inputs (e.g. LinkedIn's global
+      // "Search" box). They're never a real application question, can't be
+      // answered truthfully, and would falsely park the whole job at submit.
+      if (/^\s*search(\s+search)*\s*$/.test(label) || input.type === 'search'
+          || (input.getAttribute('role') === 'combobox' && /^\s*search\b/.test(label))) continue;
       if (profileFieldFor(label, profile || {})) continue;
       if (await this.lookupAnswer(label)) continue;
       const required = input.required || input.getAttribute('aria-required') === 'true';
