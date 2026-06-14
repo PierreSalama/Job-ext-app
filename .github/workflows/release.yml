@@ -24,6 +24,9 @@ jobs:
         run: node tools/mirror.mjs --check
       - name: Version sync gate
         run: node tools/validate-versions.mjs
+      - name: Install app deps (db-backed tests need node-sqlite3-wasm etc.)
+        working-directory: app
+        run: npm install --no-audit --no-fund
       - name: Unit tests
         # Explicit files (not a glob) so it works on Node 20 too — the test
         # runner only expands globs on Node 21+.
