@@ -913,6 +913,52 @@ async function handle(req, res, parsed) {
     return sendJson(res, 200, { ok: true, ...r });
   }
 
+  // ---- email integration (multi-provider IMAP + App Password) ----
+  if (pathname === '/email/accounts' && req.method === 'GET') {
+    const email = require('./email');
+    return sendJson(res, 200, { ok: true, accounts: email.listAccounts().map(email.publicAccount), presets: email.presetsPublic(), stats: db.emailStats(), syncing: email.isSyncing() });
+  }
+  if (pathname === '/email/accounts' && req.method === 'POST') {
+    const email = require('./email');
+    const b = await readJson(req);
+    if (!b.email || !b.password) return sendJson(res, 400, { ok: false, error: 'email and App Password are required' });
+    const acct = email.addAccount(b);
+    broadcast('settings.updated', {});
+    return sendJson(res, 200, { ok: true, account: email.publicAccount(acct) });
+  }
+  if (pathname === '/email/accounts/test' && req.method === 'POST') {
+    const email = require('./email');
+    const b = await readJson(req);
+    const acct = b.id ? email.getAccount(b.id) : b;     // test stored creds OR the just-typed ones
+    if (!acct || !acct.email || !acct.password) return sendJson(res, 400, { ok: false, error: 'email + App Password required to test' });
+    return sendJson(res, 200, await email.testConnection(acct));
+  }
+  if (pathname === '/email/sync' && req.method === 'POST') {
+    const email = require('./email');
+    const b = await readJson(req);
+    const r = await email.syncAll({ accountId: b.accountId });
+    broadcast('jobs.updated', { action: 'email-sync' });
+    broadcast('emails.updated', {});
+    return sendJson(res, 200, r);
+  }
+  const emAcct = pathname.match(/^\/email\/accounts\/([^/]+?)(\/enable)?$/);
+  if (emAcct && pathname !== '/email/accounts/test') {
+    const email = require('./email');
+    if (req.method === 'DELETE') { email.removeAccount(emAcct[1]); broadcast('settings.updated', {}); return sendJson(res, 200, { ok: true }); }
+    if (req.method === 'POST' && emAcct[2]) { const b = await readJson(req); email.setEnabled(emAcct[1], b.enabled); return sendJson(res, 200, { ok: true }); }
+  }
+  if (pathname === '/emails' && req.method === 'GET') {
+    const jobId = parsed.searchParams.get('jobId');
+    if (jobId) return sendJson(res, 200, { ok: true, matched: db.emailsForJob(jobId), suggested: db.emailSuggestionsForJob(jobId) });
+    return sendJson(res, 200, { ok: true, emails: db.listEmails({ q: parsed.searchParams.get('q') || '', unmatchedOnly: parsed.searchParams.get('unmatched') === '1' }) });
+  }
+  if (pathname === '/emails/match' && req.method === 'POST') {
+    const b = await readJson(req);
+    const r = db.setEmailMatch(b.emailId, { jobId: b.jobId || null, source: b.source, confidence: b.confidence });
+    broadcast('emails.updated', {});
+    return sendJson(res, r ? 200 : 404, { ok: !!r, email: r });
+  }
+
   // ---- data ----
   if (req.method === 'GET' && pathname === '/export') {
     return sendJson(res, 200, { ok: true, data: db.exportAll() });

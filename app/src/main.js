@@ -21,6 +21,8 @@ let tray = null;
 let updateInterval = null;
 let backupInterval = null;
 let gmailInterval = null;
+let emailInterval = null;
+let emailWarmup = null;
 let isQuitting = false;
 
 // ---------- single instance ----------
@@ -251,6 +253,29 @@ function scheduleGmail() {
   log.info(`gmail sync scheduled every ${everyMs / 60000}m`);
 }
 
+// ---------- email scheduler (multi-provider IMAP, resumable) ----------
+// Ticks every few minutes; each account resumes from its DB cursor, so it keeps
+// chipping through the mailbox over time and picks up where it left off after the
+// app is closed + reopened. Only runs when at least one account is connected.
+function scheduleEmailSync() {
+  if (emailInterval) clearInterval(emailInterval);
+  if (emailWarmup) { clearTimeout(emailWarmup); emailWarmup = null; }
+  let email;
+  try { email = require('./email'); } catch { return; }
+  if (!email.listAccounts().some((a) => a.enabled && a.password)) return;
+  const everyMs = Math.max(3, (db.getSettings().email && db.getSettings().email.syncIntervalMinutes) || 15) * 60000;
+  const tick = async () => {
+    try {
+      const r = await email.syncAll();
+      if (r && r.ok && r.results.some((x) => x.created)) { broadcast('jobs.updated', { action: 'email-sync' }); broadcast('emails.updated', {}); }
+    } catch (e) { log.warn('email sync tick failed', e.message); }
+  };
+  emailInterval = setInterval(tick, everyMs);
+  emailWarmup = setTimeout(tick, 8000);   // a first pass shortly after (re)connect/startup
+  // guard the broadcast: only refresh the UI when a tick actually pulled new mail.
+  log.info(`email sync scheduled every ${everyMs / 60000}m`);
+}
+
 // ---------- app prefs that mirror settings ----------
 function applyAppSettings() {
   const s = db.getSettings().app;
@@ -268,6 +293,7 @@ function applyAppSettings() {
     } catch (e) { log.warn('hotkey registration failed', e.message); }
   }
   scheduleGmail();
+  scheduleEmailSync();
 }
 
 // ---------- IPC ----------
@@ -382,6 +408,8 @@ app.on('will-quit', () => {
   if (updateInterval) clearInterval(updateInterval);
   if (backupInterval) clearInterval(backupInterval);
   if (gmailInterval) clearInterval(gmailInterval);
+  if (emailInterval) clearInterval(emailInterval);
+  if (emailWarmup) clearTimeout(emailWarmup);
   globalShortcut.unregisterAll();
   if (tray) { try { tray.destroy(); } catch {} tray = null; }
   stopServer();

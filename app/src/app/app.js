@@ -680,7 +680,7 @@ function connectSSE() {
   state.sse = es;
   es.onopen = () => { state.sseOk = true; stopPollingFallback(); };
   es.onerror = () => { state.sseOk = false; startPollingFallback(); };
-  for (const ev of ['jobs.updated', 'queue.updated', 'documents.updated', 'profileFields.updated']) {
+  for (const ev of ['jobs.updated', 'queue.updated', 'documents.updated', 'profileFields.updated', 'emails.updated']) {
     es.addEventListener(ev, () => softRefresh());
   }
   es.addEventListener('settings.updated', async () => {
@@ -1070,7 +1070,25 @@ route(/^\/applications\/(?<id>.+)$/, async ({ id }) => {
     </div></header></div>`);
   }
   const events = isNew ? [] : ((await api('/events?jobId=' + encodeURIComponent(id)).catch(() => ({ items: [] }))).items || []);
+  const emailData = isNew ? { matched: [], suggested: [] } : (await api('/emails?jobId=' + encodeURIComponent(id)).catch(() => ({ matched: [], suggested: [] })));
   const j = job || {};
+
+  const emailRow = (e, mode) => `<div class="mail-row" data-email="${esc(e.id)}">
+      <div class="mail-head"><span class="out-chip cat-${esc(e.category || 'other')}">${esc(String(e.category || 'other').replace(/_/g, ' '))}</span>
+        <span class="mail-subj">${esc(e.subject || '(no subject)')}</span></div>
+      <div class="mail-sub muted">${esc(e.fromName || e.from || '')} · ${esc(fmtRel(e.sentAt))}${e.matchConfidence ? ` · ${Math.round(e.matchConfidence * 100)}% match` : ''}</div>
+      ${e.snippet ? `<div class="mail-snip muted">${esc(e.snippet)}</div>` : ''}
+      <div class="mail-actions">${mode === 'suggested'
+        ? `<button class="btn small primary" data-email-confirm="${esc(e.id)}">Yes, link it</button> <button class="btn small" data-email-dismiss="${esc(e.id)}">Not this</button>`
+        : `<button class="btn small" data-email-unlink="${esc(e.id)}">Unlink</button>`}</div>
+    </div>`;
+  const emailPanelHtml = isNew ? '<div class="muted">Save the application first.</div>' : `
+    ${(emailData.matched || []).length ? (emailData.matched).map((e) => emailRow(e, 'matched')).join('') : '<div class="muted" style="font-size:13px">No emails matched yet. Connect your inbox in Settings → it auto-links replies here.</div>'}
+    ${(emailData.suggested || []).length ? `<div class="mail-suggest-head">Suggested — does this belong to this job?</div>${emailData.suggested.map((e) => emailRow(e, 'suggested')).join('')}` : ''}
+    <details class="fold mail-find"><summary>+ Link an email manually</summary>
+      <input class="input" id="mail-search" placeholder="search your synced emails…" style="margin:8px 0" />
+      <div id="mail-search-results" class="muted" style="font-size:13px">Type to search unmatched emails.</div>
+    </details>`;
 
   const field = (label, idd, value, ph = '', type = 'text') =>
     `<div class="form-row"><label class="form-label" for="${idd}">${esc(label)}</label>
@@ -1144,6 +1162,12 @@ route(/^\/applications\/(?<id>.+)$/, async ({ id }) => {
           <header class="section-header"><div><div class="section-eyebrow">Captured</div><h2 class="section-title">Form answers</h2></div></header>
           ${answersRows}
         </section>` : ''}
+
+        ${isNew ? '' : `<section class="section" id="email-section">
+          <header class="section-header"><div><div class="section-eyebrow">Mailbox</div><h2 class="section-title">Emails</h2>
+            <div class="form-hint">Replies &amp; confirmations JAT matched to this application.</div></div></header>
+          <div class="section-body" id="email-panel">${emailPanelHtml}</div>
+        </section>`}
       </div>
 
       <div>
@@ -1283,6 +1307,25 @@ route(/^\/applications\/(?<id>.+)$/, async ({ id }) => {
     } catch (e) { setStatus(e.message, 'bad'); }
   });
 
+  // ---- email panel: confirm / dismiss / unlink + manual link ----
+  const matchEmail = async (emailId, body) => { try { await api('/emails/match', { method: 'POST', body: { emailId, ...body } }); navigate(); } catch (e) { errToast(e); } };
+  v.querySelectorAll('[data-email-confirm]').forEach((b) => b.addEventListener('click', () => matchEmail(b.dataset.emailConfirm, { jobId: id, source: 'manual', confidence: 1 })));
+  v.querySelectorAll('[data-email-dismiss]').forEach((b) => b.addEventListener('click', () => matchEmail(b.dataset.emailDismiss, { jobId: null, source: 'dismissed' })));
+  v.querySelectorAll('[data-email-unlink]').forEach((b) => b.addEventListener('click', () => matchEmail(b.dataset.emailUnlink, { jobId: null, source: 'dismissed' })));
+  const mailSearch = v.querySelector('#mail-search');
+  if (mailSearch) mailSearch.addEventListener('input', debounce(async (e) => {
+    const q = e.target.value.trim();
+    const out = v.querySelector('#mail-search-results');
+    if (q.length < 2) { out.textContent = 'Type to search unmatched emails.'; return; }
+    try {
+      const r = await api('/emails?unmatched=1&q=' + encodeURIComponent(q));
+      const items = r.emails || [];
+      out.innerHTML = items.length ? items.slice(0, 12).map((m) => `<div class="mail-find-row"><div><div>${esc(m.subject || '(no subject)')}</div><div class="muted" style="font-size:11px">${esc(m.fromName || m.from || '')} · ${esc(fmtRel(m.sentAt))}</div></div><button class="btn small" data-email-link="${esc(m.id)}">Link</button></div>`).join('')
+        : 'No matching unmatched emails.';
+      out.querySelectorAll('[data-email-link]').forEach((b) => b.addEventListener('click', () => matchEmail(b.dataset.emailLink, { jobId: id, source: 'manual', confidence: 1 })));
+    } catch (err) { out.textContent = err.message || String(err); }
+  }, 350));
+
   return v;
 });
 
@@ -1293,6 +1336,9 @@ route('/pipeline', async () => {
   const r = await api('/jobs?limit=500');
   const jobs = r.items || [];
   const b = state.board;
+  const emailAcctR = await api('/email/accounts').catch(() => null);
+  const hasEmail = !!(emailAcctR && (emailAcctR.accounts || []).length);
+  const emailBannerOff = (() => { try { return localStorage.getItem('jat11.emailBannerDismissed') === '1'; } catch { return false; } })();
 
   const sources = [...new Set(jobs.map((j) => j.source).filter(Boolean))].sort();
   const q = b.q.toLowerCase();
@@ -1375,6 +1421,12 @@ route('/pipeline', async () => {
       </div>
     </header>
 
+    ${(!hasEmail && !emailBannerOff) ? `<div class="banner email-banner">
+      <div class="banner-text">📬 <strong>Connect your email</strong> to auto-track replies, interview invites &amp; offers on each application — JAT matches them to the right job for you.</div>
+      <a class="btn small primary" href="#/settings">Connect email →</a>
+      <button class="btn small" data-email-banner-dismiss>Dismiss</button>
+    </div>` : ''}
+
     <div class="board-toolbar">
       <input class="input" id="pb-q" placeholder="Search title, company, tag…" value="${esc(b.q)}" style="min-width:180px" />
       <select class="select" id="pb-source"><option value="all">All sources</option>${sources.map((sc) => `<option value="${esc(sc)}" ${b.source === sc ? 'selected' : ''}>${esc(sc)}</option>`).join('')}</select>
@@ -1429,6 +1481,10 @@ route('/pipeline', async () => {
   });
 
   v.querySelector('[data-refresh]').addEventListener('click', navigate);
+  v.querySelector('[data-email-banner-dismiss]')?.addEventListener('click', (e) => {
+    try { localStorage.setItem('jat11.emailBannerDismissed', '1'); } catch {}
+    e.currentTarget.closest('.email-banner')?.remove();
+  });
 
   v.querySelectorAll('.kb-card').forEach((card) => {
     card.addEventListener('dragstart', (e) => {
@@ -2438,11 +2494,12 @@ route('/activity', async () => {
 // VIEW: Settings (#/settings)
 // ============================================================
 route('/settings', async () => {
-  const [settings, aiSt, gmailSt, hw] = await Promise.all([
+  const [settings, aiSt, gmailSt, hw, emailR] = await Promise.all([
     getSettings(true),
     api('/ai/status').catch(() => null),
     api('/gmail/status').catch(() => null),
     api('/hardware').catch(() => null),
+    api('/email/accounts').catch(() => null),
   ]);
   const s = settings;
   const ollamaModels = aiSt?.ollama?.models?.map((m) => m.name) || [];
@@ -2472,6 +2529,24 @@ route('/settings', async () => {
   const provChip = (label, st) => st
     ? `<span class="sys-chip ${st.available ? 'ok' : 'bad'}" title="${esc(st.reason || '')}">${esc(label)} ${st.available ? '● ready' : '○ ' + esc((st.reason || 'unavailable').slice(0, 40))}</span>`
     : `<span class="sys-chip">${esc(label)} · unknown</span>`;
+
+  // ---- email integration (multi-provider IMAP) ----
+  const emailPresets = (emailR && emailR.presets) || {};
+  const emailAccts = (emailR && emailR.accounts) || [];
+  const emailStats = (emailR && emailR.stats) || {};
+  const emProvOpts = Object.entries(emailPresets).map(([k, p]) => `<option value="${esc(k)}">${esc(p.label)}</option>`).join('') || '<option value="gmail">Gmail</option>';
+  const emAcctRow = (a) => `<div class="acct-row" data-acct="${esc(a.id)}">
+      <span class="sys-chip ${a.hasPassword ? 'ok' : ''}">${a.hasPassword ? '●' : '○'}</span>
+      <span class="acct-email">${esc(a.email)}</span> <span class="muted">· ${esc((emailPresets[a.provider] || {}).label || a.provider)}</span>
+      <span class="muted acct-stat">${(emailStats.byAccount && emailStats.byAccount[a.id]) ? esc(emailStats.byAccount[a.id].count + ' synced') : ''}</span>
+      <button class="btn small danger" data-email-remove="${esc(a.id)}">Remove</button>
+    </div>`;
+  const emAccountsHtml = emailAccts.length ? emailAccts.map(emAcctRow).join('')
+    : '<div class="muted" style="font-size:13px">No email connected yet — add one below and JAT will auto-track replies, confirmations & interviews.</div>';
+  const emStatsHtml = emailStats.total
+    ? `${emailStats.total} synced · ${emailStats.matched} matched · ${emailStats.suggested} suggested`
+      + (Object.keys(emailStats.byCategory || {}).length ? ' · ' + Object.entries(emailStats.byCategory).map(([c, n]) => `${esc(String(n))} ${esc(String(c).replace(/_/g, ' '))}`).join(', ') : '')
+    : 'Nothing synced yet — connect an account, then Sync now.';
 
   const themeGrid = THEMES.map((t) => `
     <button class="swatch ${document.body.dataset.theme === t.id ? 'active' : ''}" data-theme-id="${esc(t.id)}" type="button">
@@ -2570,8 +2645,39 @@ route('/settings', async () => {
       ${row('Learn answers from applications', toggle('hv-enabled', s.harvest.enabled), 'auto-build your profile from the answers you give — appears under Profile → Learned answers')}
     </section>
 
+    <section class="section" id="email-section">
+      <header class="section-header">
+        <div><div class="section-eyebrow">Mail</div><h2 class="section-title">Connect your email</h2>
+          <div class="form-hint">Auto-track replies, confirmations, interviews &amp; offers across your applications. Gmail, Outlook &amp; Yahoo — connect once, it syncs in the background.</div></div>
+        <button class="btn small" data-email-syncnow>Sync now</button>
+      </header>
+      <div class="section-body">
+        <div id="email-accounts">${emAccountsHtml}</div>
+        <div id="email-stats" class="muted" style="font-size:12px;margin-top:8px">${emStatsHtml}</div>
+      </div>
+      <details class="fold" id="email-add" ${emailAccts.length ? '' : 'open'}>
+        <summary>+ Add an email account</summary>
+        <div class="section-body">
+          ${row('Provider', `<select class="select" id="em-provider">${emProvOpts}</select>`)}
+          <ol class="email-steps" id="em-steps"></ol>
+          <div id="em-imaprow" hidden>
+            ${row('IMAP host', `<input class="input" id="em-host" placeholder="imap.example.com" />`)}
+            ${row('Port', `<input class="input" id="em-port" type="number" value="993" />`)}
+          </div>
+          ${row('Email address', `<input class="input" id="em-email" type="email" placeholder="you@gmail.com" autocomplete="off" />`)}
+          ${row('App Password', `<input class="input" id="em-pass" type="password" placeholder="paste the 16-character app password" autocomplete="off" />`, 'This is the App Password you generated above — NOT your normal login password.')}
+          <div class="section-footer">
+            <button class="btn small" data-email-test>Test connection</button>
+            <button class="btn small primary" data-email-add>Connect</button>
+            <span class="muted" id="em-result"></span>
+          </div>
+        </div>
+      </details>
+    </section>
+
     <section class="section">
-      <header class="section-header"><div><div class="section-eyebrow">Mail</div><h2 class="section-title">Gmail status sync</h2></div>
+      <header class="section-header"><div><div class="section-eyebrow">Mail</div><h2 class="section-title">Gmail OAuth sync (advanced)</h2>
+        <div class="form-hint">Legacy LinkedIn-notification sync via Google OAuth (needs your own Google Cloud client). Most people should use “Connect your email” above instead.</div></div>
         <button class="btn small primary" data-save-section="gmail">Save</button></header>
       <div class="section-body">
         <span class="sys-chip ${gmailSt?.authorized ? 'ok' : ''}">${gmailSt?.authorized ? '● connected' : '○ not connected'}</span>
@@ -2783,6 +2889,68 @@ route('/settings', async () => {
         }
       }, 1500);
     } catch (err) { errToast(err); btn.disabled = false; }
+  });
+
+  // ---- Email integration (multi-provider IMAP) ----
+  const emProvider = v.querySelector('#em-provider');
+  const renderEmSteps = () => {
+    const p = emailPresets[emProvider.value] || {};
+    const steps = v.querySelector('#em-steps');
+    if (steps) steps.innerHTML = (p.steps || []).map((st) =>
+      `<li>${esc(st.t)}${st.url ? ` <a class="link" href="${esc(st.url)}" target="_blank" rel="noopener">open ↗</a>` : ''}</li>`).join('')
+      + (p.appPwUrl ? `<li><button class="btn small" type="button" data-open="${esc(p.appPwUrl)}">Open the App Password page ↗</button></li>` : '');
+    const imapRow = v.querySelector('#em-imaprow'); if (imapRow) imapRow.hidden = emProvider.value !== 'imap';
+    const host = v.querySelector('#em-host'); if (host && emProvider.value !== 'imap') host.value = p.host || '';
+  };
+  if (emProvider) { emProvider.addEventListener('change', renderEmSteps); renderEmSteps(); }
+  v.querySelector('#email-add')?.addEventListener('click', (e) => {   // delegate the "open link" buttons
+    const o = e.target.closest('[data-open]'); if (o) { e.preventDefault(); window.open(o.dataset.open, '_blank', 'noopener'); }
+  });
+  const emBody = () => ({
+    provider: emProvider?.value || 'gmail',
+    email: (v.querySelector('#em-email')?.value || '').trim(),
+    password: (v.querySelector('#em-pass')?.value || '').trim(),
+    host: (v.querySelector('#em-host')?.value || '').trim() || undefined,
+    port: Number(v.querySelector('#em-port')?.value) || undefined,
+  });
+  v.querySelector('[data-email-test]')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget; const out = v.querySelector('#em-result');
+    const body = emBody();
+    if (!body.email || !body.password) { out.textContent = 'Enter your email + App Password first.'; return; }
+    btn.disabled = true; out.textContent = 'Connecting…';
+    try {
+      const r = await api('/email/accounts/test', { method: 'POST', body, timeoutMs: 30000 });
+      out.textContent = r.ok ? `✓ Connected — ${r.total ?? 0} messages in your inbox` : `✗ ${r.error || 'failed'}`;
+      out.style.color = r.ok ? 'var(--success)' : 'var(--danger)';
+    } catch (err) { out.textContent = '✗ ' + (err.message || err); out.style.color = 'var(--danger)'; }
+    btn.disabled = false;
+  });
+  v.querySelector('[data-email-add]')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget; const out = v.querySelector('#em-result');
+    const body = emBody();
+    if (!body.email || !body.password) { out.textContent = 'Enter your email + App Password first.'; return; }
+    btn.disabled = true; out.textContent = 'Verifying…';
+    try {
+      const t = await api('/email/accounts/test', { method: 'POST', body, timeoutMs: 30000 });   // verify before saving
+      if (!t.ok) { out.textContent = '✗ ' + (t.error || 'connection failed — not saved'); out.style.color = 'var(--danger)'; btn.disabled = false; return; }
+      await api('/email/accounts', { method: 'POST', body });
+      toast('Email connected ✓ — syncing will start in the background');
+      api('/email/sync', { method: 'POST', body: {}, timeoutMs: 120000 }).catch(() => {});   // kick an initial sync
+      navigate();
+    } catch (err) { errToast(err); btn.disabled = false; }
+  });
+  v.querySelectorAll('[data-email-remove]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('Disconnect this email account? Synced emails stay, but it stops updating.')) return;
+    try { await api('/email/accounts/' + encodeURIComponent(b.dataset.emailRemove), { method: 'DELETE' }); toast('Email disconnected'); navigate(); } catch (e) { errToast(e); }
+  }));
+  v.querySelector('[data-email-syncnow]')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget; btn.disabled = true; const old = btn.textContent; btn.textContent = 'Syncing…';
+    try {
+      const r = await api('/email/sync', { method: 'POST', body: {}, timeoutMs: 180000 });
+      if (!r.ok) toast('Sync: ' + (r.error || 'failed'), 'danger');
+      else { const tot = (r.results || []).reduce((a, x) => ({ f: a.f + (x.fetched || 0), m: a.m + (x.matched || 0) }), { f: 0, m: 0 }); const err = (r.results || []).find((x) => x.error); toast(err ? ('Sync issue: ' + err.error) : `Synced ${tot.f} new · ${tot.m} matched`, err ? 'danger' : 'info', { ttl: 9000 }); navigate(); }
+    } catch (err) { errToast(err); }
+    btn.disabled = false; btn.textContent = old;
   });
 
   // Gmail actions

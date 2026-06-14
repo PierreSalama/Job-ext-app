@@ -289,6 +289,38 @@ const MIGRATIONS = [
       ALTER TABLE auto_apply_tasks ADD COLUMN pending_questions TEXT;   -- JSON [{question,fieldType,options,reason}]
     `);
   },
+
+  // v5 — email integration: a synced-emails table associated to jobs.
+  () => {
+    exec(`
+      CREATE TABLE emails (
+        id            TEXT PRIMARY KEY,
+        account_id    TEXT NOT NULL,                 -- which connected mailbox
+        provider      TEXT,                          -- gmail | outlook | yahoo | imap
+        uid           INTEGER,                        -- IMAP UID (per account+folder) — dedup key
+        message_id    TEXT,                           -- RFC822 Message-ID (cross-account dedup)
+        thread_id     TEXT,
+        from_addr     TEXT,
+        from_name     TEXT,
+        to_addr       TEXT,
+        subject       TEXT,
+        snippet       TEXT,                           -- short preview
+        body          TEXT,                           -- plain-text body (capped)
+        sent_at       TEXT,                           -- ISO; the email's Date
+        category      TEXT,                           -- application_confirmation|recruiter|interview|offer|rejection|other
+        matched_job_id   TEXT,                        -- the job this email belongs to (NULL = unmatched)
+        match_confidence REAL DEFAULT 0,              -- 0..1
+        match_source     TEXT,                        -- 'auto' | 'suggested' | 'manual' | 'dismissed'
+        created_at    TEXT NOT NULL,
+        FOREIGN KEY (matched_job_id) REFERENCES jobs(id) ON DELETE SET NULL
+      );
+      CREATE UNIQUE INDEX idx_emails_acct_uid ON emails(account_id, uid);
+      CREATE INDEX idx_emails_msgid  ON emails(message_id);
+      CREATE INDEX idx_emails_job    ON emails(matched_job_id);
+      CREATE INDEX idx_emails_sent   ON emails(sent_at DESC);
+      CREATE INDEX idx_emails_match  ON emails(match_source);
+    `);
+  },
 ];
 
 function userVersion() {
@@ -1456,6 +1488,84 @@ function bulkImportApplications(items, { source } = {}) {
   return { created, merged, skipped, total: list.length };
 }
 
+// ============================================================
+// Email integration (synced mailbox emails associated to jobs)
+// ============================================================
+function rowToEmail(r) {
+  if (!r) return null;
+  return {
+    id: r.id, accountId: r.account_id, provider: r.provider, uid: r.uid,
+    messageId: r.message_id, threadId: r.thread_id,
+    from: r.from_addr, fromName: r.from_name, to: r.to_addr,
+    subject: r.subject, snippet: r.snippet, body: r.body, sentAt: r.sent_at,
+    category: r.category, matchedJobId: r.matched_job_id,
+    matchConfidence: r.match_confidence, matchSource: r.match_source, createdAt: r.created_at,
+  };
+}
+// Insert or update a synced email (dedup by account+uid). A user override
+// (manual/dismissed) is never clobbered by a later re-sync.
+function emailUpsert(e) {
+  const existing = get('SELECT * FROM emails WHERE account_id = ? AND uid = ?', [e.accountId, e.uid]);
+  if (existing) {
+    const pinned = existing.match_source === 'manual' || existing.match_source === 'dismissed' ? 1 : 0;
+    run(`UPDATE emails SET from_addr=?, from_name=?, to_addr=?, subject=?, snippet=?, body=?, sent_at=?, message_id=?, thread_id=?,
+         category = COALESCE(?, category),
+         matched_job_id   = CASE WHEN ? THEN matched_job_id ELSE ? END,
+         match_confidence = CASE WHEN ? THEN match_confidence ELSE ? END,
+         match_source     = CASE WHEN ? THEN match_source ELSE ? END
+         WHERE id = ?`,
+      [e.from || '', e.fromName || '', e.to || '', e.subject || '', e.snippet || '', e.body || '', e.sentAt || null, e.messageId || null, e.threadId || null,
+       e.category || null,
+       pinned, e.matchedJobId || null, pinned, e.matchConfidence || 0, pinned, e.matchSource || null, existing.id]);
+    return { id: existing.id, action: 'updated' };
+  }
+  const id = uid('email');
+  run(`INSERT INTO emails (id, account_id, provider, uid, message_id, thread_id, from_addr, from_name, to_addr,
+       subject, snippet, body, sent_at, category, matched_job_id, match_confidence, match_source, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [id, e.accountId, e.provider || null, e.uid ?? null, e.messageId || null, e.threadId || null,
+     e.from || '', e.fromName || '', e.to || '', e.subject || '', e.snippet || '', e.body || '', e.sentAt || null,
+     e.category || null, e.matchedJobId || null, e.matchConfidence || 0, e.matchSource || null, now()]);
+  return { id, action: 'created' };
+}
+function emailsForJob(jobId) {
+  return all(`SELECT * FROM emails WHERE matched_job_id = ? AND match_source IN ('auto','manual') ORDER BY sent_at DESC`, [jobId]).map(rowToEmail);
+}
+function emailSuggestionsForJob(jobId) {
+  return all(`SELECT * FROM emails WHERE matched_job_id = ? AND match_source = 'suggested' ORDER BY match_confidence DESC`, [jobId]).map(rowToEmail);
+}
+function setEmailMatch(emailId, { jobId, source, confidence } = {}) {
+  if (!get('SELECT id FROM emails WHERE id = ?', [emailId])) return null;
+  run('UPDATE emails SET matched_job_id = ?, match_source = ?, match_confidence = ? WHERE id = ?',
+    [jobId || null, source || (jobId ? 'manual' : 'dismissed'), confidence ?? (jobId ? 1 : 0), emailId]);
+  return rowToEmail(get('SELECT * FROM emails WHERE id = ?', [emailId]));
+}
+function listEmails({ q, unmatchedOnly, limit = 100 } = {}) {
+  let sql = 'SELECT * FROM emails'; const args = []; const where = [];
+  if (unmatchedOnly) where.push('matched_job_id IS NULL');   // no job → available to link (incl. orphaned-by-delete)
+  if (q) { const k = '%' + q + '%'; where.push('(subject LIKE ? OR from_addr LIKE ? OR from_name LIKE ?)'); args.push(k, k, k); }
+  if (where.length) sql += ' WHERE ' + where.join(' AND ');
+  sql += ' ORDER BY sent_at DESC LIMIT ?'; args.push(Math.min(500, limit));
+  return all(sql, args).map(rowToEmail);
+}
+function emailStats() {
+  const one = (sql) => get(sql)?.n || 0;
+  const total = one('SELECT COUNT(*) n FROM emails');
+  const matched = one("SELECT COUNT(*) n FROM emails WHERE match_source IN ('auto','manual') AND matched_job_id IS NOT NULL");
+  const suggested = one("SELECT COUNT(*) n FROM emails WHERE match_source = 'suggested' AND matched_job_id IS NOT NULL");
+  const byCategory = {}; for (const r of all('SELECT category, COUNT(*) n FROM emails GROUP BY category')) byCategory[r.category || 'other'] = r.n;
+  const byAccount = {}; for (const r of all('SELECT account_id, COUNT(*) n, MAX(sent_at) latest FROM emails GROUP BY account_id')) byAccount[r.account_id] = { count: r.n, latest: r.latest };
+  return { total, matched, suggested, unmatched: total - matched - suggested, byCategory, byAccount };
+}
+// Per-account resumable sync cursor (highest IMAP UID synced).
+function emailCursor(accountId) { return kvGet('emailCursor:' + accountId) || { uid: 0, syncedAt: null }; }
+function setEmailCursor(accountId, cur) { kvSet('emailCursor:' + accountId, cur); }
+// Jobs the matcher considers when associating an incoming email.
+function jobsForMatching() {
+  return all('SELECT id, title, company, source, submitted_at, created_at FROM jobs ORDER BY created_at DESC LIMIT 2000')
+    .map((r) => ({ id: r.id, title: r.title, company: r.company, source: r.source, submittedAt: r.submitted_at, createdAt: r.created_at }));
+}
+
 module.exports = {
   open, close, backupNow, dailyBackup, transaction,
   getSettings, patchSettings, kvGet, kvSet,
@@ -1471,5 +1581,6 @@ module.exports = {
   queueList, queueHistory, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueRetryParked,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications,
+  emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching,
   STATUS_ORDER, TERMINAL, normJobUrl, normKey,
 };

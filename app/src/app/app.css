@@ -1492,6 +1492,29 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
 .hist-reason { font-size: 11px; color: var(--muted); margin-top: 2px; }
 .hist-meta { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; font-size: 11px; }
 .src-tag { font-size: 9px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); border: 1px solid var(--border); padding: 1px 6px; }
+/* Email integration */
+.email-steps { margin: 4px 0 14px; padding-left: 20px; font-size: 13px; line-height: 1.7; color: var(--text); }
+.email-steps li { margin: 3px 0; }
+.email-steps .link, .link { color: var(--primary2); text-decoration: underline; cursor: pointer; }
+.acct-row { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.acct-row .acct-email { font-weight: 600; }
+.acct-row .acct-stat { margin-left: auto; font-size: 11px; }
+.email-banner { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.email-banner .banner-text { flex: 1 1 320px; }
+.mail-row { padding: 9px 0; border-bottom: 1px solid var(--border); }
+.mail-head { display: flex; align-items: center; gap: 8px; }
+.mail-subj { font-size: 13px; font-weight: 600; }
+.mail-sub { font-size: 11px; margin-top: 2px; }
+.mail-snip { font-size: 12px; margin-top: 3px; opacity: 0.85; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mail-actions { margin-top: 6px; display: flex; gap: 6px; }
+.mail-suggest-head { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); margin: 14px 0 4px; }
+.mail-find { margin-top: 10px; }
+.mail-find-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.out-chip.cat-application_confirmation { background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--success); }
+.out-chip.cat-interview { background: var(--wash-25); color: var(--primary2); }
+.out-chip.cat-offer { background: color-mix(in srgb, var(--success) 26%, transparent); color: var(--success); }
+.out-chip.cat-rejection { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
+.out-chip.cat-recruiter { background: var(--wash-10); color: var(--primary2); }
 /* Sync past applications panel (Applications page) */
 .sync-panel { border: 1px solid var(--border); background: var(--wash-10); padding: 14px 16px; margin-bottom: 16px; }
 .sync-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }

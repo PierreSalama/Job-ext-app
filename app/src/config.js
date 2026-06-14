@@ -125,6 +125,14 @@ const DEFAULTS = {
     clientSecret: '',
   },
 
+  // Multi-provider email integration (IMAP + App Password). Connected mailboxes
+  // (with their app passwords) live in the kv store, NOT here — kv is never exported.
+  email: {
+    syncIntervalMinutes: 15,       // background resumable sync cadence
+    autoLinkThreshold: 0.7,        // ≥ this confidence → auto-associate an email to a job
+    suggestThreshold: 0.4,         // ≥ this (but < auto) → show as a "suggested" match
+  },
+
   followUp: {
     days: 7,                 // auto follow-up date after submit; 0 = off
   },
