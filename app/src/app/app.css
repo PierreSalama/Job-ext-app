@@ -1472,6 +1472,12 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
 .state-chip[data-state="parked"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
 .state-chip[data-state="running"] { color: var(--primary); }
 .aa-master { display: flex; align-items: center; gap: 12px; }
+.aa-timer {
+  font-family: ui-monospace, Consolas, monospace; font-size: 13px; font-weight: 600;
+  letter-spacing: 0.04em; color: var(--success); min-width: 48px; text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.aa-timer:empty { display: none; }
 .aa-switch {
   display: flex; align-items: center; gap: 8px; padding: 6px 12px;
   border: 1px solid var(--border); cursor: pointer;

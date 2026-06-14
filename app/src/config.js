@@ -86,6 +86,7 @@ const DEFAULTS = {
 
   autoApply: {
     enabled: false,          // master switch — just ON/OFF
+    startedAt: '',           // ISO time the master switch was last turned ON (live "running for" timer)
     mode: 'auto',            // default: submit for me. 'review' stops before submit
     // Generous defaults (user asked) — the Advanced area lets you tighten these.
     // Empty window = run any time of day. Gaps are auto-managed but adjustable.

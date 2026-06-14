@@ -462,6 +462,12 @@ async function handle(req, res, parsed) {
   }
   if (req.method === 'PATCH' && pathname === '/settings') {
     const body = await readJson(req);
+    // Stamp/clear the "running for" timer on the auto-apply on→off transition.
+    if (body.autoApply && typeof body.autoApply.enabled === 'boolean') {
+      const wasOn = !!db.getSettings().autoApply.enabled;
+      if (body.autoApply.enabled && !wasOn) body.autoApply.startedAt = new Date().toISOString();
+      else if (!body.autoApply.enabled) body.autoApply.startedAt = '';
+    }
     const settings = db.patchSettings(body);
     broadcast('settings.updated', {});
     return sendJson(res, 200, { ok: true, settings });

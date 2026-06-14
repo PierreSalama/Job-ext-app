@@ -1499,6 +1499,7 @@ route('/queue', async () => {
         <div class="page-sub">Searches Easy-Apply jobs and applies — paced, review-first, always stoppable.</div>
       </div>
       <div class="page-actions aa-master">
+        <span class="aa-timer" id="aa-timer" data-start="${aa.enabled && aa.startedAt ? esc(aa.startedAt) : ''}" title="Running for">${aa.enabled && aa.startedAt ? fmtElapsed(Date.now() - Date.parse(aa.startedAt)) : ''}</span>
         <label class="aa-switch ${aa.enabled ? 'on' : ''}">
           <span class="aa-switch-label">${aa.enabled ? 'ON' : 'OFF'}</span>
           <label class="toggle"><input type="checkbox" id="aa-master" ${aa.enabled ? 'checked' : ''} /><span class="knob"></span></label>
@@ -1602,11 +1603,15 @@ route('/queue', async () => {
   v.querySelector('#aa-master').addEventListener('change', async (e) => {
     const on = e.target.checked;
     try {
-      await api('/settings', { method: 'PATCH', body: { autoApply: { enabled: on } } });
+      const resp = await api('/settings', { method: 'PATCH', body: { autoApply: { enabled: on } } });
       state.settings = null;
       const sw = v.querySelector('.aa-switch');
       sw.classList.toggle('on', on);
       sw.querySelector('.aa-switch-label').textContent = on ? 'ON' : 'OFF';
+      // Seed the timer from the SERVER-stamped startedAt so client + server agree.
+      const tm = v.querySelector('#aa-timer');
+      if (tm) { const st = (on && resp?.settings?.autoApply?.startedAt) || ''; tm.dataset.start = st; tm.textContent = st ? fmtElapsed(Date.now() - Date.parse(st)) : ''; }
+      if (!on) stopAutoApplyTabs();
       toast(on ? 'Auto-apply ON — searching & applying, paced' : 'Auto-apply OFF');
     } catch (err) { errToast(err); e.target.checked = !on; }
   });
@@ -1656,8 +1661,10 @@ route('/queue', async () => {
           await api('/queue/' + encodeURIComponent(t.id), { method: 'PATCH', body: { state: 'skipped', transcriptAppend: { note: 'stop-all from dashboard' } } });
         }
       }
+      // State is now saved in the app; close the run's tabs + drop the group.
+      stopAutoApplyTabs();
       state.settings = null;
-      toast('Auto-apply stopped — master switch off');
+      toast('Auto-apply stopped — tabs closed, switch off');
       navigate();
     } catch (e) { errToast(e); }
   });
@@ -2765,6 +2772,33 @@ async function boot(reauth = false) {
 
   paintRuntime();
   navigate();
+}
+
+// Live "running for" timer: one global ticker reads the start time off #aa-timer's
+// data-start (kept current by the morph refresh) and updates the text every second.
+// Reading the live DOM each tick keeps it morph-safe and avoids stacking intervals.
+function fmtElapsed(ms) {
+  if (!(ms >= 0)) return '';
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
+}
+setInterval(() => {
+  const el = document.getElementById('aa-timer');
+  if (!el) return;
+  const start = el.dataset.start;
+  el.textContent = start ? fmtElapsed(Date.now() - Date.parse(start)) : '';
+}, 1000);
+
+// Ask the extension SW to close the auto-apply tab group (extension host only; the
+// desktop app has no `chrome`, where the SW's alarm tidies up on the next tick).
+function stopAutoApplyTabs() {
+  try {
+    if (typeof chrome !== 'undefined' && chrome.runtime?.sendMessage) {
+      chrome.runtime.sendMessage({ type: 'stop-autoapply' }, () => void chrome.runtime.lastError);
+    }
+  } catch {}
 }
 
 // global listeners (registered once)

@@ -75,6 +75,9 @@ chrome.alarms.onAlarm.addListener(async (a) => {
     // Apply one paced job; if there was nothing to apply, use the tick to top up
     // the queue via a discovery search instead. Never both in one tick.
     const r = await autoApplyTick();
+    // Auto-apply was turned OFF (from either dashboard host) → tidy up the run's
+    // tabs/group. Cheap no-op once aaGroupId is cleared.
+    if (r.reason === 'disabled' && aaGroupId != null) await closeAutoApplyTabs().catch(() => {});
     if (!r.dispatched) await discoverTick().catch(() => {});
   }
   if (a.name === 'jat11-extupdate') {
@@ -147,6 +150,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'run-autoapply-now':
       // TEST button: apply the next queued job RIGHT NOW (skips window/cap/gap).
       respond(autoApplyTick(true).then((s) => ({ ok: true, ...s })));
+      return true;
+    case 'stop-autoapply':
+      // Dashboard "Stop everything" → close the run's tabs + drop the group.
+      respond(closeAutoApplyTabs().then(() => ({ ok: true })));
       return true;
     case 'pipeline-event':
       respond(handlePipelineEvent(msg.data, sender));
@@ -404,40 +411,73 @@ let dispatching = false;
 
 // Keep every auto-apply / discovery tab in ONE labelled Chrome tab group so the
 // user can see + manage them together (and they're not scattered everywhere).
+const AA_GROUP_TITLE = 'JAT Auto-apply';
 let aaGroupId = null;
-let aaWindowId = null;
 
-// Pin the whole auto-apply / discovery operation to ONE Chrome window so its tab
-// group never splits across windows when the user switches focus mid-run. Prefer a
-// normal window that ISN'T currently focused (on screen but idle) so the apply tabs
-// don't pop up in the window the user is actively working in. Once chosen, it sticks
-// for the whole run regardless of which window is focused — only re-picking if that
-// window gets closed.
-async function pickAutoApplyWindow() {
+// MV3 evicts the service worker after ~30s idle, which would wipe aaGroupId and make
+// the next tick spawn a SECOND group. Recover the existing one by its title first so
+// there's only ever one "JAT Auto-apply" group across SW restarts.
+async function recoverAaGroup() {
+  if (aaGroupId != null) return aaGroupId;
   try {
-    if (aaWindowId != null) {
-      try { await chrome.windows.get(aaWindowId); return aaWindowId; }
-      catch { aaWindowId = null; aaGroupId = null; }   // window closed — reset the group too
+    if (chrome.tabGroups?.query) {
+      const groups = await chrome.tabGroups.query({ title: AA_GROUP_TITLE });
+      if (groups && groups.length) aaGroupId = groups[0].id;
     }
+  } catch {}
+  return aaGroupId;
+}
+
+// Where the next apply/discovery tab should open. We FOLLOW the group: if the user
+// drags the "JAT Auto-apply" group to another window, new tabs open in THAT window
+// and join the same group (no more splitting into a second group). Only when no
+// group exists yet do we pick a window — preferring one that ISN'T focused, so tabs
+// don't pop up in the window you're actively working in.
+async function autoApplyTargetWindow() {
+  await recoverAaGroup();
+  if (aaGroupId != null && chrome.tabGroups?.get) {
+    try { const g = await chrome.tabGroups.get(aaGroupId); return g.windowId; }
+    catch { aaGroupId = null; }   // group no longer exists — pick a fresh window below
+  }
+  try {
     const wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
     const pick = wins.find((w) => !w.focused) || wins[0];
-    if (pick) aaWindowId = pick.id;
-  } catch { aaWindowId = null; }
-  return aaWindowId;
+    return pick ? pick.id : undefined;
+  } catch { return undefined; }
 }
 
 async function groupTab(tabId) {
   try {
     if (!chrome.tabs.group) return;
+    await recoverAaGroup();   // reuse the existing group after an SW restart
     if (aaGroupId != null) {
-      try { await chrome.tabs.group({ tabIds: [tabId], groupId: aaGroupId }); return; }
-      catch { aaGroupId = null; }   // group was closed — fall through to make a new one
+      try {
+        if (chrome.tabGroups?.get) await chrome.tabGroups.get(aaGroupId);   // confirm it still exists
+        await chrome.tabs.group({ tabIds: [tabId], groupId: aaGroupId });   // joins the group (and its window)
+        return;
+      } catch { aaGroupId = null; }   // stale — make a fresh group below
     }
     aaGroupId = await chrome.tabs.group({ tabIds: [tabId] });
     if (chrome.tabGroups?.update) {
-      try { await chrome.tabGroups.update(aaGroupId, { title: 'JAT Auto-apply', color: 'yellow' }); } catch {}
+      try { await chrome.tabGroups.update(aaGroupId, { title: AA_GROUP_TITLE, color: 'yellow' }); } catch {}
+    }
+  } catch { aaGroupId = null; }
+}
+
+// Close every tab in the auto-apply group and forget it — used by "Stop everything"
+// so the run's tabs don't linger. Task state is already persisted in the app DB
+// (the dashboard stop-all patches queued/running → skipped before this runs), so
+// nothing is lost by closing them.
+async function closeAutoApplyTabs() {
+  try {
+    await recoverAaGroup();   // find the group even if the SW was restarted since
+    if (aaGroupId != null && chrome.tabs?.query) {
+      const tabs = await chrome.tabs.query({ groupId: aaGroupId });
+      const ids = tabs.map((t) => t.id).filter((id) => id != null);
+      if (ids.length) { try { await chrome.tabs.remove(ids); } catch {} }
     }
   } catch {}
+  aaGroupId = null;
 }
 
 async function autoApplyTick(force = false) {
@@ -453,7 +493,7 @@ async function autoApplyTick(force = false) {
   try {
     const { task, context } = r;
     const url = context.job.jobUrl;
-    const winId = await pickAutoApplyWindow();
+    const winId = await autoApplyTargetWindow();
     const tab = await chrome.tabs.create({ url, active: false, ...(winId ? { windowId: winId } : {}) });
     await groupTab(tab.id);
 
@@ -576,7 +616,7 @@ async function discoverTick(force = false) {
   const url = buildSearchUrl(board, keyword, location);
   let resp = null, enqueued = 0;
   try {
-    const winId = await pickAutoApplyWindow();
+    const winId = await autoApplyTargetWindow();
     tab = await chrome.tabs.create({ url, active: false, ...(winId ? { windowId: winId } : {}) });
     await groupTab(tab.id);
     await waitTabComplete(tab.id, 30000);
