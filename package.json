@@ -1,6 +1,6 @@
 {
   "name": "jat11",
-  "version": "11.9.0",
+  "version": "11.10.0",
   "private": true,
   "type": "module",
   "description": "Job Application Tracker v11 — workspace root (extension + Electron app + tooling). See README.md.",
@@ -9,8 +9,8 @@
     "mirror:check": "node tools/mirror.mjs --check",
     "validate:versions": "node tools/validate-versions.mjs",
     "validate:ext": "node tools/validate-extension.mjs",
-    "test": "node --test tests/status.test.mjs tests/fit.test.mjs tests/prompts.test.mjs tests/secrets.test.mjs",
-    "test:all": "node --test --test-force-exit tests/status.test.mjs tests/fit.test.mjs tests/prompts.test.mjs tests/secrets.test.mjs tests/detection.test.mjs tests/detector-flow.test.mjs tests/ai-provider.test.mjs tests/autoapply.test.mjs"
+    "test": "node --test tests/status.test.mjs tests/fit.test.mjs tests/prompts.test.mjs tests/secrets.test.mjs tests/profile-memory.test.mjs",
+    "test:all": "node --test --test-force-exit tests/status.test.mjs tests/fit.test.mjs tests/prompts.test.mjs tests/secrets.test.mjs tests/profile-memory.test.mjs tests/detection.test.mjs tests/detector-flow.test.mjs tests/ai-provider.test.mjs tests/autoapply.test.mjs"
   },
   "devDependencies": {
     "jsdom": "^29.1.1"

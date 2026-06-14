@@ -2021,14 +2021,48 @@ const FIELD_GROUPS = [
   { title: 'Education', keys: ['highestDegree', 'university', 'major', 'graduationYear', 'headline'] },
 ];
 
+// Map a learned-answer label → a structured profile key (client mirror of the
+// server's LEARNED_TO_PROFILE) for the per-row "↑ Profile" promote.
+const CLIENT_LEARNED_TO_PROFILE = [
+  [/first.?name|given.?name|prenom|firstname/i, 'firstName'],
+  [/last.?name|surname|family.?name|lastname/i, 'lastName'],
+  [/full.?name|legal.?name|^name$/i, 'fullName'],
+  [/preferred.?name|nickname/i, 'preferredName'],
+  [/pronoun/i, 'pronouns'],
+  [/email|courriel/i, 'email'],
+  [/phone|mobile|telephone|cell/i, 'phone'],
+  [/address.?2|apartment|unit|suite/i, 'address2'],
+  [/address|street/i, 'address1'],
+  [/\bcity\b|ville/i, 'city'],
+  [/province|state\b|region/i, 'state'],
+  [/postal|zip/i, 'postalCode'],
+  [/country|pays/i, 'country'],
+  [/linkedin/i, 'linkedinUrl'],
+  [/github/i, 'githubUrl'],
+  [/portfolio|website/i, 'portfolioUrl'],
+  [/work.?authoriz|authorized.?work/i, 'workAuthorization'],
+  [/sponsor|visa/i, 'sponsorshipRequired'],
+  [/salary|compensation/i, 'salaryExpectation'],
+  [/years?.*experience|experience.*years?/i, 'yearsExperience'],
+  [/notice|start.?date|availab/i, 'noticePeriod'],
+  [/degree|diploma/i, 'highestDegree'],
+  [/university|college|school/i, 'university'],
+  [/major|field.?of.?study/i, 'major'],
+  [/graduation/i, 'graduationYear'],
+  [/citizen/i, 'citizenship'],
+];
+function clientMapToProfileKey(label) {
+  const hay = String(label || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');   // fold accents so "prénom" matches
+  for (const [rx, key] of CLIENT_LEARNED_TO_PROFILE) if (rx.test(hay)) return key;
+  return null;
+}
+
 route('/profile', async () => {
-  const [profilesR, fieldsR, settings] = await Promise.all([
+  const [profilesR, settings] = await Promise.all([
     api('/profiles'),
-    api('/profile-fields').catch(() => ({ items: [] })),
     getSettings(),
   ]);
   const profiles = profilesR.items || [];
-  const harvested = fieldsR.items || [];
   const af = settings.autofill || {};
 
   if (!state.profileSel || !profiles.find((p) => p.id === state.profileSel)) {
@@ -2036,6 +2070,11 @@ route('/profile', async () => {
   }
   const cur = profiles.find((p) => p.id === state.profileSel) || { name: 'Main', isDefault: !profiles.length, sourceAssignments: [], data: {} };
   const d = cur.data || {};
+
+  // Each profile has its OWN memory — load only this profile's learned answers.
+  const harvested = cur.id
+    ? ((await api('/profile-fields?profileId=' + encodeURIComponent(cur.id)).catch(() => ({ items: [] }))).items || [])
+    : [];
 
   // Dynamic structured fields: grouped seed fields + any custom keys already
   // saved in this profile's data, rendered as a DENSE multi-column grid so many
@@ -2066,6 +2105,7 @@ route('/profile', async () => {
       <td><input class="input" data-pf-answer value="${esc(it.value)}" style="width:100%" /></td>
       <td class="num">${esc(it.seenCount)}</td>
       <td class="nowrap">
+        <button class="btn small" data-pf-promote data-pf-label="${esc(it.label)}" title="Copy this answer up into your structured profile fields">↑ Profile</button>
         <button class="btn small ${it.locked ? 'primary' : ''}" data-pf-lock title="${it.locked ? 'Locked — new applications won’t overwrite. Click to unlock.' : 'Lock so new applications don’t overwrite this value.'}">${it.locked ? '🔒' : '🔓'}</button>
         <button class="btn small" data-pf-del title="Forget">✕</button>
       </td>
@@ -2081,6 +2121,7 @@ route('/profile', async () => {
       </div>
       <div class="page-actions">
         <button class="btn" data-import>Import from résumé</button>
+        ${cur.id ? '<button class="btn" data-fill-from-memory title="Fill empty profile fields from this profile’s learned memory">Fill from memory</button>' : ''}
         ${cur.id ? '<button class="btn" data-del-profile>Delete</button>' : ''}
         <button class="btn primary" data-save>Save profile</button>
       </div>
@@ -2122,9 +2163,9 @@ route('/profile', async () => {
         </section>
 
         <section class="section">
-          <header class="section-header"><div><div class="section-eyebrow">Memory</div><h2 class="section-title">Learned answers</h2>
-            <div class="form-hint">Auto-captured from your applications (EN + FR). Edit a value to override + lock it; otherwise the newest answer wins.</div></div>
-            <div class="nowrap"><button class="btn small" data-backfill title="Harvest answers from every past application">Build from past applications</button> <span class="section-link muted">${harvested.length} stored</span></div></header>
+          <header class="section-header"><div><div class="section-eyebrow">Memory</div><h2 class="section-title">${esc(cur.name || 'This profile')} — learned answers</h2>
+            <div class="form-hint">Learned from your applications (EN + FR), private to this profile. Edit a value to override + lock it; “↑ Profile” copies an answer up into your structured fields above.</div></div>
+            <div class="nowrap">${cur.id ? '<button class="btn small" data-save-to-memory title="Push your structured profile fields into this memory so auto-apply knows them">Save profile → memory</button> <button class="btn small" data-backfill title="Harvest answers from every past application into this profile">Build from past applications</button> ' : ''}<span class="section-link muted">${harvested.length} stored</span></div></header>
           <div class="table-wrap"><table class="table">
             <thead><tr><th>Question</th><th>Answer</th><th>Seen</th><th></th></tr></thead>
             <tbody>${harvestRows}</tbody>
@@ -2169,11 +2210,12 @@ route('/profile', async () => {
     card.querySelector('input').focus();
   });
 
-  // Build the profile from every past application's answers.
-  v.querySelector('[data-backfill]').addEventListener('click', async (e) => {
+  // Build THIS profile's memory from every past application's answers.
+  v.querySelector('[data-backfill]')?.addEventListener('click', async (e) => {
+    if (!cur.id) { toast('Save the profile first', 'warn'); return; }
     const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Building…';
     try {
-      const r = await api('/profile-fields/backfill', { method: 'POST', timeoutMs: 120000 });
+      const r = await api('/profile-fields/backfill', { method: 'POST', body: { profileId: cur.id }, timeoutMs: 120000 });
       toast(r.fields ? `Learned ${r.fields} answer(s) from ${r.jobs} past application(s)` : 'No new answers found in past applications');
       navigate();
     } catch (err) { errToast(err); btn.disabled = false; btn.textContent = 'Build from past applications'; }
@@ -2265,6 +2307,26 @@ route('/profile', async () => {
     } catch (e) { errToast(e); }
   });
 
+  // Bridge (memory → profile): fill empty structured fields from this profile's memory.
+  v.querySelector('[data-fill-from-memory]')?.addEventListener('click', async () => {
+    if (!cur.id) { toast('Save the profile first', 'warn'); return; }
+    try {
+      const r = await api('/profile/from-memory?profileId=' + encodeURIComponent(cur.id));
+      const filled = fillFromParse(r.data || {});
+      toast(filled ? `Filled ${filled} empty field(s) from memory — review, then Save profile.` : 'Nothing new — those fields are already set.');
+    } catch (e) { errToast(e); }
+  });
+  // Bridge (profile → memory): push the structured fields down into this profile's memory.
+  v.querySelector('[data-save-to-memory]')?.addEventListener('click', async () => {
+    if (!cur.id) { toast('Save the profile first', 'warn'); return; }
+    try {
+      const { data } = collect();
+      const r = await api('/profile/to-memory', { method: 'POST', body: { profileId: cur.id, data } });
+      toast(r.pushed ? `Saved ${r.pushed} field(s) into ${cur.name}’s memory` : 'Nothing to save — fill in some fields first.');
+      navigate();
+    } catch (e) { errToast(e); }
+  });
+
   const delBtn = v.querySelector('[data-del-profile]');
   if (delBtn) delBtn.addEventListener('click', async () => {
     try {
@@ -2300,6 +2362,31 @@ route('/profile', async () => {
     tr.querySelector('[data-pf-del]').addEventListener('click', async () => {
       try { await api('/profile-fields/' + encodeURIComponent(id), { method: 'DELETE' }); tr.remove(); }
       catch (err) { errToast(err); }
+    });
+    // Promote a learned answer UP into the structured profile (memory → profile, one field).
+    tr.querySelector('[data-pf-promote]')?.addEventListener('click', () => {
+      const label = tr.querySelector('[data-pf-promote]').dataset.pfLabel || '';
+      const value = answerEl.value.trim();
+      if (!value) { toast('No answer to copy yet', 'warn'); return; }
+      const key = clientMapToProfileKey(label);
+      let input = key ? v.querySelector('.pf-input[data-key="' + key + '"]') : null;
+      if (!input) {
+        // No standard field maps → add it as a custom profile field.
+        const ck = (label.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 60)) || ('field_' + Date.now());
+        if (!v.querySelector('[data-key="' + ck + '"]')) {
+          const card = el(fieldCard(ck, label.slice(0, 40), true));
+          wireRemove(card.querySelector('[data-rmfield]'));
+          v.querySelector('#pf-custom').appendChild(card);
+        }
+        input = v.querySelector('.pf-input[data-key="' + ck + '"]');
+      }
+      if (input) {
+        input.value = value;
+        input.classList.add('pf-flash');
+        input.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        setTimeout(() => input.classList.remove('pf-flash'), 1200);
+        toast(`Copied into your profile (${key ? (PF_LABEL[key] || key) : 'custom field'}) — review, then Save profile.`);
+      }
     });
   });
 

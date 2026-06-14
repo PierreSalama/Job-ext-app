@@ -321,6 +321,61 @@ const MIGRATIONS = [
       CREATE INDEX idx_emails_match  ON emails(match_source);
     `);
   },
+
+  // v6 — scope learned memory (profile_fields + qa) to a profile, so each profile
+  // has its OWN memory. Rebuild both tables with a profile_id + composite uniqueness,
+  // and adopt all existing (global) memory into the default profile.
+  () => {
+    let homeId = get('SELECT id FROM profiles WHERE is_default = 1 LIMIT 1')?.id
+      || get('SELECT id FROM profiles LIMIT 1')?.id;
+    if (!homeId) {
+      homeId = uid('prof');
+      run("INSERT INTO profiles (id, name, is_default, source_assignments, data, updated_at) VALUES (?, 'Main', 1, '[]', '{}', ?)", [homeId, now()]);
+    }
+    exec(`
+      CREATE TABLE profile_fields_new (
+        id            TEXT PRIMARY KEY,
+        profile_id    TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        key_norm      TEXT NOT NULL,
+        label         TEXT NOT NULL,
+        locale        TEXT NOT NULL DEFAULT 'en',
+        value         TEXT,
+        field_type    TEXT,
+        source_job_id TEXT,
+        source        TEXT,
+        confidence    REAL NOT NULL DEFAULT 0.5,
+        locked        INTEGER NOT NULL DEFAULT 0,
+        seen_count    INTEGER NOT NULL DEFAULT 1,
+        updated_at    TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        UNIQUE(profile_id, key_norm)
+      );
+    `);
+    run(`INSERT INTO profile_fields_new
+         (id, profile_id, key_norm, label, locale, value, field_type, source_job_id, source, confidence, locked, seen_count, updated_at, created_at)
+         SELECT id, ?, key_norm, label, locale, value, field_type, source_job_id, source, confidence, locked, seen_count, updated_at, created_at
+         FROM profile_fields`, [homeId]);
+    exec('DROP TABLE profile_fields');
+    exec('ALTER TABLE profile_fields_new RENAME TO profile_fields');
+
+    exec(`
+      CREATE TABLE qa_new (
+        id            TEXT PRIMARY KEY,
+        profile_id    TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        question_norm TEXT NOT NULL,
+        question      TEXT NOT NULL,
+        answer        TEXT NOT NULL,
+        seen_count    INTEGER NOT NULL DEFAULT 1,
+        sources       TEXT,
+        updated_at    TEXT NOT NULL,
+        UNIQUE(profile_id, question_norm)
+      );
+    `);
+    run(`INSERT INTO qa_new (id, profile_id, question_norm, question, answer, seen_count, sources, updated_at)
+         SELECT id, ?, question_norm, question, answer, seen_count, sources, updated_at FROM qa`, [homeId]);
+    exec('DROP TABLE qa');
+    exec('ALTER TABLE qa_new RENAME TO qa');
+  },
 ];
 
 function userVersion() {
@@ -914,10 +969,11 @@ function normalizeQuestion(q) {
 const FR_HINT_RX = /\b(vous|votre|vos|français|francais|combien|années|prénom|courriel|veuillez|quel|quelle|salaire|expérience|téléphone|adresse|disponibilité|formation|compétences?)\b/i;
 function guessLocale(text) { return FR_HINT_RX.test(String(text || '')) ? 'fr' : 'en'; }
 
-function qaRecord({ question, answer, source }) {
+function qaRecord({ profileId, question, answer, source }) {
   const qn = normalizeQuestion(question);
   if (!qn || answer == null || answer === '') return null;
-  const cur = get('SELECT * FROM qa WHERE question_norm = ?', [qn]);
+  if (!profileId) { log.warn('qaRecord: missing profileId — answer not saved'); return null; }
+  const cur = get('SELECT * FROM qa WHERE profile_id = ? AND question_norm = ?', [profileId, qn]);
   const ts = now();
   if (cur) {
     const sources = new Set(safeParse(cur.sources, []));
@@ -931,21 +987,21 @@ function qaRecord({ question, answer, source }) {
     answer: String(answer).slice(0, 2000),
     sources: JSON.stringify(source ? [source] : []), ts,
   };
-  run(`INSERT INTO qa (id, question_norm, question, answer, seen_count, sources, updated_at)
-       VALUES (?, ?, ?, ?, 1, ?, ?)`,
-      [row.id, row.qn, row.question, row.answer, row.sources, row.ts]);
+  run(`INSERT INTO qa (id, profile_id, question_norm, question, answer, seen_count, sources, updated_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?, ?)`,
+      [row.id, profileId, row.qn, row.question, row.answer, row.sources, row.ts]);
   return get('SELECT * FROM qa WHERE id = ?', [row.id]);
 }
 
-function qaLookup(question) {
+function qaLookup(profileId, question) {
   const qn = normalizeQuestion(question);
-  if (!qn) return null;
-  const exact = get('SELECT * FROM qa WHERE question_norm = ?', [qn]);
+  if (!qn || !profileId) return null;
+  const exact = get('SELECT * FROM qa WHERE profile_id = ? AND question_norm = ?', [profileId, qn]);
   if (exact) return { ...exact, match: 'exact', score: 1 };
   const want = new Set(qn.split(' ').filter(Boolean));
   if (!want.size) return null;
   let best = null;
-  for (const row of all('SELECT * FROM qa')) {
+  for (const row of all('SELECT * FROM qa WHERE profile_id = ?', [profileId])) {
     const have = new Set(row.question_norm.split(' ').filter(Boolean));
     let hit = 0;
     for (const t of want) if (have.has(t)) hit++;
@@ -960,8 +1016,9 @@ function qaLookup(question) {
   return best;
 }
 
-function qaList(limit = 500) {
-  return all('SELECT * FROM qa ORDER BY updated_at DESC LIMIT ?', [limit]);
+function qaList(profileId, limit = 500) {
+  if (!profileId) return [];
+  return all('SELECT * FROM qa WHERE profile_id = ? ORDER BY updated_at DESC LIMIT ?', [profileId, limit]);
 }
 function qaDelete(id) { return (run('DELETE FROM qa WHERE id = ?', [id])?.changes ?? 0) > 0; }
 
@@ -979,7 +1036,7 @@ function humanizeKey(slug) {
 function pfRow(r) {
   if (!r) return null;
   return {
-    id: r.id, keyNorm: r.key_norm, label: r.label, locale: r.locale,
+    id: r.id, profileId: r.profile_id, keyNorm: r.key_norm, label: r.label, locale: r.locale,
     value: r.value || '', fieldType: r.field_type || '',
     sourceJobId: r.source_job_id || null, source: r.source || '',
     confidence: r.confidence, locked: !!r.locked, seenCount: r.seen_count,
@@ -987,14 +1044,15 @@ function pfRow(r) {
   };
 }
 
-function profileFieldUpsert({ question, value, locale, fieldType, sourceJobId, source, confidence, fromUser }) {
+function profileFieldUpsert({ profileId, question, value, locale, fieldType, sourceJobId, source, confidence, fromUser }) {
   const label = String(question || '').trim();
   const keyNorm = normalizeQuestion(label);
   const val = value == null ? '' : String(value).trim().slice(0, 2000);
   if (!keyNorm || !val) return null;
+  if (!profileId) { log.warn('profileFieldUpsert: missing profileId — answer not saved:', label); return null; }
   const ts = now();
   const loc = locale || guessLocale(label) || 'en';
-  const cur = get('SELECT * FROM profile_fields WHERE key_norm = ?', [keyNorm]);
+  const cur = get('SELECT * FROM profile_fields WHERE profile_id = ? AND key_norm = ?', [profileId, keyNorm]);
   const suppressed = cur && cur.locked && !fromUser;   // user-locked row, auto harvest
   if (cur) {
     if (suppressed) {
@@ -1009,19 +1067,20 @@ function profileFieldUpsert({ question, value, locale, fieldType, sourceJobId, s
     }
   } else {
     run(`INSERT INTO profile_fields
-         (id, key_norm, label, locale, value, field_type, source_job_id, source, confidence, locked, seen_count, updated_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
-        [uid('pf'), keyNorm, label || keyNorm, loc, val, fieldType || null, sourceJobId || null,
+         (id, profile_id, key_norm, label, locale, value, field_type, source_job_id, source, confidence, locked, seen_count, updated_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+        [uid('pf'), profileId, keyNorm, label || keyNorm, loc, val, fieldType || null, sourceJobId || null,
          source || null, confidence != null ? confidence : 0.5, fromUser ? 1 : 0, ts, ts]);
   }
-  // Keep the auto-apply executor's free-text memory in sync, except when a
-  // locked row suppressed the write.
-  if (!suppressed) { try { qaRecord({ question: label, answer: val, source }); } catch {} }
-  return pfRow(get('SELECT * FROM profile_fields WHERE key_norm = ?', [keyNorm]));
+  // Keep this profile's executor free-text memory in sync, except when a locked
+  // row suppressed the write.
+  if (!suppressed) { try { qaRecord({ profileId, question: label, answer: val, source }); } catch {} }
+  return pfRow(get('SELECT * FROM profile_fields WHERE profile_id = ? AND key_norm = ?', [profileId, keyNorm]));
 }
 
-function profileFieldList() {
-  return all('SELECT * FROM profile_fields ORDER BY locked DESC, seen_count DESC, updated_at DESC').map(pfRow);
+function profileFieldList(profileId) {
+  if (!profileId) return [];
+  return all('SELECT * FROM profile_fields WHERE profile_id = ? ORDER BY locked DESC, seen_count DESC, updated_at DESC', [profileId]).map(pfRow);
 }
 function profileFieldSet(id, { value, locked, label }) {
   const cur = get('SELECT * FROM profile_fields WHERE id = ?', [id]);
@@ -1031,20 +1090,20 @@ function profileFieldSet(id, { value, locked, label }) {
        label !== undefined ? String(label).slice(0, 300) : cur.label,
        locked !== undefined ? (locked ? 1 : 0) : cur.locked, now(), id]);
   const row = pfRow(get('SELECT * FROM profile_fields WHERE id = ?', [id]));
-  if (row && row.value) { try { qaRecord({ question: row.label, answer: row.value }); } catch {} }
+  if (row && row.value) { try { qaRecord({ profileId: cur.profile_id, question: row.label, answer: row.value }); } catch {} }
   return row;
 }
 function profileFieldDelete(id) { return (run('DELETE FROM profile_fields WHERE id = ?', [id])?.changes ?? 0) > 0; }
 
-function profileFieldLookup(question) {
+function profileFieldLookup(profileId, question) {
   const qn = normalizeQuestion(question);
-  if (!qn) return null;
-  const exact = get('SELECT * FROM profile_fields WHERE key_norm = ?', [qn]);
+  if (!qn || !profileId) return null;
+  const exact = get('SELECT * FROM profile_fields WHERE profile_id = ? AND key_norm = ?', [profileId, qn]);
   if (exact) return { ...pfRow(exact), match: 'exact', score: 1 };
   const want = new Set(qn.split(' ').filter(Boolean));
   if (!want.size) return null;
   let best = null;
-  for (const r of all('SELECT * FROM profile_fields')) {
+  for (const r of all('SELECT * FROM profile_fields WHERE profile_id = ?', [profileId])) {
     const have = new Set(String(r.key_norm).split(' ').filter(Boolean));
     let hit = 0; for (const t of want) if (have.has(t)) hit++;
     const coverage = hit / want.size;
@@ -1085,47 +1144,59 @@ const LEARNED_TO_PROFILE = [
   [/graduation/, 'graduationYear'],
   [/citizen/, 'citizenship'],
 ];
-function deriveProfileFromLearned() {
-  const data = {};
-  for (const f of profileFieldList()) {
+// Bridge (memory → profile): derive structured profile values from a profile's
+// OWN learned memory. Highest-confidence learned value wins per mapped key.
+function memoryToProfileData(profileId) {
+  const out = {}; const best = {};
+  for (const f of profileFieldList(profileId)) {
     if (!f.value) continue;
     const hay = (f.label || f.keyNorm || '').toLowerCase();
     for (const [rx, key] of LEARNED_TO_PROFILE) {
-      if (!data[key] && rx.test(hay)) { data[key] = f.value; break; }
+      if (rx.test(hay)) {
+        if (best[key] === undefined || f.confidence > best[key]) { out[key] = f.value; best[key] = f.confidence; }
+        break;
+      }
     }
   }
+  return out;
+}
+function deriveProfileFromLearned(profileId) {
+  const data = memoryToProfileData(profileId);
   return Object.keys(data).length ? { id: 'derived', name: 'From learned answers', data } : null;
 }
 
-// Everything the extension needs to pre-fill a new application: harvested
-// fields with values + the source-matched structured profile.
+// Everything the extension needs to pre-fill a new application: the source-matched
+// profile + THAT profile's harvested memory fields.
 function profileAutofillBundle(source) {
-  const fields = profileFieldList().filter((f) => f.value);
   const profile = profileForSource(source);
-  return { fields, profile: profile ? { id: profile.id, name: profile.name, data: profile.data } : null };
+  const fields = profile ? profileFieldList(profile.id).filter((f) => f.value) : [];
+  return { profileId: profile ? profile.id : null, fields, profile: profile ? { id: profile.id, name: profile.name, data: profile.data } : null };
 }
 
-// Fan a job's captured answers into the profile store (called from upsertJob).
-function harvestAnswersToProfile(answers, { jobId, source } = {}) {
+// Fan a job's captured answers into a profile's memory (called from upsertJob).
+// The owning profile = the source-matched profile (else the default).
+function harvestAnswersToProfile(answers, { profileId, jobId, source } = {}) {
   if (!answers || typeof answers !== 'object') return 0;
   let enabled = true;
   try { enabled = getSettings().harvest.enabled !== false; } catch {}
   if (!enabled) return 0;
+  const pid = profileId || resolveProfileId(source);
   let n = 0;
   for (const [key, raw] of Object.entries(answers)) {
     const value = Array.isArray(raw) ? raw.join(', ') : raw;
     if (value == null || String(value).trim() === '') continue;
     try {
-      if (profileFieldUpsert({ question: humanizeKey(key), value, sourceJobId: jobId, source, confidence: 0.6 })) n++;
+      if (profileFieldUpsert({ profileId: pid, question: humanizeKey(key), value, sourceJobId: jobId, source, confidence: 0.6 })) n++;
     } catch {}
   }
   return n;
 }
 
-// One-shot backfill: harvest answers from EVERY past application into the
-// profile store. Oldest first so the newest answer to a repeated question wins.
+// One-shot backfill: harvest answers from EVERY past application into the GIVEN
+// profile's memory. Oldest first so the newest answer to a repeated question wins.
 // Bypasses the harvest setting — this is an explicit user action.
-function backfillProfileFromJobs() {
+function backfillProfileFromJobs(profileId) {
+  const pid = profileId || ensureDefaultProfileId();
   let fields = 0, jobs = 0;
   const allJobs = listJobs({});
   allJobs.sort((a, b) => new Date(a.updatedAt || 0) - new Date(b.updatedAt || 0));
@@ -1136,7 +1207,7 @@ function backfillProfileFromJobs() {
     for (const [key, raw] of Object.entries(ans)) {
       const value = Array.isArray(raw) ? raw.join(', ') : raw;
       if (value == null || String(value).trim() === '') continue;
-      try { if (profileFieldUpsert({ question: humanizeKey(key), value, sourceJobId: j.id, source: j.source, confidence: 0.6 })) got++; } catch {}
+      try { if (profileFieldUpsert({ profileId: pid, question: humanizeKey(key), value, sourceJobId: j.id, source: j.source, confidence: 0.6 })) got++; } catch {}
     }
     if (got) { fields += got; jobs++; }
   }
@@ -1183,6 +1254,51 @@ function profileForSource(source) {
   return allP.find((p) => (p.sourceAssignments || []).some((s) => norm.includes(String(s).toLowerCase())))
       || allP.find((p) => p.isDefault)
       || allP[0];
+}
+
+// There must always be a home profile for memory; create a default one if the
+// user has none (e.g. deleted them all).
+function ensureDefaultProfileId() {
+  const cur = get('SELECT id FROM profiles WHERE is_default = 1 LIMIT 1')?.id || get('SELECT id FROM profiles LIMIT 1')?.id;
+  if (cur) return cur;
+  const nid = uid('prof');
+  run("INSERT INTO profiles (id, name, is_default, source_assignments, data, updated_at) VALUES (?, 'Main', 1, '[]', '{}', ?)", [nid, now()]);
+  return nid;
+}
+// Which profile a job's memory belongs to: the source-matched profile, else the default.
+function resolveProfileId(source) {
+  const p = profileForSource(source);
+  return (p && p.id && p.id !== 'derived') ? p.id : ensureDefaultProfileId();
+}
+
+// Canonical labels for the structured profile keys (used when pushing the
+// structured profile down into memory as learned answers).
+const PROFILE_KEY_LABELS = {
+  firstName: 'First name', lastName: 'Last name', fullName: 'Full name', preferredName: 'Preferred name',
+  email: 'Email', phone: 'Phone', address1: 'Address', address2: 'Address line 2', city: 'City',
+  state: 'State / Province', postalCode: 'Postal / ZIP code', country: 'Country',
+  linkedinUrl: 'LinkedIn URL', githubUrl: 'GitHub URL', portfolioUrl: 'Portfolio / website',
+  workAuthorization: 'Work authorization', sponsorshipRequired: 'Sponsorship required',
+  salaryExpectation: 'Salary expectation', yearsExperience: 'Years of experience',
+  noticePeriod: 'Notice period / availability', highestDegree: 'Highest degree',
+  university: 'University / college', major: 'Major / field of study', graduationYear: 'Graduation year',
+  citizenship: 'Citizenship', headline: 'Headline', summary: 'Summary', securityClearance: 'Security clearance',
+};
+
+// Bridge (profile → memory): push a profile's structured fields down into its OWN
+// memory as locked, high-confidence learned answers, so auto-apply + the answer
+// ladder know them. Skips empty/non-scalar + skills/summary/internal keys.
+function pushProfileDataToMemory(profileId, data) {
+  if (!profileId || !data || typeof data !== 'object') return { pushed: 0 };
+  let pushed = 0;
+  for (const [key, raw] of Object.entries(data)) {
+    if (key === 'skills' || key === 'summary' || String(key).startsWith('_')) continue;
+    const value = Array.isArray(raw) ? raw.join(', ') : raw;
+    if (value == null || String(value).trim() === '') continue;
+    const label = PROFILE_KEY_LABELS[key] || humanizeKey(key);
+    try { if (profileFieldUpsert({ profileId, question: label, value, fromUser: true, confidence: 1, source: 'profile' })) pushed++; } catch {}
+  }
+  return { pushed };
 }
 
 // ============================================================
@@ -1464,12 +1580,13 @@ function queueParkedQuestions() {
   const out = [];
   const seen = new Set();
   for (const t of all("SELECT * FROM auto_apply_tasks WHERE state = 'parked'").map(rowToTask)) {
+    const pid = resolveProfileId(getJob(t.jobId)?.source);   // check against THIS job's profile memory
     for (const q of t.pendingQuestions || []) {
       if (!q || !q.question) continue;
       const key = normalizeQuestion(q.question);
       if (!key || seen.has(key)) continue;
-      // already learned it? then it's not outstanding.
-      if (profileFieldLookup(q.question) || qaLookup(q.question)) continue;
+      // already learned it (for this job's profile)? then it's not outstanding.
+      if (profileFieldLookup(pid, q.question) || qaLookup(pid, q.question)) continue;
       seen.add(key);
       out.push({ question: q.question, fieldType: q.fieldType || 'text', options: q.options || null, reason: q.reason || 'missing answer', taskId: t.id, jobId: t.jobId });
     }
@@ -1477,19 +1594,38 @@ function queueParkedQuestions() {
   return out;
 }
 
-// Re-check every parked task; if the KB now answers ALL its pending questions,
-// flip it back to 'queued' so the next paced tick retries it. Returns count.
+// Re-check every parked task; if its profile's memory now answers ALL its pending
+// questions, flip it back to 'queued' so the next paced tick retries it.
 function queueRetryParked() {
   let requeued = 0;
   for (const t of all("SELECT * FROM auto_apply_tasks WHERE state = 'parked'").map(rowToTask)) {
+    const pid = resolveProfileId(getJob(t.jobId)?.source);
     const pend = t.pendingQuestions || [];
-    const stillMissing = pend.filter((q) => q && q.question && !profileFieldLookup(q.question) && !qaLookup(q.question));
+    const stillMissing = pend.filter((q) => q && q.question && !profileFieldLookup(pid, q.question) && !qaLookup(pid, q.question));
     if (pend.length && stillMissing.length === 0) {
       run("UPDATE auto_apply_tasks SET state = 'queued', park_reason = NULL, pending_questions = NULL, updated_at = ? WHERE id = ?", [now(), t.id]);
       requeued++;
     }
   }
   return requeued;
+}
+
+// Intake: the user answered a parked question. Save it into the memory of EVERY
+// profile that has a parked task asking it (so each of those tasks can retry),
+// or the default profile if none match.
+function saveIntakeAnswer({ question, value, fieldType }) {
+  if (!question || value == null || String(value).trim() === '') return 0;
+  const key = normalizeQuestion(question);
+  const pids = new Set();
+  for (const t of all("SELECT * FROM auto_apply_tasks WHERE state = 'parked'").map(rowToTask)) {
+    if ((t.pendingQuestions || []).some((q) => q && q.question && normalizeQuestion(q.question) === key)) {
+      pids.add(resolveProfileId(getJob(t.jobId)?.source));
+    }
+  }
+  if (!pids.size) pids.add(ensureDefaultProfileId());
+  let n = 0;
+  for (const pid of pids) { try { if (profileFieldUpsert({ profileId: pid, question, value, fieldType, fromUser: true, confidence: 1 })) n++; } catch {} }
+  return n > 0 ? 1 : 0;
 }
 
 function queueDelete(id) {
@@ -1538,7 +1674,7 @@ function exportAll() {
     jobs: listJobs(),
     events: all('SELECT * FROM events').map(rowToEvent),
     settings: getSettings(),
-    qa: qaList(100000),
+    qa: all('SELECT * FROM qa').map((r) => ({ profileId: r.profile_id, question: r.question, answer: r.answer })),
     profiles: listProfiles(),
     documents: listDocuments(),
     queue: queueList(),
@@ -1547,13 +1683,14 @@ function exportAll() {
 
 function importAll(payload) {
   let jobs = 0, events = 0, qa = 0;
+  const importPid = ensureDefaultProfileId();   // imported free-text answers land in the default profile's memory
   transaction(() => {
     for (const j of payload.jobs || []) { upsertJob(j); jobs++; }
     for (const e of payload.events || []) {
       if (e.jobId && getJob(e.jobId)) { recordEvent(e); events++; }
     }
     for (const q of payload.qa || []) {
-      if (q.question && q.answer) { qaRecord({ question: q.question, answer: q.answer }); qa++; }
+      if (q.question && q.answer) { qaRecord({ profileId: q.profileId || importPid, question: q.question, answer: q.answer }); qa++; }
     }
   });
   return { jobs, events, qa };
@@ -1697,11 +1834,12 @@ module.exports = {
   qaRecord, qaLookup, qaList, qaDelete, normalizeQuestion, guessLocale,
   profileFieldUpsert, profileFieldList, profileFieldSet, profileFieldDelete,
   profileFieldLookup, profileAutofillBundle, harvestAnswersToProfile, backfillProfileFromJobs, deriveProfileFromLearned,
+  memoryToProfileData, pushProfileDataToMemory, ensureDefaultProfileId, resolveProfileId,
   listProfiles, saveProfile, deleteProfile, profileForSource,
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,
   extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
-  queueList, queueHistory, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueRetryParked,
+  queueList, queueHistory, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueRetryParked, saveIntakeAnswer,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,
   emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching,

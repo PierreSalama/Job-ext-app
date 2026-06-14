@@ -189,10 +189,14 @@ async function queueNext(force = false) {
   // Honour the explicit picks from the Auto-apply page; fall back to the
   // source-matched profile, then to one DERIVED from learned answers (so it
   // works even with no saved profile), then the active résumé.
-  const profile = (s.profileId && db.listProfiles().find((p) => p.id === s.profileId))
-    || db.profileForSource(job.source) || db.deriveProfileFromLearned();
+  let profile = (s.profileId && db.listProfiles().find((p) => p.id === s.profileId))
+    || db.profileForSource(job.source);
+  // The REAL profile whose memory this job reads/writes (resolveProfileId never
+  // returns 'derived'); the executor scopes its qa lookups + answer-recording to it.
+  const profileId = (profile && profile.id && profile.id !== 'derived') ? profile.id : db.resolveProfileId(job.source);
+  if (!profile) profile = db.deriveProfileFromLearned(profileId);
   const resume = (s.resumeDocId && db.getDocument(s.resumeDocId, { withText: true })) || db.defaultDocument('resume');
-  const harvested = db.profileFieldList().filter((f) => f.value);
+  const harvested = db.profileFieldList(profileId).filter((f) => f.value);
   const siteCfg = s.sites?.[String(job.source || '').toLowerCase()] || {};
   const mode = siteCfg.mode || task.mode || s.mode;
 
@@ -208,6 +212,7 @@ async function queueNext(force = false) {
     context: {
       job,
       profile: profile || null,
+      profileId,
       harvested,
       resume: resume ? {
         id: resume.id, name: resume.name, mime: resume.mime,
@@ -545,16 +550,17 @@ async function handle(req, res, parsed) {
 
   // ---- qa ----
   if (req.method === 'GET' && pathname === '/qa') {
-    return sendJson(res, 200, { ok: true, items: db.qaList(Number(parsed.searchParams.get('limit')) || 500) });
+    const pid = parsed.searchParams.get('profileId') || db.ensureDefaultProfileId();
+    return sendJson(res, 200, { ok: true, items: db.qaList(pid, Number(parsed.searchParams.get('limit')) || 500) });
   }
   if (req.method === 'POST' && pathname === '/qa') {
     const body = await readJson(req);
     if (!body.question || body.answer == null) return sendJson(res, 400, { ok: false, error: 'question + answer required' });
-    return sendJson(res, 200, { ok: true, item: db.qaRecord(body) });
+    return sendJson(res, 200, { ok: true, item: db.qaRecord({ ...body, profileId: body.profileId || db.resolveProfileId(body.source) }) });
   }
   if (req.method === 'POST' && pathname === '/qa/lookup') {
     const body = await readJson(req);
-    return sendJson(res, 200, { ok: true, match: db.qaLookup(body.question || '') });
+    return sendJson(res, 200, { ok: true, match: db.qaLookup(body.profileId || db.resolveProfileId(body.source), body.question || '') });
   }
   if (req.method === 'DELETE' && (jm = m(/^\/qa\/([^/]+)$/))) {
     return sendJson(res, db.qaDelete(jm[1]) ? 200 : 404, { ok: true });
@@ -577,13 +583,14 @@ async function handle(req, res, parsed) {
 
   // ---- profile fields (dynamic, auto-harvested) ----
   if (req.method === 'GET' && pathname === '/profile-fields') {
-    return sendJson(res, 200, { ok: true, items: db.profileFieldList() });
+    const pid = parsed.searchParams.get('profileId') || db.ensureDefaultProfileId();
+    return sendJson(res, 200, { ok: true, items: db.profileFieldList(pid) });
   }
   if (req.method === 'POST' && pathname === '/profile-fields') {
     const body = await readJson(req);
     if (!body.question) return sendJson(res, 400, { ok: false, error: 'question required' });
     // A manual add/edit from the dashboard is authoritative → high confidence + locked.
-    const item = db.profileFieldUpsert({ ...body, confidence: 1, fromUser: true });
+    const item = db.profileFieldUpsert({ ...body, profileId: body.profileId || db.ensureDefaultProfileId(), confidence: 1, fromUser: true });
     broadcast('profileFields.updated', {});
     return sendJson(res, 200, { ok: true, item });
   }
@@ -599,9 +606,22 @@ async function handle(req, res, parsed) {
     broadcast('profileFields.updated', {});
     return sendJson(res, okDel ? 200 : 404, { ok: okDel });
   }
-  // Build the profile store from EVERY past application's answers.
+  // Build a profile's memory from EVERY past application's answers.
   if (req.method === 'POST' && pathname === '/profile-fields/backfill') {
-    const r = db.backfillProfileFromJobs();
+    const body = await readJson(req);
+    const r = db.backfillProfileFromJobs(body.profileId || db.ensureDefaultProfileId());
+    broadcast('profileFields.updated', {});
+    return sendJson(res, 200, { ok: true, ...r });
+  }
+  // Bridge (memory → profile): structured values derived from a profile's own memory.
+  if (req.method === 'GET' && pathname === '/profile/from-memory') {
+    const pid = parsed.searchParams.get('profileId') || db.ensureDefaultProfileId();
+    return sendJson(res, 200, { ok: true, data: db.memoryToProfileData(pid) });
+  }
+  // Bridge (profile → memory): push a profile's structured fields into its memory.
+  if (req.method === 'POST' && pathname === '/profile/to-memory') {
+    const body = await readJson(req);
+    const r = db.pushProfileDataToMemory(body.profileId || db.ensureDefaultProfileId(), body.data || {});
     broadcast('profileFields.updated', {});
     return sendJson(res, 200, { ok: true, ...r });
   }
@@ -787,8 +807,7 @@ async function handle(req, res, parsed) {
     const answers = Array.isArray(body.answers) ? body.answers : [];
     let saved = 0;
     for (const a of answers) {
-      if (!a || !a.question || a.value == null || String(a.value).trim() === '') continue;
-      if (db.profileFieldUpsert({ question: a.question, value: a.value, fieldType: a.fieldType, fromUser: true, confidence: 1 })) saved++;
+      if (db.saveIntakeAnswer(a)) saved++;   // routes to the memory of each profile that parked it
     }
     const requeued = db.queueRetryParked();
     broadcast('profileFields.updated', {});
@@ -894,7 +913,7 @@ async function handle(req, res, parsed) {
     const job = body.jobId ? db.getJob(body.jobId) : (body.job || {});
     const profile = db.profileForSource(job?.source);
     const resume = db.defaultDocument('resume');
-    const qaHistory = db.qaList(12);
+    const qaHistory = db.qaList(body.profileId || db.resolveProfileId(job?.source), 12);
     const r = await provider.run(prompts.answerQuestion({
       question: body.question, fieldType: body.fieldType, options: body.options,
       job, profile, qaHistory, resumeText: resume?.textContent || '',

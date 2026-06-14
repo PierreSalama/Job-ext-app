@@ -327,7 +327,7 @@ export async function run(task, context, helpers) {
   S.running = true; S.cancelled = false; S.paused = false; S.step = 0;
   S.task = task; S.context = context;
 
-  const { job, profile, resume, harvested, aiConfidenceMin = 0.7 } = context || {};
+  const { job, profile, profileId, resume, harvested, aiConfidenceMin = 0.7 } = context || {};
   const mode = task.mode || 'review';
   showOverlay(`${mode === 'review' ? 'Filling for your review' : 'Applying'} — ${job?.title || ''}`);
 
@@ -354,10 +354,10 @@ export async function run(task, context, helpers) {
   const engine = new AutofillEngine({
     getProfile: async () => profileData,
     lookupAnswer: async (label) => {
-      const r = await send({ type: 'api-call', method: 'POST', path: '/qa/lookup', body: { question: label } });
+      const r = await send({ type: 'api-call', method: 'POST', path: '/qa/lookup', body: { question: label, profileId } });
       return (r?.ok && r.match && typeof r.match.answer === 'string') ? { answer: r.match.answer } : null;
     },
-    recordAnswer: async (item) => send({ type: 'qa-record', data: { ...item, source: job?.source } }),
+    recordAnswer: async (item) => send({ type: 'qa-record', data: { ...item, source: job?.source, profileId } }),
   });
 
   let finished = false;
@@ -450,7 +450,7 @@ export async function run(task, context, helpers) {
       const r = await send({
         type: 'api-call', method: 'POST', path: '/ai/answer-question',
         timeoutMs: 150000,
-        body: { question: u.label, fieldType: u.fieldType, options: u.options, jobId: job?.id },
+        body: { question: u.label, fieldType: u.fieldType, options: u.options, jobId: job?.id, profileId },
       });
       // Validate the response shape — a malformed result (missing confidence,
       // non-string answer) must NEVER be treated as a confident answer.

@@ -26,13 +26,14 @@ test('migration v4 + park → intake → retry self-heals', () => {
   ] });
   assert.equal(db.queueParkedQuestions().length, 2, 'both questions outstanding');
 
-  // Answer ONE → still parked (one missing)
-  db.profileFieldUpsert({ question: 'How many years of Kubernetes?', value: '3', fromUser: true, confidence: 1 });
+  // Answer ONE → still parked (one missing). Use the real intake path (saveIntakeAnswer
+  // routes the answer into the memory of each profile whose parked task asked it).
+  db.saveIntakeAnswer({ question: 'How many years of Kubernetes?', value: '3' });
   assert.equal(db.queueRetryParked(), 0, 'not requeued while a question is still missing');
   assert.equal(db.queueParkedQuestions().length, 1);
 
   // Answer BOTH → requeued
-  db.profileFieldUpsert({ question: 'Are you willing to relocate?', value: 'Yes', fromUser: true, confidence: 1 });
+  db.saveIntakeAnswer({ question: 'Are you willing to relocate?', value: 'Yes' });
   assert.equal(db.queueRetryParked(), 1, 'requeued once all answered');
   assert.equal(db.queueList({ state: 'queued' }).length, 1);
   assert.equal(db.queueParkedQuestions().length, 0, 'no outstanding questions');
