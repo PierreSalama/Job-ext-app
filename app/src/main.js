@@ -85,6 +85,16 @@ function createWindow() {
     },
   });
   mainWindow.removeMenu();
+  // Any link/button that opens an external URL → the user's DEFAULT browser, never
+  // an in-app Electron window and never a navigation away from the dashboard. This
+  // catches window.open, target="_blank", and plain <a href="http…"> clicks alike.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  mainWindow.webContents.on('will-navigate', (e, url) => {
+    if (/^https?:\/\//i.test(url)) { e.preventDefault(); shell.openExternal(url); }   // hash routing is in-page; only real off-app nav hits this
+  });
   mainWindow.loadFile(path.join(__dirname, 'app', 'app.html'));
   mainWindow.once('ready-to-show', () => mainWindow.show());
 
