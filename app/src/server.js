@@ -31,6 +31,7 @@ const HOST_RX = /^(localhost|127\.0\.0\.1)(:\d+)?$/i;
 
 let server = null;
 let sseClients = new Set();
+let pairAttempts = new Map();   // origin → { count, firstAt } for the /pair rate-limit
 let opts = {};   // { getVersion, userDataDir, confirmPair(info)→Promise<bool>, notify(type,payload) }
 
 // ---------- token ----------
@@ -88,6 +89,34 @@ function broadcast(type, data) {
   for (const res of sseClients) {
     try { res.write(payload); } catch { sseClients.delete(res); }
   }
+}
+
+// A pairing request must come from a browser extension, the desktop renderer, or
+// localhost — never a remote web page (blocks the CSRF-from-evil.com vector). An empty
+// Origin (some non-browser clients / file:// renderer) is allowed; the user still has to
+// confirm the in-app prompt.
+function pairOriginAllowed(origin) {
+  if (!origin) return true;
+  return /^(chrome-extension|moz-extension|chrome|edge|file):\/\//i.test(origin)
+    || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
+}
+
+// Secrets never leave the process. db.getSettings() returns DECRYPTED values for internal
+// use; these blank them for any client-facing response (GET /settings, GET /export).
+function stripSettingSecrets(s) {
+  if (s && s.ai && s.ai.claude) s.ai.claude.apiKey = '';
+  if (s && s.ai && s.ai.chatgpt) s.ai.chatgpt.apiKey = '';
+  if (s && s.gmail) s.gmail.clientSecret = '';
+  return s;
+}
+function publicSettings() {
+  const s = JSON.parse(JSON.stringify(db.getSettings()));
+  const secretsPresent = {
+    claudeKey: !!(s.ai && s.ai.claude && s.ai.claude.apiKey),
+    chatgptKey: !!(s.ai && s.ai.chatgpt && s.ai.chatgpt.apiKey),
+    gmailSecret: !!(s.gmail && s.gmail.clientSecret),
+  };
+  return { settings: stripSettingSecrets(s), secretsPresent };
 }
 
 // ---------- auto-apply pacing ----------
@@ -366,8 +395,17 @@ async function handle(req, res, parsed) {
     });
   }
   if (req.method === 'POST' && pathname === '/pair') {
+    const origin = req.headers.origin || '';
+    if (!pairOriginAllowed(origin)) { log.warn('rejected /pair from origin', origin); return sendJson(res, 403, { ok: false, error: 'origin not allowed' }); }
+    // per-origin rate-limit: max 5 attempts / 5 min, so a page can't spam consent prompts.
+    const now = Date.now();
+    for (const [k, v] of pairAttempts) if (now - v.firstAt > 5 * 60000) pairAttempts.delete(k);   // bound the map
+    const a = pairAttempts.get(origin) || { count: 0, firstAt: now };
+    if (now - a.firstAt > 5 * 60000) { a.count = 0; a.firstAt = now; }
+    a.count++; pairAttempts.set(origin, a);
+    if (a.count > 5) return sendJson(res, 429, { ok: false, error: 'too many pairing attempts — wait a few minutes' });
     const body = await readJson(req);
-    const info = { client: String(body.client || 'unknown').slice(0, 60), origin: req.headers.origin || '' };
+    const info = { client: String(body.client || 'unknown').slice(0, 60), origin };
     const allowed = await opts.confirmPair(info);
     if (!allowed) return sendJson(res, 403, { ok: false, error: 'pairing rejected' });
     log.info('paired client', info);
@@ -488,7 +526,8 @@ async function handle(req, res, parsed) {
 
   // ---- settings ----
   if (req.method === 'GET' && pathname === '/settings') {
-    return sendJson(res, 200, { ok: true, settings: db.getSettings() });
+    const { settings, secretsPresent } = publicSettings();
+    return sendJson(res, 200, { ok: true, settings, secretsPresent });
   }
   if (req.method === 'PATCH' && pathname === '/settings') {
     const body = await readJson(req);
@@ -498,9 +537,10 @@ async function handle(req, res, parsed) {
       if (body.autoApply.enabled && !wasOn) body.autoApply.startedAt = new Date().toISOString();
       else if (!body.autoApply.enabled) body.autoApply.startedAt = '';
     }
-    const settings = db.patchSettings(body);
+    db.patchSettings(body);
     broadcast('settings.updated', {});
-    return sendJson(res, 200, { ok: true, settings });
+    const { settings, secretsPresent } = publicSettings();   // never echo decrypted secrets back in the PATCH response
+    return sendJson(res, 200, { ok: true, settings, secretsPresent });
   }
 
   // ---- qa ----
@@ -961,7 +1001,18 @@ async function handle(req, res, parsed) {
 
   // ---- data ----
   if (req.method === 'GET' && pathname === '/export') {
-    return sendJson(res, 200, { ok: true, data: db.exportAll() });
+    const data = db.exportAll();
+    if (data.settings) stripSettingSecrets(data.settings);   // never export API keys / OAuth secret
+    return sendJson(res, 200, { ok: true, data });
+  }
+  if (req.method === 'POST' && pathname === '/wipe') {
+    const body = await readJson(req);
+    if (body.confirm !== true) return sendJson(res, 400, { ok: false, error: 'confirm:true required' });
+    const r = db.wipeAllData();
+    broadcast('jobs.updated', { action: 'wipe' });
+    broadcast('emails.updated', {});
+    broadcast('settings.updated', {});
+    return sendJson(res, 200, { ok: true, ...r });
   }
   if (req.method === 'POST' && pathname === '/import') {
     const body = await readJson(req);

@@ -88,6 +88,10 @@ function profileFieldFor(label, profile) {
   return null;
 }
 
+// EEO / demographic / criminal-history fields are NEVER auto-filled, escalated to AI,
+// or harvested — regardless of settings (legal/ethical). Mirrors executor.js.
+export const NEVER_AUTOFILL_RX = /(ethnic|race|gender|disabilit|veteran|criminal|background.?check|felony|conviction|pronoun|sexual.?orientation|\blgbtq?)/i;
+
 export function isFillable(input) {
   if (!input) return false;
   if (input.disabled || input.readOnly) return false;
@@ -95,6 +99,7 @@ export function isFillable(input) {
   if (!isProbablyVisible(input)) return false;
   const id = (input.id || '') + ' ' + (input.name || '') + ' ' + (input.placeholder || '');
   if (/captcha|recaptcha|cardnumber|cvv|cvc|password/i.test(id)) return false;
+  if (NEVER_AUTOFILL_RX.test(id)) return false;
   if (input.type === 'password') return false;
   return true;
 }
@@ -152,6 +157,7 @@ export class AutofillEngine {
       if ((input.type === 'checkbox' || input.type === 'radio') && input.checked) continue;
       const label = fieldLabel(input);
       if (!label) continue;
+      if (NEVER_AUTOFILL_RX.test(label)) continue;
       const pm = profileFieldFor(label, profile || {});
       if (pm) { out.push({ input, label, source: 'profile', field: pm.field, value: pm.value }); continue; }
       const qa = await this.lookupAnswer(label);
@@ -184,6 +190,7 @@ export class AutofillEngine {
       }
       const label = fieldLabel(input);
       if (!label || label.length < 4) continue;
+      if (NEVER_AUTOFILL_RX.test(label)) continue;
       // Skip generic site-search / typeahead inputs (e.g. LinkedIn's global
       // "Search" box). They're never a real application question, can't be
       // answered truthfully, and would falsely park the whole job at submit.
@@ -235,6 +242,7 @@ export class AutofillEngine {
       if (!isFillable(input)) continue;
       const label = fieldLabel(input);
       if (!label || label.length < 3) continue;
+      if (NEVER_AUTOFILL_RX.test(label)) continue;
       let value = '';
       if (input.tagName === 'SELECT') {
         const opt = input.options[input.selectedIndex];

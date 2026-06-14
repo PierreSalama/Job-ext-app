@@ -230,6 +230,7 @@ async function getSettings(force = false) {
   if (!force && state.settings) return state.settings;
   const r = await api('/settings');
   state.settings = r.settings || {};
+  state.secretsPresent = r.secretsPresent || {};   // which secrets are saved (keys are redacted out of the response)
   return state.settings;
 }
 
@@ -2715,7 +2716,7 @@ route('/settings', async () => {
 
       <div class="ai-prov">
         <div class="ai-prov-head">Claude (Anthropic) ${aiDot(aiSt?.claude)}</div>
-        ${row('API key', `<input class="input" id="ai-claude-key" type="password" placeholder="sk-ant-…" value="${esc(claude.apiKey || '')}" />`, 'from console.anthropic.com — Claude can only run via an API key (subscriptions are blocked outside Claude Code)')}
+        ${row('API key', `<input class="input" id="ai-claude-key" type="password" placeholder="${state.secretsPresent && state.secretsPresent.claudeKey ? 'saved — leave blank to keep current' : 'sk-ant-…'}" value="${esc(claude.apiKey || '')}" />`, 'from console.anthropic.com — Claude can only run via an API key (subscriptions are blocked outside Claude Code)')}
         ${row('Model', `<input class="input" id="ai-claude-model" value="${esc(claude.model || 'claude-sonnet-4-6')}" />`)}
         <div class="section-body"><button class="btn small" data-test="claude">Test Claude</button></div>
       </div>
@@ -2725,7 +2726,7 @@ route('/settings', async () => {
         ${row('Use my ChatGPT subscription', toggle('ai-cg-sub', chatgpt.useSubscription !== false), 'via the official Codex CLI (personal use)')}
         <div class="form-row"><div class="form-label">Subscription</div><div class="form-control">${aiDot(aiSt?.chatgpt?.subscription)}
           <button class="btn small" data-connect-codex>Connect / sign in</button> <button class="btn small" data-recheck>Re-check</button></div></div>
-        ${row('OpenAI API key', `<input class="input" id="ai-oai-key" type="password" placeholder="sk-…" value="${esc(chatgpt.apiKey || '')}" />`, 'alternative to the subscription')}
+        ${row('OpenAI API key', `<input class="input" id="ai-oai-key" type="password" placeholder="${state.secretsPresent && state.secretsPresent.chatgptKey ? 'saved — leave blank to keep current' : 'sk-…'}" value="${esc(chatgpt.apiKey || '')}" />`, 'alternative to the subscription')}
         ${row('Model', `<input class="input" id="ai-cg-model" value="${esc(chatgpt.model || 'gpt-5.4')}" />`)}
         <div class="section-body"><button class="btn small" data-test="chatgpt">Test ChatGPT</button></div>
       </div>
@@ -2808,7 +2809,7 @@ route('/settings', async () => {
       ${row('Search query', `<input class="input" id="gm-query" value="${esc(s.gmail.query)}" />`, 'Gmail search syntax')}
       ${row('Interval (minutes)', `<input class="input" id="gm-interval" type="number" min="5" value="${esc(s.gmail.intervalMinutes)}" />`)}
       ${row('OAuth Client ID', `<input class="input" id="gm-cid" value="${esc(s.gmail.clientId)}" />`, 'Google Cloud Console → OAuth desktop app')}
-      ${row('OAuth Client Secret', `<input class="input" id="gm-secret" type="password" value="${esc(s.gmail.clientSecret)}" />`)}
+      ${row('OAuth Client Secret', `<input class="input" id="gm-secret" type="password" placeholder="${state.secretsPresent && state.secretsPresent.gmailSecret ? 'saved — leave blank to keep current' : ''}" value="${esc(s.gmail.clientSecret)}" />`)}
       <div class="section-footer">
         <button class="btn small" data-gmail-connect>Connect Gmail…</button>
         <button class="btn small" data-gmail-sync>Sync now</button>
@@ -2855,7 +2856,15 @@ route('/settings', async () => {
         <input type="file" id="import-file" accept=".json" hidden />
         ${state.host === 'desktop' ? '<button class="btn small" data-logs>Open logs folder</button>' : ''}
       </div>
-      <div class="section-footer muted">Daily backups rotate automatically in the app's data folder.</div>
+      <div class="section-footer muted">Daily backups rotate automatically in the app's data folder. Exports never include your API keys or OAuth secret.</div>
+    </section>
+
+    <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">Danger zone</div><h2 class="section-title">Delete all my data</h2></div></header>
+      <div class="section-body" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn small danger" data-wipe>Delete all my data…</button>
+      </div>
+      <div class="section-footer muted">Permanently removes every application, email, profile, document, and learned answer, and disconnects any linked email/Gmail accounts. Cannot be undone.</div>
     </section>
   </div>`);
 
@@ -3121,6 +3130,19 @@ route('/settings', async () => {
     } catch (e) { errToast(e); }
   });
   v.querySelector('[data-import-data]').addEventListener('click', () => v.querySelector('#import-file').click());
+  v.querySelector('[data-wipe]')?.addEventListener('click', async () => {
+    const typed = await promptModal('This permanently deletes ALL your applications, emails, profile, documents, and learned answers, and disconnects any linked email/Gmail accounts. It cannot be undone. Type DELETE to confirm.',
+      { title: 'Delete all my data', okLabel: 'Delete everything', placeholder: 'DELETE' });
+    if (typed === null) return;
+    if (String(typed).trim() !== 'DELETE') { toast('Not deleted — type DELETE exactly to confirm.', 'warn'); return; }
+    try {
+      const r = await api('/wipe', { method: 'POST', body: { confirm: true }, timeoutMs: 60000 });
+      const total = Object.values(r.deleted || {}).reduce((a, b) => a + Number(b || 0), 0);
+      state.settings = null;
+      toast(`Deleted everything (${total} records) and disconnected accounts.`, 'success');
+      navigate();
+    } catch (e) { errToast(e, 'Wipe failed'); }
+  });
   v.querySelector('#import-file').addEventListener('change', async (e) => {
     const file = e.target.files[0];
     if (!file) return;

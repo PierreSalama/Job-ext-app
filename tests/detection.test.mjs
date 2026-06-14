@@ -265,6 +265,36 @@ for (const [name, html] of NEGATIVE) {
   });
 }
 
+// ---------- uploaded-resume filename detection ----------
+// The Workday/Greenhouse "uploaded file" chip shows the real filename in its own
+// element. These can be long, multi-word names — the bug Pierre hit was an
+// 8-word filename not being detected, with instruction text not rejected.
+const WORKDAY_UPLOADED = `
+<div data-automation-id="applyFlowPage">
+  <h2>My Information</h2>
+  <div data-automation-id="resumeSection">
+    <p>Upload either a .pdf or .docx version of your resume. Please ensure you use a consistent format.</p>
+    <div data-automation-id="file-upload-item">
+      <span data-automation-id="fileName">Website Sale and Transfer Agreement - Ayhans Barbershop.pdf</span>
+      <span>Successfully Uploaded!</span>
+    </div>
+  </div>
+</div>`;
+
+test('detects a long multi-word uploaded resume filename', () => {
+  mount(WORKDAY_UPLOADED, 'https://co.wd3.myworkdayjobs.com/x/job/_R1/apply/applyManually');
+  const name = forms.findResumeFilename(document.querySelector('[data-automation-id="applyFlowPage"]'));
+  assert.equal(name, 'Website Sale and Transfer Agreement - Ayhans Barbershop.pdf');
+});
+
+test('does not mistake upload-instruction text for a filename', () => {
+  mount(`<div data-automation-id="applyFlowPage">
+    <p>Please upload a .pdf or .docx file. Maximum file size is 5 MB. Accepted file types: .pdf, .docx.</p>
+  </div>`, 'https://co.wd3.myworkdayjobs.com/x/job/_R1/apply/applyManually');
+  const name = forms.findResumeFilename(document.querySelector('[data-automation-id="applyFlowPage"]'));
+  assert.equal(name, '', `instruction text was mistaken for a filename: "${name}"`);
+});
+
 // ---------- button intent ----------
 test('step-advance + submit button classification', () => {
   mount(WORKDAY_MYINFO);

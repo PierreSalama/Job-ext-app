@@ -352,6 +352,7 @@ function open(userDataDir) {
   db = new Database(file);
   exec('PRAGMA foreign_keys = ON');
   runMigrations();
+  migrateSecrets();
   log.info('opened', file);
   return db;
 }
@@ -423,6 +424,59 @@ function maintenance() {
 }
 
 // ============================================================
+// Secrets at rest (Electron safeStorage; see secretstore.js)
+// ============================================================
+const secrets = require('./secretstore');
+
+// Settings paths + kv keys that hold credentials → sealed at rest, opened in memory.
+// Everything else stays plaintext.
+const SECRET_SETTINGS = [
+  ['ai', 'claude.apiKey'],
+  ['ai', 'chatgpt.apiKey'],
+  ['gmail', 'clientSecret'],
+];
+const SECRET_KV = new Set(['gmailTokens', 'emailAccounts']);
+
+function getPath(obj, dotted) {
+  return dotted.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
+}
+function setPath(obj, dotted, val) {
+  const keys = dotted.split('.');
+  let o = obj;
+  for (let i = 0; i < keys.length - 1; i++) {
+    if (o[keys[i]] == null || typeof o[keys[i]] !== 'object') o[keys[i]] = {};
+    o = o[keys[i]];
+  }
+  o[keys[keys.length - 1]] = val;
+}
+
+// On upgrade, re-write existing plaintext secrets through the sealing path. Idempotent,
+// gated by a flag; a no-op when no keychain is available (leaves plaintext, retries next
+// launch) and under tests (non-Electron).
+function migrateSecrets() {
+  if (!secrets.available() || kvGet('secretsEncrypted')) return;
+  try {
+    transaction(() => {
+      for (const key of SECRET_KV) {
+        const v = kvGet(key);           // open() passes legacy plaintext through
+        if (v != null) kvSet(key, v);   // seal() tags it
+      }
+      for (const [section, dotted] of SECRET_SETTINGS) {
+        const raw = safeParse(get('SELECT value FROM settings WHERE section = ?', [section])?.value, null);
+        if (!raw) continue;
+        const v = getPath(raw, dotted);
+        if (typeof v === 'string' && v && !secrets.isSealed(v)) {
+          setPath(raw, dotted, secrets.seal(v));
+          run('INSERT INTO settings (section, value) VALUES (?, ?) ON CONFLICT(section) DO UPDATE SET value = excluded.value', [section, JSON.stringify(raw)]);
+        }
+      }
+      kvSet('secretsEncrypted', true);   // atomic with the sealing — a rollback clears it so a failed run retries cleanly
+    });
+    log.info('secrets migrated to encrypted-at-rest');
+  } catch (e) { log.warn('secret migration failed (will retry next launch)', e.message); }
+}
+
+// ============================================================
 // Settings
 // ============================================================
 function getSettings() {
@@ -431,6 +485,12 @@ function getSettings() {
   for (const r of rows) stored[r.section] = safeParse(r.value, {});
   const merged = {};
   for (const k of Object.keys(DEFAULTS)) merged[k] = deepMerge(DEFAULTS[k], stored[k]);
+  // Decrypt secret fields for in-memory use (callers like the AI/email layers need the
+  // real value). The API layer re-redacts before sending anything to a client.
+  for (const [section, dotted] of SECRET_SETTINGS) {
+    const v = getPath(merged[section], dotted);
+    if (secrets.isSealed(v)) setPath(merged[section], dotted, secrets.open(v));
+  }
   return merged;
 }
 
@@ -440,6 +500,18 @@ function patchSettings(patch) {
       if (!(section in DEFAULTS)) continue;
       const cur = safeParse(get('SELECT value FROM settings WHERE section = ?', [section])?.value, {});
       const next = deepMerge(cur, value);
+      // Secret fields: a blank incoming value PRESERVES the stored secret (so the UI,
+      // which never receives the real key, can't erase it by saving a blank field);
+      // a non-blank value is sealed before it hits disk.
+      for (const [sec, dotted] of SECRET_SETTINGS) {
+        if (sec !== section) continue;
+        const incoming = getPath(value, dotted);
+        if (incoming === undefined) continue;           // not in this patch → deepMerge kept cur (already sealed)
+        if (typeof incoming !== 'string') { setPath(next, dotted, getPath(cur, dotted) || ''); continue; }   // non-string → never store; preserve
+        const trimmed = incoming.trim();
+        if (!trimmed) setPath(next, dotted, getPath(cur, dotted) || '');         // blank → preserve the stored (sealed) value
+        else if (!secrets.isSealed(trimmed)) setPath(next, dotted, secrets.seal(trimmed));
+      }
       run('INSERT INTO settings (section, value) VALUES (?, ?) ' +
           'ON CONFLICT(section) DO UPDATE SET value = excluded.value',
           [section, JSON.stringify(next)]);
@@ -452,13 +524,17 @@ function patchSettings(patch) {
 function kvGet(key) {
   if (!db) return null;
   const r = get('SELECT value FROM kv WHERE key = ?', [key]);
-  return r ? safeParse(r.value, null) : null;
+  if (!r) return null;
+  const raw = SECRET_KV.has(key) ? secrets.open(r.value) : r.value;
+  return safeParse(raw, null);
 }
 function kvSet(key, value) {
   if (!db) return;
+  let stored = JSON.stringify(value);
+  if (SECRET_KV.has(key)) stored = secrets.seal(stored);
   run('INSERT INTO kv (key, value) VALUES (?, ?) ' +
       'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-      [key, JSON.stringify(value)]);
+      [key, stored]);
 }
 
 // ============================================================
@@ -1483,6 +1559,28 @@ function importAll(payload) {
   return { jobs, events, qa };
 }
 
+// Irreversible "delete all my data": clears every user-data table and disconnects linked
+// accounts (Gmail/IMAP) + clears API keys. Keeps the pairing token + non-secret app prefs
+// so the app stays usable + paired. Returns per-table deleted counts.
+function wipeAllData() {
+  if (!db) return { ok: false, deleted: {} };
+  const tables = ['emails', 'auto_apply_tasks', 'events', 'ai_log', 'qa', 'profile_fields', 'profiles', 'documents', 'document_folders', 'jobs'];
+  const deleted = {};
+  transaction(() => {
+    for (const t of tables) deleted[t] = run(`DELETE FROM ${t}`)?.changes || 0;
+    run("DELETE FROM kv WHERE key IN ('gmailTokens', 'emailAccounts')");
+    for (const [section, dotted] of SECRET_SETTINGS) {
+      const raw = safeParse(get('SELECT value FROM settings WHERE section = ?', [section])?.value, null);
+      if (!raw) continue;
+      setPath(raw, dotted, '');
+      run('INSERT INTO settings (section, value) VALUES (?, ?) ON CONFLICT(section) DO UPDATE SET value = excluded.value', [section, JSON.stringify(raw)]);
+    }
+  });
+  try { exec('VACUUM'); } catch (e) { log.warn('post-wipe VACUUM failed', e.message); }
+  log.warn('wipeAllData: cleared all user data + disconnected accounts');
+  return { ok: true, deleted };
+}
+
 // Import the user's pre-existing applications (scraped from LinkedIn/Indeed "applied
 // jobs"). Each goes through upsertJob (so dedup + forward-only status are reused),
 // forced to status 'submitted' with the REAL applied date, tagged 'imported', and
@@ -1605,7 +1703,7 @@ module.exports = {
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
   queueList, queueHistory, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueRetryParked,
   aiLog, aiLogList, aiUsage,
-  exportAll, importAll, bulkImportApplications,
+  exportAll, importAll, bulkImportApplications, wipeAllData,
   emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching,
   STATUS_ORDER, TERMINAL, normJobUrl, normKey,
 };
