@@ -5,7 +5,7 @@
 
 const {
   app, BrowserWindow, Tray, Menu, dialog, globalShortcut,
-  Notification, ipcMain, nativeImage, shell,
+  Notification, ipcMain, nativeImage, shell, powerMonitor,
 } = require('electron');
 const path = require('path');
 const { startServer, stopServer, getToken, broadcast, rescanAllFolders, startFolderWatchers } = require('./server');
@@ -24,6 +24,22 @@ let gmailInterval = null;
 let emailInterval = null;
 let emailWarmup = null;
 let isQuitting = false;
+let suspended = false;       // machine asleep → pause all background work
+let maintenanceInterval = null;
+
+// Industry-norm guard for BACKGROUND work (email/gmail sync): don't run while the
+// machine is asleep, optionally pause on battery, and skip if our own memory is high
+// (so we never become the process that overstresses a laptop).
+function shouldRunBackground() {
+  if (suspended) return false;
+  try {
+    const m = db.getSettings().maintenance || {};
+    if (m.pauseBackgroundOnBattery && powerMonitor.isOnBatteryPower && powerMonitor.isOnBatteryPower()) return false;
+    const rssMB = process.memoryUsage().rss / (1024 * 1024);
+    if (rssMB > (m.memoryGuardMB || 1400)) { log.warn(`skipping background tick — RSS ${Math.round(rssMB)}MB over guard`); return false; }
+  } catch {}
+  return true;
+}
 
 // ---------- single instance ----------
 const gotLock = app.requestSingleInstanceLock();
@@ -244,6 +260,7 @@ function scheduleGmail() {
   if (!s.enabled) return;
   const everyMs = Math.max(5, s.intervalMinutes || 30) * 60000;
   gmailInterval = setInterval(async () => {
+    if (!shouldRunBackground()) return;
     try {
       const gmail = require('./gmail');
       const r = await gmail.syncNow();
@@ -265,6 +282,7 @@ function scheduleEmailSync() {
   if (!email.listAccounts().some((a) => a.enabled && a.password)) return;
   const everyMs = Math.max(3, (db.getSettings().email && db.getSettings().email.syncIntervalMinutes) || 15) * 60000;
   const tick = async () => {
+    if (!shouldRunBackground()) return;
     try {
       const r = await email.syncAll();
       if (r && r.ok && r.results.some((x) => x.created)) { broadcast('jobs.updated', { action: 'email-sync' }); broadcast('emails.updated', {}); }
@@ -387,6 +405,18 @@ app.whenReady().then(async () => {
   db.dailyBackup();
   backupInterval = setInterval(() => db.dailyBackup(), 24 * 3600 * 1000);
 
+  // Self-care: prune stale data + compact the DB shortly after launch (don't block
+  // startup) and once a day after that.
+  setTimeout(() => { try { db.maintenance(); } catch (e) { log.warn('maintenance failed', e.message); } }, 25000);
+  maintenanceInterval = setInterval(() => { try { db.maintenance(); } catch (e) { log.warn('maintenance failed', e.message); } }, 24 * 3600 * 1000);
+
+  // Laptop-friendly: pause all background work while the machine sleeps; resume on
+  // wake (each sync resumes from its own cursor, so nothing is lost or doubled).
+  try {
+    powerMonitor.on('suspend', () => { suspended = true; log.info('system suspend — pausing background work'); });
+    powerMonitor.on('resume', () => { suspended = false; log.info('system resume — background work re-enabled'); scheduleEmailSync(); });
+  } catch (e) { log.warn('powerMonitor unavailable', e.message); }
+
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
   if (app.isPackaged) setupAutoUpdater();
 });
@@ -410,6 +440,7 @@ app.on('will-quit', () => {
   if (gmailInterval) clearInterval(gmailInterval);
   if (emailInterval) clearInterval(emailInterval);
   if (emailWarmup) clearTimeout(emailWarmup);
+  if (maintenanceInterval) clearInterval(maintenanceInterval);
   globalShortcut.unregisterAll();
   if (tray) { try { tray.destroy(); } catch {} tray = null; }
   stopServer();

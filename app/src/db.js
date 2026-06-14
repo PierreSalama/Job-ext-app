@@ -397,6 +397,31 @@ function dailyBackup() {
   }
 }
 
+// Bound the database: prune stale rows past their retention, then (at most once per
+// vacuumEveryDays) compact the file to reclaim disk. Never touches jobs, matched/
+// manual emails, profiles, qa, documents — only churny logs. Safe to call repeatedly.
+function maintenance() {
+  if (!db) return { events: 0, tasks: 0, emails: 0, vacuumed: false };
+  const m = getSettings().maintenance || {};
+  const cut = (days, fallback) => new Date(Date.now() - Math.max(1, days || fallback) * 86400 * 1000).toISOString();
+  let events = 0, tasks = 0, emails = 0;
+  transaction(() => {
+    events = run('DELETE FROM events WHERE timestamp < ?', [cut(m.eventRetentionDays, 400)])?.changes || 0;
+    tasks = run("DELETE FROM auto_apply_tasks WHERE state IN ('skipped','failed') AND updated_at < ?", [cut(m.taskRetentionDays, 60)])?.changes || 0;
+    // unmatched only; keep user-dismissed ones so a stale dismissal can't resurface as a suggestion.
+    emails = run("DELETE FROM emails WHERE matched_job_id IS NULL AND (match_source IS NULL OR match_source NOT IN ('dismissed','manual')) AND created_at < ?", [cut(m.emailRetentionDays, 365)])?.changes || 0;
+  });
+  // VACUUM must run OUTSIDE a transaction; gate it so it doesn't run every call.
+  let vacuumed = false;
+  const last = kvGet('lastVacuumAt');
+  const everyMs = Math.max(1, m.vacuumEveryDays || 7) * 86400 * 1000;
+  if (!last || (Date.now() - Date.parse(last)) > everyMs) {
+    try { exec('VACUUM'); kvSet('lastVacuumAt', new Date().toISOString()); vacuumed = true; } catch (e) { log.warn('VACUUM failed', e.message); }
+  }
+  if (events || tasks || emails || vacuumed) log.info(`maintenance: pruned ${events} events, ${tasks} tasks, ${emails} emails${vacuumed ? ' + vacuumed' : ''}`);
+  return { events, tasks, emails, vacuumed };
+}
+
 // ============================================================
 // Settings
 // ============================================================
@@ -1567,7 +1592,7 @@ function jobsForMatching() {
 }
 
 module.exports = {
-  open, close, backupNow, dailyBackup, transaction,
+  open, close, backupNow, dailyBackup, maintenance, transaction,
   getSettings, patchSettings, kvGet, kvSet,
   listJobs, getJob, upsertJob, patchJob, deleteJob, stats,
   listEvents, listRecentEvents, recordEvent,

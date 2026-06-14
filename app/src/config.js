@@ -137,6 +137,18 @@ const DEFAULTS = {
     days: 7,                 // auto follow-up date after submit; 0 = off
   },
 
+  // Self-care: bound the data the app keeps + don't overstress the machine. Industry
+  // norms — retention pruning, periodic VACUUM, pause background work on sleep, and an
+  // opt-in battery saver. Generous defaults so nothing the user cares about is lost.
+  maintenance: {
+    eventRetentionDays: 400,        // prune timeline events older than this
+    taskRetentionDays: 60,          // prune terminal (skipped/failed) auto-apply tasks older than this
+    emailRetentionDays: 365,        // prune UNMATCHED emails older than this (matched/manual are always kept)
+    vacuumEveryDays: 7,             // reclaim disk by compacting the DB at most this often
+    pauseBackgroundOnBattery: false,// when true, defer background email/gmail sync while on battery
+    memoryGuardMB: 1400,            // skip a background sync tick if the app's own RSS exceeds this
+  },
+
   appearance: {
     theme: 'atelier',
   },
