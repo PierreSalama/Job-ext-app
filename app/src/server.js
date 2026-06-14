@@ -701,6 +701,12 @@ async function handle(req, res, parsed) {
   if (req.method === 'GET' && pathname === '/queue/parked') {
     return sendJson(res, 200, { ok: true, items: db.queueParkedQuestions() });
   }
+  // Auto-apply outcome history (the "submissions data" view): ?days=N[&state=]
+  if (req.method === 'GET' && pathname === '/auto-apply/history') {
+    const days = Number(parsed.searchParams.get('days')) || 7;
+    const state = parsed.searchParams.get('state') || undefined;
+    return sendJson(res, 200, { ok: true, ...db.queueHistory({ days, state }) });
+  }
   // User answers the parked questions → saved to the profile (locked) → parked
   // jobs whose questions are now all answerable flip back to 'queued'.
   if (req.method === 'POST' && pathname === '/auto-apply/intake') {
@@ -881,6 +887,13 @@ async function handle(req, res, parsed) {
   if (req.method === 'POST' && pathname === '/import') {
     const body = await readJson(req);
     const r = db.importAll(body.data || body);
+    broadcast('jobs.updated', { action: 'import' });
+    return sendJson(res, 200, { ok: true, ...r });
+  }
+  // Bulk-import scraped pre-existing applications (LinkedIn/Indeed "applied jobs").
+  if (req.method === 'POST' && pathname === '/import/applications') {
+    const body = await readJson(req);
+    const r = db.bulkImportApplications(body.jobs || body.items || [], { source: body.source });
     broadcast('jobs.updated', { action: 'import' });
     return sendJson(res, 200, { ok: true, ...r });
   }

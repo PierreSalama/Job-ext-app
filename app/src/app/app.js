@@ -481,6 +481,7 @@ function resolve(path) {
   return null;
 }
 let navSeq = 0;
+let aaHistoryLoad = null;   // set by the auto-apply view; lets SSE refreshes reload the History pane
 async function navigate(opts = {}) {
   // soft = an SSE-driven live refresh: morph the current view in place (counts and
   // rows update, focus + scroll preserved) instead of a full re-render.
@@ -621,6 +622,10 @@ function morphNode(from, to) {
   if (from.nodeType !== 1) return;
   if (isActiveField(from)) return;             // never touch the exact field being typed in
   morphAttrs(from, to);
+  // [data-keep] marks a subtree whose CONTENT is managed imperatively (e.g. the
+  // History pane that loads via fetch) — sync its own attributes but never morph
+  // its children, so a soft refresh can't wipe what was loaded into it.
+  if (from.dataset && from.dataset.keep != null) return;
   morphChildren(from, to);
 }
 function morphChildren(from, to) {
@@ -660,6 +665,9 @@ const softRefresh = debounce(() => {
   if (document.querySelector('.ctx-menu')) return;               // don't reshuffle under a right-click menu
   if (document.querySelector('#overlay-root .overlay')) return;  // don't refresh under an open modal
   navigate({ soft: true });
+  // The History pane is [data-keep] so the morph won't touch it — reload it here so
+  // it stays live as outcomes change.
+  if (aaHistoryLoad && document.querySelector('[data-qpane="history"]:not([hidden])')) aaHistoryLoad();
 }, 350);
 
 function connectSSE() {
@@ -883,10 +891,28 @@ route('/applications', async () => {
         <div class="page-sub">${rows.length} shown</div>
       </div>
       <div class="page-actions">
+        ${state.host === 'extension' ? '<button class="btn" data-sync-open title="Import your past LinkedIn/Indeed applications">⟳ Sync past applications</button>' : ''}
         <button class="btn" data-csv>Export CSV</button>
         <a href="#/applications/new" class="btn primary">+ New application</a>
       </div>
     </header>
+
+    ${state.host === 'extension' ? `
+    <div class="sync-panel" id="sync-panel" hidden>
+      <div class="sync-row">
+        <label class="chk"><input type="checkbox" id="sync-li" checked /> LinkedIn</label>
+        <label class="chk"><input type="checkbox" id="sync-in" /> Indeed</label>
+        <select class="select" id="sync-days" style="max-width:160px">
+          <option value="30">Last 30 days</option>
+          <option value="90" selected>Last 90 days</option>
+          <option value="180">Last 6 months</option>
+          <option value="3650">All time</option>
+        </select>
+        <button class="btn primary" data-sync-go>Sync now</button>
+        <span class="muted" id="sync-status"></span>
+      </div>
+      <div class="form-hint">Opens your applied-jobs page(s) in a background tab, reads your past applications, and imports them (deduped, marked submitted with their real date). Runs in your browser using your existing login.</div>
+    </div>` : ''}
 
     <div class="toolbar">
       <input class="input" id="f-q" type="search" placeholder="Search title, company, notes… ( / )" value="${esc(f.q)}" style="max-width:280px" />
@@ -983,6 +1009,31 @@ route('/applications', async () => {
       });
       navigate();
     } catch (e) { errToast(e); }
+  });
+
+  // Sync past applications (extension host only — the scrape runs in the SW).
+  v.querySelector('[data-sync-open]')?.addEventListener('click', () => {
+    const p = v.querySelector('#sync-panel'); if (p) p.hidden = !p.hidden;
+  });
+  v.querySelector('[data-sync-go]')?.addEventListener('click', async (e) => {
+    const sources = [];
+    if (v.querySelector('#sync-li')?.checked) sources.push('linkedin');
+    if (v.querySelector('#sync-in')?.checked) sources.push('indeed');
+    if (!sources.length) { toast('Pick LinkedIn and/or Indeed', 'danger'); return; }
+    const maxDays = Number(v.querySelector('#sync-days')?.value) || 90;
+    const btn = e.currentTarget; btn.disabled = true;
+    const status = v.querySelector('#sync-status'); if (status) status.textContent = 'Syncing… a background tab will open — leave it be';
+    try {
+      const r = await new Promise((res) => chrome.runtime.sendMessage({ type: 'sync-applied', sources, maxDays }, (x) => { void chrome.runtime.lastError; res(x); }));
+      if (!r?.ok) { toast('Sync failed: ' + (r?.error || 'unknown'), 'danger', { ttl: 9000 }); }
+      else {
+        const tot = (r.results || []).reduce((a, x) => ({ created: a.created + (x.created || 0), merged: a.merged + (x.merged || 0), scraped: a.scraped + (x.scraped || 0) }), { created: 0, merged: 0, scraped: 0 });
+        const notes = (r.results || []).filter((x) => x.note || x.error).map((x) => `${x.source}: ${x.note || x.error}`).join(' · ');
+        toast(`Imported ${tot.created} new · ${tot.merged} already tracked · read ${tot.scraped}${notes ? ' — ' + notes : ''}`, (tot.created || tot.merged) ? 'info' : 'danger', { ttl: 12000 });
+        navigate();
+      }
+    } catch (err) { errToast(err); }
+    btn.disabled = false; if (status) status.textContent = '';
   });
 
   v.querySelector('[data-csv]').addEventListener('click', () => {
@@ -1478,7 +1529,10 @@ route('/queue', async () => {
   const groupsHtml = [...groups.entries()]
     .filter(([, list]) => list.length)
     .map(([s, list]) => `<div class="queue-group-head"><span>${esc(QUEUE_STATE_LABEL[s] || s)}</span><span class="n">${list.length}</span></div>${list.map(taskCard).join('')}`)
-    .join('') || emptyHtml('Idle', 'Nothing queued', 'Add keywords above and flip the master switch — it searches Easy-Apply jobs and applies, paced.');
+    .join('') || emptyHtml('Idle', 'Nothing queued', 'Add keywords above and press Start — it searches Easy-Apply jobs and applies, paced.');
+  // Which queue pane is showing (driven by a stored pref so a soft morph refresh
+  // doesn't reset the user's Queue↔History choice).
+  const qview = (() => { try { return localStorage.getItem('jat11.queue.view') === 'history' ? 'history' : 'tasks'; } catch { return 'tasks'; } })();
 
   const intakeHtml = parked.length ? `
     <section class="section aa-intake">
@@ -1500,12 +1554,8 @@ route('/queue', async () => {
       </div>
       <div class="page-actions aa-master">
         <span class="aa-timer" id="aa-timer" data-start="${aa.enabled && aa.startedAt ? esc(aa.startedAt) : ''}" title="Running for">${aa.enabled && aa.startedAt ? fmtElapsed(Date.now() - Date.parse(aa.startedAt)) : ''}</span>
-        <label class="aa-switch ${aa.enabled ? 'on' : ''}">
-          <span class="aa-switch-label">${aa.enabled ? 'ON' : 'OFF'}</span>
-          <label class="toggle"><input type="checkbox" id="aa-master" ${aa.enabled ? 'checked' : ''} /><span class="knob"></span></label>
-        </label>
-        <button class="btn danger" data-stop-all>⏹ Stop everything</button>
-        <button class="btn primary" data-save>Save settings</button>
+        <button class="btn aa-power ${aa.enabled ? 'danger' : 'primary'}" data-power>${aa.enabled ? '⏹ Stop' : '▶ Start'}</button>
+        <button class="btn" data-save>Save settings</button>
       </div>
     </header>
 
@@ -1557,8 +1607,27 @@ route('/queue', async () => {
     </details>
 
     <section class="section">
-      <header class="section-header"><div><div class="section-eyebrow">Queue</div><h2 class="section-title">Tasks</h2></div></header>
-      ${groupsHtml}
+      <header class="section-header" style="align-items:center">
+        <div><div class="section-eyebrow">Queue</div><h2 class="section-title">Tasks &amp; history</h2></div>
+        <div class="seg" role="tablist">
+          <button class="seg-btn ${qview === 'tasks' ? 'on' : ''}" data-qview="tasks">Queue</button>
+          <button class="seg-btn ${qview === 'history' ? 'on' : ''}" data-qview="history">History</button>
+        </div>
+      </header>
+      <div data-qpane="tasks" ${qview === 'tasks' ? '' : 'hidden'}>${groupsHtml}</div>
+      <div data-qpane="history" ${qview === 'history' ? '' : 'hidden'}>
+        <div class="toolbar">
+          <select class="select" id="aa-hist-range" style="max-width:170px">
+            <option value="1">Today</option>
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="3650">All time</option>
+          </select>
+          <span class="aa-hist-roll" id="aa-hist-roll" data-keep></span>
+        </div>
+        <div id="aa-hist-body" data-keep><div class="muted" style="padding:18px">Open History to load…</div></div>
+      </div>
     </section>
   </div>`);
 
@@ -1577,7 +1646,7 @@ route('/queue', async () => {
       await api('/settings', {
         method: 'PATCH',
         body: { autoApply: {
-          enabled: v.querySelector('#aa-master').checked,
+          // enabled is owned by the Start/Stop button, not Save — don't touch it here.
           mode: v.querySelector('#aa-mode').value,
           keywords: kw.get(),
           locations: locs.get(),
@@ -1595,26 +1664,78 @@ route('/queue', async () => {
         } },
       });
       state.settings = null;
-      toast(v.querySelector('#aa-master').checked ? 'Auto-apply on — it will search & apply, paced' : 'Auto-apply settings saved');
+      toast('Auto-apply settings saved');
     } catch (e) { errToast(e); }
   });
 
-  // Header master ON/OFF — flips + saves immediately (no need to hit Save).
-  v.querySelector('#aa-master').addEventListener('change', async (e) => {
-    const on = e.target.checked;
+  // One Start↔Stop button (replaces the old ON/OFF toggle + "Stop everything").
+  // Start: enable auto-apply. Stop: disable + skip queued/running + close the tabs.
+  v.querySelector('[data-power]').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    // Read the LIVE button state (its class) — never the render-time `aa` snapshot:
+    // a soft morph can repaint Start↔Stop in place without rebinding this listener.
+    const turnOn = !btn.classList.contains('danger');
+    btn.disabled = true;
     try {
-      const resp = await api('/settings', { method: 'PATCH', body: { autoApply: { enabled: on } } });
+      if (turnOn) {
+        await api('/settings', { method: 'PATCH', body: { autoApply: { enabled: true } } });
+        toast('Auto-apply started — searching & applying, paced');
+      } else {
+        await api('/settings', { method: 'PATCH', body: { autoApply: { enabled: false } } });
+        for (const t of tasks) {
+          if (['queued', 'scheduled', 'running'].includes(t.state)) {
+            await api('/queue/' + encodeURIComponent(t.id), { method: 'PATCH', body: { state: 'skipped', transcriptAppend: { note: 'stopped from dashboard' } } });
+          }
+        }
+        stopAutoApplyTabs();   // close the run's tabs + drop the group (state already saved)
+        toast('Auto-apply stopped — tabs closed');
+      }
       state.settings = null;
-      const sw = v.querySelector('.aa-switch');
-      sw.classList.toggle('on', on);
-      sw.querySelector('.aa-switch-label').textContent = on ? 'ON' : 'OFF';
-      // Seed the timer from the SERVER-stamped startedAt so client + server agree.
-      const tm = v.querySelector('#aa-timer');
-      if (tm) { const st = (on && resp?.settings?.autoApply?.startedAt) || ''; tm.dataset.start = st; tm.textContent = st ? fmtElapsed(Date.now() - Date.parse(st)) : ''; }
-      if (!on) stopAutoApplyTabs();
-      toast(on ? 'Auto-apply ON — searching & applying, paced' : 'Auto-apply OFF');
-    } catch (err) { errToast(err); e.target.checked = !on; }
+      navigate();
+    } catch (err) { errToast(err); btn.disabled = false; }
   });
+
+  // Queue ↔ History toggle + the submissions data view. The roll + body are
+  // [data-keep] (loaded imperatively), so loadHistory targets the LIVE DOM and a
+  // soft refresh re-runs it (live) rather than wiping it.
+  const OUTCOME_LABEL = { submitted: 'Submitted', failed: 'Failed', needs_you: 'Needs you', skipped: 'Skipped', pending: 'Queued', running: 'Running' };
+  async function loadHistory() {
+    const body = document.getElementById('aa-hist-body');
+    if (!body) return;
+    const days = Number(document.getElementById('aa-hist-range')?.value) || 7;
+    try {
+      const r = await api('/auto-apply/history?days=' + days);
+      const rl = r.rollup || {};
+      const roll = document.getElementById('aa-hist-roll');
+      if (roll) roll.innerHTML = ['submitted', 'failed', 'needs_you', 'skipped'].map((k) =>
+        `<span class="roll-chip out-${k}">${rl[k] || 0} ${esc(OUTCOME_LABEL[k])}</span>`).join('');
+      const items = r.items || [];
+      const b2 = document.getElementById('aa-hist-body'); if (!b2) return;
+      b2.innerHTML = items.length ? `<div class="hist-list">${items.map((it) => `
+        <div class="hist-row" data-k="${esc(it.taskId)}">
+          <span class="out-chip out-${esc(it.outcome)}">${esc(OUTCOME_LABEL[it.outcome] || it.outcome)}</span>
+          <div class="hist-main">
+            <div class="hist-title">${esc(it.job?.title || '?')} <span class="muted">· ${esc(it.job?.company || '')}</span></div>
+            ${it.reason ? `<div class="hist-reason">${esc(it.reason)}</div>` : ''}
+          </div>
+          <div class="hist-meta">${it.job?.source ? `<span class="src-tag">${esc(it.job.source)}</span>` : ''}<span class="muted">${esc(fmtRel(it.updatedAt))}</span></div>
+        </div>`).join('')}</div>`
+        : emptyHtml('No data', 'No auto-apply activity in this range', 'Press Start and let it run — every outcome shows up here.');
+    } catch (e) {
+      const b2 = document.getElementById('aa-hist-body'); if (b2) b2.innerHTML = `<div class="task-err" style="padding:18px">${esc(String(e?.message || e))}</div>`;
+    }
+  }
+  aaHistoryLoad = loadHistory;
+  v.querySelector('#aa-hist-range')?.addEventListener('change', loadHistory);
+  v.querySelectorAll('[data-qview]').forEach((b) => b.addEventListener('click', () => {
+    const view = b.dataset.qview;
+    try { localStorage.setItem('jat11.queue.view', view); } catch {}
+    v.querySelectorAll('[data-qview]').forEach((x) => x.classList.toggle('on', x === b));
+    const tp = v.querySelector('[data-qpane="tasks"]'); if (tp) tp.hidden = view !== 'tasks';
+    const hp = v.querySelector('[data-qpane="history"]'); if (hp) hp.hidden = view !== 'history';
+    if (view === 'history') loadHistory();
+  }));
+  if (qview === 'history') loadHistory();
 
   // Manual "Search now" (extension host only — the search runs in the SW).
   v.querySelector('[data-run-disco]')?.addEventListener('click', async (e) => {
@@ -1651,22 +1772,6 @@ route('/queue', async () => {
       toast(`Saved ${r.saved} answer(s) · ${r.requeued} job(s) re-queued`);
       navigate();
     } catch (err) { errToast(err); btn.disabled = false; }
-  });
-
-  v.querySelector('[data-stop-all]').addEventListener('click', async () => {
-    try {
-      await api('/settings', { method: 'PATCH', body: { autoApply: { enabled: false } } });
-      for (const t of tasks) {
-        if (['queued', 'scheduled', 'running'].includes(t.state)) {
-          await api('/queue/' + encodeURIComponent(t.id), { method: 'PATCH', body: { state: 'skipped', transcriptAppend: { note: 'stop-all from dashboard' } } });
-        }
-      }
-      // State is now saved in the app; close the run's tabs + drop the group.
-      stopAutoApplyTabs();
-      state.settings = null;
-      toast('Auto-apply stopped — tabs closed, switch off');
-      navigate();
-    } catch (e) { errToast(e); }
   });
 
   v.querySelectorAll('.task-card').forEach((card) => {

@@ -93,6 +93,14 @@
       });
       return true;
     }
+    if (msg?.type === 'jat11.sync-applied') {
+      if (!IS_TOP) { sendResponse({ ok: false, error: 'not top frame' }); return; }
+      import(chrome.runtime.getURL('content/applied-sync.js'))
+        .then((m) => m.run({ source: msg.source, max: msg.max }))
+        .then(sendResponse)
+        .catch((e) => sendResponse({ ok: false, error: String(e?.message || e), jobs: [] }));
+      return true;
+    }
   });
 
   // ---- URL watcher (belt-and-braces beside webNavigation) ----

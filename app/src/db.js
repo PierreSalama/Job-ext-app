@@ -550,6 +550,7 @@ function upsertJob(input, opts = {}) {
     workMode: String(input.workMode || '').slice(0, 100),
     employmentType: String(input.employmentType || '').slice(0, 100),
     status: STATUS_ORDER[input.status] ? input.status : 'started',
+    submittedAt: (() => { const d = input.submittedAt ? Date.parse(input.submittedAt) : NaN; return Number.isNaN(d) ? null : new Date(d).toISOString(); })(),
     attachments: Array.isArray(input.attachments) ? input.attachments : null,
     answers: (input.answers && typeof input.answers === 'object') ? input.answers : null,
     notes: input.notes !== undefined ? String(input.notes || '') : undefined,
@@ -582,9 +583,9 @@ function upsertJob(input, opts = {}) {
       incoming.needsReview ? 1 : 0,
       incoming.tags ? JSON.stringify(incoming.tags) : null,
       ts, ts,
-      incoming.status === 'submitted' ? ts : null,
+      incoming.status === 'submitted' ? (incoming.submittedAt || ts) : null,   // historical date for imports
     ]);
-    harvestAnswersToProfile(incoming.answers, { jobId: id, source: incoming.source });
+    if (!opts.skipHarvest) harvestAnswersToProfile(incoming.answers, { jobId: id, source: incoming.source });
     return { job: getJob(id), action: 'created', previousStatus: null, statusChanged: true };
   }
 
@@ -636,11 +637,11 @@ function upsertJob(input, opts = {}) {
     incoming.tags ? JSON.stringify([...new Set([...(prev.tags || []), ...incoming.tags])])
                   : (prev.tags?.length ? JSON.stringify(prev.tags) : null),
     ts,
-    prev.submittedAt || (crossedSubmitted(prev.status, nextStatus) ? ts : null),
+    prev.submittedAt || (crossedSubmitted(prev.status, nextStatus) ? (incoming.submittedAt || ts) : null),
     existing.id,
   ]);
 
-  harvestAnswersToProfile(incoming.answers, { jobId: existing.id, source: incoming.source || prev.source });
+  if (!opts.skipHarvest) harvestAnswersToProfile(incoming.answers, { jobId: existing.id, source: incoming.source || prev.source });
 
   const after = getJob(existing.id);
   return {
@@ -1251,6 +1252,39 @@ function queueList({ state } = {}) {
   }));
 }
 
+// Auto-apply OUTCOME history for the dashboard's "submissions data" view: every
+// task touched in the last N days, joined to its job, projected to a single 'reason'
+// + an 'outcome' bucket, plus rollup counts. Time signal is updated_at (the last
+// state transition — auto_apply_tasks has no separate finished_at column).
+function queueHistory({ days = 7, state } = {}) {
+  const cutoff = new Date(Date.now() - Math.max(1, days) * 86400 * 1000).toISOString();
+  let sql = `SELECT t.*, j.title AS _title, j.company AS _company, j.job_url AS _url,
+                    j.source AS _src, j.status AS _status, j.submitted_at AS _submittedAt
+             FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
+             WHERE t.updated_at >= ?`;
+  const args = [cutoff];
+  if (state) { sql += ' AND t.state = ?'; args.push(state); }
+  sql += ' ORDER BY t.updated_at DESC';
+  const OUTCOME = {
+    done: 'submitted', awaiting_review: 'submitted', failed: 'failed',
+    parked: 'needs_you', awaiting_input: 'needs_you', skipped: 'skipped',
+    queued: 'pending', scheduled: 'pending', running: 'running',
+  };
+  const items = all(sql, args).map((r) => {
+    const t = rowToTask(r);
+    const reason = t.lastError || t.parkReason || (t.pendingQuestions[0] && t.pendingQuestions[0].reason) || '';
+    return {
+      taskId: t.id, jobId: t.jobId, state: t.state, mode: t.mode,
+      outcome: OUTCOME[t.state] || t.state, reason,
+      updatedAt: t.updatedAt, createdAt: t.createdAt, pendingQuestions: t.pendingQuestions,
+      job: { title: r._title, company: r._company, jobUrl: r._url, source: r._src, status: r._status, submittedAt: r._submittedAt },
+    };
+  });
+  const rollup = { submitted: 0, failed: 0, needs_you: 0, skipped: 0, pending: 0, running: 0, total: items.length };
+  for (const it of items) rollup[it.outcome] = (rollup[it.outcome] || 0) + 1;
+  return { items, rollup };
+}
+
 function queueAdd(jobId, { mode } = {}) {
   if (!getJob(jobId)) return null;
   const dup = get(
@@ -1392,6 +1426,36 @@ function importAll(payload) {
   return { jobs, events, qa };
 }
 
+// Import the user's pre-existing applications (scraped from LinkedIn/Indeed "applied
+// jobs"). Each goes through upsertJob (so dedup + forward-only status are reused),
+// forced to status 'submitted' with the REAL applied date, tagged 'imported', and
+// with answer-harvest skipped (an import must not teach the profile). New rows count
+// as 'created', dedup hits as 'merged'.
+function bulkImportApplications(items, { source } = {}) {
+  const list = (Array.isArray(items) ? items : []).slice(0, 800);
+  let created = 0, merged = 0, skipped = 0;
+  transaction(() => {
+    for (const it of list) {
+      const title = String(it.title || '').trim();
+      if (!title) { skipped++; continue; }
+      const r = upsertJob({
+        externalId: it.externalId || null,
+        source: it.source || source || null,
+        title,
+        company: String(it.company || '').trim(),
+        location: it.location || '',
+        jobUrl: it.jobUrl || '',
+        status: 'submitted',
+        submittedAt: it.appliedAt || it.submittedAt || null,
+        tags: ['imported'],
+      }, { skipHarvest: true });
+      if (r.action === 'created') created++; else merged++;
+      try { recordEvent({ jobId: r.job.id, type: 'imported', source: 'import', summary: `Imported from ${it.source || source || 'sync'}` }); } catch {}
+    }
+  });
+  return { created, merged, skipped, total: list.length };
+}
+
 module.exports = {
   open, close, backupNow, dailyBackup, transaction,
   getSettings, patchSettings, kvGet, kvSet,
@@ -1404,8 +1468,8 @@ module.exports = {
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,
   extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
-  queueList, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueRetryParked,
+  queueList, queueHistory, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueRetryParked,
   aiLog, aiLogList, aiUsage,
-  exportAll, importAll,
+  exportAll, importAll, bulkImportApplications,
   STATUS_ORDER, TERMINAL, normJobUrl, normKey,
 };

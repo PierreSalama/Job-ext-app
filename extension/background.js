@@ -155,6 +155,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // Dashboard "Stop everything" → close the run's tabs + drop the group.
       respond(closeAutoApplyTabs().then(() => ({ ok: true })));
       return true;
+    case 'sync-applied':
+      // Applications page → import past LinkedIn/Indeed applications.
+      respond(syncApplied({ sources: msg.sources, maxDays: msg.maxDays }));
+      return true;
     case 'pipeline-event':
       respond(handlePipelineEvent(msg.data, sender));
       return true;
@@ -642,4 +646,48 @@ async function discoverTick(force = false) {
   await api.call('POST', '/auto-apply/discovery-status', status, 6000).catch(() => {});
   console.log('[JAT] discovery', board, '"' + keyword + '" found', status.found, 'enqueued', enqueued, status.note || '');
   return status;
+}
+
+// ---------- applied-jobs sync: import the user's PAST applications ----------
+const APPLIED_URL = {
+  linkedin: 'https://www.linkedin.com/my-items/saved-jobs/?cardType=APPLIED',
+  indeed: 'https://myjobs.indeed.com/',
+};
+async function syncAppliedFor(source, maxDays) {
+  const url = APPLIED_URL[source];
+  if (!url) return { source, error: 'unknown source' };
+  let tab = null;
+  try {
+    const winId = await autoApplyTargetWindow();
+    tab = await chrome.tabs.create({ url, active: false, ...(winId ? { windowId: winId } : {}) });
+    await groupTab(tab.id);
+    await waitTabComplete(tab.id, 35000);
+    await new Promise((r) => setTimeout(r, 3000));   // the applied list hydrates slowly
+    let resp = null;
+    try { resp = await chrome.tabs.sendMessage(tab.id, { type: 'jat11.sync-applied', source, max: 400 }, { frameId: 0 }); }
+    catch (e) { resp = { ok: false, error: String(e?.message || e), jobs: [], note: 'could not reach the applied-jobs page (are you logged in?)' }; }
+    const all = (resp && resp.jobs) || [];
+    const cutoff = Date.now() - Math.max(1, maxDays) * 86400 * 1000;
+    // Keep undated items too (don't silently drop) — the importer dedups regardless.
+    const jobs = all.filter((j) => !j.appliedAt || Date.parse(j.appliedAt) >= cutoff);
+    let imp = { created: 0, merged: 0 };
+    if (jobs.length) imp = (await api.call('POST', '/import/applications', { source, jobs }, 20000)) || imp;
+    return { source, scraped: all.length, kept: jobs.length, created: imp.created || 0, merged: imp.merged || 0, note: resp?.note || resp?.error || '' };
+  } catch (e) {
+    return { source, error: String(e?.message || e) };
+  } finally {
+    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} }
+  }
+}
+async function syncApplied({ sources = ['linkedin'], maxDays = 90 } = {}) {
+  if (dispatching) return { ok: false, error: 'busy — auto-apply is mid-task, try again in a moment' };
+  if (!(await api.isPaired())) return { ok: false, error: 'app not connected' };
+  const list = (Array.isArray(sources) ? sources : [sources]).filter((s) => APPLIED_URL[s]);
+  if (!list.length) return { ok: false, error: 'pick LinkedIn and/or Indeed' };
+  dispatching = true;
+  try {
+    const results = [];
+    for (const s of list) results.push(await syncAppliedFor(s, maxDays));   // serial — one tab at a time
+    return { ok: true, results };
+  } finally { dispatching = false; }
 }

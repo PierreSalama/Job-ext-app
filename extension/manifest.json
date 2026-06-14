@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Job Application Tracker v11",
   "short_name": "JAT v11",
-  "version": "11.4.7",
+  "version": "11.5.0",
   "description": "Captures job applications across every job board, with a local SQLite desktop companion, AI assistance (Codex/Ollama), and a paced auto-apply engine.",
   "permissions": [
     "storage",
@@ -77,6 +77,7 @@
         "content/autofill.js",
         "content/executor.js",
         "content/discover.js",
+        "content/applied-sync.js",
         "content/lib/*.js",
         "content/signals/*.js",
         "content/sites/*.js"
