@@ -1762,7 +1762,7 @@ route('/queue', async () => {
           <option value="review" ${aa.mode === 'review' ? 'selected' : ''}>Review — stop before submit</option>
         </select>`)}
         ${qc('Job boards', `<label class="aa-chk"><input type="checkbox" id="aa-li" ${boards.includes('linkedin') ? 'checked' : ''}/> LinkedIn</label> <label class="aa-chk"><input type="checkbox" id="aa-in" ${boards.includes('indeed') ? 'checked' : ''}/> Indeed</label>`)}
-        ${qc('Easy Apply only', '<label class="toggle"><input type="checkbox" checked disabled /><span class="knob"></span></label><div class="form-hint">locked — other applies aren\'t supported yet</div>')}
+        ${qc('Easy Apply only', `<label class="toggle"><input type="checkbox" id="aa-easy" ${aa.easyApplyOnly !== false ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">On = only 1-click / in-page applies (most reliable). Off = also surface normal &amp; external postings — the in-page ones get filled too; true external sites are flagged "needs you" in the breakdown.</div>`)}
         ${qc('Apply with profile', `<select class="select" id="aa-profile"><option value="">Default</option>${profiles.map((p) => `<option value="${esc(p.id)}" ${aa.profileId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>`)}
         ${qc('Attach résumé', `<select class="select" id="aa-resume"><option value="">Active résumé</option>${resumes.map((d) => `<option value="${esc(d.id)}" ${aa.resumeDocId === d.id ? 'selected' : ''}>${esc(d.label || d.name)}</option>`).join('')}</select>`)}
         ${qc('Your experience (years)', `<input class="input" id="aa-exp" type="number" min="0" max="40" value="${Number(aa.experienceYears) || 0}" /><div class="form-hint">skip roles that demand many more years than this (0 = off)</div>`)}
@@ -1776,14 +1776,15 @@ route('/queue', async () => {
       </div>
     </section>
 
-    <details class="section aa-advanced" ${(aa.runAnytime === false || aa.maxPerDay < 50) ? 'open' : ''}>
+    <details class="section aa-advanced" ${(aa.runAnytime === false || aa.maxPerDay < 50 || (Number(aa.concurrency) || 1) > 1) ? 'open' : ''}>
       <summary><span class="section-eyebrow">Advanced</span> Pacing &amp; limits</summary>
       <div class="queue-controls section-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px">
         ${qc('Run anytime (24/7)', `<label class="toggle"><input type="checkbox" id="aa-anytime" ${aa.runAnytime !== false ? 'checked' : ''} /><span class="knob"></span></label>`)}
         ${qc('Max / day', `<input class="input" id="aa-day" type="number" min="1" max="500" value="${aa.maxPerDay}" />`)}
         ${qc('Max / hour', `<input class="input" id="aa-hour" type="number" min="1" max="100" value="${aa.maxPerHour}" />`)}
-        ${qc('Gap min (min)', `<input class="input" id="aa-gmin" type="number" min="0" max="180" value="${aa.minGapMinutes}" />`)}
-        ${qc('Gap max (min)', `<input class="input" id="aa-gmax" type="number" min="0" max="360" value="${aa.maxGapMinutes}" />`)}
+        ${qc('Gap min (min)', `<input class="input" id="aa-gmin" type="number" min="0" max="180" step="0.25" value="${aa.minGapMinutes}" />`)}
+        ${qc('Gap max (min)', `<input class="input" id="aa-gmax" type="number" min="0" max="360" step="0.25" value="${aa.maxGapMinutes}" />`)}
+        ${qc('Parallel applications', `<input class="input" id="aa-conc" type="number" min="1" max="8" value="${Math.max(1, Number(aa.concurrency) || 1)}" /><div class="form-hint">1 = one at a time (safest). 2+ runs that many apply tabs at once — much faster, but LinkedIn/Indeed are more likely to flag your account.</div>`)}
         <div id="aa-window-row">
           ${qc('Window start', `<input class="input" id="aa-ws" type="time" value="${esc(aa.windowStart || '')}" />`)}
           ${qc('Window end', `<input class="input" id="aa-we" type="time" value="${esc(aa.windowEnd || '')}" />`)}
@@ -1829,6 +1830,15 @@ route('/queue', async () => {
       const boardsSel = [];
       if (v.querySelector('#aa-li').checked) boardsSel.push('linkedin');
       if (v.querySelector('#aa-in').checked) boardsSel.push('indeed');
+      const conc = Math.max(1, Math.min(8, Number(v.querySelector('#aa-conc').value) || 1));
+      // Parallel = more apply tabs at once = much faster, but a bigger automation
+      // footprint. Warn (once) only when the user is RAISING it past safe serial.
+      if (conc > 1 && conc > (Math.max(1, Number(aa.concurrency) || 1))) {
+        const ok = await confirmModal(
+          `This opens ${conc} apply tabs at the same time, so it applies much faster — but LinkedIn and Indeed watch for automated behaviour, and the more you run in parallel the more likely a temporary block or account flag becomes. "1" (one at a time) is the safe default. Continue?`,
+          { title: `Run ${conc} applications in parallel?`, danger: true, okLabel: 'Yes, go parallel', cancelLabel: 'Keep it safe' });
+        if (!ok) return;
+      }
       await api('/settings', {
         method: 'PATCH',
         body: { autoApply: {
@@ -1837,7 +1847,8 @@ route('/queue', async () => {
           keywords: kw.get(),
           locations: locs.get(),
           boards: boardsSel,
-          easyApplyOnly: true,
+          easyApplyOnly: v.querySelector('#aa-easy').checked,
+          concurrency: conc,
           experienceYears: Math.max(0, Number(v.querySelector('#aa-exp').value) || 0),
           seniorityMax: v.querySelector('#aa-seniority').value,
           excludeKeywords: (v.querySelector('#aa-exclude').value || '').split(',').map((x) => x.trim()).filter(Boolean),
@@ -1853,7 +1864,7 @@ route('/queue', async () => {
         } },
       });
       state.settings = null;
-      toast('Auto-apply settings saved');
+      toast(conc > 1 ? `Saved — running ${conc} in parallel` : 'Auto-apply settings saved');
     } catch (e) { errToast(e); }
   });
 
@@ -1888,19 +1899,56 @@ route('/queue', async () => {
   // [data-keep] (loaded imperatively), so loadHistory targets the LIVE DOM and a
   // soft refresh re-runs it (live) rather than wiping it.
   const OUTCOME_LABEL = { submitted: 'Submitted', failed: 'Failed', needs_you: 'Needs you', skipped: 'Skipped', pending: 'Queued', running: 'Running' };
+  const OUTCOME_COLOR = { submitted: '#16a34a', failed: '#dc2626', needs_you: '#d97706', skipped: '#9ca3af', pending: '#3b82f6', running: '#8b5cf6' };
+  // The breakdown chart: total + a stacked outcome bar, then by-board, by-route
+  // (easy/in-page vs external), and the top skip/fail reasons. Self-contained
+  // inline styles so it needs no CSS-file change (keeps the app/extension mirror simple).
+  function aaBreakdownHtml(bd) {
+    if (!bd || !bd.total) return '';
+    const oc = bd.byOutcome || {};
+    const ORDER = ['submitted', 'failed', 'needs_you', 'skipped', 'pending', 'running'];
+    const present = ORDER.filter((k) => oc[k]);
+    const bar = present.map((k) => `<span title="${esc(OUTCOME_LABEL[k])}: ${oc[k]}" style="display:block;flex:${oc[k]};background:${OUTCOME_COLOR[k]}"></span>`).join('');
+    const legend = present.map((k) => `<span style="display:inline-flex;align-items:center;gap:5px;font-size:12px;margin-right:12px"><i style="width:9px;height:9px;border-radius:2px;background:${OUTCOME_COLOR[k]};display:inline-block"></i>${oc[k]} ${esc(OUTCOME_LABEL[k])}</span>`).join('');
+    const tot = (m) => (m ? Object.values(m).reduce((a, b) => a + b, 0) : 0);
+    const sub = (m) => (m && m.submitted) || 0;
+    const line = (label, m) => `<div style="display:flex;justify-content:space-between;gap:10px;font-size:12px;padding:3px 0;border-top:1px solid var(--border,#2a2a2a)"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(label)}">${esc(label)}</span><span class="muted"><b style="color:${OUTCOME_COLOR.submitted}">${sub(m)}</b> ✓ · ${tot(m)}</span></div>`;
+    const rows = (obj, labels) => {
+      const e2 = Object.entries(obj || {}).sort((a, b) => tot(b[1]) - tot(a[1]));
+      return e2.length ? e2.map(([name, m]) => line((labels && labels[name]) || name, m)).join('') : '<div class="muted" style="font-size:12px">—</div>';
+    };
+    const ROUTE_LABEL = { 'easy-apply': 'Easy / in-page', external: 'External (needs you)', unknown: 'Unknown' };
+    const reasons = (bd.topReasons || []).length
+      ? bd.topReasons.map((r2) => `<div style="display:flex;justify-content:space-between;gap:10px;font-size:12px;padding:3px 0;border-top:1px solid var(--border,#2a2a2a)"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r2.reason)}">${esc(r2.reason)}</span><span class="muted">${r2.count}</span></div>`).join('')
+      : '<div class="muted" style="font-size:12px">No skips or failures 🎉</div>';
+    const h = (t) => `<div style="font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted,#888);margin-bottom:2px">${t}</div>`;
+    return `<div class="card" style="padding:14px;margin-bottom:14px">
+      <div style="font-size:13px;margin-bottom:8px"><b style="font-size:18px">${bd.total}</b> application${bd.total === 1 ? '' : 's'} <span class="muted">in the last ${bd.days} day${bd.days === 1 ? '' : 's'}</span></div>
+      <div style="display:flex;height:14px;border-radius:7px;overflow:hidden;background:var(--border,#2a2a2a)">${bar}</div>
+      <div style="margin-top:9px">${legend}</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:16px;margin-top:14px">
+        <div>${h('By board')}${rows(bd.byBoard)}</div>
+        <div>${h('By route')}${rows(bd.byRoute, ROUTE_LABEL)}</div>
+        <div>${h('Why skipped / failed')}${reasons}</div>
+      </div>
+    </div>`;
+  }
   async function loadHistory() {
     const body = document.getElementById('aa-hist-body');
     if (!body) return;
     const days = Number(document.getElementById('aa-hist-range')?.value) || 7;
     try {
-      const r = await api('/auto-apply/history?days=' + days);
+      const [r, bd] = await Promise.all([
+        api('/auto-apply/history?days=' + days),
+        api('/auto-apply/breakdown?days=' + days).catch(() => null),
+      ]);
       const rl = r.rollup || {};
       const roll = document.getElementById('aa-hist-roll');
       if (roll) roll.innerHTML = ['submitted', 'failed', 'needs_you', 'skipped'].map((k) =>
         `<span class="roll-chip out-${k}">${rl[k] || 0} ${esc(OUTCOME_LABEL[k])}</span>`).join('');
       const items = r.items || [];
       const b2 = document.getElementById('aa-hist-body'); if (!b2) return;
-      b2.innerHTML = items.length ? `<div class="hist-list">${items.map((it) => `
+      b2.innerHTML = aaBreakdownHtml(bd) + (items.length ? `<div class="hist-list">${items.map((it) => `
         <div class="hist-row" data-k="${esc(it.taskId)}">
           <span class="out-chip out-${esc(it.outcome)}">${esc(OUTCOME_LABEL[it.outcome] || it.outcome)}</span>
           <div class="hist-main">
@@ -1909,7 +1957,7 @@ route('/queue', async () => {
           </div>
           <div class="hist-meta">${it.job?.source ? `<span class="src-tag">${esc(it.job.source)}</span>` : ''}<span class="muted">${esc(fmtRel(it.updatedAt))}</span></div>
         </div>`).join('')}</div>`
-        : emptyHtml('No data', 'No auto-apply activity in this range', 'Press Start and let it run — every outcome shows up here.');
+        : emptyHtml('No data', 'No auto-apply activity in this range', 'Press Start and let it run — every outcome shows up here.'));
     } catch (e) {
       const b2 = document.getElementById('aa-hist-body'); if (b2) b2.innerHTML = `<div class="task-err" style="padding:18px">${esc(String(e?.message || e))}</div>`;
     }

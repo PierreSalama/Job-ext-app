@@ -376,6 +376,11 @@ const MIGRATIONS = [
     exec('DROP TABLE qa');
     exec('ALTER TABLE qa_new RENAME TO qa');
   },
+
+  // v7 — record which route an auto-apply task took (easy-apply | external).
+  () => {
+    exec('ALTER TABLE auto_apply_tasks ADD COLUMN apply_route TEXT;');
+  },
 ];
 
 function userVersion() {
@@ -1487,6 +1492,7 @@ function rowToTask(r) {
     scheduledAt: r.scheduled_at, attempts: r.attempts, lastError: r.last_error,
     transcript: safeParse(r.transcript, []),
     parkReason: r.park_reason || null,
+    applyRoute: r.apply_route || null,
     pendingQuestions: safeParse(r.pending_questions, []),
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
@@ -1537,6 +1543,42 @@ function queueHistory({ days = 7, state } = {}) {
   return { items, rollup };
 }
 
+// Aggregated breakdown for the Auto-apply chart: how many applications total,
+// split by OUTCOME (submitted/failed/needs_you/skipped/pending), by BOARD
+// (linkedin/indeed/…), by ROUTE (easy-apply vs external), plus the top skip/fail
+// reasons — all over the last N days. updated_at is the time signal.
+function queueBreakdown({ days = 30 } = {}) {
+  const cutoff = new Date(Date.now() - Math.max(1, days) * 86400 * 1000).toISOString();
+  const rows = all(
+    `SELECT t.state, t.last_error, t.park_reason, t.apply_route, j.source AS src
+     FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
+     WHERE t.updated_at >= ?`, [cutoff]);
+  const OUTCOME = {
+    done: 'submitted', awaiting_review: 'submitted', failed: 'failed',
+    parked: 'needs_you', awaiting_input: 'needs_you', skipped: 'skipped',
+    queued: 'pending', scheduled: 'pending', running: 'running',
+  };
+  const byOutcome = {}, byBoard = {}, byRoute = {}, reasons = {};
+  const bump = (obj, k1, k2) => {
+    if (!obj[k1]) obj[k1] = {};
+    obj[k1][k2] = (obj[k1][k2] || 0) + 1;
+  };
+  for (const r of rows) {
+    const oc = OUTCOME[r.state] || r.state;
+    byOutcome[oc] = (byOutcome[oc] || 0) + 1;
+    bump(byBoard, (r.src || 'other').toLowerCase(), oc);
+    bump(byRoute, r.apply_route || 'unknown', oc);
+    if (oc === 'failed' || oc === 'skipped' || oc === 'needs_you') {
+      const reason = String(r.last_error || r.park_reason || '').slice(0, 80) || '(unspecified)';
+      reasons[reason] = (reasons[reason] || 0) + 1;
+    }
+  }
+  const topReasons = Object.entries(reasons)
+    .sort((a, b) => b[1] - a[1]).slice(0, 8)
+    .map(([reason, count]) => ({ reason, count }));
+  return { total: rows.length, days, byOutcome, byBoard, byRoute, topReasons };
+}
+
 function queueAdd(jobId, { mode } = {}) {
   if (!getJob(jobId)) return null;
   const dup = get(
@@ -1552,7 +1594,7 @@ function queueAdd(jobId, { mode } = {}) {
   return rowToTask(get('SELECT * FROM auto_apply_tasks WHERE id = ?', [id]));
 }
 
-function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attemptsDelta, mode, parkReason, pendingQuestions }) {
+function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attemptsDelta, mode, parkReason, pendingQuestions, applyRoute }) {
   const cur = get('SELECT * FROM auto_apply_tasks WHERE id = ?', [id]);
   if (!cur) return null;
   if (state && !QUEUE_STATES.has(state)) return null;
@@ -1563,7 +1605,7 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
   }
   run(`UPDATE auto_apply_tasks SET
        state = ?, mode = ?, scheduled_at = ?, attempts = attempts + ?, last_error = ?,
-       transcript = ?, park_reason = ?, pending_questions = ?, updated_at = ? WHERE id = ?`,
+       transcript = ?, park_reason = ?, pending_questions = ?, apply_route = COALESCE(?, apply_route), updated_at = ? WHERE id = ?`,
       [state || cur.state,
        mode || cur.mode,
        scheduledAt !== undefined ? scheduledAt : cur.scheduled_at,
@@ -1572,6 +1614,7 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
        JSON.stringify(transcript.slice(-200)),
        parkReason !== undefined ? parkReason : cur.park_reason,
        pendingQuestions !== undefined ? JSON.stringify((pendingQuestions || []).slice(0, 40)) : cur.pending_questions,
+       (applyRoute !== undefined && applyRoute !== null) ? String(applyRoute) : null,
        now(), id]);
   return rowToTask(get('SELECT * FROM auto_apply_tasks WHERE id = ?', [id]));
 }
@@ -1646,7 +1689,12 @@ function queueRunStats() {
     [hourAgo]).n;
   const lastRun = get(
     `SELECT MAX(updated_at) AS t FROM auto_apply_tasks WHERE state IN ('done','awaiting_review','failed')`).t;
-  return { doneDay, doneHour, lastRun };
+  // Last START (scheduled_at) — the gap between applications is paced from when
+  // the previous one *began*, not finished, so a self-driving serial loop and a
+  // parallel pool both space their launches correctly without stalling.
+  const lastStart = get(
+    `SELECT MAX(scheduled_at) AS t FROM auto_apply_tasks WHERE scheduled_at IS NOT NULL`).t;
+  return { doneDay, doneHour, lastRun, lastStart };
 }
 
 // ============================================================
@@ -1842,7 +1890,7 @@ module.exports = {
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,
   extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
-  queueList, queueHistory, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueRetryParked, saveIntakeAnswer,
+  queueList, queueHistory, queueBreakdown, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueRetryParked, saveIntakeAnswer,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,
   emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching,

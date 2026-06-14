@@ -88,12 +88,13 @@ const DEFAULTS = {
     enabled: false,          // master switch — just ON/OFF
     startedAt: '',           // ISO time the master switch was last turned ON (live "running for" timer)
     mode: 'auto',            // default: submit for me. 'review' stops before submit
-    // Generous defaults (user asked) — the Advanced area lets you tighten these.
-    // Empty window = run any time of day. Gaps are auto-managed but adjustable.
-    maxPerDay: 50,
-    maxPerHour: 10,
-    minGapMinutes: 2,
-    maxGapMinutes: 6,
+    // Aggressive defaults (user asked for speed) — the Advanced area lets you tune.
+    // Empty window = run any time of day.
+    maxPerDay: 200,
+    maxPerHour: 60,
+    minGapMinutes: 0.25,          // ~15s between starts
+    maxGapMinutes: 0.6,           // ~36s
+    concurrency: 1,               // applications in PARALLEL (1 = aggressive serial). >1 = parallel tabs: much faster, but RAISES LinkedIn/Indeed account-flag risk (warned in the UI).
     runAnytime: true,        // ON by default — run 24/7. Turn OFF to use the window below.
     windowStart: '',         // only used when runAnytime is false
     windowEnd: '',

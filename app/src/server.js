@@ -161,17 +161,22 @@ function withinWindow(settings) {
 // pacing so the user can shake it out immediately — but still needs enabled.
 async function queueNext(force = false) {
   const s = db.getSettings().autoApply;
-  if (!s.enabled) return { task: null, reason: 'disabled' };
+  const concurrency = Math.max(1, Math.min(8, Number(s.concurrency) || 1));
+  if (!s.enabled) return { task: null, reason: 'disabled', concurrency };
   if (!force) {
-    if (!withinWindow(s)) return { task: null, reason: 'outside-window' };
+    if (!withinWindow(s)) return { task: null, reason: 'outside-window', concurrency };
     const stats = db.queueRunStats();
-    if (stats.doneDay >= s.maxPerDay) return { task: null, reason: 'daily-cap' };
-    if (stats.doneHour >= s.maxPerHour) return { task: null, reason: 'hourly-cap' };
-    if (stats.lastRun) {
+    if (stats.doneDay >= s.maxPerDay) return { task: null, reason: 'daily-cap', concurrency };
+    if (stats.doneHour >= s.maxPerHour) return { task: null, reason: 'hourly-cap', concurrency };
+    // Pace launches from when the PREVIOUS application STARTED (not finished) —
+    // otherwise a self-driving loop re-arms the gap on every completion and
+    // collapses back to one-per-alarm-tick. The job's own runtime usually
+    // absorbs the gap, so serial flows continuously; parallel spaces its starts.
+    if (stats.lastStart) {
       const gapMin = s.minGapMinutes + Math.random() * Math.max(0, s.maxGapMinutes - s.minGapMinutes);
-      const eligibleAt = new Date(stats.lastRun).getTime() + gapMin * 60000;
+      const eligibleAt = new Date(stats.lastStart).getTime() + gapMin * 60000;
       if (Date.now() < eligibleAt) {
-        return { task: null, reason: 'gap', nextEligibleAt: new Date(eligibleAt).toISOString() };
+        return { task: null, reason: 'gap', nextEligibleAt: new Date(eligibleAt).toISOString(), concurrency };
       }
     }
   }
@@ -209,6 +214,7 @@ async function queueNext(force = false) {
 
   return {
     task: { ...task, mode },
+    concurrency,
     context: {
       job,
       profile: profile || null,
@@ -784,6 +790,11 @@ async function handle(req, res, parsed) {
     const days = Number(parsed.searchParams.get('days')) || 7;
     const state = parsed.searchParams.get('state') || undefined;
     return sendJson(res, 200, { ok: true, ...db.queueHistory({ days, state }) });
+  }
+  // Aggregated breakdown for the Auto-apply chart (outcome / board / route / reasons): ?days=N
+  if (req.method === 'GET' && pathname === '/auto-apply/breakdown') {
+    const days = Number(parsed.searchParams.get('days')) || 30;
+    return sendJson(res, 200, { ok: true, ...db.queueBreakdown({ days }) });
   }
   // User answers the parked questions → saved to the profile (locked) → parked
   // jobs whose questions are now all answerable flip back to 'queued'.

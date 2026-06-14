@@ -175,9 +175,17 @@ function cancel(reason) {
 let reportQueue = Promise.resolve();
 function report(patch) {
   if (!S.task) return;
+  // Stamp the apply ROUTE on real outcome transitions so the dashboard chart can
+  // split the "easy / in-page apply" route from "external": an apply form that
+  // never opened in-page means the posting bounced us to an external ATS or a
+  // verification wall we can't auto-drive. Skips (relevance) get no route.
+  if (patch && ROUTE_STATES.has(patch.state) && patch.applyRoute === undefined) {
+    patch.applyRoute = S.everHadForm ? 'easy-apply' : 'external';
+  }
   reportQueue = reportQueue.then(() =>
     send({ type: 'task-progress', taskId: S.task.id, patch })).catch(() => {});
 }
+const ROUTE_STATES = new Set(['done', 'awaiting_review', 'awaiting_input', 'parked', 'failed']);
 
 // ============================================================
 // Helpers
@@ -325,7 +333,7 @@ async function tryAttachResume(root, resume) {
 export async function run(task, context, helpers) {
   if (S.running) return { ok: false, error: 'executor already running' };
   S.running = true; S.cancelled = false; S.paused = false; S.step = 0;
-  S.task = task; S.context = context;
+  S.task = task; S.context = context; S.everHadForm = false;
 
   const { job, profile, profileId, resume, harvested, aiConfidenceMin = 0.7 } = context || {};
   const mode = task.mode || 'review';
@@ -414,7 +422,7 @@ export async function run(task, context, helpers) {
       .find((d) => isProbablyVisible(d) && d.querySelector('input, textarea, select, [role="combobox"], [contenteditable="true"]')) || null;
     const root = dialog || formProbe?.form || null;
     const haveForm = !!root;
-    if (haveForm) everHadForm = true;
+    if (haveForm) { everHadForm = true; S.everHadForm = true; }
 
     // ---- fill from profile + learned answers ----
     setStatus(`Step ${S.step}: ${haveForm ? 'filling fields…' : 'opening the application…'}`);

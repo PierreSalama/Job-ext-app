@@ -30,7 +30,7 @@ jobs:
       - name: Unit tests
         # Explicit files (not a glob) so it works on Node 20 too — the test
         # runner only expands globs on Node 21+.
-        run: node --test tests/status.test.mjs tests/fit.test.mjs tests/prompts.test.mjs tests/secrets.test.mjs tests/profile-memory.test.mjs tests/resume.test.mjs
+        run: node --test tests/status.test.mjs tests/fit.test.mjs tests/prompts.test.mjs tests/secrets.test.mjs tests/profile-memory.test.mjs tests/resume.test.mjs tests/autoapply-breakdown.test.mjs
 
   build:
     needs: checks

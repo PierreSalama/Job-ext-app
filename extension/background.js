@@ -72,12 +72,17 @@ chrome.alarms.onAlarm.addListener(async (a) => {
     await paintBadge();
   }
   if (a.name === 'jat11-autoapply') {
-    // Apply one paced job; if there was nothing to apply, use the tick to top up
-    // the queue via a discovery search instead. Never both in one tick.
-    const r = await autoApplyTick();
+    // Top up the apply pool (serial self-drives between ticks; this is the backstop
+    // + the parallel re-fill). If nothing could be dispatched AND no applies are in
+    // flight, use the tick to grow the queue via a discovery search instead.
+    const r = await pump();
     // Auto-apply was turned OFF (from either dashboard host) → tidy up the run's
     // tabs/group. Cheap no-op once aaGroupId is cleared.
     if (r.reason === 'disabled' && aaGroupId != null) await closeAutoApplyTabs().catch(() => {});
+    // If we couldn't dispatch (queue empty/low/gap), top the queue up — even while
+    // applies are in flight. A continuously-busy pool would otherwise starve
+    // discovery and drain the queue to a stall (discoverTick self-gates on queue
+    // depth, so this never over-enqueues).
     if (!r.dispatched) await discoverTick().catch(() => {});
   }
   if (a.name === 'jat11-extupdate') {
@@ -149,7 +154,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     case 'run-autoapply-now':
       // TEST button: apply the next queued job RIGHT NOW (skips window/cap/gap).
-      respond(autoApplyTick(true).then((s) => ({ ok: true, ...s })));
+      respond(forceApplyOne().then((s) => ({ ok: true, ...s })));
       return true;
     case 'stop-autoapply':
       // Dashboard "Stop everything" → close the run's tabs + drop the group.
@@ -410,8 +415,19 @@ async function launchApp() {
   }
 }
 
-// ---------- auto-apply dispatcher ----------
-let dispatching = false;
+// ---------- auto-apply dispatcher (worker pool) ----------
+// Aggressive serial by DEFAULT (concurrency 1) but SELF-DRIVING: each job re-pumps
+// the moment it finishes instead of waiting for the 1-min alarm — that alone takes
+// throughput from ~one-per-tick to as fast as the pacing gap allows. The user can
+// raise `concurrency` (server setting) to run several apply tabs in PARALLEL.
+//   activeCount  — apply tabs currently running (the pool's live slots)
+//   pumping      — re-entrancy guard for the fill loop
+//   scanning     — separate mutex for discovery / applied-sync (never overlap an apply)
+let activeCount = 0;
+let pumping = false;
+let scanning = false;
+let currentConcurrency = 1;       // learned from each /queue/next response
+let gapTimer = null;              // precise wake-up when only the pacing gap held us back
 
 // Keep every auto-apply / discovery tab in ONE labelled Chrome tab group so the
 // user can see + manage them together (and they're not scattered everywhere).
@@ -494,21 +510,17 @@ async function closeAutoApplyTabs() {
   aaGroupId = null;
 }
 
-async function autoApplyTick(force = false) {
-  if (dispatching) return { dispatched: false, reason: 'busy' };
-  if (!(await api.isPaired())) return { dispatched: false, reason: 'not paired' };
-  const h = await api.health();
-  if (!h?.ok) return { dispatched: false, reason: 'app offline' };
-
-  const r = await api.call('GET', '/queue/next' + (force ? '?force=1' : ''), null, 8000);
-  if (!r?.ok || !r.task) return { dispatched: false, reason: r?.reason || 'nothing queued' };
-
-  dispatching = true;
+// Run ONE queued task end-to-end in its own tab. Pure per-task: opens the tab,
+// hands the task to the executor (awaits the WHOLE run → resolves with the run's
+// authoritative terminal state, which the executor has already report()-ed),
+// reconciles, and closes the tab on terminal/parked outcomes. Never throws;
+// returns the final state string. Slot accounting belongs to the caller.
+async function launchOne(task, context) {
+  const url = context.job.jobUrl;
+  let tab = null;
   try {
-    const { task, context } = r;
-    const url = context.job.jobUrl;
     const winId = await autoApplyTargetWindow();
-    const tab = await chrome.tabs.create({ url, active: false, ...(winId ? { windowId: winId } : {}) });
+    tab = await chrome.tabs.create({ url, active: false, ...(winId ? { windowId: winId } : {}) });
     await groupTab(tab.id);
 
     // Wait for the page (and content script) to settle, then hand over the task.
@@ -543,7 +555,7 @@ async function autoApplyTick(force = false) {
         transcriptAppend: { note: 'executor error: ' + String(e?.message || e) },
       });
       try { await chrome.tabs.remove(tab.id); } catch {}
-      return { dispatched: true, state: 'failed' };
+      return 'failed';
     }
     const finalState = (result && typeof result.state === 'string') ? result.state : null;
     if (!result || result.ok === false || !finalState) {
@@ -552,7 +564,7 @@ async function autoApplyTick(force = false) {
         transcriptAppend: { note: 'executor failed: ' + String(result?.error || 'no state') },
       });
       try { await chrome.tabs.remove(tab.id); } catch {}
-      return { dispatched: true, state: 'failed' };
+      return 'failed';
     }
     if (finalState !== 'running') {
       await api.call('PATCH', '/queue/' + task.id, { state: finalState });   // idempotent reconcile
@@ -563,9 +575,80 @@ async function autoApplyTick(force = false) {
     if (['done', 'skipped', 'failed', 'parked'].includes(finalState)) {
       try { await chrome.tabs.remove(tab.id); } catch {}
     }
-    return { dispatched: true, state: finalState, title: r.context?.job?.title };
+    return finalState;
+  } catch (e) {
+    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} }
+    return 'failed';
+  }
+}
+
+// Debounced top-up: when an apply slot frees, try to launch the next job WITHOUT
+// waiting for the 1-min alarm. This is what makes serial mode fast and keeps a
+// parallel pool full.
+let pumpTimer = null;
+function schedulePump() {
+  if (pumpTimer) return;
+  pumpTimer = setTimeout(() => { pumpTimer = null; pump().catch(() => {}); }, 300);
+}
+
+// Fill open apply slots up to the configured concurrency, paced by the server.
+// FIRE-AND-FORGET per task: each launch frees its slot on completion and re-pumps,
+// so N tabs cycle continuously. concurrency comes back with every /queue/next.
+async function pump(force = false) {
+  if (pumping) return { dispatched: false, reason: 'pumping' };
+  if (!(await api.isPaired())) return { dispatched: false, reason: 'not paired' };
+  const h = await api.health();
+  if (!h?.ok) return { dispatched: false, reason: 'app offline' };
+  if (gapTimer) { clearTimeout(gapTimer); gapTimer = null; }
+  pumping = true;
+  let dispatched = 0;
+  let reason = 'idle';
+  let gapEligibleAt = null;
+  try {
+    while (activeCount < currentConcurrency) {
+      const r = await api.call('GET', '/queue/next' + (force ? '?force=1' : ''), null, 8000);
+      if (r && r.concurrency) currentConcurrency = Math.max(1, Math.min(8, r.concurrency));
+      if (!r?.ok || !r.task) {
+        reason = r?.reason || 'nothing queued';
+        if (r?.nextEligibleAt) gapEligibleAt = r.nextEligibleAt;
+        break;
+      }
+      activeCount++;
+      dispatched++;
+      launchOne(r.task, r.context)
+        .catch(() => {})
+        .finally(() => { activeCount = Math.max(0, activeCount - 1); schedulePump(); });
+      // Small stagger so parallel launches don't open N tabs in the same instant.
+      if (activeCount < currentConcurrency) await new Promise((r2) => setTimeout(r2, 500));
+    }
   } finally {
-    dispatching = false;
+    pumping = false;
+  }
+  // Held back only by the pacing gap → wake exactly when it expires (bounded), so
+  // a fast-finishing job doesn't idle until the next 1-min alarm.
+  if (reason === 'gap' && gapEligibleAt) {
+    const delay = Math.max(300, new Date(gapEligibleAt).getTime() - Date.now());
+    if (delay < 70000) { clearTimeout(gapTimer); gapTimer = setTimeout(() => { gapTimer = null; pump().catch(() => {}); }, delay); }
+  }
+  return { dispatched: dispatched > 0, count: dispatched, active: activeCount, reason };
+}
+
+// TEST button: apply the next queued job RIGHT NOW (skips window/cap/gap), AWAITED
+// so the dashboard can show the outcome. Still counts against the pool's slots.
+async function forceApplyOne() {
+  if (!(await api.isPaired())) return { dispatched: false, reason: 'not paired' };
+  const h = await api.health();
+  if (!h?.ok) return { dispatched: false, reason: 'app offline' };
+  const r = await api.call('GET', '/queue/next?force=1', null, 8000);
+  if (r && r.concurrency) currentConcurrency = Math.max(1, Math.min(8, r.concurrency));
+  if (!r?.ok || !r.task) return { dispatched: false, reason: r?.reason || 'nothing queued' };
+  activeCount++;
+  try {
+    const state = await launchOne(r.task, r.context);
+    return { dispatched: true, state, title: r.context?.job?.title };
+  } finally {
+    activeCount = Math.max(0, activeCount - 1);
+    schedulePump();
   }
 }
 
@@ -592,18 +675,25 @@ function withinWindow(aa) {
   return mins >= sh * 60 + (sm || 0) && mins <= eh * 60 + (em || 0);
 }
 
-function buildSearchUrl(board, keyword, location) {
+function buildSearchUrl(board, keyword, location, { easyApplyOnly = true } = {}) {
   const kw = encodeURIComponent(keyword);
   const loc = location ? encodeURIComponent(location) : '';
   if (board === 'indeed') {
     return `https://www.indeed.com/jobs?q=${kw}&sort=date&fromage=7` + (loc ? `&l=${loc}` : '');
   }
-  // linkedin (default) — f_AL=true is the Easy-Apply filter; DD = sort by date
-  return `https://www.linkedin.com/jobs/search/?f_AL=true&keywords=${kw}&sortBy=DD` + (loc ? `&location=${loc}` : '');
+  // linkedin (default) — f_AL=true is the Easy-Apply filter; DD = sort by date.
+  // When easyApplyOnly is OFF the user also wants normal/external postings, so we
+  // drop the filter (the executor drives any in-page apply form and flags true
+  // external redirects as "needs you / external" in the breakdown).
+  const al = easyApplyOnly ? 'f_AL=true&' : '';
+  return `https://www.linkedin.com/jobs/search/?${al}keywords=${kw}&sortBy=DD` + (loc ? `&location=${loc}` : '');
 }
 
 async function discoverTick(force = false) {
-  if (dispatching) return { ok: false, note: 'busy' };
+  // Only block on another scan or the brief pump grab-window — discovery may run
+  // ALONGSIDE active applies (its own tab) so the queue stays fed while the pool
+  // is busy. (aaGroup tab-window races during the grab are why we still gate on pumping.)
+  if (scanning || pumping) return { ok: false, note: 'busy' };
   if (!(await api.isPaired())) return { ok: false, note: 'not paired' };
   const h = await api.health();
   if (!h?.ok) return { ok: false, note: 'app offline' };
@@ -622,12 +712,12 @@ async function discoverTick(force = false) {
     if ((q?.items || []).length >= (aa.discovery.refillBelow || 3)) return { ok: false, note: 'queue already full' };
   }
 
-  dispatching = true;
+  scanning = true;
   let tab = null;
   const board = boards[lastBoardIdx++ % boards.length];
   const keyword = keywords[Math.floor(Math.random() * keywords.length)];
   const location = (aa.locations || [])[0] || '';
-  const url = buildSearchUrl(board, keyword, location);
+  const url = buildSearchUrl(board, keyword, location, { easyApplyOnly: aa.easyApplyOnly !== false });
   let resp = null, enqueued = 0;
   try {
     const winId = await autoApplyTargetWindow();
@@ -649,7 +739,7 @@ async function discoverTick(force = false) {
     resp = { ok: false, error: String(e?.message || e), jobs: [], found: 0, note: 'discovery failed: ' + String(e?.message || e) };
   } finally {
     if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} }
-    dispatching = false;
+    scanning = false;
   }
   // Report what this search saw so the dashboard can show it (and we can tune).
   const status = { board, keyword, url, found: resp?.found ?? 0, enqueued, note: resp?.note || resp?.error || '', ok: resp?.ok !== false };
@@ -690,14 +780,14 @@ async function syncAppliedFor(source, maxDays) {
   }
 }
 async function syncApplied({ sources = ['linkedin'], maxDays = 90 } = {}) {
-  if (dispatching) return { ok: false, error: 'busy — auto-apply is mid-task, try again in a moment' };
+  if (scanning || pumping || activeCount > 0) return { ok: false, error: 'busy — auto-apply is mid-task, try again in a moment' };
   if (!(await api.isPaired())) return { ok: false, error: 'app not connected' };
   const list = (Array.isArray(sources) ? sources : [sources]).filter((s) => APPLIED_URL[s]);
   if (!list.length) return { ok: false, error: 'pick LinkedIn and/or Indeed' };
-  dispatching = true;
+  scanning = true;
   try {
     const results = [];
     for (const s of list) results.push(await syncAppliedFor(s, maxDays));   // serial — one tab at a time
     return { ok: true, results };
-  } finally { dispatching = false; }
+  } finally { scanning = false; }
 }
