@@ -91,6 +91,32 @@ function broadcast(type, data) {
 }
 
 // ---------- auto-apply pacing ----------
+// Relevance: classify a title's seniority and skip roles above the user's max or
+// matching an excluded keyword (so a junior dev doesn't get Senior/Lead/Manager/Game
+// roles queued). 1=entry 2=mid 3=senior 4=lead+.
+function jobLevel(title) {
+  const t = String(title || '').toLowerCase();
+  // level 4 = lead/management. "lead" only as a real eng-lead title ("Tech Lead",
+  // "Lead Software Engineer") — NOT "Lead Generation" or "...at Principal Co".
+  if (/\b(staff|principal|architect|manager|mgr|director|head of|vp|vice president|chief)\b/.test(t)
+      || /\b(?:tech|technical|team|engineering|dev|development|squad)\s+lead\b/.test(t)
+      || /\blead\s+(?:software|develop|engineer|back|front|full|data|ml|devops|sdet|qa|cloud|platform)/.test(t)) return 4;
+  if (/\b(senior|sr\.?|sr)\b/.test(t)) return 3;
+  if (/\b(intern(ship)?|co-?op|junior|jr\.?|entry[- ]?level|new ?grad|graduate|apprentice|trainee|student)\b/.test(t)) return 1;
+  return 2;
+}
+const SENIORITY_CAP = { any: 99, senior: 3, mid: 2, entry: 1 };
+function jobFit(title, aa) {
+  const cap = SENIORITY_CAP[aa && aa.seniorityMax] ?? 99;
+  if (jobLevel(title) > cap) return { ok: false, reason: `above your level cap (${aa.seniorityMax})` };
+  const t = String(title || '').toLowerCase();
+  for (const kw of (aa && aa.excludeKeywords) || []) {
+    const k = String(kw || '').trim().toLowerCase();
+    if (k && t.includes(k)) return { ok: false, reason: `excluded keyword "${k}"` };
+  }
+  return { ok: true };
+}
+
 function withinWindow(settings) {
   if (settings.runAnytime !== false) return true;                  // 24/7 (default) — ignore the window
   if (!settings.windowStart || !settings.windowEnd) return true;   // no window = any time
@@ -158,6 +184,10 @@ async function queueNext(force = false) {
         id: resume.id, name: resume.name, mime: resume.mime,
       } : null,
       aiConfidenceMin: s.aiAnswerConfidenceMin,
+      // Fit filters the executor re-checks against the live job page (a manually
+      // queued job can bypass the discovery gate; and only the page has the
+      // "needs N years" requirement text).
+      fit: { experienceYears: s.experienceYears || 0, seniorityMax: s.seniorityMax || 'any', excludeKeywords: s.excludeKeywords || [] },
     },
   };
 }
@@ -677,9 +707,12 @@ async function handle(req, res, parsed) {
     const body = await readJson(req);
     const jobs = Array.isArray(body.jobs) ? body.jobs : [];
     const s = db.getSettings().autoApply;
-    let enqueued = 0;
+    let enqueued = 0, filtered = 0;
     for (const jd of jobs.slice(0, 50)) {
       if (!jd || !jd.jobUrl) continue;
+      // Relevance gate — don't even queue roles above the user's level / excluded.
+      const fit = jobFit(jd.title, s);
+      if (!fit.ok) { filtered++; continue; }
       const r = db.transaction(() => {
         const up = db.upsertJob({
           externalId: jd.externalId, source: body.source || jd.source || null,
@@ -695,7 +728,7 @@ async function handle(req, res, parsed) {
     }
     broadcast('queue.updated', { action: 'discover' });
     broadcast('jobs.updated', { action: 'discover' });
-    return sendJson(res, 200, { ok: true, enqueued });
+    return sendJson(res, 200, { ok: true, enqueued, filtered });
   }
   // The deduped list of questions parked jobs are waiting on (the intake form).
   if (req.method === 'GET' && pathname === '/queue/parked') {

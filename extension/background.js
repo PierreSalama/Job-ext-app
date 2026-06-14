@@ -450,6 +450,14 @@ async function autoApplyTargetWindow() {
   } catch { return undefined; }
 }
 
+// Keep the group COLLAPSED so its tabs stay tucked behind a single chip — out of
+// the user's way + impossible to click into by accident. (A truly hidden/minimized
+// window throttles page rendering and would break the LinkedIn/Indeed scraping, so
+// collapsed-in-a-background-window is the reliable "hidden".)
+async function collapseAaGroup() {
+  if (aaGroupId == null || !chrome.tabGroups?.update) return;
+  try { await chrome.tabGroups.update(aaGroupId, { collapsed: true }); } catch {}
+}
 async function groupTab(tabId) {
   try {
     if (!chrome.tabs.group) return;
@@ -458,6 +466,7 @@ async function groupTab(tabId) {
       try {
         if (chrome.tabGroups?.get) await chrome.tabGroups.get(aaGroupId);   // confirm it still exists
         await chrome.tabs.group({ tabIds: [tabId], groupId: aaGroupId });   // joins the group (and its window)
+        await collapseAaGroup();
         return;
       } catch { aaGroupId = null; }   // stale — make a fresh group below
     }
@@ -465,6 +474,7 @@ async function groupTab(tabId) {
     if (chrome.tabGroups?.update) {
       try { await chrome.tabGroups.update(aaGroupId, { title: AA_GROUP_TITLE, color: 'yellow' }); } catch {}
     }
+    await collapseAaGroup();
   } catch { aaGroupId = null; }
 }
 

@@ -102,6 +102,10 @@ const DEFAULTS = {
     keywords: [],                 // e.g. ['software engineer', 'data analyst']
     locations: [],                // e.g. ['Toronto', 'Remote']
     boards: ['linkedin', 'indeed'],
+    // ---- relevance / fit filters (skip jobs that don't match your level) ----
+    experienceYears: 0,           // your years of experience; >0 = skip jobs that demand many more
+    seniorityMax: 'any',          // 'any' | 'entry' | 'mid' | 'senior' — skip roles above this level
+    excludeKeywords: [],          // title terms to always skip, e.g. ['game','manager','sales']
     profileId: '',                // which profile to apply with ('' = default)
     resumeDocId: '',              // which résumé to attach ('' = default)
     discovery: {

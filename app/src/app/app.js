@@ -1587,6 +1587,14 @@ route('/queue', async () => {
         ${qc('Easy Apply only', '<label class="toggle"><input type="checkbox" checked disabled /><span class="knob"></span></label><div class="form-hint">locked — other applies aren\'t supported yet</div>')}
         ${qc('Apply with profile', `<select class="select" id="aa-profile"><option value="">Default</option>${profiles.map((p) => `<option value="${esc(p.id)}" ${aa.profileId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>`)}
         ${qc('Attach résumé', `<select class="select" id="aa-resume"><option value="">Active résumé</option>${resumes.map((d) => `<option value="${esc(d.id)}" ${aa.resumeDocId === d.id ? 'selected' : ''}>${esc(d.label || d.name)}</option>`).join('')}</select>`)}
+        ${qc('Your experience (years)', `<input class="input" id="aa-exp" type="number" min="0" max="40" value="${Number(aa.experienceYears) || 0}" /><div class="form-hint">skip roles that demand many more years than this (0 = off)</div>`)}
+        ${qc('Max seniority', `<select class="select" id="aa-seniority">
+          <option value="any" ${(aa.seniorityMax || 'any') === 'any' ? 'selected' : ''}>Any level</option>
+          <option value="entry" ${aa.seniorityMax === 'entry' ? 'selected' : ''}>Entry / Junior only</option>
+          <option value="mid" ${aa.seniorityMax === 'mid' ? 'selected' : ''}>Up to Mid</option>
+          <option value="senior" ${aa.seniorityMax === 'senior' ? 'selected' : ''}>Up to Senior (skip Lead/Manager)</option>
+        </select>`)}
+        ${qc('Exclude titles', `<input class="input" id="aa-exclude" type="text" placeholder="game, manager, sales…" value="${esc((aa.excludeKeywords || []).join(', '))}" /><div class="form-hint">comma-separated — skip any title containing these</div>`)}
       </div>
     </section>
 
@@ -1652,6 +1660,9 @@ route('/queue', async () => {
           locations: locs.get(),
           boards: boardsSel,
           easyApplyOnly: true,
+          experienceYears: Math.max(0, Number(v.querySelector('#aa-exp').value) || 0),
+          seniorityMax: v.querySelector('#aa-seniority').value,
+          excludeKeywords: (v.querySelector('#aa-exclude').value || '').split(',').map((x) => x.trim()).filter(Boolean),
           profileId: v.querySelector('#aa-profile').value,
           resumeDocId: v.querySelector('#aa-resume').value,
           maxPerDay: Number(v.querySelector('#aa-day').value) || 50,

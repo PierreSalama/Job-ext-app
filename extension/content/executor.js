@@ -38,6 +38,37 @@ const ADVANCE_KEYWORDS = [
 ];
 const FINAL_SUBMIT_RX = /^(submit( application)?|send( application)?|soumettre|envoyer( ma candidature)?|confirm and submit)$/i;
 
+// ---- relevance / fit (mirror of server jobFit + a page "needs N years" scan) ----
+function jobLevel(title) {
+  const t = String(title || '').toLowerCase();
+  if (/\b(staff|principal|architect|manager|mgr|director|head of|vp|vice president|chief)\b/.test(t)
+      || /\b(?:tech|technical|team|engineering|dev|development|squad)\s+lead\b/.test(t)
+      || /\blead\s+(?:software|develop|engineer|back|front|full|data|ml|devops|sdet|qa|cloud|platform)/.test(t)) return 4;
+  if (/\b(senior|sr\.?|sr)\b/.test(t)) return 3;
+  if (/\b(intern(ship)?|co-?op|junior|jr\.?|entry[- ]?level|new ?grad|graduate|apprentice|trainee|student)\b/.test(t)) return 1;
+  return 2;
+}
+const SENIORITY_CAP = { any: 99, senior: 3, mid: 2, entry: 1 };
+// Largest "N years of experience" the page demands (experience-context only, to
+// avoid counting unrelated numbers). Returns 0 if none found.
+function requiredYears(text) {
+  const t = String(text || '').toLowerCase().slice(0, 16000);
+  const re = /(?:(\d{1,2})\s*\+?\s*(?:years?|yrs?)\s*(?:of\s*)?(?:experience|exp\b))|(?:experience[^.\n]{0,24}?(\d{1,2})\s*\+?\s*(?:years?|yrs?))/g;
+  let m, max = 0;
+  while ((m = re.exec(t))) { const n = Number(m[1] || m[2]); if (n >= 1 && n <= 25 && n > max) max = n; }
+  return max;
+}
+function checkFit(title, pageText, fit) {
+  if (!fit) return null;
+  const cap = SENIORITY_CAP[fit.seniorityMax] ?? 99;
+  if (jobLevel(title) > cap) return `role looks above your level cap (${fit.seniorityMax})`;
+  const tl = String(title || '').toLowerCase();
+  for (const kw of fit.excludeKeywords || []) { const k = String(kw || '').trim().toLowerCase(); if (k && tl.includes(k)) return `excluded keyword "${k}"`; }
+  const yrs = Number(fit.experienceYears) || 0;
+  if (yrs > 0) { const req = requiredYears(pageText); if (req && req > yrs + 3) return `needs ~${req} yrs experience (you set ${yrs})`; }
+  return null;
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const send = (msg) => new Promise((res) => {
   try { chrome.runtime.sendMessage(msg, (r) => { void chrome.runtime.lastError; res(r); }); }
@@ -308,6 +339,18 @@ export async function run(task, context, helpers) {
   const learnedCount = Array.isArray(harvested) ? harvested.length : 0;
   logLine('ok', `start mode=${mode} · profile=${profile ? 'loaded' : 'none'} · learned=${learnedCount} · resume=${resume?.name || 'none'}`);
 
+  // ---- relevance gate: don't apply to roles above your level / excluded / that
+  // demand far more experience than you set (re-checked against the live page). ----
+  const fitReason = checkFit(job?.title || '', document.body?.innerText || '', context?.fit);
+  if (fitReason) {
+    logLine('warn', `skipping — ${fitReason}`);
+    setStatus(`Skipped — ${fitReason}`);
+    report({ state: 'skipped', lastError: fitReason, transcriptAppend: { note: 'relevance skip: ' + fitReason } });
+    S.running = false;
+    hideOverlay(3500);
+    return { ok: true, state: 'skipped', steps: 0 };
+  }
+
   const engine = new AutofillEngine({
     getProfile: async () => profileData,
     lookupAnswer: async (label) => {
@@ -321,6 +364,7 @@ export async function run(task, context, helpers) {
   let finalState = null;
   let everHadForm = false;     // has the apply form/modal ever appeared this run?
   let submitAttempted = false; // did we click a final submit (auto mode) at least once?
+  let noChange = 0;            // consecutive advance clicks that didn't change the page (stall)
 
   // Self-healing park: questions we couldn't answer with HIGH confidence. We
   // NEVER submit a job with these outstanding — instead we park it (with the
@@ -501,7 +545,21 @@ export async function run(task, context, helpers) {
     const prevHash = domHash();
     syntheticClick(clickBtn);
     const changed = await waitForChange(prevHash);
-    if (!changed) logLine('warn', 'page did not change after click');
+    // Stall guard: 3 advance clicks in a row with no page change → we're stuck on a
+    // step (validation we can't satisfy, a dead button). Stop cleanly instead of
+    // spinning to MAX_STEPS. NEVER count the final-submit click — its confirmation
+    // (below) renders a beat later and must run, or a real submit gets mis-reported.
+    const isFinalAuto = isFinal && mode !== 'review';
+    if (!changed && !isFinalAuto) {
+      logLine('warn', 'page did not change after click');
+      if (++noChange >= 3) {
+        if (parked.length) { reportParked('stalled'); break; }
+        logLine('warn', 'stuck — the page stopped advancing; handing back to you');
+        report({ state: 'awaiting_input', lastError: 'stuck on a step (page stopped advancing)' });
+        finalState = 'awaiting_input';
+        break;
+      }
+    } else if (changed) { noChange = 0; }
 
     // ---- confirm a real submit (auto mode) ----
     // After clicking the final submit, WAIT for the confirmation (banner or the
