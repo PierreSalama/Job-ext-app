@@ -247,6 +247,52 @@ function setUpdateState(patch) {
   try { broadcast('updates.state', updateState); } catch {}
 }
 
+// A background check that no-ops in dev and when the user set mode:'manual'.
+function maybeCheck() {
+  if (!app.isPackaged) return;
+  try { if (db.getSettings().autoUpdate.mode === 'manual') return; } catch {}
+  autoUpdater.checkForUpdates().catch((e) => log.warn('[updater] check failed:', e?.message || e));
+}
+
+// ---- idle auto-install (the centerpiece) ----
+// Install an ALREADY-DOWNLOADED update only when the machine is idle AND no auto-apply
+// work is in flight, so a restart can NEVER interrupt an application mid-submit or yank
+// focus from active work. A human "Later" opts out; only non-response triggers this.
+let pendingInstall = null;      // { version, downloadedAt }
+let autoInstallTimer = null;
+let updateDeferred = false;     // user clicked "Later" → no unattended install for this version
+
+function armIdleAutoInstall() {
+  if (autoInstallTimer) clearInterval(autoInstallTimer);
+  autoInstallTimer = setInterval(tryIdleInstall, 60 * 1000);
+}
+function tryIdleInstall() {
+  try {
+    const au = db.getSettings().autoUpdate;
+    if (!pendingInstall || au.mode !== 'auto' || updateDeferred) return;
+    // GATE 1: grace window — give a returning user the chance to see the banner first.
+    if (Date.now() - pendingInstall.downloadedAt < (au.graceMinutes || 10) * 60000) return;
+    // GATE 2: machine genuinely idle and not asleep, no pairing prompt open.
+    if (suspended || pendingPair) return;
+    let idleSec = 0;
+    try { idleSec = powerMonitor.getSystemIdleTime(); } catch { return; }
+    if (idleSec < (au.idleMinutes || 5) * 60) return;
+    // GATE 3 (the data-safety gate): never restart while an application is running,
+    // dispatched, or still queued for this run — only when the pool is fully drained.
+    try {
+      const aa = db.getSettings().autoApply;
+      if (aa && aa.enabled) {
+        const live = db.queueLive({ startedAt: aa.startedAt || '' });
+        if (live.active > 0 || live.scheduled > 0 || live.queuedDepth > 0) return;
+      }
+    } catch { return; }
+    log.info('[updater] idle + safe → auto-installing update', pendingInstall.version);
+    clearInterval(autoInstallTimer); autoInstallTimer = null;
+    isQuitting = true;
+    autoUpdater.quitAndInstall(true, true);   // silent install + relaunch into the new version
+  } catch (e) { log.warn('[updater] idle install check failed', e?.message || e); }
+}
+
 function setupAutoUpdater() {
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
@@ -260,6 +306,7 @@ function setupAutoUpdater() {
   autoUpdater.on('checking-for-update', () => setUpdateState({ status: 'checking' }));
   autoUpdater.on('update-available', (info) => {
     log.info('[updater] update available:', info?.version);
+    updateDeferred = false;   // a NEW version resets any prior "Later"
     setUpdateState({ status: 'downloading', version: info?.version, percent: 0 });
     // Announce the moment an update is detected (it downloads in the background) —
     // as an in-app toast, never a native OS notification.
@@ -269,12 +316,29 @@ function setupAutoUpdater() {
   autoUpdater.on('download-progress', (p) => setUpdateState({ status: 'downloading', percent: Math.round(p.percent || 0) }));
   autoUpdater.on('update-downloaded', (info) => {
     setUpdateState({ status: 'downloaded', version: info?.version });
-    notify('updates', 'Update ready', `v${info?.version} downloaded — restart to apply.`, 'success');
+    notify('updates', 'Update ready', `v${info?.version} downloaded — restart to apply (it auto-installs once your machine is idle).`, 'success');
     showWindow();   // bring the dashboard forward so the in-app "Restart now" banner is visible
+    pendingInstall = { version: info?.version, downloadedAt: Date.now() };
+    armIdleAutoInstall();
   });
 
-  autoUpdater.checkForUpdates().catch((e) => log.warn('[updater] initial check failed:', e?.message || e));
-  updateInterval = setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), UPDATE_CHECK_INTERVAL_MS);
+  const everyMs = (() => { try { return Math.max(15, db.getSettings().autoUpdate.checkEveryMinutes || 30) * 60000; } catch { return 30 * 60000; } })();
+  maybeCheck();
+  updateInterval = setInterval(maybeCheck, everyMs);
+
+  // Also check when the window regains focus (throttled to every 10min) so a release
+  // is noticed within minutes of the user being active, not just on the slow interval.
+  try {
+    if (mainWindow) {
+      let lastFocusCheck = 0;
+      mainWindow.on('focus', () => {
+        try { if (db.getSettings().autoUpdate.checkOnFocus === false) return; } catch {}
+        if (Date.now() - lastFocusCheck < 10 * 60000) return;
+        lastFocusCheck = Date.now();
+        maybeCheck();
+      });
+    }
+  } catch {}
 }
 
 // Manual check that resolves with a user-facing result (tray + dashboard).
@@ -377,6 +441,9 @@ ipcMain.handle('jat:restart-to-update', () => {
   if (updateState.status === 'downloaded') { isQuitting = true; autoUpdater.quitAndInstall(true, true); return true; }
   return false;
 });
+// User clicked "Later" on the in-app update banner → suppress the unattended idle
+// install for this version (an explicit human choice beats idle auto-install).
+ipcMain.handle('jat:update-later', () => { updateDeferred = true; return true; });
 ipcMain.handle('jat:pick-folder', async () => {
   const r = await dialog.showOpenDialog(mainWindow, {
     title: 'Choose a folder to index', properties: ['openDirectory'],
@@ -452,7 +519,7 @@ app.whenReady().then(async () => {
   // wake (each sync resumes from its own cursor, so nothing is lost or doubled).
   try {
     powerMonitor.on('suspend', () => { suspended = true; log.info('system suspend — pausing background work'); });
-    powerMonitor.on('resume', () => { suspended = false; log.info('system resume — background work re-enabled'); scheduleEmailSync(); });
+    powerMonitor.on('resume', () => { suspended = false; log.info('system resume — background work re-enabled'); scheduleEmailSync(); maybeCheck(); });
   } catch (e) { log.warn('powerMonitor unavailable', e.message); }
 
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
@@ -474,6 +541,7 @@ app.on('will-quit', () => {
   // Stop every timer that might touch the DB BEFORE we close it, so an
   // in-flight gmail tick / backup can't call into a closed database.
   if (updateInterval) clearInterval(updateInterval);
+  if (autoInstallTimer) clearInterval(autoInstallTimer);
   if (backupInterval) clearInterval(backupInterval);
   if (gmailInterval) clearInterval(gmailInterval);
   if (emailInterval) clearInterval(emailInterval);

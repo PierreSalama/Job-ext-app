@@ -151,6 +151,7 @@ function withinWindow(settings) {
   if (!settings.windowStart || !settings.windowEnd) return true;   // no window = any time
   const [sh, sm] = String(settings.windowStart).split(':').map(Number);
   const [eh, em] = String(settings.windowEnd).split(':').map(Number);
+  if (![sh, eh].every(Number.isFinite)) return true;   // unparseable window → 'any time' (the default), never a silent dead-stop
   const nowD = new Date();
   const mins = nowD.getHours() * 60 + nowD.getMinutes();
   return mins >= sh * 60 + (sm || 0) && mins <= eh * 60 + (em || 0);
@@ -187,13 +188,22 @@ async function queueNext(force = false) {
 
   const queued = db.queueList({ state: 'queued' });
   if (!queued.length) return { task: null, reason: 'empty' };
-  const task = queued[queued.length - 1]; // oldest (list is DESC)
-
-  const job = db.getJob(task.jobId);
-  if (!job || !job.jobUrl) {
-    db.queuePatch(task.id, { state: 'failed', lastError: 'job missing or has no URL' });
-    return { task: null, reason: 'bad-task' };
+  // Oldest-first (the list is DESC). Retire dead tasks instead of opening a tab for
+  // them: a job can become 'submitted' (passive capture / Gmail / applied-sync /
+  // manual apply) or be deleted AFTER it was queued, but the task stays 'queued'.
+  let task = null, job = null;
+  for (let i = queued.length - 1; i >= 0; i--) {
+    const t = queued[i];
+    const j = db.getJob(t.jobId);
+    if (!j || !j.jobUrl) { db.queuePatch(t.id, { state: 'failed', lastError: 'job missing or has no URL' }); continue; }
+    if (j.status === 'submitted') {
+      db.queuePatch(t.id, { state: 'skipped', lastError: 'already applied' });
+      broadcast('queue.updated', { taskId: t.id, state: 'skipped' });
+      continue;
+    }
+    task = t; job = j; break;
   }
+  if (!task) return { task: null, reason: 'empty', concurrency };
 
   // Honour the explicit picks from the Auto-apply page; fall back to the
   // source-matched profile, then to one DERIVED from learned answers (so it

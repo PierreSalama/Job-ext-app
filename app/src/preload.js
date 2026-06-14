@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('jatDesktop', {
   updateState: () => ipcRenderer.invoke('jat:update-state'),
   openReleases: () => ipcRenderer.invoke('jat:open-releases'),
   restartToUpdate: () => ipcRenderer.invoke('jat:restart-to-update'),
+  updateLater: () => ipcRenderer.invoke('jat:update-later'),
   pickFolder: () => ipcRenderer.invoke('jat:pick-folder'),
   pendingPair: () => ipcRenderer.invoke('jat:pending-pair'),
   pairRespond: (id, allow) => ipcRenderer.invoke('jat:pair-respond', id, allow),

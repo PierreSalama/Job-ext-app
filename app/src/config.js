@@ -17,6 +17,14 @@ const DEFAULTS = {
     globalHotkey: true,      // Ctrl+Shift+J toggles the dashboard window
   },
 
+  autoUpdate: {
+    mode: 'auto',            // 'auto' = silently install when the machine is idle + safe; 'prompt' = only via the in-app banner; 'manual' = only the tray check + Restart button
+    idleMinutes: 5,          // OS idle (no keyboard/mouse) required before an unattended install
+    graceMinutes: 10,        // after download, wait this long for the user to choose before auto-install is eligible
+    checkEveryMinutes: 30,   // background poll cadence (floored to 15min)
+    checkOnFocus: true,      // also check for updates when the app window regains focus
+  },
+
   ai: {
     // Priority order — tried top to bottom, first one that's configured wins.
     // Reorder freely in Settings. Default: Claude → ChatGPT → local.

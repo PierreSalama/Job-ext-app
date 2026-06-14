@@ -112,12 +112,63 @@ export function isFillable(input) {
 export function matchOption(select, v) {
   const opts = Array.from(select.options);
   const vl = String(v).toLowerCase();
-  return opts.find((o) => o.value === v || o.text === v)
-    || opts.find((o) => o.value.toLowerCase() === vl || o.text.toLowerCase().trim() === vl)
-    || opts
-      .filter((o) => o.text.toLowerCase().includes(vl) || o.value.toLowerCase().includes(vl))
-      .sort((a, b) => b.text.length - a.text.length)[0]
+  const exact = opts.find((o) => o.value === v || o.text === v)
+    || opts.find((o) => o.value.toLowerCase() === vl || o.text.toLowerCase().trim() === vl);
+  if (exact) return exact;
+  // Numeric answer (years-of-experience, salary band) → pick the option whose RANGE
+  // contains it, so '6' selects '5-10 years' not '16+ years' by accidental substring.
+  const ni = numericMatch(opts.map((o) => o.text), v);
+  if (ni != null) return opts[ni];
+  return opts
+    .filter((o) => o.text.toLowerCase().includes(vl) || o.value.toLowerCase().includes(vl))
+    .sort((a, b) => b.text.length - a.text.length)[0]
     || null;
+}
+
+// If `value` is a bare number (optionally $/years/k), return the INDEX of the label
+// whose numeric range contains it (tightest range wins; "N+" thresholds pick the
+// largest floor ≤ value). Returns null for non-numeric answers so prose is untouched.
+export function numericMatch(labels, value) {
+  const s = String(value).trim();
+  if (!/^\$?\s*\d[\d,.]*\s*\+?\s*(years?|yrs?|k)?\.?$/i.test(s)) return null;
+  const n = Number(s.replace(/[^\d.]/g, ''));
+  if (!Number.isFinite(n)) return null;
+  let inRange = -1, span = Infinity, plus = -1, plusLo = -Infinity;
+  labels.forEach((raw, i) => {
+    const t = String(raw).replace(/,/g, '');
+    let m;
+    if ((m = t.match(/(\d+(?:\.\d+)?)\s*(?:[-–—]|to)\s*(\d+(?:\.\d+)?)/i))) {
+      const lo = +m[1], hi = +m[2];
+      if (n >= lo && n <= hi && (hi - lo) < span) { inRange = i; span = hi - lo; }
+    } else if ((m = t.match(/(\d+(?:\.\d+)?)\s*\+/))) {
+      const lo = +m[1];
+      if (n >= lo && lo > plusLo) { plusLo = lo; plus = i; }
+    }
+  });
+  return inRange >= 0 ? inRange : (plus >= 0 ? plus : null);
+}
+
+// Pick the radio in `input`'s group whose LABEL best matches the answer value — the
+// radio analogue of matchOption (years-of-experience, work-authorization, and salary
+// bands are radio groups, so a confident AI answer like "5-7 years" must select the
+// matching option, not be discarded by the old yes/no-only check).
+export function pickRadioInGroup(input, v) {
+  let group;
+  try {
+    group = input.name
+      ? Array.from((input.getRootNode() || document).querySelectorAll(`input[type="radio"][name="${CSS.escape(input.name)}"]`))
+      : [input];
+  } catch { group = [input]; }
+  if (!group.length) return null;
+  const vl = String(v).toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!vl) return null;
+  const labelled = group
+    .map((r) => ({ r, lbl: String(fieldLabel(r) || r.value || '').toLowerCase().replace(/\s+/g, ' ').trim() }))
+    .filter((x) => x.lbl);
+  const hit = labelled.find((x) => x.lbl === vl)
+    || labelled.filter((x) => x.lbl.includes(vl) || vl.includes(x.lbl)).sort((a, b) => b.lbl.length - a.lbl.length)[0]
+    || null;
+  return hit ? hit.r : null;
 }
 
 // React-proof value injection.
@@ -222,8 +273,18 @@ export class AutofillEngine {
           const opt = matchOption(s.input, v);
           if (!opt) continue;
           setNativeValue(s.input, opt.value);
-        } else if (s.input.type === 'checkbox' || s.input.type === 'radio') {
-          const yes = /^(yes|true|y|oui|sí|si|ja)$/i.test(v);
+        } else if (s.input.type === 'radio') {
+          // Radio GROUPS (years-of-experience, work-authorization, salary band) are
+          // not yes/no — pick the option in the group whose label best matches the
+          // answer. Falls back to the old yes-token behaviour for boolean radios.
+          const picked = pickRadioInGroup(s.input, v);
+          const target = picked || (/^(yes|true|y|oui|sí|si|ja|1)$/i.test(v) ? s.input : null);
+          if (!target) continue;
+          target.checked = true;
+          target.dispatchEvent(new Event('input', { bubbles: true }));
+          target.dispatchEvent(new Event('change', { bubbles: true }));
+        } else if (s.input.type === 'checkbox') {
+          const yes = /^(yes|true|y|oui|sí|si|ja|1)$/i.test(v);
           if (!yes) continue;
           s.input.checked = true;
           s.input.dispatchEvent(new Event('input', { bubbles: true }));

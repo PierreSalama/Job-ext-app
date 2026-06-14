@@ -177,6 +177,9 @@ export function snapshotAnswers(root = document) {
     if (!el.matches?.('[contenteditable="true"]') && !el.name && !el.id && !labelFor(el)) continue;
     if (['hidden', 'password', 'submit', 'button', 'file'].includes(type)) continue;
     if (/captcha|recaptcha|hcaptcha|cvv|card.?number/i.test((el.name || '') + (el.id || '') + labelFor(el))) continue;
+    // Never capture EEO / demographic / protected-class answers into memory (the
+    // server has a backstop too, but don't even send them).
+    if (/(ethnic|race\b|gender|\bsex\b|disabilit|veteran|criminal|background.?check|felony|conviction|pronoun|sexual.?orientation|\blgbtq?|\bssn\b|social.?security|date.?of.?birth|\bdob\b)/i.test((el.name || '') + ' ' + (el.id || '') + ' ' + labelFor(el))) continue;
 
     let value = '';
     if (el.matches?.('[contenteditable="true"]')) {

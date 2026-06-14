@@ -994,11 +994,17 @@ function installWatchers() {
   // (started lazily; see startSuccessTicker / stopSuccessTicker)
 
   // ---- URL changes (loader + webNavigation both call reboot; this is local) ----
-  urlTickerId = setInterval(() => {
+  // Event-driven for back/forward + hash changes (instant + free at rest); a slow
+  // 2.5s backstop catches SPA pushState the events miss — instead of a 1.2s poll
+  // running forever in every job-board tab the user has open.
+  const onUrlMaybeChanged = () => {
     if (location.href === state.lastUrl) return;
     state.lastUrl = location.href;
     onUrlChanged();
-  }, 1200);
+  };
+  window.addEventListener('popstate', onUrlMaybeChanged);
+  window.addEventListener('hashchange', onUrlMaybeChanged);
+  urlTickerId = setInterval(onUrlMaybeChanged, 2500);
 
   // ---- flush state when the tab goes away mid-flow (C12) ----
   document.addEventListener('visibilitychange', () => {

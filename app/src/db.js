@@ -381,6 +381,16 @@ const MIGRATIONS = [
   () => {
     exec('ALTER TABLE auto_apply_tasks ADD COLUMN apply_route TEXT;');
   },
+
+  // v8 — indexes for the auto-apply hot paths. queueRunStats (gates EVERY dispatch
+  // + polled by the live panel every 2.5s), queueHistory/Breakdown/Live all filter
+  // auto_apply_tasks by updated_at and JOIN on job_id; the table only had an index
+  // on (state, scheduled_at). (profile_fields/qa already have composite indexes via
+  // their v6 UNIQUE(profile_id, …) constraints, so they need nothing here.)
+  () => {
+    exec('CREATE INDEX IF NOT EXISTS idx_tasks_updated ON auto_apply_tasks(updated_at)');
+    exec('CREATE INDEX IF NOT EXISTS idx_tasks_job ON auto_apply_tasks(job_id)');
+  },
 ];
 
 function userVersion() {
@@ -1178,6 +1188,16 @@ function profileAutofillBundle(source) {
   return { profileId: profile ? profile.id : null, fields, profile: profile ? { id: profile.id, name: profile.name, data: profile.data } : null };
 }
 
+// EEO / demographic / sensitive questions are NEVER retained in memory — the
+// server-side backstop to the extension's NEVER_AUTOFILL_RX, so even a buggy or
+// malicious client can't POST protected-class answers (race/gender/disability/
+// veteran/criminal-history/SSN/DOB) into long-lived profile memory.
+const SENSITIVE_RX = /(ethnic|race\b|gender|\bsex\b|disabilit|veteran|criminal|background.?check|felony|conviction|pronoun|sexual.?orientation|\blgbtq?|\bssn\b|social.?security|date.?of.?birth|\bdob\b)/i;
+function isSensitiveKey(key) {
+  const k = String(key || '');
+  try { return SENSITIVE_RX.test(k) || SENSITIVE_RX.test(humanizeKey(k)); } catch { return SENSITIVE_RX.test(k); }
+}
+
 // Fan a job's captured answers into a profile's memory (called from upsertJob).
 // The owning profile = the source-matched profile (else the default).
 function harvestAnswersToProfile(answers, { profileId, jobId, source } = {}) {
@@ -1188,6 +1208,7 @@ function harvestAnswersToProfile(answers, { profileId, jobId, source } = {}) {
   const pid = profileId || resolveProfileId(source);
   let n = 0;
   for (const [key, raw] of Object.entries(answers)) {
+    if (isSensitiveKey(key)) continue;
     const value = Array.isArray(raw) ? raw.join(', ') : raw;
     if (value == null || String(value).trim() === '') continue;
     try {
@@ -1210,6 +1231,7 @@ function backfillProfileFromJobs(profileId) {
     if (!ans || typeof ans !== 'object' || !Object.keys(ans).length) continue;
     let got = 0;
     for (const [key, raw] of Object.entries(ans)) {
+      if (isSensitiveKey(key)) continue;
       const value = Array.isArray(raw) ? raw.join(', ') : raw;
       if (value == null || String(value).trim() === '') continue;
       try { if (profileFieldUpsert({ profileId: pid, question: humanizeKey(key), value, sourceJobId: j.id, source: j.source, confidence: 0.6 })) got++; } catch {}
@@ -1764,6 +1786,11 @@ function exportAll() {
     events: all('SELECT * FROM events').map(rowToEvent),
     settings: getSettings(),
     qa: all('SELECT * FROM qa').map((r) => ({ profileId: r.profile_id, question: r.question, answer: r.answer })),
+    // The v6 per-profile learned memory — the most expensive-to-rebuild data in the
+    // app. Was missing from export entirely, so "export everything" silently dropped it.
+    profileFields: all('SELECT * FROM profile_fields').map((r) => ({
+      profileId: r.profile_id, question: r.label || r.key_norm, value: r.value, confidence: r.confidence,
+    })),
     profiles: listProfiles(),
     documents: listDocuments(),
     queue: queueList(),
@@ -1771,18 +1798,32 @@ function exportAll() {
 }
 
 function importAll(payload) {
-  let jobs = 0, events = 0, qa = 0;
-  const importPid = ensureDefaultProfileId();   // imported free-text answers land in the default profile's memory
+  if (!payload || typeof payload !== 'object'
+    || (!Array.isArray(payload.jobs) && !Array.isArray(payload.qa) && !Array.isArray(payload.profileFields))) {
+    throw new Error('not a JAT export file');
+  }
+  // Import MUTATES existing rows (upsertJob elevates status / merges answers), so
+  // snapshot first — importing the wrong file is then recoverable.
+  const backup = db ? backupNow('pre-import-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')) : null;
+  let jobs = 0, events = 0, qa = 0, profileFields = 0;
+  const importPid = ensureDefaultProfileId();   // imported answers land in the default profile unless their profile still exists
+  const existing = new Set(listProfiles().map((p) => p.id));
+  const pidFor = (id) => (id && existing.has(id)) ? id : importPid;   // FK-safe: never reference a profile that isn't there
   transaction(() => {
     for (const j of payload.jobs || []) { upsertJob(j); jobs++; }
     for (const e of payload.events || []) {
       if (e.jobId && getJob(e.jobId)) { recordEvent(e); events++; }
     }
     for (const q of payload.qa || []) {
-      if (q.question && q.answer) { qaRecord({ profileId: q.profileId || importPid, question: q.question, answer: q.answer }); qa++; }
+      if (q.question && q.answer) { qaRecord({ profileId: pidFor(q.profileId), question: q.question, answer: q.answer }); qa++; }
+    }
+    for (const f of payload.profileFields || []) {
+      if (f && f.question && f.value != null && !isSensitiveKey(f.question)) {
+        try { profileFieldUpsert({ profileId: pidFor(f.profileId), question: f.question, value: f.value, confidence: f.confidence || 0.6 }); profileFields++; } catch {}
+      }
     }
   });
-  return { jobs, events, qa };
+  return { jobs, events, qa, profileFields, backup };
 }
 
 // Irreversible "delete all my data": clears every user-data table and disconnects linked
@@ -1790,6 +1831,9 @@ function importAll(payload) {
 // so the app stays usable + paired. Returns per-table deleted counts.
 function wipeAllData() {
   if (!db) return { ok: false, deleted: {} };
+  // Last-ditch recovery snapshot before the one irreversible op — the typed-DELETE
+  // confirm prevents misclicks, this makes even a regretted/wrong-account wipe undoable.
+  const backup = backupNow('pre-wipe-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-'));
   const tables = ['emails', 'auto_apply_tasks', 'events', 'ai_log', 'qa', 'profile_fields', 'profiles', 'documents', 'document_folders', 'jobs'];
   const deleted = {};
   transaction(() => {
@@ -1804,7 +1848,7 @@ function wipeAllData() {
   });
   try { exec('VACUUM'); } catch (e) { log.warn('post-wipe VACUUM failed', e.message); }
   log.warn('wipeAllData: cleared all user data + disconnected accounts');
-  return { ok: true, deleted };
+  return { ok: true, deleted, backup };
 }
 
 // Import the user's pre-existing applications (scraped from LinkedIn/Indeed "applied

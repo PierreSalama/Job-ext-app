@@ -790,16 +790,33 @@ function renderUpdateBanner() {
   if (!host) return;
   host.replaceChildren();
   const u = state.update;
-  if (u && u.status === 'downloaded' && u.version && u.version !== updateBannerDismissed) {
+  if (!u || !u.version) return;
+  // Show the update DOWNLOADING (progress) so the user knows one's incoming, then the
+  // actionable "ready" prompt. Downloading is informational (auto-replaced); only the
+  // ready state is dismissible.
+  if (u.status === 'downloading') {
+    const pct = Math.max(0, Math.min(100, Number(u.percent) || 0));
+    host.appendChild(el(`<div class="app-banner">
+      <span class="app-banner-msg">Update v${esc(u.version)} is downloading… ${pct}%
+        <span style="display:inline-block;width:90px;height:5px;border-radius:3px;background:var(--border,#2a2a2a);vertical-align:middle;margin-left:8px;overflow:hidden"><span style="display:block;height:100%;width:${pct}%;background:var(--accent,#d9a441)"></span></span>
+      </span>
+    </div>`));
+    return;
+  }
+  if (u.status === 'downloaded' && u.version !== updateBannerDismissed) {
     const b = el(`<div class="app-banner">
-      <span class="app-banner-msg">Update v${esc(u.version)} is ready to install.</span>
+      <span class="app-banner-msg">Update v${esc(u.version)} is ready — it auto-installs when your machine is idle.</span>
       <span class="app-banner-actions">
-        <button class="btn small primary" data-upd-restart>Restart now</button>
+        <button class="btn small primary" data-upd-restart>Update &amp; restart</button>
         <button class="btn small" data-upd-later>Later</button>
       </span>
     </div>`);
     b.querySelector('[data-upd-restart]').addEventListener('click', () => { if (window.jatDesktop) window.jatDesktop.restartToUpdate(); });
-    b.querySelector('[data-upd-later]').addEventListener('click', () => { updateBannerDismissed = u.version; renderUpdateBanner(); });
+    b.querySelector('[data-upd-later]').addEventListener('click', () => {
+      updateBannerDismissed = u.version;
+      try { window.jatDesktop?.updateLater?.(); } catch {}   // explicit human "Later" opts out of the unattended idle install
+      renderUpdateBanner();
+    });
     host.appendChild(b);
   }
 }
@@ -1167,9 +1184,16 @@ route('/applications', async () => {
 
   v.querySelector('[data-csv]').addEventListener('click', () => {
     const cols = ['title', 'company', 'status', 'source', 'location', 'compensation', 'jobUrl', 'fitScore', 'createdAt', 'submittedAt', 'updatedAt', 'notes'];
-    const csv = [cols.join(',')].concat(rows.map((j) =>
-      cols.map((c) => `"${String(j[c] ?? '').replace(/"/g, '""').replace(/\r?\n/g, ' ')}"`).join(','))).join('\n');
-    downloadBlob(new Blob([csv], { type: 'text/csv' }), `jat-applications-${new Date().toISOString().slice(0, 10)}.csv`);
+    // Guard CSV formula injection (a cell starting with = + - @ runs as a formula in
+    // Excel/Sheets) by prefixing a quote, and prepend a UTF-8 BOM so accented (FR)
+    // company/role names don't mojibake in Excel.
+    const cell = (x) => {
+      let s = String(x ?? '').replace(/\r?\n/g, ' ');
+      if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+      return `"${s.replace(/"/g, '""')}"`;
+    };
+    const csv = [cols.join(',')].concat(rows.map((j) => cols.map((c) => cell(j[c])).join(','))).join('\n');
+    downloadBlob(new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' }), `jat-applications-${new Date().toISOString().slice(0, 10)}.csv`);
   });
 
   v.querySelectorAll('.row-link').forEach((tr) => {

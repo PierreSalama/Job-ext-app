@@ -11,9 +11,11 @@ const log = scope('extract');
 
 async function extractText(filePath, mime = '') {
   const ext = path.extname(filePath).toLowerCase();
-  const buf = fs.readFileSync(filePath);
 
   try {
+    // Inside the try: a locked PDF (open in Word) or a file deleted between save and
+    // read degrades to '' (no extracted text) instead of throwing a 500 on upload.
+    const buf = fs.readFileSync(filePath);
     if (ext === '.pdf' || /pdf/.test(mime)) {
       const pdfParse = require('pdf-parse');
       const out = await pdfParse(buf);
