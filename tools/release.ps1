@@ -48,6 +48,7 @@ $pairs = @(
   @{ src = 'app\src'; dst = 'app\src' },
   @{ src = 'app\build'; dst = 'app\build' },
   @{ src = 'app\package.json'; dst = 'app\package.json' },
+  @{ src = 'package.json'; dst = 'package.json' },
   @{ src = 'tools'; dst = 'tools' },
   @{ src = '.github'; dst = '.github' },
   @{ src = 'README.md'; dst = 'README.md' }
