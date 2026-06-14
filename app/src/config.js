@@ -93,7 +93,8 @@ const DEFAULTS = {
     maxPerHour: 10,
     minGapMinutes: 2,
     maxGapMinutes: 6,
-    windowStart: '',         // '' = no daytime window (runs any time)
+    runAnytime: true,        // ON by default — run 24/7. Turn OFF to use the window below.
+    windowStart: '',         // only used when runAnytime is false
     windowEnd: '',
     aiAnswerConfidenceMin: 0.8,   // AI answers a screening question ONLY when highly confident
     easyApplyOnly: true,          // ON + locked in the UI (non-Easy-Apply isn't supported yet)

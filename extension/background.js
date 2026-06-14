@@ -526,8 +526,10 @@ function waitTabComplete(tabId, timeoutMs) {
   });
 }
 
-// Same window check the server applies — empty window = run any time.
+// Same window check the server applies (server.js queueNext). runAnytime (default
+// ON) means 24/7; otherwise an empty window also means run any time.
 function withinWindow(aa) {
+  if (aa.runAnytime !== false) return true;
   if (!aa.windowStart || !aa.windowEnd) return true;
   const [sh, sm] = String(aa.windowStart).split(':').map(Number);
   const [eh, em] = String(aa.windowEnd).split(':').map(Number);

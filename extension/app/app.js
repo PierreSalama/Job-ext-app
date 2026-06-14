@@ -480,25 +480,14 @@ function resolve(path) {
   }
   return null;
 }
-// Find the actual scrolling element so a soft refresh can keep your place.
-function getScroller() {
-  let el = $('#main');
-  while (el && el !== document.body) {
-    const oy = getComputedStyle(el).overflowY;
-    if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 4) return el;
-    el = el.parentElement;
-  }
-  return document.scrollingElement || document.documentElement;
-}
 let navSeq = 0;
 async function navigate(opts = {}) {
-  // soft = an SSE-driven refresh, not a real navigation: keep scroll, skip the
-  // skeleton + entrance animation so the page doesn't flash/reload abruptly.
+  // soft = an SSE-driven live refresh: morph the current view in place (counts and
+  // rows update, focus + scroll preserved) instead of a full re-render.
   const soft = opts && opts.soft === true;
   const path = (location.hash.replace(/^#/, '') || '/').replace(/\/+$/, '') || '/';
   state.route = { path };
-  state.selection = new Set();
-  hideRefreshPill();
+  if (!soft) state.selection = new Set();   // keep multi-select intact across live refreshes
   if (!soft) closeAllOverlays();
   document.querySelectorAll('.nav-item').forEach((n) => {
     const r = n.dataset.route;
@@ -508,8 +497,6 @@ async function navigate(opts = {}) {
   const seq = ++navSeq;
   const match = resolve(path) || resolve('/');
   const main = $('#main');
-  const scroller = soft ? getScroller() : null;
-  const savedTop = scroller ? scroller.scrollTop : 0;
   const loadT = soft ? null : setTimeout(() => {
     if (seq === navSeq) main.innerHTML = skeletonHtml();
   }, 130);
@@ -517,11 +504,10 @@ async function navigate(opts = {}) {
     const node = await match.render(match.params);
     if (loadT) clearTimeout(loadT);
     if (seq !== navSeq) return;
-    if (soft) main.classList.add('no-anim');
-    main.replaceChildren(node);
-    if (soft) {
-      if (scroller) scroller.scrollTop = savedTop;
-      requestAnimationFrame(() => main.classList.remove('no-anim'));
+    if (soft && main.firstElementChild) {
+      morphNode(main.firstElementChild, node);   // in-place patch — scroll, focus & listeners preserved
+    } else {
+      main.replaceChildren(node);
     }
   } catch (e) {
     clearTimeout(loadT);
@@ -595,9 +581,6 @@ function renderNotConnected() {
 
 // ---------- Refresh pill + SSE ----------
 const LIST_ROUTES = new Set(['/', '/applications', '/pipeline', '/queue', '/documents', '/activity', '/profile']);
-function showRefreshPill() { const p = $('#refresh-pill'); if (p) p.hidden = false; }
-function hideRefreshPill() { const p = $('#refresh-pill'); if (p) p.hidden = true; }
-
 function canAutoRefresh() {
   if (!LIST_ROUTES.has(state.route.path)) return false;
   const a = document.activeElement;
@@ -607,10 +590,77 @@ function canAutoRefresh() {
   return true;
 }
 
+// Patch the live #main subtree toward a freshly-rendered view instead of replacing
+// it wholesale: counts tick in place, a new row appends (with a pulse), gone rows
+// drop, and the field you're typing in is never rebuilt. Keyed by data-k/-id/-task.
+function nodeKey(n) {
+  if (!n || n.nodeType !== 1) return null;
+  return n.dataset.k ?? n.dataset.id ?? n.dataset.task ?? null;
+}
+function isEditable(a) {
+  return !!a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable);
+}
+function isActiveField(n) { return n === document.activeElement && isEditable(n); }
+function containsActiveField(n) {
+  const a = document.activeElement;
+  return !!(a && isEditable(a) && n.nodeType === 1 && n !== a && n.contains(a));
+}
+function morphAttrs(from, to) {
+  for (const at of [...from.attributes]) if (!to.hasAttribute(at.name)) from.removeAttribute(at.name);
+  for (const at of [...to.attributes]) if (from.getAttribute(at.name) !== at.value) from.setAttribute(at.name, at.value);
+}
+// NOTE: kept (unkeyed) container nodes survive a morph WITH their original event
+// listeners while their children/attrs are patched — so container-level listeners
+// must read live DOM, never close over render-time data snapshots (they'd go stale).
+function morphNode(from, to) {
+  if (from.nodeType !== to.nodeType || from.nodeName !== to.nodeName) {
+    if (containsActiveField(from)) return;     // a type change under the cursor — leave it till blur
+    from.replaceWith(to); return;
+  }
+  if (from.nodeType === 3 || from.nodeType === 8) { if (from.nodeValue !== to.nodeValue) from.nodeValue = to.nodeValue; return; }
+  if (from.nodeType !== 1) return;
+  if (isActiveField(from)) return;             // never touch the exact field being typed in
+  morphAttrs(from, to);
+  morphChildren(from, to);
+}
+function morphChildren(from, to) {
+  const keyed = new Map();
+  for (const c of from.childNodes) { const k = nodeKey(c); if (k != null) keyed.set(k, c); }
+  let cursor = from.firstChild;
+  for (const want of [...to.childNodes]) {
+    const k = nodeKey(want);
+    if (k != null && keyed.has(k)) {
+      const have = keyed.get(k); keyed.delete(k);
+      if (have !== cursor) from.insertBefore(have, cursor);            // reorder into place (preserves focus)
+      if (have.outerHTML !== want.outerHTML) {
+        if (containsActiveField(have)) { morphNode(have, want); }      // patch in place — keep the focused field
+        else { have.replaceWith(want); cursor = want.nextSibling; continue; }  // changed → fresh node + listeners
+      }
+      cursor = have.nextSibling;
+    } else if (k != null) {
+      if (want.nodeType === 1) want.classList.add('row-new');          // brand-new entry → pulse
+      from.insertBefore(want, cursor);
+    } else if (cursor && cursor.nodeName === want.nodeName && nodeKey(cursor) == null) {
+      const next = cursor.nextSibling;
+      morphNode(cursor, want);                                         // recurse unkeyed container (counts, headers)
+      cursor = next;
+    } else {
+      from.insertBefore(want, cursor);
+    }
+  }
+  while (cursor) {                                                     // drop leftovers (but never the focused field)
+    const next = cursor.nextSibling;
+    if (!(cursor.nodeType === 1 && (isActiveField(cursor) || containsActiveField(cursor)))) cursor.remove();
+    cursor = next;
+  }
+}
+
 const softRefresh = debounce(() => {
-  if (canAutoRefresh()) { hideRefreshPill(); navigate({ soft: true }); }
-  else showRefreshPill();
-}, 700);
+  if (!LIST_ROUTES.has(state.route.path)) return;
+  if (document.querySelector('.ctx-menu')) return;               // don't reshuffle under a right-click menu
+  if (document.querySelector('#overlay-root .overlay')) return;  // don't refresh under an open modal
+  navigate({ soft: true });
+}, 350);
 
 function connectSSE() {
   if (state.sse) { try { state.sse.close(); } catch {} state.sse = null; }
@@ -1489,17 +1539,20 @@ route('/queue', async () => {
       </div>
     </section>
 
-    <details class="section aa-advanced" ${(aa.windowStart || aa.maxPerDay < 50) ? 'open' : ''}>
+    <details class="section aa-advanced" ${(aa.runAnytime === false || aa.maxPerDay < 50) ? 'open' : ''}>
       <summary><span class="section-eyebrow">Advanced</span> Pacing &amp; limits</summary>
       <div class="queue-controls section-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px">
+        ${qc('Run anytime (24/7)', `<label class="toggle"><input type="checkbox" id="aa-anytime" ${aa.runAnytime !== false ? 'checked' : ''} /><span class="knob"></span></label>`)}
         ${qc('Max / day', `<input class="input" id="aa-day" type="number" min="1" max="500" value="${aa.maxPerDay}" />`)}
         ${qc('Max / hour', `<input class="input" id="aa-hour" type="number" min="1" max="100" value="${aa.maxPerHour}" />`)}
         ${qc('Gap min (min)', `<input class="input" id="aa-gmin" type="number" min="0" max="180" value="${aa.minGapMinutes}" />`)}
         ${qc('Gap max (min)', `<input class="input" id="aa-gmax" type="number" min="0" max="360" value="${aa.maxGapMinutes}" />`)}
-        ${qc('Window start', `<input class="input" id="aa-ws" type="time" value="${esc(aa.windowStart || '')}" />`)}
-        ${qc('Window end', `<input class="input" id="aa-we" type="time" value="${esc(aa.windowEnd || '')}" />`)}
+        <div id="aa-window-row">
+          ${qc('Window start', `<input class="input" id="aa-ws" type="time" value="${esc(aa.windowStart || '')}" />`)}
+          ${qc('Window end', `<input class="input" id="aa-we" type="time" value="${esc(aa.windowEnd || '')}" />`)}
+        </div>
       </div>
-      <div class="section-footer muted">Defaults are generous. Leave the window blank to run any time. LinkedIn/Indeed flag bots — if you push the volume up, expect more risk to your account. Auto mode submits real applications.</div>
+      <div class="section-footer muted">Run anytime is on by default (24/7). Turn it off to restrict applying to a daily time window. LinkedIn/Indeed flag bots — if you push the volume up, expect more risk to your account. Auto mode submits real applications.</div>
     </details>
 
     <section class="section">
@@ -1512,6 +1565,8 @@ route('/queue', async () => {
   v.querySelector('#aa-keywords-slot').appendChild(kw.node);
   const locs = chipsInput(aa.locations || [], 'Toronto, Remote…');
   v.querySelector('#aa-locations-slot').appendChild(locs.node);
+  // The run-anytime toggle shows/hides #aa-window-row purely via CSS :has() — no JS
+  // here, so a live morph refresh can never fight the user's toggle state.
 
   v.querySelector('[data-save]').addEventListener('click', async () => {
     try {
@@ -1533,8 +1588,9 @@ route('/queue', async () => {
           maxPerHour: Number(v.querySelector('#aa-hour').value) || 10,
           minGapMinutes: Math.max(0, Number(v.querySelector('#aa-gmin').value) || 0),
           maxGapMinutes: Math.max(0, Number(v.querySelector('#aa-gmax').value) || 0),
-          windowStart: v.querySelector('#aa-ws').value || '',
-          windowEnd: v.querySelector('#aa-we').value || '',
+          runAnytime: v.querySelector('#aa-anytime').checked,
+          windowStart: v.querySelector('#aa-ws')?.value || '',
+          windowEnd: v.querySelector('#aa-we')?.value || '',
         } },
       });
       state.settings = null;
@@ -2713,7 +2769,6 @@ async function boot(reauth = false) {
 
 // global listeners (registered once)
 window.addEventListener('hashchange', navigate);
-$('#refresh-pill')?.addEventListener('click', () => { hideRefreshPill(); navigate(); });
 document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openPalette(); return; }
   if (e.key === 'Escape') { if (closeTopOverlay()) e.preventDefault(); return; }

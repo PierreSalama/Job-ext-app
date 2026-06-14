@@ -92,6 +92,7 @@ function broadcast(type, data) {
 
 // ---------- auto-apply pacing ----------
 function withinWindow(settings) {
+  if (settings.runAnytime !== false) return true;                  // 24/7 (default) — ignore the window
   if (!settings.windowStart || !settings.windowEnd) return true;   // no window = any time
   const [sh, sm] = String(settings.windowStart).split(':').map(Number);
   const [eh, em] = String(settings.windowEnd).split(':').map(Number);

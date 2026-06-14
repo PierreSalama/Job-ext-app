@@ -1153,24 +1153,6 @@ input[type="checkbox"] { accent-color: var(--primary); width: 15px; height: 15px
 /* ============================================================
    REFRESH PILL + SPINNER + UTILITIES
    ============================================================ */
-.refresh-pill {
-  position: fixed;
-  bottom: 24px; left: 50%;
-  transform: translateX(-50%);
-  z-index: 800;
-  padding: 11px 22px;
-  background: var(--bg2);
-  border: 1px solid var(--primary);
-  color: var(--primary);
-  font-family: inherit;
-  font-size: 10px; font-weight: 500;
-  letter-spacing: 0.22em; text-transform: uppercase;
-  cursor: pointer;
-  box-shadow: var(--shadow-1);
-  animation: toast-in 300ms var(--ease-firm);
-}
-.refresh-pill:hover { background: var(--wash-10); color: var(--primary2); }
-
 .spin {
   display: inline-block;
   width: 12px; height: 12px;
@@ -1538,7 +1520,9 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
 .aa-advanced > summary::before { content: '▸'; color: var(--muted); font-size: 11px; }
 .aa-advanced[open] > summary::before { content: '▾'; }
 .aa-advanced > summary .section-eyebrow { display: inline; }
-/* Soft-refresh: skip the entrance animation so SSE updates don't flash/reload. */
-#main.no-anim > * { animation: none; }
+/* Run-anytime toggle drives the window row via CSS only (morph-safe, no JS). */
+#aa-window-row { display: none; }
+.aa-advanced:has(#aa-anytime:not(:checked)) #aa-window-row { display: contents; }
+/* Live morph refresh: a freshly-appended row pulses once so it's noticeable. */
 @keyframes row-new-pulse { 0% { background: var(--wash-25); } 100% { background: transparent; } }
 .row-new { animation: row-new-pulse 1.6s var(--ease-firm); }
