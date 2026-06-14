@@ -244,23 +244,45 @@ function resumeParse({ resumeText }) {
     kind: 'resume-parse',
     system: SYSTEM_BASE,
     prompt:
-`Extract structured profile data from this resume. Only include facts present in the text; leave fields empty when absent.
+`Extract structured profile data from this résumé. Include ONLY facts present in the text; omit/leave empty anything absent.
 
-${clip(resumeText, 12000)}`,
+Capture EVERY job in workExperience (most recent first) and EVERY school in educationHistory — do not collapse them. Copy dates as written (e.g. "2024", "Jan 2024", "Present"); set current:true for a role with no end date. For each job, put the responsibility/achievement bullets into description (newline-separated). Also fill the flat highestDegree / university / major / graduationYear from the most recent or highest degree, and split the contact location into city / state / country. Capture linkedinUrl / githubUrl / portfolioUrl as full URLs.
+
+${clip(resumeText, 14000)}`,
     schema: {
       type: 'object',
-      required: ['firstName', 'lastName', 'email', 'phone', 'headline', 'summary', 'skills', 'yearsExperience'],
+      required: ['firstName', 'lastName', 'email', 'phone', 'headline', 'summary', 'skills', 'workExperience', 'educationHistory'],
       additionalProperties: false,
       properties: {
         firstName: { type: 'string' }, lastName: { type: 'string' },
         email: { type: 'string' }, phone: { type: 'string' },
-        location: { type: 'string' }, headline: { type: 'string' },
-        summary: { type: 'string' },
+        city: { type: 'string' }, state: { type: 'string' }, country: { type: 'string' },
+        headline: { type: 'string' }, summary: { type: 'string' },
         linkedinUrl: { type: 'string' }, githubUrl: { type: 'string' }, portfolioUrl: { type: 'string' },
         skills: { type: 'array', items: { type: 'string' }, maxItems: 40 },
         yearsExperience: { type: 'string' },
-        degree: { type: 'string' }, university: { type: 'string' }, major: { type: 'string' },
-        gradYear: { type: 'string' },
+        highestDegree: { type: 'string' }, university: { type: 'string' }, major: { type: 'string' }, graduationYear: { type: 'string' },
+        workExperience: {
+          type: 'array', maxItems: 20,
+          items: {
+            type: 'object', additionalProperties: false,
+            properties: {
+              title: { type: 'string' }, company: { type: 'string' }, location: { type: 'string' },
+              startDate: { type: 'string' }, endDate: { type: 'string' }, current: { type: 'boolean' },
+              description: { type: 'string' },
+            },
+          },
+        },
+        educationHistory: {
+          type: 'array', maxItems: 10,
+          items: {
+            type: 'object', additionalProperties: false,
+            properties: {
+              degree: { type: 'string' }, school: { type: 'string' }, field: { type: 'string' },
+              startYear: { type: 'string' }, endYear: { type: 'string' }, gpa: { type: 'string' }, details: { type: 'string' },
+            },
+          },
+        },
       },
     },
   };

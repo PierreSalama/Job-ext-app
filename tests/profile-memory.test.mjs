@@ -44,12 +44,16 @@ test('the same question holds DIFFERENT values in two profiles', () => {
 
 test('bridge: push profile → memory, then derive memory → profile', () => {
   const c = db.saveProfile({ name: 'C', data: {} });
-  const r = db.pushProfileDataToMemory(c.id, { firstName: 'Cara', email: 'cara@x.io', skills: ['js'], summary: 'hi' });
-  assert.ok(r.pushed >= 2, 'pushed firstName + email (skills/summary skipped)');
+  const r = db.pushProfileDataToMemory(c.id, {
+    firstName: 'Cara', email: 'cara@x.io', skills: ['js'], summary: 'hi',
+    workHistory: [{ title: 'Dev', company: 'X' }], educationHistory: [{ degree: 'BSc' }],
+  });
+  assert.equal(r.pushed, 2, 'only firstName + email pushed (skills/summary/work/education arrays skipped)');
   const derived = db.memoryToProfileData(c.id);
   assert.equal(derived.firstName, 'Cara');
   assert.equal(derived.email, 'cara@x.io');
   assert.equal(db.profileFieldList(c.id).some((f) => /summary/i.test(f.label)), false, 'summary not pushed to memory');
+  assert.equal(db.profileFieldList(c.id).some((f) => /\[object Object\]/.test(f.value)), false, 'no array-as-text leaked into memory');
 });
 
 test('harvest routes a job\'s answers to the source-matched profile', () => {

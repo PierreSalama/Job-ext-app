@@ -2012,6 +2012,90 @@ const PROFILE_FIELDS = [
   ['headline', 'Headline'],
 ];
 const PF_LABEL = Object.fromEntries(PROFILE_FIELDS);
+
+// Editable multi-field rows (work history, education history).
+// fields: [{ key, ph, wide?, ta? }]. Returns { node, get(), set(arr) }.
+function recordRows(initial, fields, addLabel, onChange) {
+  const root = el('<div class="rec-rows"></div>');
+  const list = el('<div class="rec-list"></div>');
+  const addBtn = el(`<button class="btn small" type="button">+ ${esc(addLabel)}</button>`);
+  root.appendChild(list); root.appendChild(addBtn);
+  const fire = () => { try { onChange && onChange(); } catch {} };
+  function addRow(vals = {}) {
+    const row = el('<div class="rec-row"></div>');
+    for (const f of fields) {
+      const node = el(f.ta
+        ? `<textarea class="input rec-f rec-ta${f.wide ? ' rec-wide' : ''}" data-f="${esc(f.key)}" placeholder="${esc(f.ph)}" rows="2"></textarea>`
+        : `<input class="input rec-f${f.wide ? ' rec-wide' : ''}" data-f="${esc(f.key)}" placeholder="${esc(f.ph)}" />`);
+      node.value = vals[f.key] || '';
+      row.appendChild(node);
+    }
+    const rm = el('<button class="btn small rec-rm" type="button" title="Remove">✕</button>');
+    rm.addEventListener('click', () => { row.remove(); fire(); });
+    row.appendChild(rm);
+    list.appendChild(row);
+    return row;
+  }
+  (initial || []).forEach((vv) => addRow(vv));
+  addBtn.addEventListener('click', () => { const r = addRow(); r.querySelector('input,textarea')?.focus(); fire(); });
+  root.addEventListener('input', fire);
+  return {
+    node: root,
+    get() {
+      return [...list.querySelectorAll('.rec-row')].map((row) => {
+        const o = {};
+        for (const f of row.querySelectorAll('.rec-f')) { const val = String(f.value || '').trim(); if (val) o[f.dataset.f] = val; }
+        return o;
+      }).filter((o) => Object.keys(o).length);
+    },
+    set(arr) { list.replaceChildren(); (arr || []).forEach((vv) => addRow(vv)); fire(); },
+  };
+}
+
+// First 4-digit year in a string; "Present"/"current" → this year.
+function expYear(s, fallback) {
+  const str = String(s || '');
+  if (/present|current|now|ongoing/i.test(str)) return new Date().getFullYear();
+  const m = str.match(/(?:19|20)\d{2}/);
+  return m ? Number(m[0]) : fallback;
+}
+
+// SVG timeline of work + education spans across years (the "experience chart").
+function experienceChart(work, education) {
+  const nowY = new Date().getFullYear();
+  const rows = [];
+  for (const w of (work || [])) {
+    if (!w.title && !w.company) continue;
+    const s = expYear(w.startDate, null); if (s == null) continue;
+    rows.push({ kind: 'work', label: w.title || w.company, sub: w.company || '', s, e: Math.max(expYear(w.endDate, nowY), s) });
+  }
+  for (const ed of (education || [])) {
+    if (!ed.degree && !ed.school) continue;
+    const s = expYear(ed.startYear, null); if (s == null) continue;
+    rows.push({ kind: 'edu', label: ed.degree || ed.school, sub: ed.school || '', s, e: Math.max(expYear(ed.endYear, nowY), s) });
+  }
+  if (!rows.length) return el('<div class="muted" style="font-size:12px;padding:6px 2px">Add work or education with years and your experience timeline appears here.</div>');
+  const minY = Math.min(...rows.map((r) => r.s));
+  const maxY = Math.max(nowY, ...rows.map((r) => r.e));
+  const span = Math.max(1, maxY - minY);
+  const W = 1000, labelW = 250, trackW = W - labelW - 12, rowH = 30, top = 26, H = top + rows.length * rowH + 10;
+  const xFor = (y) => labelW + ((y - minY) / span) * trackW;
+  const step = span <= 10 ? 1 : span <= 22 ? 2 : 5;
+  let ticks = '';
+  for (let y = minY; y <= maxY; y += step) {
+    const x = xFor(y);
+    ticks += `<line x1="${x}" y1="${top - 4}" x2="${x}" y2="${H - 6}" class="ec-grid"/><text x="${x}" y="${top - 10}" class="ec-yr" text-anchor="middle">${y}</text>`;
+  }
+  let bars = '';
+  rows.forEach((r, i) => {
+    const y = top + i * rowH;
+    const x1 = xFor(r.s), x2 = Math.max(xFor(r.e), x1 + 6);
+    const sub = r.sub ? ` <tspan class="ec-sub">· ${esc(String(r.sub).slice(0, 28))}</tspan>` : '';
+    bars += `<text x="0" y="${y + rowH / 2 + 4}" class="ec-lab">${esc(String(r.label).slice(0, 30))}${sub}</text>`;
+    bars += `<rect x="${x1}" y="${y + 6}" width="${x2 - x1}" height="${rowH - 14}" rx="4" class="ec-bar ec-${r.kind}"><title>${esc(r.label)} (${r.s}–${r.e >= nowY ? 'Present' : r.e})</title></rect>`;
+  });
+  return el(`<svg viewBox="0 0 ${W} ${H}" class="exp-chart" preserveAspectRatio="xMinYMin meet">${ticks}${bars}</svg>`);
+}
 const FIELD_GROUPS = [
   { title: 'Identity', keys: ['firstName', 'lastName', 'fullName', 'preferredName', 'pronouns'] },
   { title: 'Contact & location', keys: ['email', 'phone', 'address1', 'address2', 'city', 'state', 'postalCode', 'country'] },
@@ -2160,6 +2244,18 @@ route('/profile', async () => {
             <div class="pf-group-title">Skills</div>
             <div id="pf-skills-slot"></div>
           </div>
+          <div class="pf-group">
+            <div class="pf-group-title">Experience timeline</div>
+            <div id="pf-chart-slot"></div>
+          </div>
+          <div class="pf-group">
+            <div class="pf-group-title">Work history</div>
+            <div id="pf-work-slot"></div>
+          </div>
+          <div class="pf-group">
+            <div class="pf-group-title">Education history</div>
+            <div id="pf-edu-slot"></div>
+          </div>
         </section>
 
         <section class="section">
@@ -2179,6 +2275,21 @@ route('/profile', async () => {
   v.querySelector('#pf-sources-slot').appendChild(sources.node);
   const skills = chipsInput(d.skills || [], 'Add skill…');
   v.querySelector('#pf-skills-slot').appendChild(skills.node);
+
+  // Work + education history (editable rows) + the experience timeline chart.
+  const redrawChart = () => { const slot = v.querySelector('#pf-chart-slot'); if (slot) slot.replaceChildren(experienceChart(work.get(), education.get())); };
+  const work = recordRows(d.workHistory, [
+    { key: 'title', ph: 'Title', wide: true }, { key: 'company', ph: 'Company' }, { key: 'location', ph: 'Location' },
+    { key: 'startDate', ph: 'Start (e.g. 2024)' }, { key: 'endDate', ph: 'End / Present' },
+    { key: 'description', ph: 'What you did (one per line)', ta: true },
+  ], 'Add job', () => redrawChart());
+  const education = recordRows(d.educationHistory, [
+    { key: 'degree', ph: 'Degree', wide: true }, { key: 'school', ph: 'School' },
+    { key: 'field', ph: 'Field of study' }, { key: 'startYear', ph: 'Start' }, { key: 'endYear', ph: 'End' }, { key: 'gpa', ph: 'GPA' },
+  ], 'Add education', () => redrawChart());
+  v.querySelector('#pf-work-slot').appendChild(work.node);
+  v.querySelector('#pf-edu-slot').appendChild(education.node);
+  redrawChart();
 
   // Autofill master toggle (persists to settings.autofill.enabled).
   v.querySelector('#af-enabled').addEventListener('change', async (e) => {
@@ -2231,6 +2342,24 @@ route('/profile', async () => {
     const sum = v.querySelector('#pf-summary');
     if (sum && !sum.value.trim() && parsed.summary) { sum.value = parsed.summary; filled++; }
     if (Array.isArray(parsed.skills) && parsed.skills.length && !skills.get().length) { skills.set(parsed.skills); filled++; }
+    // Work + education arrays → fill the row editors, but only when empty so we
+    // never clobber what you've already entered.
+    if (Array.isArray(parsed.workExperience) && parsed.workExperience.length && !work.get().length) {
+      work.set(parsed.workExperience.map((w) => ({
+        title: w.title || '', company: w.company || '', location: w.location || '',
+        startDate: w.startDate || '', endDate: w.endDate || (w.current ? 'Present' : ''),
+        description: w.description || '',
+      })));
+      filled += parsed.workExperience.length;
+    }
+    if (Array.isArray(parsed.educationHistory) && parsed.educationHistory.length && !education.get().length) {
+      education.set(parsed.educationHistory.map((e2) => ({
+        degree: e2.degree || '', school: e2.school || '', field: e2.field || '',
+        startYear: e2.startYear || '', endYear: e2.endYear || '', gpa: e2.gpa || '',
+      })));
+      filled += parsed.educationHistory.length;
+    }
+    redrawChart();
     return filled;
   };
   const importFromDoc = async (documentId, name) => {
@@ -2289,6 +2418,8 @@ route('/profile', async () => {
     if (summary) data.summary = summary;
     const sk = skills.get();
     if (sk.length) data.skills = sk;
+    const wh = work.get(); if (wh.length) data.workHistory = wh;
+    const eh = education.get(); if (eh.length) data.educationHistory = eh;
     return {
       id: cur.id || undefined,
       name: v.querySelector('#pf-name').value.trim() || 'Profile',

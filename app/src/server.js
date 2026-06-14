@@ -239,24 +239,9 @@ const SKIP_DIR_RX = /^(node_modules|\$recycle\.bin|system volume information|\.g
 const RESUME_RX = /\b(resumes?|résumés?|cv|cvs|curriculum)\b/i;
 const COVER_RX  = /\b(cover\s*letters?|coverletters?|lettres?\s*de\s*motivation|motivation)\b/i;
 
-// High-precision deterministic resume fields — merged with the AI parse so the
-// import still fills the obvious things (contacts, links) even when AI is slow,
-// unavailable, or returns little.
-function deterministicResumeFields(text) {
-  const t = String(text || '');
-  const out = {};
-  const email = t.match(/[\w.+-]+@[\w-]+\.[\w.-]+\.?\w+/);
-  if (email) out.email = email[0].replace(/\.$/, '');
-  const phone = t.match(/(?:\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/);
-  if (phone) out.phone = phone[0].trim();
-  const li = t.match(/(?:https?:\/\/)?(?:www\.)?linkedin\.com\/[\w\-/%]+/i);
-  if (li) out.linkedinUrl = li[0];
-  const gh = t.match(/(?:https?:\/\/)?(?:www\.)?github\.com\/[\w\-/%]+/i);
-  if (gh) out.githubUrl = gh[0];
-  const site = t.match(/https?:\/\/(?!.*(?:linkedin|github)\.com)[\w.-]+\.[a-z]{2,}(?:\/[\w\-/%.#?=&]*)?/i);
-  if (site) out.portfolioUrl = site[0];
-  return out;
-}
+// Deterministic résumé fields (contacts + links) — pure module, merged with the
+// AI parse so the obvious things always come through. See resumefields.js.
+const { deterministicResumeFields } = require('./resumefields');
 
 function isUnsafeFolder(p) {
   const r = path.resolve(p);

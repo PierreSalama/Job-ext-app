@@ -1292,8 +1292,11 @@ function pushProfileDataToMemory(profileId, data) {
   if (!profileId || !data || typeof data !== 'object') return { pushed: 0 };
   let pushed = 0;
   for (const [key, raw] of Object.entries(data)) {
-    if (key === 'skills' || key === 'summary' || String(key).startsWith('_')) continue;
-    const value = Array.isArray(raw) ? raw.join(', ') : raw;
+    // Only scalar fields belong in Q&A memory — skip skills/summary, the
+    // work/education history arrays, internal keys, and any non-scalar value.
+    if (key === 'skills' || key === 'summary' || key === 'workHistory' || key === 'educationHistory' || String(key).startsWith('_')) continue;
+    if (raw && typeof raw === 'object') continue;
+    const value = raw;
     if (value == null || String(value).trim() === '') continue;
     const label = PROFILE_KEY_LABELS[key] || humanizeKey(key);
     try { if (profileFieldUpsert({ profileId, question: label, value, fromUser: true, confidence: 1, source: 'profile' })) pushed++; } catch {}

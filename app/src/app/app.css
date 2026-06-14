@@ -318,6 +318,27 @@ body {
 .input[readonly] { opacity: 0.6; cursor: default; }
 /* brief highlight when a value is promoted from memory into a profile field */
 .pf-flash { box-shadow: 0 0 0 2px var(--primary) !important; transition: box-shadow 250ms var(--ease-firm); }
+
+/* Work / education history editable rows */
+.rec-rows { display: flex; flex-direction: column; gap: 10px; }
+.rec-list { display: flex; flex-direction: column; gap: 10px; }
+.rec-row {
+  display: flex; gap: 6px; align-items: flex-start; flex-wrap: wrap;
+  padding: 8px; border: 1px solid var(--border); background: var(--bg2);
+}
+.rec-f { flex: 1 1 120px; min-width: 88px; }
+.rec-f.rec-wide { flex: 2 1 200px; }
+.rec-f.rec-ta { flex: 1 1 100%; resize: vertical; min-height: 38px; }
+.rec-rm { flex: 0 0 auto; align-self: center; }
+
+/* Experience timeline chart (SVG) */
+.exp-chart { width: 100%; height: auto; display: block; }
+.exp-chart .ec-grid { stroke: var(--border); stroke-width: 1; }
+.exp-chart .ec-yr  { fill: var(--muted); font-size: 11px; }
+.exp-chart .ec-lab { fill: var(--text); font-size: 12px; }
+.exp-chart .ec-sub { fill: var(--muted); font-size: 11px; }
+.exp-chart .ec-bar.ec-work { fill: var(--primary); }
+.exp-chart .ec-bar.ec-edu  { fill: var(--warn); }
 .select { appearance: none; padding-right: 32px;
   background-image: linear-gradient(45deg, transparent 50%, var(--primary) 50%),
                     linear-gradient(135deg, var(--primary) 50%, transparent 50%);

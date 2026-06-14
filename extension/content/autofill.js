@@ -81,7 +81,9 @@ function profileFieldFor(label, profile) {
   // "prénom") still hit patterns even where only the unaccented form is listed.
   const folded = stripAccents(label);
   for (const [rx, field] of PROFILE_PATTERNS) {
-    if ((rx.test(label) || rx.test(folded)) && profile[field] != null && profile[field] !== '') {
+    // Only scalar profile values are fillable — never stringify an array/object
+    // (e.g. workHistory) into a form field.
+    if ((rx.test(label) || rx.test(folded)) && profile[field] != null && profile[field] !== '' && typeof profile[field] !== 'object') {
       return { field, value: profile[field] };
     }
   }
