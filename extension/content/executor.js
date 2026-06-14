@@ -16,9 +16,10 @@
 import { AutofillEngine, setNativeValue, fieldLabel } from './autofill.js';
 import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
+import { pageTextLooksLikeSuccess, urlLooksLikeSuccess } from './signals/success.js';
 import { qsa, isProbablyVisible, compactText } from './lib/dom.js';
 
-const MAX_STEPS = 25;
+const MAX_STEPS = 40;
 const STEP_TIMEOUT = 9000;
 const LEGAL_RX = /(work.*authoriz|sponsor|visa|citizen|clearance|ethnic|race|gender|disabilit|veteran|criminal|background.*check)/i;
 // Demographic / sensitive fields we NEVER auto-fill from any source (not even
@@ -196,8 +197,44 @@ function findAdvanceButton(root) {
   return null;
 }
 
+// LinkedIn's "Easy Apply" button on the job-view page (before the modal opens).
+// Matched by its known classes + an "easy apply" label so we never click an
+// external "Apply" button (which leaves LinkedIn). Used to OPEN the form when the
+// generic advance scan misses it (some postings render an icon/badged button).
+function findEasyApplyButton() {
+  const sel = 'button.jobs-apply-button, .jobs-apply-button--top-card button, [data-live-test-job-apply-button], button[aria-label*="easy apply" i], button[aria-label*="candidature simpli" i]';
+  for (const el of qsa(sel)) {
+    if (!el || el.disabled || !isProbablyVisible(el)) continue;
+    const label = (btnText(el) + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
+    if (/easy apply|candidature simpli/.test(label)) return el;
+  }
+  return null;
+}
+
 function isFinalSubmit(el) {
   return FINAL_SUBMIT_RX.test(btnText(el)) || isSubmitClick(el);
+}
+
+// After clicking a final submit, the application is "sent" when the page shows a
+// real success confirmation (text or URL — reuses the maintained EN/FR signals in
+// success.js) OR, only when we actually had a real field-bearing apply modal open,
+// that modal closes with no apply form left and no captcha/login. We poll instead
+// of checking once (the banner renders a beat after the click — the old single
+// check missed it, mislabeling real submissions as awaiting_input). `applyModal`
+// must be the verified apply dialog (never a loose fallback) so an unrelated
+// modal closing — or the user X-ing the modal — can't be read as a submit.
+async function confirmSubmitted(applyModal, timeoutMs = 15000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs && !S.cancelled) {
+    if (pageTextLooksLikeSuccess(8000) || urlLooksLikeSuccess()) return 'confirmation';
+    if (applyModal) {
+      const stillOpen = document.contains(applyModal) && isProbablyVisible(applyModal);
+      const anotherApplyForm = document.querySelector('.jobs-easy-apply-modal, [data-test-modal][role="dialog"], [data-testid="smartapply-container"]');
+      if (!stillOpen && !anotherApplyForm && !captchaOrLoginPresent()) return 'apply form closed';
+    }
+    await sleep(400);
+  }
+  return null;
 }
 
 function syntheticClick(el) {
@@ -282,6 +319,8 @@ export async function run(task, context, helpers) {
 
   let finished = false;
   let finalState = null;
+  let everHadForm = false;     // has the apply form/modal ever appeared this run?
+  let submitAttempted = false; // did we click a final submit (auto mode) at least once?
 
   // Self-healing park: questions we couldn't answer with HIGH confidence. We
   // NEVER submit a job with these outstanding — instead we park it (with the
@@ -331,6 +370,7 @@ export async function run(task, context, helpers) {
       .find((d) => isProbablyVisible(d) && d.querySelector('input, textarea, select, [role="combobox"], [contenteditable="true"]')) || null;
     const root = dialog || formProbe?.form || null;
     const haveForm = !!root;
+    if (haveForm) everHadForm = true;
 
     // ---- fill from profile + learned answers ----
     setStatus(`Step ${S.step}: ${haveForm ? 'filling fields…' : 'opening the application…'}`);
@@ -394,28 +434,44 @@ export async function run(task, context, helpers) {
 
     // ---- advance ----
     setStatus(`Step ${S.step}: looking for next/submit…`);
-    const btn = findAdvanceButton(root);
+    // In-form: prefer buttons inside the modal. Not open yet: also try LinkedIn's
+    // Easy-Apply button to OPEN the form (covers postings the generic scan misses).
+    let btn = findAdvanceButton(root) || (!haveForm ? findEasyApplyButton() : null);
     if (!btn) {
-      // Maybe required fields are empty → validation visible, or page needs a human.
-      logLine('warn', 'no advance button — waiting 30s for the page (or you)');
+      const opening = !everHadForm;   // the apply form has never appeared yet
+      logLine('warn', opening ? 'couldn’t open the application — waiting a bit' : 'no advance button — waiting 30s for the page (or you)');
       let found = null;
-      for (let i = 0; i < 60 && !S.cancelled; i++) {
+      const tries = opening ? 24 : 60;   // ~12s for a slow Easy-Apply button to hydrate; 30s once in-form
+      for (let i = 0; i < tries && !S.cancelled; i++) {
         await sleep(500);
-        found = findAdvanceButton();
+        found = findAdvanceButton() || (!haveForm ? findEasyApplyButton() : null);
         if (found) break;
       }
       if (!found) {
         // If we're stuck because of unanswered questions, park (self-heal) rather
         // than a generic "needs input" — so the next run can ask + retry.
         if (parked.length) { reportParked('no-advance'); break; }
-        report({ state: 'awaiting_input', lastError: 'no advance button found' });
-        finalState = 'awaiting_input';
+        if (submitAttempted) {
+          // We clicked the final submit but couldn't auto-confirm it. Don't call it
+          // failed, and don't falsely stamp it submitted — flag it for a quick look.
+          logLine('ok', 'final submit clicked — confirmation not detected; flagged for your review');
+          report({ state: 'awaiting_review', lastError: 'submitted but not auto-confirmed — please verify', transcriptAppend: { note: 'submit clicked; no confirmation seen' } });
+          finalState = 'awaiting_review';
+        } else {
+          // Either the Easy-Apply form never opened (likely external/verification —
+          // nothing to auto-do) or in-form validation needs a human. Leave it as
+          // awaiting_input: it's in the queue de-dup set, so discovery won't churn
+          // it into a re-skip loop.
+          report({ state: 'awaiting_input', lastError: opening ? 'application did not open (not Easy-Apply / verification)' : 'no advance button found' });
+          finalState = 'awaiting_input';
+        }
         break;
       }
       continue;
     }
 
-    if (isFinalSubmit(btn)) {
+    const isFinal = isFinalSubmit(btn);
+    if (isFinal) {
       // SAFETY NET: never submit a job that still has unanswered questions.
       if (parked.length) { reportParked('final-submit'); break; }
       if (mode === 'review') {
@@ -427,12 +483,16 @@ export async function run(task, context, helpers) {
       }
       logLine('ok', 'final submit (auto mode)');
     }
+    // Snapshot the VERIFIED apply modal (the field-bearing `dialog`, never a loose
+    // fallback) before clicking submit, so detecting it close can't be tricked by
+    // an unrelated modal (cookie/consent) closing.
+    const submitDialog = isFinal ? dialog : null;
 
     // Re-verify the button is still clickable right before acting — the DOM may
     // have changed since findAdvanceButton() above (validation re-render, etc.).
     let clickBtn = btn;
     if (clickBtn.disabled || !isProbablyVisible(clickBtn) || !document.contains(clickBtn)) {
-      clickBtn = findAdvanceButton(root) || findAdvanceButton();
+      clickBtn = findAdvanceButton(root) || findAdvanceButton() || (!haveForm ? findEasyApplyButton() : null);
       if (!clickBtn) { logLine('warn', 'advance button became invalid before click — re-scanning'); continue; }
     }
     const label = compactText(clickBtn.textContent || clickBtn.value || '').slice(0, 30);
@@ -443,12 +503,34 @@ export async function run(task, context, helpers) {
     const changed = await waitForChange(prevHash);
     if (!changed) logLine('warn', 'page did not change after click');
 
-    // ---- success? ----
-    const text = (document.body?.innerText || '').slice(0, 6000);
-    if (/application (was )?(received|submitted|sent)|thank you for applying|we['']?ve received your application|candidature (envoy|soumis|reçu)/i.test(text)) {
+    // ---- confirm a real submit (auto mode) ----
+    // After clicking the final submit, WAIT for the confirmation (banner or the
+    // Easy-Apply modal closing) instead of checking once — the banner renders a
+    // beat later, which used to make real submissions look like awaiting_input.
+    if (isFinal && mode !== 'review') {
+      submitAttempted = true;
+      setStatus('Submitting — waiting for confirmation…');
+      const how = await confirmSubmitted(submitDialog);
+      if (how) {
+        logLine('ok', `✓ application submitted (${how})`);
+        setStatus('✓ Application submitted');
+        // Mark the JOB submitted too, so it's counted even if the passive capture
+        // detector misses the banner (queuePatch only updates the task).
+        if (job?.id) await send({ type: 'api-call', method: 'PATCH', path: '/jobs/' + encodeURIComponent(job.id), body: { status: 'submitted' } });
+        report({ state: 'done', transcriptAppend: { note: `submitted — ${how}` } });
+        finalState = 'done';
+        finished = true;
+        continue;
+      }
+      logLine('warn', 'submit not confirmed yet — continuing');
+    }
+
+    // ---- success? (generic net for one-click / non-modal apply flows) ----
+    if (pageTextLooksLikeSuccess(6000) || urlLooksLikeSuccess()) {
       logLine('ok', '✓ application submitted');
       setStatus('✓ Application submitted');
-      report({ state: 'done', transcriptAppend: { note: 'success text detected' } });
+      if (job?.id) await send({ type: 'api-call', method: 'PATCH', path: '/jobs/' + encodeURIComponent(job.id), body: { status: 'submitted' } });
+      report({ state: 'done', transcriptAppend: { note: 'success detected' } });
       finalState = 'done';
       finished = true;
     }
