@@ -62,3 +62,37 @@ test('queueRunStats exposes lastStart (start-based pacing)', () => {
   const st = db.queueRunStats();
   assert.ok(st.lastStart, 'lastStart is populated from scheduled_at');
 });
+
+test('queueLive reports in-flight workers with their current step', () => {
+  const j = db.upsertJob({ externalId: 'live1', title: 'Dev live1', company: 'Acme', source: 'linkedin', status: 'started', jobUrl: 'https://x/live1' }).job;
+  const t = db.queueAdd(j.id, { mode: 'auto' });
+  db.queuePatch(t.id, { state: 'running', scheduledAt: new Date().toISOString(), transcriptAppend: { text: 'filling fields…' } });
+  const live = db.queueLive({});
+  const mine = live.running.find((w) => w.taskId === t.id);
+  assert.ok(mine, 'a running task shows as an active worker');
+  assert.equal(mine.step, 'filling fields…', 'current step = last transcript entry');
+  assert.ok(live.active >= 1, 'active worker count includes it');
+});
+
+test('queueLive session counts: submitted = done ONLY, awaiting_review is separate', () => {
+  const since = new Date(Date.now() - 3600 * 1000).toISOString();
+  const mk = (id, state) => {
+    const j = db.upsertJob({ externalId: id, title: 'Dev ' + id, company: 'Acme', source: 'indeed', status: 'started', jobUrl: 'https://x/' + id }).job;
+    db.queuePatch(db.queueAdd(j.id, { mode: 'auto' }).id, { state });
+  };
+  const before = db.queueLive({ startedAt: since }).session;
+  mk('sess-done', 'done');
+  mk('sess-rev', 'awaiting_review');
+  mk('sess-park', 'parked');
+  const after = db.queueLive({ startedAt: since }).session;
+  assert.equal(after.submitted, before.submitted + 1, 'only done counts as submitted');
+  assert.equal(after.readyForReview, before.readyForReview + 1, 'awaiting_review counted separately, not as submitted');
+  assert.equal(after.parked, before.parked + 1, 'parked counted separately');
+});
+
+test('queueBreakdown no longer folds awaiting_review into submitted', () => {
+  const j = db.upsertJob({ externalId: 'br-rev', title: 'Dev br-rev', company: 'Acme', source: 'linkedin', status: 'started', jobUrl: 'https://x/br-rev' }).job;
+  db.queuePatch(db.queueAdd(j.id, { mode: 'auto' }).id, { state: 'awaiting_review', applyRoute: 'easy-apply' });
+  const bd = db.queueBreakdown({ days: 30 });
+  assert.ok((bd.byOutcome.needs_you || 0) >= 1, 'awaiting_review now maps to needs_you, not submitted');
+});

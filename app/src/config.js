@@ -98,7 +98,7 @@ const DEFAULTS = {
     runAnytime: true,        // ON by default — run 24/7. Turn OFF to use the window below.
     windowStart: '',         // only used when runAnytime is false
     windowEnd: '',
-    aiAnswerConfidenceMin: 0.8,   // AI answers a screening question ONLY when highly confident
+    aiAnswerConfidenceMin: 0.7,   // AI answers a screening question when reasonably confident (lower = fewer parks, more autonomy)
     easyApplyOnly: true,          // ON + locked in the UI (non-Easy-Apply isn't supported yet)
     keywords: [],                 // e.g. ['software engineer', 'data analyst']
     locations: [],                // e.g. ['Toronto', 'Remote']

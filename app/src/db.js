@@ -1524,7 +1524,7 @@ function queueHistory({ days = 7, state } = {}) {
   if (state) { sql += ' AND t.state = ?'; args.push(state); }
   sql += ' ORDER BY t.updated_at DESC';
   const OUTCOME = {
-    done: 'submitted', awaiting_review: 'submitted', failed: 'failed',
+    done: 'submitted', awaiting_review: 'needs_you', failed: 'failed',
     parked: 'needs_you', awaiting_input: 'needs_you', skipped: 'skipped',
     queued: 'pending', scheduled: 'pending', running: 'running',
   };
@@ -1554,7 +1554,7 @@ function queueBreakdown({ days = 30 } = {}) {
      FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
      WHERE t.updated_at >= ?`, [cutoff]);
   const OUTCOME = {
-    done: 'submitted', awaiting_review: 'submitted', failed: 'failed',
+    done: 'submitted', awaiting_review: 'needs_you', failed: 'failed',
     parked: 'needs_you', awaiting_input: 'needs_you', skipped: 'skipped',
     queued: 'pending', scheduled: 'pending', running: 'running',
   };
@@ -1577,6 +1577,44 @@ function queueBreakdown({ days = 30 } = {}) {
     .sort((a, b) => b[1] - a[1]).slice(0, 8)
     .map(([reason, count]) => ({ reason, count }));
   return { total: rows.length, days, byOutcome, byBoard, byRoute, topReasons };
+}
+
+// Live snapshot for the Auto-apply "Running now" panel: the in-flight workers
+// (state='running' tasks — their count IS the live parallel-worker number) with
+// each one's current step + elapsed, the queue depth, and a session tally by
+// outcome since the user pressed Start. Submitted = done ONLY (review-stops and
+// parks are counted separately, honestly).
+function queueLive({ startedAt } = {}) {
+  const running = all(
+    `SELECT t.*, j.title AS _title, j.company AS _company, j.source AS _src
+     FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
+     WHERE t.state = 'running' ORDER BY t.scheduled_at ASC`
+  ).map((r) => {
+    const tk = rowToTask(r);
+    const last = tk.transcript[tk.transcript.length - 1] || null;
+    return {
+      taskId: tk.id, title: r._title || '', company: r._company || '', source: r._src || '',
+      step: last ? String(last.text || last.note || last.step || '').slice(0, 120) : 'starting…',
+      startedAt: tk.scheduledAt || tk.updatedAt, mode: tk.mode,
+    };
+  });
+  const cnt = (st) => get('SELECT COUNT(*) AS n FROM auto_apply_tasks WHERE state = ?', [st]).n;
+  const scheduled = cnt('scheduled');
+  const queuedDepth = cnt('queued');
+  // Session window = since the master switch was last turned ON (fallback: 24h).
+  const since = startedAt || new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const by = {};
+  for (const r of all('SELECT state, COUNT(*) AS n FROM auto_apply_tasks WHERE updated_at >= ? GROUP BY state', [since])) by[r.state] = r.n;
+  const session = {
+    submitted: by.done || 0,
+    readyForReview: by.awaiting_review || 0,
+    parked: by.parked || 0,
+    needsYou: by.awaiting_input || 0,
+    skipped: by.skipped || 0,
+    failed: by.failed || 0,
+  };
+  session.finished = session.submitted + session.readyForReview + session.parked + session.needsYou + session.skipped + session.failed;
+  return { running, active: running.length, scheduled, queuedDepth, session };
 }
 
 function queueAdd(jobId, { mode } = {}) {
@@ -1890,7 +1928,7 @@ module.exports = {
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,
   extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
-  queueList, queueHistory, queueBreakdown, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueRetryParked, saveIntakeAnswer,
+  queueList, queueHistory, queueBreakdown, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueRetryParked, saveIntakeAnswer,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,
   emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching,

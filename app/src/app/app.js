@@ -552,6 +552,7 @@ function resolve(path) {
 }
 let navSeq = 0;
 let aaHistoryLoad = null;   // set by the auto-apply view; lets SSE refreshes reload the History pane
+let aaLiveLoad = null;      // set by the auto-apply view; refreshes the live "Running now" panel
 async function navigate(opts = {}) {
   // soft = an SSE-driven live refresh: morph the current view in place (counts and
   // rows update, focus + scroll preserved) instead of a full re-render.
@@ -738,7 +739,13 @@ const softRefresh = debounce(() => {
   // The History pane is [data-keep] so the morph won't touch it — reload it here so
   // it stays live as outcomes change.
   if (aaHistoryLoad && document.querySelector('[data-qpane="history"]:not([hidden])')) aaHistoryLoad();
+  if (aaLiveLoad && document.getElementById('aa-live')) aaLiveLoad();
 }, 350);
+
+// Live "Running now" panel — one global ticker (reads live DOM, so no stacked
+// intervals across navigations). Refreshes the in-flight workers ~every 2.5s while
+// the panel is mounted, independent of SSE, so elapsed times + steps stay current.
+setInterval(() => { if (aaLiveLoad && document.getElementById('aa-live') && !document.hidden) aaLiveLoad(); }, 2500);
 
 function connectSSE() {
   if (state.sse) { try { state.sse.close(); } catch {} state.sse = null; }
@@ -1739,6 +1746,8 @@ route('/queue', async () => {
 
     ${working ? '<div class="aa-running"><span class="aa-pulse"></span> Auto-apply is working in a background tab — <strong>don\'t touch that window</strong>. It\'s paced and you can Stop any time.</div>' : ''}
 
+    <div id="aa-live" data-keep></div>
+
     <div class="aa-disco">
       <div class="aa-disco-main">
         <span class="aa-disco-eyebrow">Last search</span>
@@ -1962,6 +1971,69 @@ route('/queue', async () => {
       const b2 = document.getElementById('aa-hist-body'); if (b2) b2.innerHTML = `<div class="task-err" style="padding:18px">${esc(String(e?.message || e))}</div>`;
     }
   }
+  // ---- LIVE "Running now" panel: in-flight workers + session tally + effective rate ----
+  const AA_STATUS = {
+    running: ['#16a34a', 'Applying'],
+    pacing: ['#d97706', 'Pacing — waiting for the next slot'],
+    'queue-empty': ['#3b82f6', 'Queue empty — searching for more jobs'],
+    'hourly-cap': ['#d97706', 'Hourly limit reached — resumes next hour'],
+    off: ['#9ca3af', 'Stopped'],
+  };
+  function liveHtml(d) {
+    const [col, label] = AA_STATUS[d.status] || ['#9ca3af', d.status || ''];
+    const p = d.pacing || {}, s = d.session || {};
+    const slow = p.effectivePerHour && p.effectivePerHour <= 12;
+    const workers = (d.running || []).length
+      ? d.running.map((w) => `<div style="display:flex;gap:10px;align-items:flex-start;font-size:12px;padding:5px 0;border-top:1px solid var(--border,#2a2a2a)">
+          <span style="color:${col};line-height:1.4">●</span>
+          <span style="flex:1;min-width:0"><b style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block">${esc(w.title || 'job')} <span class="muted">· ${esc(w.company || '')}</span></b><span class="muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block">${esc(w.step || '')}</span></span>
+          <span class="muted" style="white-space:nowrap">${esc(w.source || '')} · ${esc(fmtElapsed((Date.now() - Date.parse(w.startedAt || '')) || 0))}</span>
+        </div>`).join('')
+      : `<div class="muted" style="font-size:12px;padding:6px 0">${d.enabled ? (d.queuedDepth ? 'Next application starting…' : 'No applications in flight — topping up the queue.') : 'Press Start to begin.'}</div>`;
+    const stat = (n, lbl, c) => `<span style="display:inline-flex;flex-direction:column;align-items:center;min-width:56px"><b style="font-size:17px;color:${c || 'inherit'}">${n}</b><span class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.03em">${lbl}</span></span>`;
+    return `<section class="section" style="margin-bottom:14px">
+      <header class="section-header" style="align-items:center">
+        <div><div class="section-eyebrow">Live</div><h2 class="section-title">Running now</h2></div>
+        <span style="display:inline-flex;align-items:center;gap:7px;font-size:12px"><span style="width:9px;height:9px;border-radius:50%;background:${col};box-shadow:0 0 0 3px ${col}22"></span>${esc(label)} · <b>${d.active || 0}/${d.concurrency || 1}</b> workers</span>
+      </header>
+      <div class="section-body">
+        <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin-bottom:8px">
+          ${stat(s.submitted || 0, 'submitted', '#16a34a')}
+          ${stat(s.readyForReview || 0, 'to review', '#3b82f6')}
+          ${stat(s.parked || 0, 'parked', '#d97706')}
+          ${stat(s.needsYou || 0, 'needs you', '#d97706')}
+          ${stat(s.skipped || 0, 'skipped', '#9ca3af')}
+          ${stat(s.failed || 0, 'failed', '#dc2626')}
+          ${stat(d.queuedDepth || 0, 'in queue', '#6b7280')}
+        </div>
+        <div class="muted" style="font-size:12px;margin-bottom:8px">≈ <b style="color:${slow ? '#dc2626' : 'inherit'}">${p.effectivePerHour || 0}</b> applications/hour at current settings${p.bindingCap ? ` (capped by ${p.bindingCap === 'hourly-cap' ? 'your hourly limit' : 'the gap between applications'})` : ''}${slow ? ` — your saved pacing predates the speed update. <button class="btn small" data-aa-maxspeed style="padding:2px 9px">⚡ Max speed</button>` : ''}</div>
+        ${workers}
+      </div>
+    </section>`;
+  }
+  async function aaMaxSpeed() {
+    try {
+      await api('/settings', { method: 'PATCH', body: { autoApply: {
+        maxPerHour: 60, maxPerDay: 200, minGapMinutes: 0.25, maxGapMinutes: 0.6, aiAnswerConfidenceMin: 0.7,
+      } } });
+      state.settings = null;
+      toast('⚡ Max speed on — faster pacing + more autonomous answers');
+      loadLive();
+    } catch (e) { errToast(e); }
+  }
+  async function loadLive() {
+    const host = document.getElementById('aa-live');
+    if (!host) return;
+    try {
+      const d = await api('/auto-apply/live');
+      if (!d || d.ok === false) { host.innerHTML = ''; return; }
+      host.innerHTML = liveHtml(d);
+      host.querySelector('[data-aa-maxspeed]')?.addEventListener('click', aaMaxSpeed);
+    } catch { /* keep the last good render on a transient error */ }
+  }
+  aaLiveLoad = loadLive;
+  loadLive();
+
   aaHistoryLoad = loadHistory;
   v.querySelector('#aa-hist-range')?.addEventListener('change', loadHistory);
   v.querySelectorAll('[data-qview]').forEach((b) => b.addEventListener('click', () => {

@@ -79,11 +79,12 @@ chrome.alarms.onAlarm.addListener(async (a) => {
     // Auto-apply was turned OFF (from either dashboard host) → tidy up the run's
     // tabs/group. Cheap no-op once aaGroupId is cleared.
     if (r.reason === 'disabled' && aaGroupId != null) await closeAutoApplyTabs().catch(() => {});
-    // If we couldn't dispatch (queue empty/low/gap), top the queue up — even while
-    // applies are in flight. A continuously-busy pool would otherwise starve
-    // discovery and drain the queue to a stall (discoverTick self-gates on queue
-    // depth, so this never over-enqueues).
-    if (!r.dispatched) await discoverTick().catch(() => {});
+    // ALWAYS try to top up the queue — even when the pool just dispatched. A busy
+    // parallel pool consumes faster than one-discovery-per-idle-tick can refill, so
+    // gating refill on "dispatched nothing" starved the queue to a stall. discoverTick
+    // self-gates on queue depth (only searches when below refillBelow), so calling it
+    // every tick never over-enqueues; it just keeps N workers fed.
+    await discoverTick().catch(() => {});
   }
   if (a.name === 'jat11-extupdate') {
     await checkExtUpdate().catch(() => {});
@@ -428,6 +429,10 @@ let pumping = false;
 let scanning = false;
 let currentConcurrency = 1;       // learned from each /queue/next response
 let gapTimer = null;              // precise wake-up when only the pacing gap held us back
+let pumpDirty = false;            // a re-pump request arrived while pumping — re-run once we finish
+// Resume the right parallelism after an MV3 service-worker eviction — otherwise the
+// pool silently runs serial (1) until the next grant re-learns the concurrency.
+try { chrome.storage.session?.get('jat11.concurrency').then((o) => { const c = o && o['jat11.concurrency']; if (c) currentConcurrency = Math.max(1, Math.min(8, Number(c))); }).catch(() => {}); } catch {}
 
 // Keep every auto-apply / discovery tab in ONE labelled Chrome tab group so the
 // user can see + manage them together (and they're not scattered everywhere).
@@ -595,7 +600,7 @@ function schedulePump() {
 // FIRE-AND-FORGET per task: each launch frees its slot on completion and re-pumps,
 // so N tabs cycle continuously. concurrency comes back with every /queue/next.
 async function pump(force = false) {
-  if (pumping) return { dispatched: false, reason: 'pumping' };
+  if (pumping) { pumpDirty = true; return { dispatched: false, reason: 'pumping' }; }
   if (!(await api.isPaired())) return { dispatched: false, reason: 'not paired' };
   const h = await api.health();
   if (!h?.ok) return { dispatched: false, reason: 'app offline' };
@@ -607,7 +612,10 @@ async function pump(force = false) {
   try {
     while (activeCount < currentConcurrency) {
       const r = await api.call('GET', '/queue/next' + (force ? '?force=1' : ''), null, 8000);
-      if (r && r.concurrency) currentConcurrency = Math.max(1, Math.min(8, r.concurrency));
+      if (r && r.concurrency) {
+        const c = Math.max(1, Math.min(8, r.concurrency));
+        if (c !== currentConcurrency) { currentConcurrency = c; try { chrome.storage.session?.set({ 'jat11.concurrency': c }); } catch {} }
+      }
       if (!r?.ok || !r.task) {
         reason = r?.reason || 'nothing queued';
         if (r?.nextEligibleAt) gapEligibleAt = r.nextEligibleAt;
@@ -624,6 +632,9 @@ async function pump(force = false) {
   } finally {
     pumping = false;
   }
+  // A slot-free (or alarm) re-pump that arrived while we were mid-pump is honoured now,
+  // so freed parallel slots never get swallowed by the re-entrancy guard.
+  if (pumpDirty) { pumpDirty = false; schedulePump(); }
   // Held back only by the pacing gap → wake exactly when it expires (bounded), so
   // a fast-finishing job doesn't idle until the next 1-min alarm.
   if (reason === 'gap' && gapEligibleAt) {

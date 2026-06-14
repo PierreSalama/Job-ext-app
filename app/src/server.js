@@ -173,7 +173,11 @@ async function queueNext(force = false) {
     // collapses back to one-per-alarm-tick. The job's own runtime usually
     // absorbs the gap, so serial flows continuously; parallel spaces its starts.
     if (stats.lastStart) {
-      const gapMin = s.minGapMinutes + Math.random() * Math.max(0, s.maxGapMinutes - s.minGapMinutes);
+      // Divide the gap by concurrency so a pool of N may start N applications within
+      // one base gap window. This single global per-start clock otherwise serializes
+      // EVERY launch, so `concurrency` bought zero extra throughput (the v11.12 bug).
+      const baseGap = s.minGapMinutes + Math.random() * Math.max(0, s.maxGapMinutes - s.minGapMinutes);
+      const gapMin = baseGap / concurrency;
       const eligibleAt = new Date(stats.lastStart).getTime() + gapMin * 60000;
       if (Date.now() < eligibleAt) {
         return { task: null, reason: 'gap', nextEligibleAt: new Date(eligibleAt).toISOString(), concurrency };
@@ -795,6 +799,35 @@ async function handle(req, res, parsed) {
   if (req.method === 'GET' && pathname === '/auto-apply/breakdown') {
     const days = Number(parsed.searchParams.get('days')) || 30;
     return sendJson(res, 200, { ok: true, ...db.queueBreakdown({ days }) });
+  }
+  // LIVE pool snapshot for the "Running now" panel — in-flight workers + their step,
+  // queue depth, session tally, and the EFFECTIVE throughput (so a stale-pacing
+  // throttle is visible). Polled + refreshed on the queue.updated SSE.
+  if (req.method === 'GET' && pathname === '/auto-apply/live') {
+    const s = db.getSettings().autoApply;
+    const concurrency = Math.max(1, Math.min(8, Number(s.concurrency) || 1));
+    const live = db.queueLive({ startedAt: s.startedAt || '' });
+    const stats = db.queueRunStats();
+    const maxPerHour = Number(s.maxPerHour) || 0;
+    const avgGap = Math.max(0.05, (Number(s.minGapMinutes) + Number(s.maxGapMinutes)) / 2);
+    const gapPerHour = Math.round((60 / avgGap) * concurrency);   // gap divides by concurrency now
+    const effectivePerHour = maxPerHour ? Math.min(maxPerHour, gapPerHour) : gapPerHour;
+    const bindingCap = maxPerHour && maxPerHour <= gapPerHour ? 'hourly-cap' : 'gap';
+    let status;
+    if (!s.enabled) status = 'off';
+    else if (live.active > 0) status = 'running';
+    else if (live.queuedDepth === 0 && live.scheduled === 0) status = 'queue-empty';
+    else if (maxPerHour && stats.doneHour >= maxPerHour) status = 'hourly-cap';
+    else status = 'pacing';
+    return sendJson(res, 200, {
+      ok: true, enabled: !!s.enabled, startedAt: s.startedAt || '', mode: s.mode || 'auto',
+      concurrency, status, ...live,
+      pacing: {
+        maxPerHour, maxPerDay: Number(s.maxPerDay) || 0,
+        minGapMinutes: Number(s.minGapMinutes) || 0, maxGapMinutes: Number(s.maxGapMinutes) || 0,
+        concurrency, effectivePerHour, bindingCap, doneHour: stats.doneHour, doneDay: stats.doneDay,
+      },
+    });
   }
   // User answers the parked questions → saved to the profile (locked) → parked
   // jobs whose questions are now all answerable flip back to 'queued'.

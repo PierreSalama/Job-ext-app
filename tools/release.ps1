@@ -51,6 +51,7 @@ $pairs = @(
   @{ src = 'package.json'; dst = 'package.json' },
   @{ src = 'tests'; dst = 'tests' },
   @{ src = 'tools'; dst = 'tools' },
+  @{ src = 'docs'; dst = 'docs' },
   @{ src = '.github'; dst = '.github' },
   @{ src = 'README.md'; dst = 'README.md' }
 )
