@@ -13,4 +13,7 @@ contextBridge.exposeInMainWorld('jatDesktop', {
   openReleases: () => ipcRenderer.invoke('jat:open-releases'),
   restartToUpdate: () => ipcRenderer.invoke('jat:restart-to-update'),
   pickFolder: () => ipcRenderer.invoke('jat:pick-folder'),
+  pendingPair: () => ipcRenderer.invoke('jat:pending-pair'),
+  pairRespond: (id, allow) => ipcRenderer.invoke('jat:pair-respond', id, allow),
+  onPairingRequest: (cb) => { ipcRenderer.removeAllListeners('jat:pairing-request'); ipcRenderer.on('jat:pairing-request', (_e, data) => cb(data)); },
 });

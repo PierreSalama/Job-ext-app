@@ -1,13 +1,15 @@
 // JAT v11 — Electron main process.
 // Single instance, tray-resident (close-to-tray keeps capture alive),
 // token-guarded REST+SSE server on 127.0.0.1:7744, electron-updater,
-// global hotkey, native notifications, daily backups, Gmail sync scheduler.
+// global hotkey, in-app notifications (toasts pushed over SSE — never native OS
+// popups), daily backups, Gmail sync scheduler.
 
 const {
   app, BrowserWindow, Tray, Menu, dialog, globalShortcut,
-  Notification, ipcMain, nativeImage, shell, powerMonitor,
+  ipcMain, nativeImage, shell, powerMonitor,
 } = require('electron');
 const path = require('path');
+const crypto = require('crypto');
 const { startServer, stopServer, getToken, broadcast, rescanAllFolders, startFolderWatchers } = require('./server');
 const db = require('./db');
 const { autoUpdater } = require('electron-updater');
@@ -107,6 +109,21 @@ function iconPath() {
       : process.platform === 'darwin' ? 'icon.icns' : 'icon128.png');
 }
 
+// A catastrophic startup failure (DB won't open, port taken) is shown in a small
+// custom window — never a native dialog.showErrorBox. Closing it quits the app.
+function showFatalError(title, detail) {
+  try {
+    const w = new BrowserWindow({
+      width: 520, height: 360, title: 'Job Application Tracker', icon: iconPath(),
+      backgroundColor: '#0a0a0a', resizable: false, minimizable: false, maximizable: false,
+      webPreferences: { contextIsolation: true, nodeIntegration: false },
+    });
+    w.removeMenu();
+    w.loadFile(path.join(__dirname, 'fatal.html'), { query: { title: String(title || 'Error'), detail: String(detail || '') } });
+    w.on('closed', () => { isQuitting = true; app.quit(); });
+  } catch { isQuitting = true; app.quit(); }
+}
+
 // ---------- tray ----------
 function createTray() {
   const img = nativeImage.createFromPath(
@@ -119,18 +136,15 @@ function createTray() {
     {
       label: 'Check for updates…',
       click: async () => {
+        showWindow();
         const r = await manualCheckForUpdates();
-        if (r.status === 'dev') {
-          dialog.showMessageBox(mainWindow, { type: 'info', title: 'Dev build', message: 'Updates are only checked in the installed app.', noLink: true });
-        } else if (r.status === 'current') {
-          dialog.showMessageBox(mainWindow, { type: 'info', title: 'Up to date', message: `You're on the latest version (v${r.current}).`, noLink: true });
-        } else if (r.status === 'available' || r.status === 'downloaded') {
-          dialog.showMessageBox(mainWindow, { type: 'info', title: 'Update found', message: `v${r.version} is downloading. You'll be asked to restart when it's ready.`, noLink: true });
-        } else if (r.status === 'error') {
-          dialog.showMessageBox(mainWindow, { type: 'warning', title: 'Update check failed', message: r.error || 'Could not check for updates.', noLink: true });
-        } else {
-          dialog.showMessageBox(mainWindow, { type: 'info', title: 'Checking…', message: 'Still checking — try again in a moment.', noLink: true });
-        }
+        const body = r.status === 'dev' ? 'Updates are only checked in the installed app.'
+          : r.status === 'current' ? `You're on the latest version (v${r.current}).`
+          : (r.status === 'available' || r.status === 'downloaded') ? `Update v${r.version} found — downloading in the background. You'll be prompted to restart when it's ready.`
+          : r.status === 'error' ? (r.error || 'Could not check for updates.')
+          : 'Still checking — try again in a moment.';
+        // Manual check → always give feedback (bypass the notifications gate) as an in-app toast.
+        try { broadcast('notify.toast', { kind: 'updates', title: 'Updates', body, toastKind: r.status === 'error' ? 'danger' : 'info' }); } catch {}
       },
     },
     {
@@ -147,22 +161,25 @@ function createTray() {
 }
 
 // ---------- notifications (all gated by settings) ----------
-function notify(kind, title, body) {
+// Delivered as in-app toasts over SSE — never as native OS notifications. If no
+// dashboard window is open they're simply not shown (the user sees them next time
+// the app is in front); state that needs action (a downloaded update) persists in
+// updateState and re-renders as an in-app banner on the next open.
+function notify(kind, title, body, toastKind = 'info') {
   try {
     const s = db.getSettings().notifications;
     const gate = { status: s.statusChanges, autoApply: s.autoApply, updates: s.updates, followUps: s.followUps };
     if (kind in gate && !gate[kind]) return;
-    if (!Notification.isSupported()) return;
-    new Notification({ title, body: String(body || '').slice(0, 180), icon: iconPath() }).show();
+    broadcast('notify.toast', { kind, title, body: String(body || '').slice(0, 240), toastKind });
   } catch {}
 }
 
 function notifyEvent(type, payload) {
   if (type === 'status' && payload?.job) {
     if (payload.action === 'created') {
-      notify('status', 'Application captured', `${payload.job.title} — ${payload.job.company}`);
+      notify('status', 'Application captured', `${payload.job.title} — ${payload.job.company}`, 'success');
     } else if (payload.statusChanged) {
-      notify('status', 'Status updated', `${payload.job.title}: ${payload.previousStatus} → ${payload.job.status}`);
+      notify('status', 'Status updated', `${payload.job.title}: ${payload.previousStatus} → ${payload.job.status}`, 'info');
     }
   }
   if (type === 'autoApply' && payload) {
@@ -172,29 +189,53 @@ function notifyEvent(type, payload) {
       done: 'An application was submitted.',
       failed: `A queued application failed: ${payload.lastError || 'see transcript'}`,
     };
-    if (msgs[payload.state]) notify('autoApply', 'Auto-apply', msgs[payload.state]);
+    const kinds = { awaiting_review: 'info', awaiting_input: 'warn', done: 'success', failed: 'danger' };
+    if (msgs[payload.state]) notify('autoApply', 'Auto-apply', msgs[payload.state], kinds[payload.state] || 'info');
   }
 }
 
-// ---------- pairing consent ----------
-async function confirmPair(info) {
-  showWindow();
-  const r = await dialog.showMessageBox(mainWindow, {
-    type: 'question',
-    title: 'Connect extension?',
-    message: 'A browser extension wants to connect to your Job Application Tracker data.',
-    detail: `Client: ${info.client}\nOrigin: ${info.origin || '(none)'}\n\nOnly allow this if you just clicked "Connect" in the JAT extension.`,
-    buttons: ['Allow', 'Deny'],
-    defaultId: 0,
-    cancelId: 1,
-    noLink: true,
+// ---------- pairing consent (in-app modal, never a native dialog) ----------
+// The server awaits this promise before granting the token. We surface the request
+// to the dashboard two ways so it can't be missed: a live SSE 'pairing.request'
+// (window already open) and a jat:pending-pair poll the renderer runs on boot
+// (window was just opened by showWindow()). Times out → denied.
+let pendingPair = null;   // { id, info:{client,origin}, resolve(allow), timer }
+function confirmPair(info) {
+  return new Promise((resolve) => {
+    if (pendingPair) { try { pendingPair.resolve(false); } catch {} }   // supersede any stale request
+    const id = crypto.randomUUID();
+    const data = { id, client: String(info.client || 'unknown').slice(0, 60), origin: String(info.origin || '').slice(0, 200) };
+    const finish = (allow) => {
+      if (!pendingPair || pendingPair.id !== id) return;
+      clearTimeout(pendingPair.timer);
+      pendingPair = null;
+      resolve(!!allow);
+    };
+    pendingPair = { id, info: { client: data.client, origin: data.origin }, resolve: finish, timer: setTimeout(() => finish(false), 60000) };
+    showWindow();
+    // Deliver the consent prompt ONLY to the trusted desktop renderer (never broadcast
+    // it to other authed clients). If the window is still loading, the renderer's
+    // boot-time jat:pending-pair poll picks it up; pairingShownId de-dupes any overlap.
+    try {
+      const wc = mainWindow && mainWindow.webContents;
+      if (wc) {
+        if (wc.isLoading()) wc.once('did-finish-load', () => { try { wc.send('jat:pairing-request', data); } catch {} });
+        else wc.send('jat:pairing-request', data);
+      }
+    } catch {}
   });
-  return r.response === 0;
 }
 
 // ---------- auto-updater ----------
 const RELEASES_URL = 'https://github.com/PierreSalama/Job-ext-app/releases';
 let updateState = { status: 'idle', current: null, version: null, percent: 0 };
+
+// Push update state to every connected dashboard so it can render the in-app
+// banner / status line. Never triggers a native popup.
+function setUpdateState(patch) {
+  updateState = { ...updateState, ...patch };
+  try { broadcast('updates.state', updateState); } catch {}
+}
 
 function setupAutoUpdater() {
   autoUpdater.autoDownload = true;
@@ -204,38 +245,26 @@ function setupAutoUpdater() {
 
   autoUpdater.on('error', (err) => {
     log.warn('[updater] error:', err?.message || err);
-    updateState = { ...updateState, status: 'error', error: String(err?.message || err) };
+    setUpdateState({ status: 'error', error: String(err?.message || err) });
   });
-  autoUpdater.on('checking-for-update', () => { updateState = { ...updateState, status: 'checking' }; });
+  autoUpdater.on('checking-for-update', () => setUpdateState({ status: 'checking' }));
   autoUpdater.on('update-available', (info) => {
     log.info('[updater] update available:', info?.version);
-    updateState = { ...updateState, status: 'downloading', version: info?.version, percent: 0 };
-    // Prompt the moment an update is detected (it downloads in the background).
-    notify('updates', 'Update available', `Job Application Tracker v${info?.version} is downloading — you'll be asked to restart when it's ready.`);
+    setUpdateState({ status: 'downloading', version: info?.version, percent: 0 });
+    // Announce the moment an update is detected (it downloads in the background) —
+    // as an in-app toast, never a native OS notification.
+    notify('updates', 'Update available', `Job Application Tracker v${info?.version} is downloading — you'll be prompted to restart when it's ready.`);
   });
-  autoUpdater.on('update-not-available', () => { updateState = { ...updateState, status: 'current' }; });
-  autoUpdater.on('download-progress', (p) => { updateState = { ...updateState, status: 'downloading', percent: Math.round(p.percent || 0) }; });
+  autoUpdater.on('update-not-available', () => setUpdateState({ status: 'current' }));
+  autoUpdater.on('download-progress', (p) => setUpdateState({ status: 'downloading', percent: Math.round(p.percent || 0) }));
   autoUpdater.on('update-downloaded', (info) => {
-    updateState = { ...updateState, status: 'downloaded', version: info?.version };
-    notify('updates', 'Update ready', `v${info?.version} downloaded — restart to apply.`);
-    promptRestart(info?.version);
+    setUpdateState({ status: 'downloaded', version: info?.version });
+    notify('updates', 'Update ready', `v${info?.version} downloaded — restart to apply.`, 'success');
+    showWindow();   // bring the dashboard forward so the in-app "Restart now" banner is visible
   });
 
   autoUpdater.checkForUpdates().catch((e) => log.warn('[updater] initial check failed:', e?.message || e));
   updateInterval = setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), UPDATE_CHECK_INTERVAL_MS);
-}
-
-function promptRestart(version) {
-  showWindow();
-  const result = dialog.showMessageBoxSync({
-    type: 'info',
-    title: 'Update ready',
-    message: `Job Application Tracker v${version} is ready to install.`,
-    detail: 'Restart now to apply the update, or it will install the next time you quit.',
-    buttons: ['Restart now', 'Later'],
-    defaultId: 0, cancelId: 1, noLink: true,
-  });
-  if (result === 0) { isQuitting = true; autoUpdater.quitAndInstall(true, true); }
 }
 
 // Manual check that resolves with a user-facing result (tray + dashboard).
@@ -344,6 +373,9 @@ ipcMain.handle('jat:pick-folder', async () => {
   });
   return (r.canceled || !r.filePaths?.length) ? null : r.filePaths[0];
 });
+// Pairing consent (answered by the in-app modal in the dashboard).
+ipcMain.handle('jat:pending-pair', () => (pendingPair ? { id: pendingPair.id, ...pendingPair.info } : null));
+ipcMain.handle('jat:pair-respond', (_e, id, allow) => { if (pendingPair && pendingPair.id === id) pendingPair.resolve(!!allow); });
 
 // ---------- lifecycle ----------
 app.whenReady().then(async () => {
@@ -351,8 +383,7 @@ app.whenReady().then(async () => {
     db.open(app.getPath('userData'));
   } catch (e) {
     log.error('failed to open DB', e);
-    dialog.showErrorBox('Database error', 'Could not open the JAT database:\n' + e.message);
-    app.quit();
+    showFatalError('Database error', 'Could not open the JAT database:\n' + e.message + '\n\nIf this keeps happening, check the logs from the tray or app data folder.');
     return;
   }
 
@@ -367,15 +398,12 @@ app.whenReady().then(async () => {
     log.info(`server listening on http://127.0.0.1:${port}`);
   } catch (e) {
     log.error('failed to start server', e);
-    dialog.showErrorBox(
-      'Port in use',
+    // Without the server there is no backend for the dashboard — show the reason in
+    // a custom window (closing it quits, which cleans up via will-quit) rather than
+    // a native error box.
+    showFatalError('Port in use',
       `JAT could not listen on 127.0.0.1:${port} (${e.code || e.message}).\n\n` +
       'Another program is using that port. Close it, or change the port in Settings → General, then restart.');
-    // Without the server there is no backend for the dashboard — don't bring up
-    // a window/tray that looks alive but can't talk to anything. Quit cleanly.
-    db.close();
-    isQuitting = true;
-    app.quit();
     return;
   }
 

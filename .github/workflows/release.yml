@@ -22,6 +22,8 @@ jobs:
           node-version: '20'
       - name: Dashboard mirror gate
         run: node tools/mirror.mjs --check
+      - name: Version sync gate
+        run: node tools/validate-versions.mjs
       - name: Unit tests
         # Explicit files (not a glob) so it works on Node 20 too — the test
         # runner only expands globs on Node 21+.
@@ -69,6 +71,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_IDENTITY_AUTO_DISCOVERY: false
+          # Signing-ready: the moment CSC_LINK (base64-encoded .pfx) + CSC_KEY_PASSWORD
+          # exist as repo secrets, the Windows build is Authenticode-signed automatically.
+          # Scoped to the Windows leg so a Windows cert is never handed to the mac/linux
+          # signers; with the secrets absent these resolve to '' → unsigned build, no error.
+          CSC_LINK: ${{ matrix.os == 'windows-latest' && secrets.CSC_LINK || '' }}
+          CSC_KEY_PASSWORD: ${{ matrix.os == 'windows-latest' && secrets.CSC_KEY_PASSWORD || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -120,6 +128,17 @@ jobs:
             cp artifacts/jat-v11-Linux/latest-linux.yml release/latest-linux.yml
           fi
           ls -la release/
+
+      - name: Checksums (SHA-256)
+        shell: bash
+        run: |
+          cd release
+          shopt -s nullglob
+          files=( *.exe *.dmg *.AppImage )
+          if [ ${#files[@]} -gt 0 ]; then
+            sha256sum "${files[@]}" > SHA256SUMS.txt
+            cat SHA256SUMS.txt
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

@@ -296,6 +296,75 @@ function closeAllOverlays() {
   document.querySelectorAll('#overlay-root .overlay').forEach((o) => o.remove());
 }
 
+// ---------- Custom confirm / prompt dialogs ----------
+// We never use the browser's native confirm()/prompt() — they render as OS dialogs.
+// These resolve on ANY dismissal path (button, click-outside, the global Escape
+// handler, or closeAllOverlays() on navigation) via a removal observer.
+function dialogOverlay(node, onDismiss) {
+  const root = $('#overlay-root');
+  const ov = document.createElement('div');
+  ov.className = 'overlay';
+  ov.appendChild(node);
+  ov.addEventListener('mousedown', (e) => { if (e.target === ov) ov.remove(); });
+  root.appendChild(ov);
+  const obs = new MutationObserver(() => {
+    if (!document.contains(ov)) { obs.disconnect(); try { onDismiss(); } catch {} }
+  });
+  obs.observe(root, { childList: true });
+  return { close: () => ov.remove(), stop: () => obs.disconnect() };
+}
+
+function confirmModal(message, opts = {}) {
+  return new Promise((resolve) => {
+    const danger = !!opts.danger;
+    const m = el(`<div class="modal modal-ask">
+      <div class="modal-head"><h3 class="modal-title"></h3></div>
+      <div class="modal-body"><p class="ask-text"></p></div>
+      <div class="modal-foot">
+        <button class="btn small" data-cancel></button>
+        <button class="btn small ${danger ? 'danger' : 'primary'}" data-ok></button>
+      </div>
+    </div>`);
+    m.querySelector('.modal-title').textContent = opts.title || (danger ? 'Are you sure?' : 'Please confirm');
+    m.querySelector('.ask-text').textContent = message;
+    m.querySelector('[data-cancel]').textContent = opts.cancelLabel || 'Cancel';
+    m.querySelector('[data-ok]').textContent = opts.okLabel || (danger ? 'Delete' : 'Confirm');
+    let settled = false;
+    const handle = dialogOverlay(m, () => { if (!settled) { settled = true; resolve(false); } });
+    const done = (val) => { if (settled) return; settled = true; handle.stop(); handle.close(); resolve(val); };
+    m.querySelector('[data-cancel]').addEventListener('click', () => done(false));
+    m.querySelector('[data-ok]').addEventListener('click', () => done(true));
+    setTimeout(() => m.querySelector('[data-ok]').focus(), 0);
+  });
+}
+
+function promptModal(label, opts = {}) {
+  return new Promise((resolve) => {
+    const m = el(`<div class="modal modal-ask">
+      <div class="modal-head"><h3 class="modal-title"></h3></div>
+      <div class="modal-body"><p class="ask-text"></p><input type="text" class="input ask-input" /></div>
+      <div class="modal-foot">
+        <button class="btn small" data-cancel></button>
+        <button class="btn small primary" data-ok></button>
+      </div>
+    </div>`);
+    m.querySelector('.modal-title').textContent = opts.title || 'Enter a value';
+    m.querySelector('.ask-text').textContent = label;
+    const input = m.querySelector('.ask-input');
+    input.value = opts.value || '';
+    if (opts.placeholder) input.placeholder = opts.placeholder;
+    m.querySelector('[data-cancel]').textContent = opts.cancelLabel || 'Cancel';
+    m.querySelector('[data-ok]').textContent = opts.okLabel || 'Save';
+    let settled = false;
+    const handle = dialogOverlay(m, () => { if (!settled) { settled = true; resolve(null); } });
+    const done = (val) => { if (settled) return; settled = true; handle.stop(); handle.close(); resolve(val); };
+    m.querySelector('[data-cancel]').addEventListener('click', () => done(null));
+    m.querySelector('[data-ok]').addEventListener('click', () => done(input.value));
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); done(input.value); } });
+    setTimeout(() => { input.focus(); input.select(); }, 0);
+  });
+}
+
 // ---------- Right-click context menu (per-page actions) ----------
 // items: [{ label, danger?, run() } | { sep:true }]. Falsy items are skipped.
 function contextMenu(e, items) {
@@ -690,6 +759,10 @@ function connectSSE() {
     } catch {}
     softRefresh();
   });
+  // Desktop pushes update state, notifications, and pairing prompts here instead of
+  // ever showing a native OS popup.
+  es.addEventListener('updates.state', (e) => { try { state.update = JSON.parse(e.data); } catch {} renderUpdateBanner(); });
+  es.addEventListener('notify.toast', (e) => { try { const d = JSON.parse(e.data); toast(d.body || d.title || '', d.toastKind || 'info'); } catch {} });
 }
 function startPollingFallback() {
   if (state.pollTimer) return;
@@ -700,6 +773,54 @@ function startPollingFallback() {
 }
 function stopPollingFallback() {
   if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+}
+
+// ---------- In-app update banner + pairing prompt (replace native popups) ----------
+let updateBannerDismissed = null;   // version the user clicked "Later" on
+function renderUpdateBanner() {
+  const host = $('#app-banner');
+  if (!host) return;
+  host.replaceChildren();
+  const u = state.update;
+  if (u && u.status === 'downloaded' && u.version && u.version !== updateBannerDismissed) {
+    const b = el(`<div class="app-banner">
+      <span class="app-banner-msg">Update v${esc(u.version)} is ready to install.</span>
+      <span class="app-banner-actions">
+        <button class="btn small primary" data-upd-restart>Restart now</button>
+        <button class="btn small" data-upd-later>Later</button>
+      </span>
+    </div>`);
+    b.querySelector('[data-upd-restart]').addEventListener('click', () => { if (window.jatDesktop) window.jatDesktop.restartToUpdate(); });
+    b.querySelector('[data-upd-later]').addEventListener('click', () => { updateBannerDismissed = u.version; renderUpdateBanner(); });
+    host.appendChild(b);
+  }
+}
+
+let pairingShownId = null;
+function showPairingModal(p) {
+  if (!window.jatDesktop || !p || !p.id || pairingShownId === p.id) return;   // only the desktop host can answer
+  pairingShownId = p.id;
+  const m = el(`<div class="modal modal-ask">
+    <div class="modal-head"><h3 class="modal-title">Connect extension?</h3></div>
+    <div class="modal-body">
+      <p class="ask-text">A browser extension wants to connect to your Job Application Tracker data.</p>
+      <div class="kv" style="margin-top:12px"><span class="muted">Client</span> <strong data-pair-client></strong></div>
+      <div class="kv"><span class="muted">Origin</span> <strong data-pair-origin></strong></div>
+      <p class="ask-text muted" style="margin-top:12px">Only allow this if you just clicked “Connect” in the JAT extension.</p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn small" data-deny>Deny</button>
+      <button class="btn small primary" data-allow>Allow</button>
+    </div>
+  </div>`);
+  m.querySelector('[data-pair-client]').textContent = p.client || 'unknown';
+  m.querySelector('[data-pair-origin]').textContent = p.origin || '(none)';
+  let settled = false;
+  const respond = (allow) => { try { window.jatDesktop.pairRespond(p.id, allow); } catch {} };
+  const handle = dialogOverlay(m, () => { if (!settled) { settled = true; respond(false); } });
+  const done = (allow) => { if (settled) return; settled = true; handle.stop(); handle.close(); respond(allow); };
+  m.querySelector('[data-allow]').addEventListener('click', () => done(true));
+  m.querySelector('[data-deny]').addEventListener('click', () => done(false));
 }
 
 // ---------- Runtime footer ----------
@@ -832,7 +953,7 @@ route('/', async () => {
       ...STATUSES.map((s) => ({ label: `→ ${s.label}`, run: async () => { await api('/jobs/' + encodeURIComponent(tr.dataset.id), { method: 'PATCH', body: { status: s.id, _source: 'manual' } }); navigate(); } })),
       { sep: true },
       { label: 'Queue auto-apply', run: async () => { await api('/queue', { method: 'POST', body: { jobId: tr.dataset.id } }); toast('Queued for auto-apply'); } },
-      { label: 'Delete', danger: true, run: async () => { if (!window.confirm('Delete this application?')) return; await api('/jobs/' + encodeURIComponent(tr.dataset.id), { method: 'DELETE' }); navigate(); } },
+      { label: 'Delete', danger: true, run: async () => { if (!(await confirmModal('Delete this application?', { danger: true, okLabel: 'Delete' }))) return; await api('/jobs/' + encodeURIComponent(tr.dataset.id), { method: 'DELETE' }); navigate(); } },
     ]));
   });
   return v;
@@ -1500,7 +1621,7 @@ route('/pipeline', async () => {
       ...STATUSES.map((s) => ({ label: `→ ${s.label}`, run: async () => { await api('/jobs/' + encodeURIComponent(card.dataset.id), { method: 'PATCH', body: { status: s.id, _source: 'manual' } }); navigate(); } })),
       { sep: true },
       { label: 'Queue auto-apply', run: async () => { await api('/queue', { method: 'POST', body: { jobId: card.dataset.id } }); toast('Queued for auto-apply'); } },
-      { label: 'Delete', danger: true, run: async () => { if (!window.confirm('Delete this application?')) return; await api('/jobs/' + encodeURIComponent(card.dataset.id), { method: 'DELETE' }); navigate(); } },
+      { label: 'Delete', danger: true, run: async () => { if (!(await confirmModal('Delete this application?', { danger: true, okLabel: 'Delete' }))) return; await api('/jobs/' + encodeURIComponent(card.dataset.id), { method: 'DELETE' }); navigate(); } },
     ]));
   });
 
@@ -2036,8 +2157,8 @@ route('/profile', async () => {
   // Add / remove custom structured fields.
   const wireRemove = (btn) => btn.addEventListener('click', () => btn.closest('[data-fieldrow]')?.remove());
   v.querySelectorAll('[data-rmfield]').forEach(wireRemove);
-  v.querySelector('[data-addfield]').addEventListener('click', () => {
-    const name = window.prompt('Field name (e.g. “Years of AutoCAD”, “Preferred shift”):');
+  v.querySelector('[data-addfield]').addEventListener('click', async () => {
+    const name = await promptModal('Field name (e.g. “Years of AutoCAD”, “Preferred shift”):', { title: 'New field', okLabel: 'Add' });
     if (!name || !name.trim()) return;
     const key = (name.trim().replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 60)) || ('field_' + Date.now());
     if (v.querySelector('[data-key="' + key + '"]')) { toast('That field already exists', 'danger'); return; }
@@ -2305,14 +2426,14 @@ route('/documents', async () => {
       const doc = docs.find((x) => x.id === docId);
       tr.addEventListener('contextmenu', (e) => contextMenu(e, [
         { label: doc.isDefault ? `Active ${DOC_ROLE_LABEL[doc.role] || doc.role} ✓` : `Set as active ${DOC_ROLE_LABEL[doc.role] || doc.role}`, run: async () => { await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { isDefault: true } }); toast('Set as active'); navigate(); } },
-        { label: 'Set designation…', run: async () => { const val = window.prompt('Designation (e.g. “Master CV”):', doc.label || ''); if (val === null) return; await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { label: val.trim() } }); navigate(); } },
+        { label: 'Set designation…', run: async () => { const val = await promptModal('Designation (e.g. “Master CV”):', { title: 'Set designation', value: doc.label || '' }); if (val === null) return; await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { label: val.trim() } }); navigate(); } },
         { sep: true },
         ...DOC_ROLES.map((r) => ({ label: `Role → ${r.label}${doc.role === r.id ? ' ✓' : ''}`, run: async () => { await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { role: r.id } }); toast('Role updated'); navigate(); } })),
         { sep: true },
         doc.hasText && { label: 'View text', run: async () => { const r2 = await api('/documents/' + encodeURIComponent(docId) + '?text=1'); textModal(doc.name, r2.document?.textContent || '(no text)', { downloadName: doc.name + '.txt' }); } },
         doc.source !== 'folder' && { label: 'Download', run: async () => { const res = await api('/documents/' + encodeURIComponent(docId) + '?raw=1', { raw: true, timeoutMs: 30000 }); downloadBlob(await res.blob(), doc.name); } },
         { sep: true },
-        { label: 'Remove', danger: true, run: async () => { const permanent = doc.source !== 'folder'; if (!window.confirm(permanent ? `Delete “${doc.name}”? The file is permanently removed.` : 'Remove this entry? Your file is untouched.')) return; await api('/documents/' + encodeURIComponent(docId), { method: 'DELETE' }); toast('Removed'); navigate(); } },
+        { label: 'Remove', danger: true, run: async () => { const permanent = doc.source !== 'folder'; if (!(await confirmModal(permanent ? `Delete “${doc.name}”? The file is permanently removed.` : 'Remove this entry? Your file is untouched.', { danger: true, okLabel: permanent ? 'Delete' : 'Remove' }))) return; await api('/documents/' + encodeURIComponent(docId), { method: 'DELETE' }); toast('Removed'); navigate(); } },
       ]));
       tr.querySelector('[data-star]')?.addEventListener('click', async () => {
         try { await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { isDefault: true } }); toast(`Set as active ${DOC_ROLE_LABEL[doc.role] || doc.role}`); navigate(); }
@@ -2323,7 +2444,7 @@ route('/documents', async () => {
         catch (err) { errToast(err); }
       });
       tr.querySelector('[data-label]')?.addEventListener('click', async () => {
-        const val = window.prompt('Designation for this document (e.g. “Master CV”, “Short résumé”):', doc.label || '');
+        const val = await promptModal('Designation for this document (e.g. “Master CV”, “Short résumé”):', { title: 'Set designation', value: doc.label || '' });
         if (val === null) return;
         try { await api('/documents/' + encodeURIComponent(docId), { method: 'PATCH', body: { label: val.trim() } }); navigate(); }
         catch (err) { errToast(err); }
@@ -2345,7 +2466,7 @@ route('/documents', async () => {
         const msg = permanent
           ? `Delete “${doc.name}”? The file will be permanently removed from the app.`
           : `Remove “${doc?.name || 'this entry'}” from the library? Your original file is untouched.`;
-        if (!window.confirm(msg)) return;
+        if (!(await confirmModal(msg, { danger: true, okLabel: permanent ? 'Delete' : 'Remove' }))) return;
         try { await api('/documents/' + encodeURIComponent(docId), { method: 'DELETE' }); toast('Document removed'); navigate(); }
         catch (e) { errToast(e); }
       });
@@ -2411,7 +2532,7 @@ route('/documents', async () => {
       catch (err) { errToast(err); btn.disabled = false; btn.textContent = 'Re-index'; }
     });
     card.querySelector('[data-unlink]').addEventListener('click', async () => {
-      if (!window.confirm('Unlink this folder? Its indexed entries leave the library (your actual files are untouched).')) return;
+      if (!(await confirmModal('Unlink this folder? Its indexed entries leave the library (your actual files are untouched).', { danger: true, okLabel: 'Unlink' }))) return;
       try { await api('/document-folders/' + encodeURIComponent(fid) + '?prune=1', { method: 'DELETE' }); toast('Folder unlinked'); navigate(); }
       catch (err) { errToast(err); }
     });
@@ -2940,7 +3061,7 @@ route('/settings', async () => {
     } catch (err) { errToast(err); btn.disabled = false; }
   });
   v.querySelectorAll('[data-email-remove]').forEach((b) => b.addEventListener('click', async () => {
-    if (!confirm('Disconnect this email account? Synced emails stay, but it stops updating.')) return;
+    if (!(await confirmModal('Disconnect this email account? Synced emails stay, but it stops updating.', { danger: true, okLabel: 'Disconnect' }))) return;
     try { await api('/email/accounts/' + encodeURIComponent(b.dataset.emailRemove), { method: 'DELETE' }); toast('Email disconnected'); navigate(); } catch (e) { errToast(e); }
   }));
   v.querySelector('[data-email-syncnow]')?.addEventListener('click', async (e) => {
@@ -3052,6 +3173,14 @@ async function boot(reauth = false) {
       const t = s.appearance?.theme;
       if (t) { applyTheme(t); try { localStorage.setItem(LS_THEME, t); } catch {} }
     }).catch(() => {});
+  }
+
+  // Desktop host: reflect any pending update + a pairing request that may have
+  // arrived before this window finished loading (both also arrive live over SSE).
+  if (window.jatDesktop) {
+    if (window.jatDesktop.updateState) window.jatDesktop.updateState().then((u) => { state.update = u; renderUpdateBanner(); }).catch(() => {});
+    if (window.jatDesktop.onPairingRequest) window.jatDesktop.onPairingRequest((p) => showPairingModal(p));
+    if (window.jatDesktop.pendingPair) window.jatDesktop.pendingPair().then((p) => { if (p) showPairingModal(p); }).catch(() => {});
   }
 
   paintRuntime();

@@ -1120,6 +1120,32 @@ input[type="checkbox"] { accent-color: var(--primary); width: 15px; height: 15px
   border-top: 1px solid var(--border);
 }
 
+/* Ask dialogs (custom confirm / prompt — never the native browser dialogs) */
+.modal.modal-ask { width: min(440px, 100%); }
+.modal-ask .ask-text { margin: 0; font-size: 13px; line-height: 1.6; color: var(--body-text); overflow-wrap: anywhere; }
+.modal-ask .ask-text.muted { color: var(--muted); }
+.modal-ask .ask-input { display: block; width: 100%; margin-top: 14px; }
+
+/* In-app update / app banner — replaces native update popups */
+#app-banner {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 600;
+  display: flex; justify-content: center;
+  pointer-events: none;
+}
+.app-banner {
+  pointer-events: auto;
+  margin-top: 14px;
+  display: flex; align-items: center; gap: 18px;
+  padding: 11px 18px;
+  background: var(--bg2);
+  border: 1px solid var(--primary);
+  box-shadow: var(--shadow-2);
+  max-width: min(620px, calc(100% - 40px));
+  animation: overlay-in 220ms var(--ease-firm);
+}
+.app-banner-msg { font-size: 12px; letter-spacing: 0.02em; color: var(--text); }
+.app-banner-actions { display: flex; gap: 8px; white-space: nowrap; }
+
 .palette {
   width: min(580px, 100%);
   background: var(--bg2);

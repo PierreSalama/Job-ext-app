@@ -1,6 +1,6 @@
 # JAT v11 — release helper.
-# Bumps BOTH versions in lockstep, mirrors the dashboard, syncs the working
-# copy into ..\.v10-publish (the git repo for PierreSalama/Job-ext-app),
+# Bumps all three versions in lockstep, mirrors the dashboard, syncs the working
+# copy into ..\.v11-publish (the git repo for PierreSalama/Job-ext-app),
 # commits, tags, and pushes — which triggers the CI release build.
 #
 #   .\tools\release.ps1 -Version 11.0.1 -Message "capture fixes"
@@ -14,7 +14,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot          # ...\v11
-$Publish = Join-Path (Split-Path -Parent $Root) '.v10-publish'
+$Publish = Join-Path (Split-Path -Parent $Root) '.v11-publish'
 
 if ($Version -notmatch '^11\.\d+\.\d+$') { throw "Version must be 11.x.y (got $Version)" }
 if (-not (Test-Path $Publish)) { throw "publish repo not found at $Publish" }
@@ -28,11 +28,19 @@ $manifest.version = $Version
 $pkg.version = $Version
 $manifest | ConvertTo-Json -Depth 20 | Set-Content $manifestPath -Encoding utf8
 $pkg | ConvertTo-Json -Depth 20 | Set-Content $pkgPath -Encoding utf8
-Write-Host "versions → $Version (extension + app)" -ForegroundColor Green
+$rootPkgPath = Join-Path $Root 'package.json'
+$rootPkg = Get-Content $rootPkgPath -Raw | ConvertFrom-Json
+$rootPkg.version = $Version
+$rootPkg | ConvertTo-Json -Depth 20 | Set-Content $rootPkgPath -Encoding utf8
+Write-Host "versions → $Version (extension + app + root)" -ForegroundColor Green
 
 # 2. mirror dashboard
 node (Join-Path $Root 'tools\mirror.mjs')
 if ($LASTEXITCODE -ne 0) { throw 'mirror failed' }
+
+# 2b. version-sync gate (extension + app + root must match before we tag)
+node (Join-Path $Root 'tools\validate-versions.mjs')
+if ($LASTEXITCODE -ne 0) { throw 'version sync check failed' }
 
 # 3. sync working copy → publish repo (extension/, app/ sources, workflows, tools, docs)
 $pairs = @(
