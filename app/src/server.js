@@ -864,6 +864,13 @@ async function handle(req, res, parsed) {
     broadcast('queue.updated', { action: 'discovery-status' });
     return sendJson(res, 200, { ok: true });
   }
+  // Pool refresh: re-queue stale retriable (failed, transient) tasks when discovery
+  // is exhausted, so the workers aren't starved by an empty queue of already-tried jobs.
+  if (req.method === 'POST' && pathname === '/auto-apply/retry-stale') {
+    const requeued = db.retryStaleQueue({});
+    if (requeued) broadcast('queue.updated', { action: 'retry-stale', requeued });
+    return sendJson(res, 200, { ok: true, requeued });
+  }
 
   // ---- AI ----
   if (req.method === 'GET' && pathname === '/ai/status') {

@@ -505,13 +505,26 @@ async function groupTab(tabId) {
 // nothing is lost by closing them.
 async function closeAutoApplyTabs() {
   try {
-    await recoverAaGroup();   // find the group even if the SW was restarted since
-    if (aaGroupId != null && chrome.tabs?.query) {
-      const tabs = await chrome.tabs.query({ groupId: aaGroupId });
-      const ids = tabs.map((t) => t.id).filter((id) => id != null);
-      if (ids.length) { try { await chrome.tabs.remove(ids); } catch {} }
+    const ids = new Set();
+    // Close EVERY "JAT Auto-apply" group's tabs — not just the cached one. An SW
+    // eviction mid-run can leave MORE THAN ONE such group (recoverAaGroup only ever
+    // adopted groups[0]), so Stop used to close one and leave the rest lingering.
+    if (chrome.tabGroups?.query) {
+      const groups = await chrome.tabGroups.query({ title: AA_GROUP_TITLE });
+      for (const g of (groups || [])) {
+        try { const tabs = await chrome.tabs.query({ groupId: g.id }); for (const t of tabs) if (t.id != null) ids.add(t.id); } catch {}
+      }
     }
+    if (aaGroupId != null && chrome.tabs?.query) {   // also the cached id, in case the title query missed it
+      try { const tabs = await chrome.tabs.query({ groupId: aaGroupId }); for (const t of tabs) if (t.id != null) ids.add(t.id); } catch {}
+    }
+    if (ids.size) { try { await chrome.tabs.remove([...ids]); } catch {} }
   } catch {}
+  // Stop the self-driving timers too, so a queued re-pump can't pop a new tab open
+  // moments after the user hit Stop.
+  if (gapTimer) { clearTimeout(gapTimer); gapTimer = null; }
+  if (pumpTimer) { clearTimeout(pumpTimer); pumpTimer = null; }
+  pumpDirty = false;
   aaGroupId = null;
 }
 
@@ -664,7 +677,7 @@ async function forceApplyOne() {
 }
 
 // ---- discovery: search a board for Easy-Apply jobs + enqueue them ----
-let lastBoardIdx = 0;
+let discoverIdx = 0;   // cycles the full board × keyword × location search space
 
 function waitTabComplete(tabId, timeoutMs) {
   return new Promise((resolve) => {
@@ -725,9 +738,14 @@ async function discoverTick(force = false) {
 
   scanning = true;
   let tab = null;
-  const board = boards[lastBoardIdx++ % boards.length];
-  const keyword = keywords[Math.floor(Math.random() * keywords.length)];
-  const location = (aa.locations || [])[0] || '';
+  // Cycle the FULL search space — board × keyword × location — so successive searches
+  // surface FRESH jobs instead of re-finding the same handful from one fixed query
+  // (the #1 cause of the "found 6, enqueued 0" pool exhaustion).
+  const locList = (aa.locations || []).filter(Boolean);
+  const combos = [];
+  for (const b of boards) for (const k of keywords) for (const l of (locList.length ? locList : [''])) combos.push({ b, k, l });
+  const combo = combos[discoverIdx++ % combos.length];
+  const board = combo.b, keyword = combo.k, location = combo.l;
   const url = buildSearchUrl(board, keyword, location, { easyApplyOnly: aa.easyApplyOnly !== false });
   let resp = null, enqueued = 0;
   try {
@@ -752,10 +770,21 @@ async function discoverTick(force = false) {
     if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} }
     scanning = false;
   }
-  // Report what this search saw so the dashboard can show it (and we can tune).
-  const status = { board, keyword, url, found: resp?.found ?? 0, enqueued, note: resp?.note || resp?.error || '', ok: resp?.ok !== false };
+  // Pool exhaustion: found jobs but enqueued NONE = everything this query returned was
+  // already tried (deduped). Re-queue stale retriable tasks so the workers have
+  // something to do, and tell the user plainly to broaden their search.
+  const found = resp?.found ?? 0;
+  let note = resp?.note || resp?.error || '';
+  if (found > 0 && enqueued === 0) {
+    const rr = await api.call('POST', '/auto-apply/retry-stale', {}, 6000).catch(() => null);
+    const requeued = rr?.requeued ?? 0;
+    note = requeued
+      ? `all ${found} here were already tried — re-queued ${requeued} earlier job(s) for another pass`
+      : `all ${found} jobs here were already tried — broaden your keywords/locations for fresh results`;
+  }
+  const status = { board, keyword, url, found, enqueued, note, ok: resp?.ok !== false };
   await api.call('POST', '/auto-apply/discovery-status', status, 6000).catch(() => {});
-  console.log('[JAT] discovery', board, '"' + keyword + '" found', status.found, 'enqueued', enqueued, status.note || '');
+  console.log('[JAT] discovery', board, '"' + keyword + '"@"' + location + '" found', found, 'enqueued', enqueued, note);
   return status;
 }
 

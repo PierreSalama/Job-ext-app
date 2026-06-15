@@ -1639,6 +1639,23 @@ function queueLive({ startedAt } = {}) {
   return { running, active: running.length, scheduled, queuedDepth, session };
 }
 
+// Pool refresh when discovery is exhausted (found jobs but all already tried):
+// re-queue stale FAILED tasks (transient errors like the old "not top frame" race,
+// which the current engine no longer hits) whose job isn't already submitted, capped
+// by attempts so a permanently-dead job can't churn forever. Excludes skipped
+// (relevance won't change) and awaiting_input/parked (those genuinely need the user).
+function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25 } = {}) {
+  const cutoff = new Date(Date.now() - Math.max(1, olderThanMinutes) * 60000).toISOString();
+  const rows = all(
+    `SELECT t.id FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
+     WHERE t.state = 'failed' AND t.updated_at < ?
+       AND COALESCE(t.attempts, 0) < ? AND j.status != 'submitted'
+     ORDER BY t.updated_at ASC LIMIT ?`, [cutoff, maxAttempts, limit]);
+  let n = 0;
+  for (const r of rows) { if (queuePatch(r.id, { state: 'queued', lastError: null })) n++; }
+  return n;
+}
+
 function queueAdd(jobId, { mode } = {}) {
   if (!getJob(jobId)) return null;
   const dup = get(
@@ -1972,7 +1989,7 @@ module.exports = {
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,
   extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
-  queueList, queueHistory, queueBreakdown, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueRetryParked, saveIntakeAnswer,
+  queueList, queueHistory, queueBreakdown, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueRetryParked, retryStaleQueue, saveIntakeAnswer,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,
   emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching,
