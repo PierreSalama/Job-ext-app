@@ -32,6 +32,17 @@ function pageNote() {
   return '';
 }
 
+// LinkedIn's job-card aria-label bleeds UI cruft into the title: a "with verification"
+// badge suffix, and often the title doubled (visually-hidden + visible span). Clean it.
+function cleanTitle(s) {
+  let t = compactText(s || '');
+  t = t.replace(/\s*[-–—]?\s*with verification\b/ig, '');     // verified-job badge text
+  t = t.replace(/\s*\(verified\)\s*$/ig, '');
+  const h = Math.floor(t.length / 2);                          // collapse an exactly-doubled title
+  if (t.length > 6 && t.slice(0, h).trim() && t.slice(0, h).trim() === t.slice(h).trim()) t = t.slice(0, h).trim();
+  return t.trim();
+}
+
 function scrapeLinkedIn(max) {
   const out = [];
   const seen = new Set();
@@ -44,7 +55,7 @@ function scrapeLinkedIn(max) {
     if (id && seen.has(id)) continue;
     if (/\bapplied\b/.test((card.textContent || '').toLowerCase())) continue;   // skip already-applied
     const link = card.querySelector('a.job-card-list__title, a.job-card-container__link, a[href*="/jobs/view/"]');
-    const title = compactText(link?.getAttribute('aria-label') || link?.textContent || card.querySelector('[class*="job-card-list__title"]')?.textContent || '');
+    const title = cleanTitle(link?.getAttribute('aria-label') || link?.textContent || card.querySelector('[class*="job-card-list__title"]')?.textContent || '');
     const company = compactText(card.querySelector('.job-card-container__primary-description, .artdeco-entity-lockup__subtitle, [class*="subtitle"]')?.textContent || '');
     const loc = compactText(card.querySelector('.job-card-container__metadata-item, [class*="metadata-item"]')?.textContent || '');
     const jobUrl = id ? `https://www.linkedin.com/jobs/view/${id}/` : abs(link?.getAttribute('href'));
@@ -55,7 +66,7 @@ function scrapeLinkedIn(max) {
   return out;
 }
 
-function scrapeIndeed(max) {
+function scrapeIndeed(max, easyApplyOnly = true) {
   const out = [];
   const seen = new Set();
   for (const card of qsa(IN_CARD_SEL)) {
@@ -65,6 +76,9 @@ function scrapeIndeed(max) {
       || (card.querySelector('a[href*="jk="]')?.getAttribute('href') || '').match(/[?&]jk=([^&]+)/)?.[1];
     if (!jk || seen.has(jk)) continue;
     seen.add(jk);
+    // Second guard (the URL DSQF7 filter is the first): only keep cards Indeed marks
+    // "Easily apply" — the rest are external "apply on company site" jobs we can't drive.
+    if (easyApplyOnly && !/easily apply|apply with indeed|indeed apply/i.test(card.textContent || '')) continue;
     const title = compactText(card.querySelector('a.jcs-JobTitle, h2 a, [id^="jobTitle"], [class*="jobTitle"]')?.textContent || '');
     const company = compactText(card.querySelector('[data-testid="company-name"], [class*="companyName"]')?.textContent || '');
     const loc = compactText(card.querySelector('[data-testid="text-location"], [class*="companyLocation"]')?.textContent || '');
@@ -76,7 +90,7 @@ function scrapeIndeed(max) {
 
 // Entry — wait for the list, scroll to load lazily, then scrape one page.
 // Returns { ok, source, jobs, found (raw cards seen), note }.
-export async function run({ source, max = 8 } = {}) {
+export async function run({ source, max = 8, easyApplyOnly = true } = {}) {
   try {
     const host = location.hostname;
     const isLinkedIn = /linkedin/i.test(host) || source === 'linkedin';
@@ -91,7 +105,7 @@ export async function run({ source, max = 8 } = {}) {
     }
 
     const found = qsa(sel).length;
-    const jobs = (isLinkedIn ? scrapeLinkedIn(max) : scrapeIndeed(max)).slice(0, max);
+    const jobs = (isLinkedIn ? scrapeLinkedIn(max) : scrapeIndeed(max, easyApplyOnly)).slice(0, max);
     const note = jobs.length ? '' : (pageNote() || (found ? `saw ${found} card(s) but couldn't read any (selectors may need tuning)` : 'no job cards rendered on the page'));
     return { ok: true, source: source || host, jobs, found, note };
   } catch (e) {

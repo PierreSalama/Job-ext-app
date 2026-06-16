@@ -416,7 +416,7 @@ input[type="checkbox"] { accent-color: var(--primary); width: 15px; height: 15px
 /* System strip (AI / Gmail / auto-apply chips on the dashboard) */
 .sys-strip {
   display: flex; flex-wrap: wrap; gap: 10px;
-  margin: -22px 0 36px;
+  margin: 0 0 26px;
   align-items: center;
 }
 .sys-chip {
@@ -671,6 +671,16 @@ input[type="checkbox"] { accent-color: var(--primary); width: 15px; height: 15px
 .toolbar .input { flex: 1; min-width: 200px; }
 .toolbar .input:focus, .toolbar .select:focus { box-shadow: none; background: var(--panel); }
 .toolbar .btn { border: 0; border-right: 1px solid var(--border); }
+/* Search field with leading magnifier icon */
+.tb-search { flex: 1 1 260px; min-width: 200px; display: flex; align-items: center; border-right: 1px solid var(--border); background: transparent; }
+.tb-search .tb-ic { flex: 0 0 auto; margin-left: 16px; color: var(--muted); transition: color 200ms var(--ease-firm); }
+.tb-search:focus-within .tb-ic { color: var(--primary); }
+.tb-search .input { border: 0; border-right: 0; padding-left: 10px; background: transparent; }
+.tb-search:focus-within { background: var(--panel); }
+/* Filter selects: hover affordance + a clear "this filter is active" highlight */
+.toolbar .tb-filter { color: var(--body-text); cursor: pointer; transition: background 200ms var(--ease-firm), color 200ms var(--ease-firm); min-width: 150px; }
+.toolbar .tb-filter:hover { background: var(--wash-04); color: var(--text); }
+.toolbar .tb-filter.on { color: var(--primary2); background: var(--wash-06); font-weight: 500; }
 
 .bulkbar {
   display: flex; align-items: center; gap: 12px;
@@ -680,6 +690,9 @@ input[type="checkbox"] { accent-color: var(--primary); width: 15px; height: 15px
   background: var(--wash-06);
   flex-wrap: wrap;
 }
+/* The `hidden` attribute is overridden by `display:flex` above — restore it so the
+   bulk-action bar ONLY appears once rows are actually selected. */
+.bulkbar[hidden], .sync-panel[hidden] { display: none; }
 .bulkbar .count {
   font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase;
   color: var(--primary); font-weight: 500;
@@ -1621,3 +1634,130 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
 /* Live morph refresh: a freshly-appended row pulses once so it's noticeable. */
 @keyframes row-new-pulse { 0% { background: var(--wash-25); } 100% { background: transparent; } }
 .row-new { animation: row-new-pulse 1.6s var(--ease-firm); }
+
+/* ============================================================
+   Provenance badges — auto-apply vs manual (Applications, Dashboard, Pipeline)
+   ============================================================ */
+.via-badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 9px; font-size: 9px; font-weight: 500;
+  letter-spacing: 0.14em; text-transform: uppercase; white-space: nowrap;
+  border: 1px solid var(--border); border-radius: 2px; color: var(--body-text);
+}
+.via-badge.via-auto     { color: var(--primary2); border-color: color-mix(in srgb, var(--primary) 45%, transparent); background: var(--wash-06); }
+.via-badge.via-manual   { color: var(--muted); }
+.via-badge.via-pipeline { color: var(--primary2); border-color: color-mix(in srgb, var(--primary) 30%, transparent); border-style: dashed; }
+
+/* ============================================================
+   Dashboard — auto-apply health card
+   ============================================================ */
+.aa-dash-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 0; border: 1px solid var(--border); margin-bottom: 18px;
+}
+.mini { padding: 14px 18px; border-right: 1px solid var(--border); }
+.mini:last-child { border-right: 0; }
+.mini-label { font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
+.mini-value { font-size: 22px; font-weight: 500; margin-top: 8px; color: var(--text); font-variant-numeric: tabular-nums; line-height: 1.1; display: flex; align-items: center; gap: 7px; }
+.mini-value.gold { color: var(--primary); }
+.mini-value.warn { color: var(--warn); }
+.mini-value.live { color: var(--success); font-size: 15px; letter-spacing: 0.02em; }
+.mini.warn { background: var(--warn-wash); }
+
+.split-wrap { margin-bottom: 12px; }
+.split-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 11px; margin-bottom: 7px; color: var(--body-text); }
+.split-bar { height: 8px; background: color-mix(in srgb, var(--muted) 22%, transparent); border: 1px solid var(--border); overflow: hidden; }
+.split-fill { height: 100%; background: var(--primary); transition: width 420ms var(--ease-firm); }
+
+.aa-dash-live { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.aa-live-chip { display: inline-flex; align-items: center; gap: 7px; font-size: 11px; padding: 5px 11px; border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border)); background: var(--wash-04); color: var(--text); max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.aa-dash-reason { font-size: 11px; }
+.aa-dash-reason b { color: var(--body-text); font-weight: 500; }
+
+/* Auto-apply card: split/blockers on the left, sparkline on the right */
+.dash-aa-cols { display: grid; grid-template-columns: 1.3fr 1fr; gap: 28px; align-items: start; }
+.dash-sub { font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: var(--muted); font-weight: 500; margin-bottom: 9px; }
+.dash-blockers { margin-top: 14px; }
+.blk-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+.blk-row:last-child { border-bottom: 0; }
+.blk-reason { flex: 1; color: var(--body-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.blk-n { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* 14-day submission sparkline (auto stacked over manual) */
+.spark-wrap { min-width: 0; }
+.spark { display: flex; align-items: flex-end; gap: 3px; height: 44px; padding-top: 4px; }
+.spk-col { flex: 1; display: flex; align-items: flex-end; justify-content: center; min-width: 0; height: 100%; }
+.spk-stack { width: 100%; max-width: 16px; display: flex; flex-direction: column-reverse; }
+.spk-auto { background: var(--primary); }
+.spk-man { background: color-mix(in srgb, var(--muted) 60%, transparent); }
+.spark-legend { display: flex; gap: 14px; margin-top: 8px; }
+.lg { font-size: 10px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+.lg::before { content: ''; width: 8px; height: 8px; }
+.lg-auto::before { background: var(--primary); }
+.lg-man::before { background: color-mix(in srgb, var(--muted) 60%, transparent); }
+
+/* Two-column dashboard row (Funnel | Sources) */
+.dash-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+.dash-cols .section { margin-bottom: 22px; }
+
+/* Funnel + source bars */
+.fn-row { margin-bottom: 14px; }
+.fn-row:last-child { margin-bottom: 0; }
+.fn-top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; font-size: 12px; }
+.fn-label { color: var(--body-text); letter-spacing: 0.04em; }
+.fn-n { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
+.fn-n .muted { font-weight: 400; font-size: 11px; }
+.fn-bar { height: 10px; background: color-mix(in srgb, var(--muted) 16%, transparent); border: 1px solid var(--border); overflow: hidden; }
+.fn-fill { height: 100%; background: var(--primary); transition: width 420ms var(--ease-firm); min-width: 2px; }
+.fn-fill.alt { background: color-mix(in srgb, var(--primary) 62%, var(--muted)); }
+
+@media (max-width: 980px) {
+  .dash-cols, .dash-aa-cols { grid-template-columns: 1fr; }
+}
+
+/* ============================================================
+   Auto-apply page — LIVE WORKER detail cards ("what the runners are doing")
+   ============================================================ */
+.aa-workers { display: flex; flex-direction: column; gap: 12px; }
+.aa-worker {
+  border: 1px solid color-mix(in srgb, var(--primary) 32%, var(--border));
+  background: var(--bg2); position: relative; overflow: hidden;
+}
+.aa-worker::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: var(--primary); }
+.aa-worker-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 16px 12px 18px; border-bottom: 1px solid var(--border); }
+.aa-worker-title { color: var(--text); font-weight: 500; font-size: 13px; overflow-wrap: anywhere; }
+.aa-worker-co { color: var(--muted); font-size: 11px; }
+.aa-worker-meta { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 10px; color: var(--muted); }
+.aa-worker-elapsed { font-family: var(--font-mono); color: var(--success); font-variant-numeric: tabular-nums; }
+.aa-route-chip { font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; padding: 2px 7px; border: 1px solid var(--border); color: var(--body-text); }
+.aa-route-chip.easy-apply { color: var(--success); border-color: color-mix(in srgb, var(--success) 40%, transparent); }
+.aa-route-chip.external   { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+.aa-worker-trail { padding: 10px 16px 12px 18px; display: flex; flex-direction: column; gap: 3px; font-family: var(--font-mono); font-size: 11px; }
+.trail-line { display: flex; gap: 8px; align-items: baseline; color: var(--body-text); overflow-wrap: anywhere; }
+.trail-line .t-dot { color: var(--muted); flex: 0 0 auto; }
+.trail-line.lv-ok   .t-dot { color: var(--success); }
+.trail-line.lv-warn { color: var(--warn); }
+.trail-line.lv-warn .t-dot { color: var(--warn); }
+.trail-line.lv-err  { color: var(--danger); }
+.trail-line.lv-err  .t-dot { color: var(--danger); }
+.trail-line.cur { color: var(--text); }
+.trail-line.cur .t-dot { color: var(--primary); }
+.aa-worker-q { padding: 8px 16px 12px 18px; border-top: 1px dashed var(--border); font-size: 11px; color: var(--warn); }
+
+.aa-empty-live { padding: 20px 18px; text-align: center; color: var(--muted); font-size: 12px; border: 1px dashed var(--border); }
+
+/* ============================================================
+   Applications — "Needs your input" intake cards (finish parked auto-applies)
+   ============================================================ */
+.needs-you { border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); margin-bottom: 22px; }
+.needs-you .section-eyebrow { color: var(--warn); }
+.ny-card { border: 1px solid var(--border); background: var(--bg2); padding: 14px 16px; margin: 0 0 12px; }
+.ny-card:last-child { margin-bottom: 0; }
+.ny-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+.ny-title { color: var(--text); font-weight: 500; font-size: 13px; overflow-wrap: anywhere; }
+.ny-co { color: var(--muted); font-size: 11px; }
+.ny-reason { font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+.ny-q { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.ny-q-label { font-size: 12px; color: var(--body-text); }
+.ny-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.ny-empty { padding: 16px 18px; color: var(--muted); font-size: 12px; }

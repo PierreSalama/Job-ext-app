@@ -28,6 +28,11 @@ async function ensureUp(cfg) {
   try {
     const exe = cfg.exePath || 'ollama';
     const child = spawn(exe, ['serve'], { detached: true, stdio: 'ignore', windowsHide: true });
+    // CRITICAL: spawn reports a missing binary (ENOENT) ASYNCHRONOUSLY via an 'error'
+    // event — the surrounding try/catch only sees sync throws. Without this listener the
+    // ENOENT becomes an uncaughtException and CRASHES the app (Dad's machine: no ollama
+    // installed → repeated crashes). Swallow it; the ping loop below just reports "down".
+    child.on('error', (e) => { try { log.warn('ollama serve spawn error:', e && e.message); } catch {} });
     child.unref();
     log.info('spawned `ollama serve`, waiting for it to come up…');
   } catch (e) {

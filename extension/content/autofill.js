@@ -72,6 +72,31 @@ function idRefText(root, ids) {
     .join(' ').trim();
 }
 
+// The QUESTION for a radio group — NOT the per-option "Yes"/"No" label. LinkedIn/
+// Greenhouse render Yes/No screening questions as a <fieldset><legend>question</legend>
+// (or a [role="radiogroup"]/[role="group"] with aria-label/labelledby), and each radio's
+// own <label> is just "Yes"/"No". Using fieldLabel(input) there returns "yes" (3 chars),
+// which scanUnknown drops (length<4) → the question is never asked → stuck on Review.
+// Walk up to the group to recover the real question text.
+export function radioGroupLabel(input) {
+  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const fs = input.closest?.('fieldset');
+  if (fs) {
+    const lg = norm(fs.querySelector?.('legend')?.textContent);
+    if (lg.length >= 4) return lg;
+  }
+  const grp = input.closest?.('[role="radiogroup"], [role="group"], [data-test-form-builder-radio-button-form-component], fieldset');
+  if (grp) {
+    const al = norm(grp.getAttribute?.('aria-label'));
+    if (al.length >= 4) return al;
+    const lb = grp.getAttribute?.('aria-labelledby');
+    if (lb) { const t = norm(idRefText(grp.getRootNode?.() || document, lb)); if (t.length >= 4) return t; }
+    const lab = norm(grp.querySelector?.('legend, [class*="fb-dash-form-element__label"], label, [class*="label"], [class*="Label"]')?.textContent);
+    if (lab.length >= 4) return lab;
+  }
+  return '';
+}
+
 function cssEscape(s) {
   return (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/([^\w-])/g, '\\$1');
 }
@@ -80,7 +105,13 @@ function profileFieldFor(label, profile) {
   // Match against both the raw and accent-folded label so French fields (e.g.
   // "prénom") still hit patterns even where only the unaccented form is listed.
   const folded = stripAccents(label);
+  // A "how many years / how long / experience with X" question wants a NUMBER — it must
+  // NOT be filled with a profile URL/handle that merely mentions X (e.g. "years of
+  // experience with GitHub" was grabbing the GitHub URL → "Invalid input"). Skip URL
+  // fields for these; the AI estimates the years from the resume instead.
+  const wantsQuantity = /\b(how many|how long|years?|number of|combien|nombre d)\b/i.test(label) || /\byears?\b/i.test(folded);
   for (const [rx, field] of PROFILE_PATTERNS) {
+    if (wantsQuantity && /Url$/.test(field)) continue;
     // Only scalar profile values are fillable — never stringify an array/object
     // (e.g. workHistory) into a form field.
     if ((rx.test(label) || rx.test(folded)) && profile[field] != null && profile[field] !== '' && typeof profile[field] !== 'object') {
@@ -184,6 +215,55 @@ export function setNativeValue(el, value) {
   el.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
+// Fill custom comboboxes / typeaheads / react-selects (Workday, Greenhouse, Lever, and
+// LinkedIn's own dropdowns INCLUDING the "Location (city)" typeahead — the #1 ATS gap).
+// You can't just TYPE these: LinkedIn requires you to PICK a suggestion, and that list
+// renders ASYNC after typing — so we type, WAIT for the options, then click the match.
+// FULLY wrapped: any failure is a no-op (field left for the AI/park path) — never regresses.
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+export async function fillCombobox(el, value) {
+  try {
+    const v = String(value == null ? '' : value).trim();
+    if (!v) return false;
+    const vl = v.toLowerCase();
+    el.focus?.();
+    try { el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch {}
+    try { el.click?.(); } catch {}
+    // Typeable combobox/typeahead (location, etc.): type the value to trigger suggestions.
+    if (el.tagName === 'INPUT' || el.isContentEditable) {
+      try { setNativeValue(el, v); } catch {}
+      try { el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: v.slice(-1) })); } catch {}
+      try { el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: v.slice(-1) })); } catch {}
+    }
+    // WAIT (up to ~3.5s) for the option list to render — async typeaheads need this.
+    const SEL = '[role="option"], [role="listbox"] li, [class*="typeahead"] [role="option"], [class*="typeahead-result"], .basic-typeahead__selectable, [class*="select__option"], [class*="-option"], li[role="option"]';
+    let opts = [];
+    for (let i = 0; i < 14; i++) {
+      opts = qsa(SEL, document).filter((o) => o && o.offsetParent !== null && (o.textContent || '').trim());
+      if (opts.length) break;
+      await sleepMs(250);
+    }
+    const txt = (o) => (o.textContent || '').trim().toLowerCase();
+    // exact → the typed text is a prefix of the option (LinkedIn location: "Toronto, ON"
+    // → "Toronto, Ontario, Canada") → substring. NO blind first-option pick (would mis-fill
+    // a real dropdown like years-of-experience).
+    const pick = opts.find((o) => txt(o) === vl)
+      || opts.find((o) => txt(o).startsWith(vl) && vl.length > 1)
+      || opts.find((o) => vl.startsWith(txt(o)) && txt(o).length > 2)
+      || opts.find((o) => txt(o).includes(vl) && vl.length > 2);
+    if (!pick) {
+      try { el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); } catch {}
+      return false;
+    }
+    try { pick.scrollIntoView?.({ block: 'nearest' }); } catch {}
+    try { pick.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch {}
+    try { pick.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch {}
+    try { pick.click?.(); } catch {}
+    await sleepMs(150);
+    return true;
+  } catch { return false; }
+}
+
 export class AutofillEngine {
   // { getProfile: async ()=>data{}, lookupAnswer: async (label)=>({answer}|null),
   //   recordAnswer: async ({question,answer,fieldType,source,jobId})=>void, log }
@@ -196,7 +276,11 @@ export class AutofillEngine {
   }
 
   fields(rootEl) {
-    return qsa('input, textarea, select', rootEl || document);
+    // Include custom comboboxes / react-selects ([role=combobox] divs + react-select
+    // inputs), not just native controls — these are the required ATS/LinkedIn dropdowns
+    // that, left unfilled, made "Review"/"Next" silently refuse to advance (the dominant
+    // "stuck on a step" failure). fill() routes them to fillCombobox().
+    return qsa('input, textarea, select, [role="combobox"]', rootEl || document);
   }
 
   // Empty fillable fields + a suggestion for each (profile first, then qa).
@@ -241,7 +325,9 @@ export class AutofillEngine {
       } else if (input.value && String(input.value).trim()) {
         continue;
       }
-      const label = fieldLabel(input);
+      // For radios, the per-option <label> is just "Yes"/"No" — use the group's
+      // legend/question instead so the screening question is actually surfaced.
+      const label = (input.type === 'radio' ? radioGroupLabel(input) : '') || fieldLabel(input);
       if (!label || label.length < 4) continue;
       if (NEVER_AUTOFILL_RX.test(label)) continue;
       // Skip generic site-search / typeahead inputs (e.g. LinkedIn's global
@@ -264,15 +350,20 @@ export class AutofillEngine {
     return out;
   }
 
-  fill(suggestions) {
+  async fill(suggestions) {
     let n = 0;
     for (const s of suggestions) {
       try {
         const v = String(s.value);
+        const isCombo = s.input.getAttribute && (s.input.getAttribute('role') === 'combobox'
+          || (s.input.closest && s.input.closest('[class*="select__control"],[class*="react-select"],[class*="-control"],[class*="basic-typeahead"]')));
         if (s.input.tagName === 'SELECT') {
           const opt = matchOption(s.input, v);
           if (!opt) continue;
           setNativeValue(s.input, opt.value);
+        } else if (isCombo) {
+          // custom dropdown / typeahead (Workday/Greenhouse/Lever/LinkedIn location) — async
+          if (!(await fillCombobox(s.input, v))) continue;
         } else if (s.input.type === 'radio') {
           // Radio GROUPS (years-of-experience, work-authorization, salary band) are
           // not yes/no — pick the option in the group whose label best matches the
@@ -303,7 +394,8 @@ export class AutofillEngine {
     let n = 0;
     for (const input of this.fields(rootEl)) {
       if (!isFillable(input)) continue;
-      const label = fieldLabel(input);
+      if (input.type === 'radio' && !input.checked) continue;   // only the chosen option
+      const label = (input.type === 'radio' ? radioGroupLabel(input) : '') || fieldLabel(input);
       if (!label || label.length < 3) continue;
       if (NEVER_AUTOFILL_RX.test(label)) continue;
       let value = '';

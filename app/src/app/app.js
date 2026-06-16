@@ -143,6 +143,16 @@ const statusChip = (s) =>
   `<span class="status-chip" data-status="${esc(s)}"><span class="dot"></span>${esc(STATUS_LABEL[s] || s)}</span>`;
 const fitBadgeHtml = (score) => (score == null || score === '') ? ''
   : `<span class="fit-badge ${score >= 70 ? 'good' : score >= 45 ? 'mid' : 'low'}" title="AI fit score">${esc(score)}</span>`;
+// Provenance badge — was this application submitted BY THE AUTO-APPLY PIPELINE or BY HAND?
+// `via` is set server-side (db.annotateAutoApply): 'auto' = a completed auto-apply task
+// exists, 'manual' = reached submitted+ without one, null = not submitted yet.
+const viaBadge = (j) => {
+  if (!j) return '';
+  if (j.via === 'auto') return `<span class="via-badge via-auto" title="Submitted by the auto-apply pipeline">⚡ Auto</span>`;
+  if (j.via === 'manual') return `<span class="via-badge via-manual" title="Applied to by hand">✋ Manual</span>`;
+  if (j.autoApply) return `<span class="via-badge via-pipeline" title="In the auto-apply pipeline (not submitted yet)">⚡ Pipeline</span>`;
+  return '';
+};
 const statusOptions = (sel) =>
   STATUSES.map((s) => `<option value="${s.id}" ${sel === s.id ? 'selected' : ''}>${esc(s.label)}</option>`).join('');
 
@@ -162,7 +172,7 @@ const state = {
   selection: new Set(),              // bulk selection on the applications list
   profileSel: null,
   apps: (() => {
-    const def = { q: '', status: 'all', source: 'all', sort: 'updatedAt', dir: 'desc' };
+    const def = { q: '', status: 'all', source: 'all', via: 'all', sort: 'updatedAt', dir: 'desc' };
     try { return { ...def, ...JSON.parse(localStorage.getItem(LS_FILTERS) || '{}'), q: '' }; }
     catch { return def; }
   })(),
@@ -182,8 +192,8 @@ function persistBoard() {
 const HOST_LABEL = { extension: 'Extension', desktop: 'Desktop', web: 'Web' };
 function persistFilters() {
   try {
-    const { status, source, sort, dir } = state.apps;
-    localStorage.setItem(LS_FILTERS, JSON.stringify({ status, source, sort, dir }));
+    const { status, source, via, sort, dir } = state.apps;
+    localStorage.setItem(LS_FILTERS, JSON.stringify({ status, source, via, sort, dir }));
   } catch {}
 }
 
@@ -870,18 +880,20 @@ async function paintRuntime() {
 // VIEW: Dashboard (#/)
 // ============================================================
 route('/', async () => {
-  const [statsR, jobsR, queueR, aiR, gmailR] = await Promise.all([
+  const [statsR, jobsR, queueR, aiR, gmailR, liveR, bdR, trendR] = await Promise.all([
     api('/stats'),
     api('/jobs?limit=8'),
     api('/queue').catch(() => ({ items: [] })),
     api('/ai/status').catch(() => null),
     api('/gmail/status').catch(() => null),
+    api('/auto-apply/live').catch(() => null),
+    api('/auto-apply/breakdown?days=7').catch(() => null),
+    api('/stats/activity?days=14').catch(() => null),
   ]);
   const stats = statsR;
   const jobs = jobsR.items || [];
   const tasks = queueR.items || [];
   const byStatus = stats.byStatus || {};
-  const inPipeline = PIPELINE_ACTIVE.reduce((s, id) => s + (byStatus[id] || 0), 0);
   const qCounts = {};
   for (const t of tasks) qCounts[t.state] = (qCounts[t.state] || 0) + 1;
 
@@ -891,28 +903,67 @@ route('/', async () => {
     return `<span class="sys-chip ${ok ? 'ok' : 'bad'}" title="${esc(st.reason || '')}">${esc(label)} ${ok ? '●' : '○'}</span>`;
   };
   const sysBits = [];
-  if (aiR) {
-    sysBits.push(aiChip('Codex', aiR.codex));
-    sysBits.push(aiChip('Ollama', aiR.ollama));
-  }
+  if (aiR) { sysBits.push(aiChip('Codex', aiR.codex)); sysBits.push(aiChip('Ollama', aiR.ollama)); }
   if (gmailR?.enabled) {
     const lr = gmailR.lastResult;
     sysBits.push(`<span class="sys-chip">Gmail · ${lr?.at ? 'synced ' + fmtRel(lr.at) : (gmailR.authorized ? 'connected' : 'not connected')}</span>`);
   }
   const awaiting = (qCounts.awaiting_review || 0) + (qCounts.awaiting_input || 0);
-  if (tasks.length) {
-    sysBits.push(`<span class="sys-chip ${awaiting ? 'warn' : ''}">Auto-apply · ${qCounts.queued || 0} queued${awaiting ? ` · ${awaiting} need you` : ''}</span>`);
-  }
+  if (tasks.length) sysBits.push(`<span class="sys-chip ${awaiting ? 'warn' : ''}">Auto-apply · ${qCounts.queued || 0} queued${awaiting ? ` · ${awaiting} need you` : ''}</span>`);
 
-  const pills = STATUSES.map((s) =>
-    `<button class="pill" data-status="${s.id}" type="button"><span class="dot"></span>${esc(s.label)}<span class="count">${byStatus[s.id] || 0}</span></button>`).join('');
+  // ---- auto-apply health (live) ----
+  const live = (liveR && liveR.ok) ? liveR : null;
+  const sess = (live && live.session) || {};
+  const aaStatus = live ? live.status : 'off';
+  const AA_STATUS_LABEL = { off: 'Off', running: 'Running', 'queue-empty': 'Idle · queue empty', 'hourly-cap': 'Hourly cap hit', pacing: 'Paced · waiting' };
+  const subAuto = stats.submittedAuto || 0, subMan = stats.submittedManual || 0;
+  const subTot = stats.submittedTotal || (subAuto + subMan);
+  const autoPct = (subAuto + subMan) ? Math.round(100 * subAuto / (subAuto + subMan)) : 0;
+  const sessTried = (sess.submitted || 0) + (sess.failed || 0);
+  const openRate = sessTried ? Math.round(100 * (sess.submitted || 0) / sessTried) : null;
+  const topReasons = ((bdR && bdR.topReasons) || []).slice(0, 3);
+
+  // ---- 14-day submission sparkline (auto stacked over manual) ----
+  const trend = (trendR && trendR.items) || [];
+  const maxDay = Math.max(1, ...trend.map((d) => d.auto + d.manual));
+  const SPK_H = 38;
+  const sparkBars = trend.map((d) => {
+    const total = d.auto + d.manual;
+    const h = total ? Math.max(2, Math.round((total / maxDay) * SPK_H)) : 1;
+    const ah = total ? Math.round((d.auto / total) * h) : 0;
+    const lbl = `${d.date}: ${d.auto} auto, ${d.manual} manual`;
+    return `<div class="spk-col" title="${lbl}"><div class="spk-stack" style="height:${h}px"><div class="spk-auto" style="height:${ah}px"></div><div class="spk-man" style="height:${h - ah}px"></div></div></div>`;
+  }).join('');
+  const trendTotal = trend.reduce((s, d) => s + d.auto + d.manual, 0);
+
+  // ---- pipeline funnel (with stage-to-stage conversion) ----
+  const fn = stats.funnel || {};
+  const fnStages = [
+    { label: 'Submitted', n: fn.submitted || 0 },
+    { label: 'Responded', n: fn.responded || 0 },
+    { label: 'Interviews', n: fn.interviews || 0 },
+    { label: 'Offers', n: fn.offers || 0 },
+  ];
+  const fnMax = Math.max(1, fn.submitted || 0);
+  const funnelHtml = fnStages.map((st, i) => {
+    const pct = Math.round((st.n / fnMax) * 100);
+    const conv = i > 0 && fnStages[i - 1].n ? Math.round(100 * st.n / fnStages[i - 1].n) : null;
+    return `<div class="fn-row"><div class="fn-top"><span class="fn-label">${st.label}</span><span class="fn-n">${st.n}${conv != null ? ` <span class="muted">${conv}%</span>` : ''}</span></div><div class="fn-bar"><div class="fn-fill" style="width:${pct}%"></div></div></div>`;
+  }).join('');
+
+  // ---- source breakdown ----
+  const srcEntries = Object.entries(stats.bySource || {}).filter(([, vv]) => vv).sort((a, b) => b[1] - a[1]).slice(0, 6);
+  const srcMax = Math.max(1, ...srcEntries.map(([, vv]) => vv));
+  const sourcesHtml = srcEntries.length
+    ? srcEntries.map(([k, vv]) => `<div class="fn-row"><div class="fn-top"><span class="fn-label">${esc(k)}</span><span class="fn-n">${vv}</span></div><div class="fn-bar"><div class="fn-fill alt" style="width:${Math.round(vv / srcMax * 100)}%"></div></div></div>`).join('')
+    : '<div class="ny-empty">No sources yet.</div>';
 
   const recent = jobs.length ? jobs.map((j) => `
     <tr data-id="${esc(j.id)}" class="row-link">
       <td class="title-cell">${esc(j.title || 'Untitled')}${j.needsReview ? ' <span class="muted" title="Needs review">⚠</span>' : ''}</td>
       <td>${esc(j.company || '')}</td>
       <td>${statusChip(j.status)}</td>
-      <td>${fitBadgeHtml(j.fitScore)}</td>
+      <td>${viaBadge(j) || fitBadgeHtml(j.fitScore)}</td>
       <td>${esc(j.source || '—')}</td>
       <td>${relHtml(j.updatedAt)}</td>
     </tr>`).join('')
@@ -935,18 +986,57 @@ route('/', async () => {
 
     <section class="stats">
       <div class="stat"><div class="stat-label">Applications</div><div class="stat-value">${stats.total || 0}</div><div class="stat-delta">All time</div></div>
-      <div class="stat"><div class="stat-label">This week</div><div class="stat-value">${stats.thisWeek || 0}</div><div class="stat-delta">Captured</div></div>
-      <div class="stat"><div class="stat-label">In pipeline</div><div class="stat-value">${inPipeline}</div><div class="stat-delta">Submitted → offer</div></div>
-      <div class="stat" data-go-review style="cursor:pointer"><div class="stat-label">Needs review</div><div class="stat-value ${stats.needsReview ? 'warn' : ''}">${stats.needsReview || 0}</div><div class="stat-delta">Sparse captures</div></div>
+      <div class="stat"><div class="stat-label">Submitted</div><div class="stat-value gold">${subTot}</div><div class="stat-delta">${subAuto} auto · ${subMan} by hand</div></div>
+      <div class="stat"><div class="stat-label">Response rate</div><div class="stat-value">${fn.responseRate == null ? '—' : fn.responseRate + '%'}</div><div class="stat-delta">${fn.responded || 0} replied${fn.interviews ? ` · ${fn.interviews} interview${fn.interviews === 1 ? '' : 's'}` : ''}</div></div>
+      <div class="stat clickable" data-go-review><div class="stat-label">Needs review</div><div class="stat-value ${stats.needsReview ? 'warn' : ''}">${stats.needsReview || 0}</div><div class="stat-delta">${stats.thisWeek || 0} new this week</div></div>
     </section>
 
     <section class="section">
       <header class="section-header">
-        <div><div class="section-eyebrow">Status</div><h2 class="section-title">Pipeline</h2></div>
-        <a href="#/pipeline" class="section-link">Board view</a>
+        <div><div class="section-eyebrow">Automate</div><h2 class="section-title">Auto-apply</h2></div>
+        <a href="#/queue" class="section-link">Open auto-apply</a>
       </header>
-      <div class="pipeline">${pills}</div>
+      <div class="section-body">
+        <div class="aa-dash-grid">
+          <div class="mini"><div class="mini-label">Status</div><div class="mini-value ${aaStatus === 'running' ? 'live' : ''}">${aaStatus === 'running' ? '<span class="aa-pulse"></span> ' : ''}${esc(AA_STATUS_LABEL[aaStatus] || aaStatus)}</div></div>
+          <div class="mini"><div class="mini-label">Submitted today</div><div class="mini-value gold">${stats.submittedToday || 0}</div></div>
+          <div class="mini"><div class="mini-label">In queue</div><div class="mini-value">${(live ? live.queuedDepth : 0) || 0}</div></div>
+          <div class="mini ${sess.needsYou ? 'warn' : ''}"><div class="mini-label">Needs you</div><div class="mini-value ${sess.needsYou ? 'warn' : ''}">${sess.needsYou || 0}</div></div>
+          <div class="mini"><div class="mini-label">Session open-rate</div><div class="mini-value">${openRate == null ? '—' : openRate + '%'}</div></div>
+        </div>
+        <div class="dash-aa-cols">
+          <div>
+            <div class="split-wrap">
+              <div class="split-head"><span class="muted">Submissions — auto-apply vs by hand</span><span>${subAuto} · ${subMan}</span></div>
+              <div class="split-bar" title="${autoPct}% via auto-apply"><div class="split-fill" style="width:${autoPct}%"></div></div>
+            </div>
+            ${topReasons.length ? `<div class="dash-blockers"><div class="dash-sub">Top blockers · 7 days</div>${topReasons.map((r) => `<div class="blk-row"><span class="blk-reason">${esc(r.reason)}</span><span class="blk-n">${r.count}×</span></div>`).join('')}</div>` : ''}
+          </div>
+          <div class="spark-wrap">
+            <div class="dash-sub">Submissions · 14 days <span class="muted">(${trendTotal})</span></div>
+            <div class="spark">${sparkBars || '<span class="muted" style="font-size:12px">No activity yet</span>'}</div>
+            <div class="spark-legend"><span class="lg lg-auto">Auto</span><span class="lg lg-man">Manual</span></div>
+          </div>
+        </div>
+        ${(live && live.running && live.running.length) ? `<div class="aa-dash-live">${live.running.map((w) => `<span class="aa-live-chip"><span class="aa-pulse"></span> ${esc(w.title || '…')} <span class="muted">${esc((w.step || '').slice(0, 44))}</span></span>`).join('')}</div>` : ''}
+      </div>
     </section>
+
+    <div class="dash-cols">
+      <section class="section">
+        <header class="section-header">
+          <div><div class="section-eyebrow">Pipeline</div><h2 class="section-title">Funnel</h2></div>
+          <a href="#/pipeline" class="section-link">Board</a>
+        </header>
+        <div class="section-body">${funnelHtml}</div>
+      </section>
+      <section class="section">
+        <header class="section-header">
+          <div><div class="section-eyebrow">Where from</div><h2 class="section-title">Sources</h2></div>
+        </header>
+        <div class="section-body">${sourcesHtml}</div>
+      </section>
+    </div>
 
     <section class="section">
       <header class="section-header">
@@ -954,7 +1044,7 @@ route('/', async () => {
         <a href="#/applications" class="section-link">All applications</a>
       </header>
       <div class="table-wrap"><table class="table">
-        <thead><tr><th>Title</th><th>Company</th><th>Status</th><th></th><th>Source</th><th>Updated</th></tr></thead>
+        <thead><tr><th>Title</th><th>Company</th><th>Status</th><th>Via</th><th>Source</th><th>Updated</th></tr></thead>
         <tbody>${recent}</tbody>
       </table></div>
     </section>
@@ -994,8 +1084,12 @@ route('/applications', async () => {
   else if (f.status !== 'all') q += '&status=' + encodeURIComponent(f.status);
   if (f.source !== 'all') q += '&source=' + encodeURIComponent(f.source);
   if (f.q) q += '&q=' + encodeURIComponent(f.q);
-  const r = await api(q);
+  const [r, nyR] = await Promise.all([api(q), api('/auto-apply/needs-you').catch(() => ({ items: [] }))]);
   let rows = r.items || [];
+  // Provenance filter (client-side — `via` is derived server-side, not a DB column).
+  if (f.via === 'auto') rows = rows.filter((j) => j.via === 'auto' || j.autoApply);
+  else if (f.via === 'manual') rows = rows.filter((j) => j.via === 'manual' && !j.autoApply);
+  const needsYou = (nyR && nyR.items) || [];
 
   const dir = f.dir === 'asc' ? 1 : -1;
   rows = rows.slice().sort((a, b) => {
@@ -1019,15 +1113,52 @@ route('/applications', async () => {
       <td class="title-cell">${esc(j.title || 'Untitled')}${j.needsReview ? ' <span class="muted" title="Needs review">⚠</span>' : ''}</td>
       <td>${esc(j.company || '')}</td>
       <td>${statusChip(j.status)}</td>
+      <td>${viaBadge(j)}</td>
       <td>${fitBadgeHtml(j.fitScore)}</td>
       <td>${esc(j.source || '—')}</td>
       <td>${dateHtml(j.createdAt)}</td>
       <td>${relHtml(j.updatedAt)}</td>
     </tr>`).join('')
-    : `<tr><td colspan="8">${emptyHtml(
+    : `<tr><td colspan="9">${emptyHtml(
       f.q || f.status !== 'all' || f.source !== 'all' ? 'No matches' : 'No entries',
       f.q || f.status !== 'all' || f.source !== 'all' ? 'Nothing matches the current filter' : 'The ledger is empty',
       'Adjust the filters, or hit Apply on a job and JAT will record it.')}</td></tr>`;
+
+  // "Needs your input" — auto-apply tasks that parked / await you, surfaced so you can
+  // answer the missing question right here and the pipeline re-queues + finishes them.
+  const NY_STATE_LABEL = { parked: 'Parked', awaiting_input: 'Needs you', awaiting_review: 'Review' };
+  const nyCard = (t) => `
+    <div class="ny-card" data-task="${esc(t.taskId)}" data-job="${esc(t.jobId)}">
+      <div class="ny-head">
+        <span class="ny-title">${esc(t.title || 'Application')}</span>
+        <span class="ny-co">${esc(t.company || '')}</span>
+        <span class="state-chip" data-state="${esc(t.state)}">${esc(NY_STATE_LABEL[t.state] || t.state)}</span>
+        ${t.route === 'external' ? '<span class="aa-route-chip external">external</span>' : ''}
+      </div>
+      ${t.reason ? `<div class="ny-reason">${esc(t.reason)}</div>` : ''}
+      ${(t.questions || []).map((qq) => `
+        <div class="ny-q">
+          <label class="ny-q-label">${esc(qq.question)}</label>
+          ${(qq.options && qq.options.length)
+            ? `<select class="select ny-input" data-q="${esc(qq.question)}">${qq.options.map((o) => `<option>${esc(o)}</option>`).join('')}</select>`
+            : `<input class="input ny-input" data-q="${esc(qq.question)}" placeholder="Your answer" />`}
+        </div>`).join('')}
+      ${(t.questions || []).length ? '' : '<div class="ny-reason muted">No specific question captured — open the job to finish it by hand.</div>'}
+      <div class="ny-actions">
+        ${(t.questions || []).length ? '<button class="btn small primary" data-ny-save>Save &amp; continue</button>' : ''}
+        ${t.jobUrl ? `<a class="btn small" href="${esc(t.jobUrl)}" target="_blank" rel="noopener">Open job ↗</a>` : ''}
+        <button class="btn small" data-ny-detail>Details</button>
+        <button class="btn small" data-ny-skip>Dismiss</button>
+      </div>
+    </div>`;
+  const needsYouHtml = needsYou.length ? `
+    <section class="section needs-you">
+      <header class="section-header">
+        <div><div class="section-eyebrow">Needs your input</div><h2 class="section-title">${needsYou.length} auto-apply${needsYou.length === 1 ? '' : 's'} waiting on you</h2></div>
+        <a href="#/queue" class="section-link">Auto-apply page</a>
+      </header>
+      <div class="section-body">${needsYou.map(nyCard).join('')}</div>
+    </section>` : '';
 
   const v = el(`<div>
     <header class="page-header">
@@ -1060,16 +1191,26 @@ route('/applications', async () => {
       <div class="form-hint">Opens your applied-jobs page(s) in a background tab, reads your past applications, and imports them (deduped, marked submitted with their real date). Runs in your browser using your existing login.</div>
     </div>` : ''}
 
+    ${needsYouHtml}
+
     <div class="toolbar">
-      <input class="input" id="f-q" type="search" placeholder="Search title, company, notes… ( / )" value="${esc(f.q)}" style="max-width:280px" />
-      <select class="select" id="f-status">
+      <div class="tb-search">
+        <svg class="tb-ic" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+        <input class="input" id="f-q" type="search" placeholder="Search title, company, notes…   ( / )" value="${esc(f.q)}" />
+      </div>
+      <select class="select tb-filter ${f.status !== 'all' ? 'on' : ''}" id="f-status" title="Filter by status">
         <option value="all" ${f.status === 'all' ? 'selected' : ''}>All statuses</option>
         <option value="needs_review" ${f.status === 'needs_review' ? 'selected' : ''}>Needs review ⚠</option>
         ${STATUSES.map((s) => `<option value="${s.id}" ${f.status === s.id ? 'selected' : ''}>${esc(s.label)}</option>`).join('')}
       </select>
-      <select class="select" id="f-source">
+      <select class="select tb-filter ${f.source !== 'all' ? 'on' : ''}" id="f-source" title="Filter by source">
         <option value="all">All sources</option>
         ${allSources.map((s) => `<option value="${esc(s)}" ${f.source === s ? 'selected' : ''}>${esc(s)}</option>`).join('')}
+      </select>
+      <select class="select tb-filter ${f.via !== 'all' ? 'on' : ''}" id="f-via" title="Filter by how it was applied to">
+        <option value="all" ${f.via === 'all' ? 'selected' : ''}>Auto &amp; manual</option>
+        <option value="auto" ${f.via === 'auto' ? 'selected' : ''}>⚡ Auto-apply only</option>
+        <option value="manual" ${f.via === 'manual' ? 'selected' : ''}>✋ Manual only</option>
       </select>
     </div>
 
@@ -1086,7 +1227,7 @@ route('/applications', async () => {
       <div class="table-wrap"><table class="table">
         <thead><tr>
           <th style="width:30px"><input type="checkbox" id="sel-all" /></th>
-          ${th('title', 'Title')}${th('company', 'Company')}${th('status', 'Status')}${th('fitScore', 'Fit')}${th('source', 'Source')}${th('createdAt', 'Applied')}${th('updatedAt', 'Updated')}
+          ${th('title', 'Title')}${th('company', 'Company')}${th('status', 'Status')}<th>Via</th>${th('fitScore', 'Fit')}${th('source', 'Source')}${th('createdAt', 'Applied')}${th('updatedAt', 'Updated')}
         </tr></thead>
         <tbody>${bodyRows}</tbody>
       </table></div>
@@ -1098,6 +1239,31 @@ route('/applications', async () => {
   v.querySelector('#f-q').addEventListener('input', debounce((e) => { f.q = e.target.value.trim(); requery(); }, 350));
   v.querySelector('#f-status').addEventListener('change', (e) => { f.status = e.target.value; requery(); });
   v.querySelector('#f-source').addEventListener('change', (e) => { f.source = e.target.value; requery(); });
+  v.querySelector('#f-via').addEventListener('change', (e) => { f.via = e.target.value; requery(); });
+
+  // Needs-you intake cards: answer the parked question(s) → saved to profile → the task
+  // is re-queued and the pipeline finishes it on the next tick.
+  v.querySelectorAll('.ny-card').forEach((card) => {
+    const taskId = card.dataset.task, jobId = card.dataset.job;
+    card.querySelector('[data-ny-save]')?.addEventListener('click', async (e) => {
+      const btn = e.currentTarget; btn.disabled = true;
+      const answers = [...card.querySelectorAll('.ny-input')]
+        .map((inp) => ({ question: inp.dataset.q, value: (inp.value || '').trim() }))
+        .filter((a) => a.value);
+      if (!answers.length) { toast('Type an answer first', 'danger'); btn.disabled = false; return; }
+      try {
+        const rr = await api('/auto-apply/intake', { method: 'POST', body: { answers } });
+        toast(`Saved${rr && rr.requeued ? ` — ${rr.requeued} re-queued` : ''} ✓`);
+        navigate();
+      } catch (err) { errToast(err); btn.disabled = false; }
+    });
+    card.querySelector('[data-ny-detail]')?.addEventListener('click', () => { location.hash = '#/applications/' + jobId; });
+    card.querySelector('[data-ny-skip]')?.addEventListener('click', async () => {
+      try { await api('/queue/' + encodeURIComponent(taskId), { method: 'PATCH', body: { state: 'skipped' } }); toast('Dismissed'); navigate(); }
+      catch (err) { errToast(err); }
+    });
+  });
+
   v.querySelectorAll('th[data-sort]').forEach((h) => h.addEventListener('click', () => {
     const k = h.dataset.sort;
     if (f.sort === k) f.dir = f.dir === 'asc' ? 'desc' : 'asc';
@@ -1265,7 +1431,7 @@ route(/^\/applications\/(?<id>.+)$/, async ({ id }) => {
       <div>
         <a href="#/applications" class="back-link">← All applications</a>
         <h1 class="page-title" style="margin-top:10px">${isNew ? 'New application' : esc(j.title || 'Untitled')}</h1>
-        <div class="page-sub">${isNew ? 'Capture the essentials.' : esc(j.company || '') + (j.location ? ' · ' + esc(j.location) : '')}</div>
+        <div class="page-sub" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">${isNew ? 'Capture the essentials.' : `<span>${esc(j.company || '') + (j.location ? ' · ' + esc(j.location) : '')}</span> ${viaBadge(j)}`}</div>
       </div>
       <div class="page-actions">
         ${isNew ? '' : '<button class="btn" data-delete>Delete</button>'}
@@ -1531,6 +1697,8 @@ route('/pipeline', async () => {
     const sub = [];
     if (j.source) sub.push(`<span class="kb-source">${esc(j.source)}</span>`);
     if (j.location) sub.push(`<span class="kb-loc">${esc(j.location)}</span>`);
+    if (j.via === 'auto') sub.push('<span class="via-badge via-auto">⚡ Auto</span>');
+    else if (j.via === 'manual') sub.push('<span class="via-badge via-manual">✋ Manual</span>');
     return `<div class="kb-card ${fitCls} ${stale ? 'stale' : ''}" draggable="true" data-id="${esc(j.id)}">
       <div class="kb-card-top">
         <span class="kb-avatar" style="--hue:${avatarHue(j.company || j.title)}">${esc(initials(j.company || j.title))}</span>
@@ -1744,7 +1912,7 @@ route('/queue', async () => {
   const qview = (() => { try { return localStorage.getItem('jat11.queue.view') === 'history' ? 'history' : 'tasks'; } catch { return 'tasks'; } })();
 
   const intakeHtml = parked.length ? `
-    <section class="section aa-intake">
+    <section class="section aa-intake" data-keep>
       <header class="section-header"><div><div class="section-eyebrow">Self-healing</div><h2 class="section-title">Needs your input</h2>
         <div class="form-hint">${parked.length} question(s) auto-apply couldn't answer confidently. Answer them — they're saved to your profile and the set-aside jobs retry automatically.</div></div></header>
       ${parked.map((q) => `<div class="form-row"><div class="form-label">${esc(q.question)}${q.reason ? `<div class="form-hint">${esc(q.reason)}</div>` : ''}</div>
@@ -1817,7 +1985,8 @@ route('/queue', async () => {
         ${qc('Max / hour', `<input class="input" id="aa-hour" type="number" min="1" max="100" value="${aa.maxPerHour}" />`)}
         ${qc('Gap min (min)', `<input class="input" id="aa-gmin" type="number" min="0" max="180" step="0.25" value="${aa.minGapMinutes}" />`)}
         ${qc('Gap max (min)', `<input class="input" id="aa-gmax" type="number" min="0" max="360" step="0.25" value="${aa.maxGapMinutes}" />`)}
-        ${qc('Parallel applications', `<input class="input" id="aa-conc" type="number" min="1" max="8" value="${Math.max(1, Number(aa.concurrency) || 1)}" /><div class="form-hint">1 = one at a time (safest). 2+ runs that many apply tabs at once — much faster, but LinkedIn/Indeed are more likely to flag your account.</div>`)}
+        ${qc('Parallel applications', `<input class="input" id="aa-conc" type="number" min="1" max="3" value="${Math.max(1, Math.min(3, Number(aa.concurrency) || 1))}" /><div class="form-hint">1 = one at a time (safest). 2–3 runs that many applications at once, each in its OWN dedicated window so every one stays un-throttled. Faster, but a bigger automation footprint (LinkedIn/Indeed watch for it) and more windows + machine load. The hourly cap still binds total throughput.</div>`)}
+        ${qc('Bring window to front while applying', `<label class="toggle"><input type="checkbox" id="aa-bringfront" ${aa.bringToFrontToHydrate ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">For max reliability when a fullscreen app (e.g. a game) covers the apply window — Chrome throttles a fully-hidden window so the Easy-Apply button never loads. ON brings the apply window to the front while each application runs (it takes focus). Leave OFF for unobtrusive background applying.</div>`)}
         <div id="aa-window-row">
           ${qc('Window start', `<input class="input" id="aa-ws" type="time" value="${esc(aa.windowStart || '')}" />`)}
           ${qc('Window end', `<input class="input" id="aa-we" type="time" value="${esc(aa.windowEnd || '')}" />`)}
@@ -1882,6 +2051,7 @@ route('/queue', async () => {
           boards: boardsSel,
           easyApplyOnly: v.querySelector('#aa-easy').checked,
           concurrency: conc,
+          bringToFrontToHydrate: v.querySelector('#aa-bringfront').checked,
           experienceYears: Math.max(0, Number(v.querySelector('#aa-exp').value) || 0),
           seniorityMax: v.querySelector('#aa-seniority').value,
           excludeKeywords: (v.querySelector('#aa-exclude').value || '').split(',').map((x) => x.trim()).filter(Boolean),
@@ -2007,30 +2177,50 @@ route('/queue', async () => {
     const [col, label] = AA_STATUS[d.status] || ['#9ca3af', d.status || ''];
     const p = d.pacing || {}, s = d.session || {};
     const slow = p.effectivePerHour && p.effectivePerHour <= 12;
+    // Per-worker live card: the runner's title/company, route, attempt, elapsed timer,
+    // and a streaming trail of the LAST several transcript lines — i.e. exactly what it's
+    // seeing / filling / answering right now (last line = current action), plus any
+    // question it's waiting on.
+    const lvClass = (l) => l === 'ok' ? 'lv-ok' : l === 'warn' ? 'lv-warn' : (l === 'err' || l === 'error') ? 'lv-err' : '';
+    const workerCard = (w) => {
+      const elapsed = fmtElapsed((Date.now() - Date.parse(w.startedAt || '')) || 0);
+      const route = w.route ? `<span class="aa-route-chip ${esc(w.route)}">${esc(w.route)}</span>` : '';
+      const trail = (w.trail && w.trail.length)
+        ? w.trail.map((e, i) => {
+            const cur = i === w.trail.length - 1 ? 'cur' : '';
+            return `<div class="trail-line ${lvClass(e.level)} ${cur}"><span class="t-dot">${cur ? '▸' : '·'}</span><span>${esc(e.text || '')}</span></div>`;
+          }).join('')
+        : `<div class="trail-line"><span class="t-dot">·</span><span class="muted">opening the application…</span></div>`;
+      const q = (w.pendingQuestions && w.pendingQuestions.length)
+        ? `<div class="aa-worker-q">⏳ waiting on — ${w.pendingQuestions.map((x) => esc(x.question || '')).slice(0, 3).join(' · ')}</div>` : '';
+      return `<div class="aa-worker">
+        <div class="aa-worker-head">
+          <div><div class="aa-worker-title">${esc(w.title || 'job')}</div><div class="aa-worker-co">${esc(w.company || '')}</div></div>
+          <div class="aa-worker-meta">${route}<span>${esc(w.source || '')}</span>${(w.attempts || 0) > 1 ? `<span>try ${w.attempts}</span>` : ''}<span class="aa-worker-elapsed">${elapsed}</span></div>
+        </div>
+        <div class="aa-worker-trail">${trail}</div>
+        ${q}
+      </div>`;
+    };
     const workers = (d.running || []).length
-      ? d.running.map((w) => `<div style="display:flex;gap:10px;align-items:flex-start;font-size:12px;padding:5px 0;border-top:1px solid var(--border,#2a2a2a)">
-          <span style="color:${col};line-height:1.4">●</span>
-          <span style="flex:1;min-width:0"><b style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block">${esc(w.title || 'job')} <span class="muted">· ${esc(w.company || '')}</span></b><span class="muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block">${esc(w.step || '')}</span></span>
-          <span class="muted" style="white-space:nowrap">${esc(w.source || '')} · ${esc(fmtElapsed((Date.now() - Date.parse(w.startedAt || '')) || 0))}</span>
-        </div>`).join('')
-      : `<div class="muted" style="font-size:12px;padding:6px 0">${d.enabled ? (d.queuedDepth ? 'Next application starting…' : 'No applications in flight — topping up the queue.') : 'Press Start to begin.'}</div>`;
-    const stat = (n, lbl, c) => `<span style="display:inline-flex;flex-direction:column;align-items:center;min-width:56px"><b style="font-size:17px;color:${c || 'inherit'}">${n}</b><span class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.03em">${lbl}</span></span>`;
+      ? `<div class="aa-workers">${d.running.map(workerCard).join('')}</div>`
+      : `<div class="aa-empty-live">${d.enabled ? (d.queuedDepth ? 'Next application starting…' : 'No applications in flight — topping up the queue from discovery + retries.') : 'Auto-apply is stopped. Press Start to begin.'}</div>`;
+    const stat = (n, lbl, cls) => `<div class="mini"><div class="mini-label">${lbl}</div><div class="mini-value ${cls || ''}">${n}</div></div>`;
     return `<section class="section" style="margin-bottom:14px">
       <header class="section-header" style="align-items:center">
         <div><div class="section-eyebrow">Live</div><h2 class="section-title">Running now</h2></div>
-        <span style="display:inline-flex;align-items:center;gap:7px;font-size:12px"><span style="width:9px;height:9px;border-radius:50%;background:${col};box-shadow:0 0 0 3px ${col}22"></span>${esc(label)} · <b>${d.active || 0}/${d.concurrency || 1}</b> workers</span>
+        <span style="display:inline-flex;align-items:center;gap:7px;font-size:12px"><span style="width:9px;height:9px;border-radius:50%;background:${col};box-shadow:0 0 0 3px ${col}22"></span>${esc(label)} · <b>${d.active || 0}/${d.concurrency || 1}</b> ${d.active === 1 ? 'worker' : 'workers'}</span>
       </header>
       <div class="section-body">
-        <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin-bottom:8px">
-          ${stat(s.submitted || 0, 'submitted', '#16a34a')}
-          ${stat(s.readyForReview || 0, 'to review', '#3b82f6')}
-          ${stat(s.parked || 0, 'parked', '#d97706')}
-          ${stat(s.needsYou || 0, 'needs you', '#d97706')}
-          ${stat(s.skipped || 0, 'skipped', '#9ca3af')}
-          ${stat(s.failed || 0, 'failed', '#dc2626')}
-          ${stat(d.queuedDepth || 0, 'in queue', '#6b7280')}
+        <div class="aa-dash-grid" style="margin-bottom:14px">
+          ${stat(s.submitted || 0, 'submitted', 'gold')}
+          ${stat(s.readyForReview || 0, 'to review', '')}
+          ${stat(s.needsYou || 0, 'needs you', s.needsYou ? 'warn' : '')}
+          ${stat(s.skipped || 0, 'skipped', '')}
+          ${stat(s.failed || 0, 'failed', '')}
+          ${stat(d.queuedDepth || 0, 'in queue', '')}
         </div>
-        <div class="muted" style="font-size:12px;margin-bottom:8px">≈ <b style="color:${slow ? '#dc2626' : 'inherit'}">${p.effectivePerHour || 0}</b> applications/hour at current settings${p.bindingCap ? ` (capped by ${p.bindingCap === 'hourly-cap' ? 'your hourly limit' : 'the gap between applications'})` : ''}${slow ? ` — your saved pacing predates the speed update. <button class="btn small" data-aa-maxspeed style="padding:2px 9px">⚡ Max speed</button>` : ''}</div>
+        <div class="muted" style="font-size:12px;margin-bottom:12px">≈ <b style="color:${slow ? 'var(--danger)' : 'inherit'}">${p.effectivePerHour || 0}</b> applications/hour at current settings${p.bindingCap ? ` (capped by ${p.bindingCap === 'hourly-cap' ? 'your hourly limit' : 'the gap between applications'})` : ''}${slow ? ` — your saved pacing predates the speed update. <button class="btn small" data-aa-maxspeed style="padding:2px 9px">⚡ Max speed</button>` : ''}</div>
         ${workers}
       </div>
     </section>`;

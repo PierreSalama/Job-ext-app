@@ -132,12 +132,20 @@ function jobLevel(title) {
       || /\blead\s+(?:software|develop|engineer|back|front|full|data|ml|devops|sdet|qa|cloud|platform)/.test(t)) return 4;
   if (/\b(senior|sr\.?|sr)\b/.test(t)) return 3;
   if (/\b(intern(ship)?|co-?op|junior|jr\.?|entry[- ]?level|new ?grad|graduate|apprentice|trainee|student)\b/.test(t)) return 1;
-  return 2;
+  // UNLABELLED titles ("Software Engineer", "Network Technician") carry no seniority
+  // signal — treat them as entry-eligible (1) so a sensible cap (entry/mid) doesn't
+  // silently nuke perfectly applyable jobs. Only EXPLICIT senior/lead/staff get capped.
+  return 1;
 }
 const SENIORITY_CAP = { any: 99, senior: 3, mid: 2, entry: 1 };
+// Academic/research roles (postdoc, PhD-track, faculty, research fellow) are never a
+// fit for a software-dev candidate — they require a doctorate. Skip them outright
+// (EN + FR, since LinkedIn QC postings are bilingual) so they never reach apply.
+const ACADEMIC_RE = /\b(post-?doc|postdoctoral|post-?doctorale|ph\.?\s?d|doctorate|doctoral|doctorant|research fellow(ship)?|bourse de recherche|bourse postdoctorale|professor|professeur|faculty|tenure[- ]track|lecturer|chercheur|chercheuse|ma[iî]tre de conf)\b/i;
 function jobFit(title, aa) {
   const cap = SENIORITY_CAP[aa && aa.seniorityMax] ?? 99;
   if (jobLevel(title) > cap) return { ok: false, reason: `above your level cap (${aa.seniorityMax})` };
+  if (ACADEMIC_RE.test(String(title || ''))) return { ok: false, reason: 'academic/research role (postdoc/PhD/faculty) — off-target' };
   const t = String(title || '').toLowerCase();
   for (const kw of (aa && aa.excludeKeywords) || []) {
     const k = String(kw || '').trim().toLowerCase();
@@ -161,8 +169,14 @@ function withinWindow(settings) {
 // force=true (the dashboard "Test: apply now" button) skips the window/cap/gap
 // pacing so the user can shake it out immediately — but still needs enabled.
 async function queueNext(force = false) {
+  // Free any pool slot held by a task stuck 'running'/'scheduled' (SW eviction / hung
+  // tab) so a single stall can't freeze the whole pipeline — checked every dispatch tick.
+  try { db.reconcileStaleRunning({ olderThanMinutes: 8 }); } catch {}
   const s = db.getSettings().autoApply;
-  const concurrency = Math.max(1, Math.min(8, Number(s.concurrency) || 1));
+  // The extension now runs each worker in its OWN dedicated window (one active/visible,
+  // un-throttled tab per window — see acquireApplyWindow), so parallelism is safe again.
+  // Clamp to a sane max of 3 (more windows = more flag risk + machine load).
+  const concurrency = Math.max(1, Math.min(3, Number(s.concurrency) || 1));
   if (!s.enabled) return { task: null, reason: 'disabled', concurrency };
   if (!force) {
     if (!withinWindow(s)) return { task: null, reason: 'outside-window', concurrency };
@@ -186,8 +200,16 @@ async function queueNext(force = false) {
     }
   }
 
-  const queued = db.queueList({ state: 'queued' });
-  if (!queued.length) return { task: null, reason: 'empty' };
+  let queued = db.queueList({ state: 'queued' });
+  if (!queued.length && !force) {
+    // Self-heal: when the queue drains, pull stale retriable failures back in (20-min
+    // cooldown, capped attempts) so the pool keeps working even between discovery
+    // combos — the engine no longer sits idle on a transient failure pile.
+    if (db.retryStaleQueue({ olderThanMinutes: 20, maxAttempts: 4, limit: 10 })) {
+      queued = db.queueList({ state: 'queued' });
+    }
+  }
+  if (!queued.length) return { task: null, reason: 'empty', concurrency };
   // Oldest-first (the list is DESC). Retire dead tasks instead of opening a tab for
   // them: a job can become 'submitted' (passive capture / Gmail / applied-sync /
   // manual apply) or be deleted AFTER it was queued, but the task stays 'queued'.
@@ -233,6 +255,7 @@ async function queueNext(force = false) {
       job,
       profile: profile || null,
       profileId,
+      bringToFront: !!s.bringToFrontToHydrate,   // SW focuses the apply window so an occluded page isn't throttled
       harvested,
       resume: resume ? {
         id: resume.id, name: resume.name, mime: resume.mime,
@@ -533,6 +556,10 @@ async function handle(req, res, parsed) {
   if (req.method === 'GET' && pathname === '/stats') {
     return sendJson(res, 200, { ok: true, ...db.stats() });
   }
+  if (req.method === 'GET' && pathname === '/stats/activity') {
+    const days = Number(parsed.searchParams.get('days')) || 14;
+    return sendJson(res, 200, { ok: true, days, items: db.activityTrend({ days }) });
+  }
 
   // ---- settings ----
   if (req.method === 'GET' && pathname === '/settings') {
@@ -744,7 +771,7 @@ async function handle(req, res, parsed) {
   if (req.method === 'POST' && pathname === '/queue') {
     const body = await readJson(req);
     if (!body.jobId) return sendJson(res, 400, { ok: false, error: 'jobId required' });
-    const task = db.queueAdd(body.jobId, { mode: body.mode });
+    const task = db.queueAdd(body.jobId, { mode: body.mode, force: true });
     if (!task) return sendJson(res, 404, { ok: false, error: 'job not found' });
     broadcast('queue.updated', { taskId: task.id, state: task.state });
     return sendJson(res, 200, { ok: true, task });
@@ -799,6 +826,11 @@ async function handle(req, res, parsed) {
   if (req.method === 'GET' && pathname === '/queue/parked') {
     return sendJson(res, 200, { ok: true, items: db.queueParkedQuestions() });
   }
+  // Auto-apply tasks that need the user (parked / needs-input / review) WITH their job +
+  // outstanding questions — surfaced in the Applications page to finish in place.
+  if (req.method === 'GET' && pathname === '/auto-apply/needs-you') {
+    return sendJson(res, 200, { ok: true, items: db.queueNeedsYou() });
+  }
   // Auto-apply outcome history (the "submissions data" view): ?days=N[&state=]
   if (req.method === 'GET' && pathname === '/auto-apply/history') {
     const days = Number(parsed.searchParams.get('days')) || 7;
@@ -815,7 +847,7 @@ async function handle(req, res, parsed) {
   // throttle is visible). Polled + refreshed on the queue.updated SSE.
   if (req.method === 'GET' && pathname === '/auto-apply/live') {
     const s = db.getSettings().autoApply;
-    const concurrency = Math.max(1, Math.min(8, Number(s.concurrency) || 1));
+    const concurrency = Math.max(1, Math.min(3, Number(s.concurrency) || 1));   // per-worker windows (see queueNext)
     const live = db.queueLive({ startedAt: s.startedAt || '' });
     const stats = db.queueRunStats();
     const maxPerHour = Number(s.maxPerHour) || 0;
@@ -941,8 +973,13 @@ async function handle(req, res, parsed) {
   }
   if (req.method === 'POST' && pathname === '/ai/cover-letter') {
     const ctx = await aiFeature(); if (!ctx) return;
-    const r = await provider.run(prompts.coverLetter({ ...ctx, tone: ctx.body.tone }));
-    return sendJson(res, 200, { ok: true, text: r.text, provider: r.provider });
+    // Graceful: cover letters are optional — skip cleanly when AI is unavailable.
+    try {
+      const r = await provider.run(prompts.coverLetter({ ...ctx, tone: ctx.body.tone }));
+      return sendJson(res, 200, { ok: true, text: r.text, provider: r.provider });
+    } catch (e) {
+      return sendJson(res, 200, { ok: true, text: '', aiUnavailable: true, reason: String(e?.message || e) });
+    }
   }
   if (req.method === 'POST' && pathname === '/ai/tailor-resume') {
     const ctx = await aiFeature(); if (!ctx) return;
@@ -960,11 +997,17 @@ async function handle(req, res, parsed) {
     const profile = db.profileForSource(job?.source);
     const resume = db.defaultDocument('resume');
     const qaHistory = db.qaList(body.profileId || db.resolveProfileId(job?.source), 12);
-    const r = await provider.run(prompts.answerQuestion({
-      question: body.question, fieldType: body.fieldType, options: body.options,
-      job, profile, qaHistory, resumeText: resume?.textContent || '',
-    }));
-    return sendJson(res, 200, { ok: true, result: r.json, provider: r.provider });
+    // Graceful: if AI is unavailable, return no answer (the executor parks the question
+    // for the user) instead of a 500 — keeps the run clean on Dad's no-AI machine.
+    try {
+      const r = await provider.run(prompts.answerQuestion({
+        question: body.question, fieldType: body.fieldType, options: body.options,
+        job, profile, qaHistory, resumeText: resume?.textContent || '',
+      }));
+      return sendJson(res, 200, { ok: true, result: r.json, provider: r.provider });
+    } catch (e) {
+      return sendJson(res, 200, { ok: true, result: null, aiUnavailable: true, reason: String(e?.message || e) });
+    }
   }
   if (req.method === 'POST' && pathname === '/ai/classify-email') {
     const body = await readJson(req);
@@ -987,13 +1030,16 @@ async function handle(req, res, parsed) {
     const body = await readJson(req);
     const doc = body.documentId ? db.getDocument(body.documentId, { withText: true }) : db.defaultDocument('resume');
     if (!doc?.textContent) return sendJson(res, 400, { ok: false, error: 'no extractable text in that document' });
-    const r = await provider.run(prompts.resumeParse({ resumeText: doc.textContent }));
-    // Merge: AI result wins where it has a value; deterministic extraction fills
-    // the gaps so contacts/links always come through.
-    const result = { ...(r.json || {}) };
+    // GRACEFUL DEGRADATION: deterministic extraction (contacts/links/name) ALWAYS runs,
+    // so resume import works even with no AI at all (Dad's case). AI refines it when
+    // available; if every provider fails we return the deterministic fields + a flag.
     const det = deterministicResumeFields(doc.textContent);
+    let aiJson = null, prov = 'deterministic', aiUnavailable = false;
+    try { const r = await provider.run(prompts.resumeParse({ resumeText: doc.textContent })); aiJson = r.json; prov = r.provider; }
+    catch (e) { aiUnavailable = true; log.warn && log.warn('resume-parse AI unavailable, deterministic-only:', e?.message || e); }
+    const result = { ...(aiJson || {}) };
     for (const [k, val] of Object.entries(det)) if (!result[k]) result[k] = val;
-    return sendJson(res, 200, { ok: true, result, provider: r.provider });
+    return sendJson(res, 200, { ok: true, result, provider: prov, aiUnavailable });
   }
   if (req.method === 'POST' && pathname === '/ai/validate-capture') {
     const ctx = await aiFeature(); if (!ctx) return;

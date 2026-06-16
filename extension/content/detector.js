@@ -64,6 +64,10 @@ const state = {
   answersCount: 0,
   persisted: false,
   fired: { started: false, submitted: false },
+  autoApplyDriven: false,      // true while the EXECUTOR drives this tab — passive capture must
+                               // NOT mark the job submitted then (the executor's confirmed
+                               // outcome is authoritative; otherwise a clicked-but-failed
+                               // Easy-Apply/external flow gets falsely stamped "submitted").
   lastUrl: location.href,
   lastPersistFingerprint: null,
   inflight: null,
@@ -423,6 +427,11 @@ function stopSuccessTicker() {
 
 function fireSubmitted(summary) {
   if (state.fired.submitted) return;
+  // In an executor-driven (auto-apply) tab, ONLY the executor may mark the job
+  // submitted — and only when it actually confirms a submit. Passive success
+  // detection here would falsely stamp jobs whose Easy-Apply/external flow was
+  // clicked but never completed (the "I never applied to that" bug).
+  if (state.autoApplyDriven) { log('passive submit suppressed — executor-driven tab'); return; }
   state.fired.submitted = true;
   state.stage = 'submitted';
   stopSuccessTicker();
@@ -1135,6 +1144,11 @@ export async function captureNow({ manual } = {}) {
 
 // Auto-apply executor entry (top frame only; loader enforces).
 export async function runTask(task, context) {
+  // From here on, the EXECUTOR owns this tab — suppress passive submit detection so a
+  // clicked-but-incomplete apply can't be falsely stamped submitted (executor.run does
+  // the authoritative PATCH only on a confirmed submit).
+  state.autoApplyDriven = true;
+  stopSuccessTicker();
   try {
     const mod = await import(chrome.runtime.getURL('content/executor.js'));
     return await mod.run(task, context, {

@@ -118,7 +118,13 @@ async function run({ kind, prompt, system, schema, prose = false, modelOverride 
   const s = db.getSettings().ai;
   const attempts = buildAttempts(s, { prose, modelOverride, providerOverride });
   if (!attempts.length) {
-    throw Object.assign(new Error('No AI provider is configured. Add a Claude or OpenAI API key, connect ChatGPT, or set up local AI in Settings.'), { code: 'NO_PROVIDER' });
+    // If local AI is still downloading in the background, say so — "unavailable until
+    // ready" rather than a flat "not configured" error.
+    let setupMsg = '';
+    try { const st = require('../localsetup').getState(); if (st && st.busy) setupMsg = `Local AI is still setting up in the background (${st.message || st.step}) — AI features will work once it finishes.`; } catch {}
+    throw Object.assign(
+      new Error(setupMsg || 'No AI provider is configured. Add a Claude or OpenAI API key, connect ChatGPT, or set up local AI in Settings.'),
+      { code: setupMsg ? 'AI_SETTING_UP' : 'NO_PROVIDER' });
   }
   const errors = [];
   for (const att of attempts) {

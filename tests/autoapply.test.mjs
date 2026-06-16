@@ -56,6 +56,29 @@ test('upsertJob merges tags — discovery never drops a job\'s existing tags', (
 test('discovery dedups: re-queueing the same job is a no-op while in flight', () => {
   const job = db.upsertJob({ title: 'Z', company: 'W', source: 'linkedin', status: 'started', jobUrl: 'https://x/p3' }).job;
   const t1 = db.queueAdd(job.id, { mode: 'review' });
-  const t2 = db.queueAdd(job.id, { mode: 'review' });
-  assert.equal(t1.id, t2.id, 'same in-flight job is not double-queued');
+  const t2 = db.queueAdd(job.id, { mode: 'review' });   // discovery path → honest no-op
+  assert.ok(t1 && t1.id, 'first add queues the job');
+  assert.equal(t2, null, 're-discovering an in-flight job creates no second task (and is not counted as enqueued)');
+  assert.equal(db.queueList({ state: 'queued' }).filter((t) => t.jobId === job.id).length, 1, 'queued exactly once');
+});
+
+test('a transient failure misfiled as awaiting_input never permanently blocks re-queue', () => {
+  // This is the starvation bug that zeroed out submissions: a "did not open" task was
+  // parked as awaiting_input with NO pending questions, and the OLD dedup treated it as
+  // an in-flight dup forever — so discovery could never re-queue the job.
+  const job = db.upsertJob({ title: 'Q', company: 'V', source: 'linkedin', status: 'started', jobUrl: 'https://x/p4' }).job;
+  const t = db.queueAdd(job.id, { mode: 'auto' });
+  db.queuePatch(t.id, { state: 'awaiting_input', lastError: 'application did not open (not Easy-Apply / verification)' });
+
+  // reclaimDeadParks flips the dead awaiting_input (no questions) → retriable failed.
+  assert.ok(db.reclaimDeadParks() >= 1, 'dead awaiting_input reclaimed to failed');
+  assert.equal(db.queueList({ state: 'awaiting_input' }).filter((x) => x.jobId === job.id).length, 0, 'no longer awaiting_input');
+
+  // A GENUINE intake (real pending questions) must NOT be reclaimed.
+  const g = db.upsertJob({ title: 'G', company: 'V', source: 'linkedin', status: 'started', jobUrl: 'https://x/p5' }).job;
+  const gt = db.queueAdd(g.id, { mode: 'auto' });
+  db.queuePatch(gt.id, { state: 'awaiting_input', pendingQuestions: [{ question: 'Salary expectation?', reason: 'x' }] });
+  const reclaimed = db.reclaimDeadParks();
+  assert.equal(db.queueList({ state: 'awaiting_input' }).filter((x) => x.jobId === g.id).length, 1, 'genuine intake is preserved');
+  assert.ok(reclaimed === 0, 'a task with real questions is not reclaimed');
 });

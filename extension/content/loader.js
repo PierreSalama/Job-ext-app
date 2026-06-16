@@ -89,7 +89,7 @@
       if (!IS_TOP) { sendResponse({ ok: false, error: 'not top frame' }); return; }
       ensureEngine().then(async (engine) => {
         if (!engine || !engine.runDiscover) return sendResponse({ ok: false, error: 'engine failed to load', jobs: [] });
-        sendResponse(await engine.runDiscover({ source: msg.source, max: msg.max }));
+        sendResponse(await engine.runDiscover({ source: msg.source, max: msg.max, easyApplyOnly: msg.easyApplyOnly !== false }));
       });
       return true;
     }

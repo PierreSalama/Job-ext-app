@@ -27,6 +27,10 @@ const LEGAL_RX = /(work.*authoriz|sponsor|visa|citizen|clearance|ethnic|race|gen
 // authorization / sponsorship / citizenship stay fillable (that's the profile's
 // purpose); this list is the EEO + criminal-history subset only.
 const NEVER_AUTOFILL_RX = /(ethnic|race\b|gender|\bsex\b|disabilit|veteran|criminal|background.*check|felony|conviction|pronoun)/i;
+// Optional, non-text-answerable fields (a profile photo/headshot URL, etc.) — leave
+// them BLANK and move on instead of parking the whole job. They're almost always
+// optional, and the AI correctly refuses to invent a photo URL.
+const OPTIONAL_SKIP_RX = /(head\s?shot|profile (photo|picture|image)|upload (a )?(photo|picture|image)|\bphoto\b|\bavatar\b|picture of you|middle name|middle initial)/i;
 const CAPTCHA_RX = /captcha|verify (that )?you('| a)re (a )?human|unusual activity|are you a robot/i;
 const ADVANCE_KEYWORDS = [
   /^submit application$/i, /^submit$/i, /^submit & continue$/i,
@@ -254,6 +258,23 @@ function isFinalSubmit(el) {
   return FINAL_SUBMIT_RX.test(btnText(el)) || isSubmitClick(el);
 }
 
+// Positive evidence the posting is EXTERNAL — a visible CTA that sends you off to the
+// company's own ATS rather than an in-page Easy-Apply. Lets us bail in ~0s instead of
+// spinning ~12s waiting for a form that will never open.
+function externalApplyPresent() {
+  for (const el of qsa('a, button')) {
+    if (!isProbablyVisible(el)) continue;
+    const t = btnText(el).toLowerCase();
+    if (!t) continue;
+    if (/apply on (the )?company|apply externally|apply on employer|on company (site|website)|apply on .* website/.test(t)) return true;
+    if (el.tagName === 'A') {
+      const href = el.getAttribute('href') || '';
+      if (/^https?:\/\//i.test(href) && !/linkedin\.com|indeed\.com/i.test(href) && /\bapply\b/.test(t)) return true;
+    }
+  }
+  return false;
+}
+
 // After clicking a final submit, the application is "sent" when the page shows a
 // real success confirmation (text or URL — reuses the maintained EN/FR signals in
 // success.js) OR, only when we actually had a real field-bearing apply modal open,
@@ -403,8 +424,8 @@ export async function run(task, context, helpers) {
     if (blocker) {
       logLine('warn', `${blocker} detected — handing back to you`);
       setStatus(blocker === 'captcha' ? 'CAPTCHA — your move' : 'Login required — your move');
-      report({ state: 'awaiting_input', lastError: blocker });
-      finalState = 'awaiting_input';
+      report({ state: 'failed', lastError: blocker === 'captcha' ? 'captcha — pass it in this browser, will retry' : 'login required — sign into the site in this browser, will retry' });
+      finalState = 'failed';
       break;
     }
 
@@ -433,15 +454,15 @@ export async function run(task, context, helpers) {
       }
       return true;
     }) : [];
-    const filled = engine.fill(suggestions);
+    const filled = await engine.fill(suggestions);
     if (filled) logLine('ok', `filled ${filled} field(s) from profile/history`);
 
     // ---- resume upload ----
     const att = haveForm ? await tryAttachResume(root, resume) : { attempted: false, attached: 0 };
     if (resume?.id && att.attempted && att.attached === 0) {
       logLine('err', 'resume could not be attached — stopping for you to upload it');
-      report({ state: 'awaiting_input', lastError: 'resume attachment failed' });
-      finalState = 'awaiting_input';
+      report({ state: 'failed', lastError: 'resume attachment failed (will retry)' });
+      finalState = 'failed';
       break;
     }
 
@@ -452,6 +473,12 @@ export async function run(task, context, helpers) {
       if (LEGAL_RX.test(u.label)) {
         logLine('warn', `legal/eligibility question not in profile: "${u.label.slice(0, 60)}" — leaving for you`);
         if (u.required || onJobBoard) park(u.label, u.fieldType, u.options, 'legal/eligibility — needs your answer');
+        continue;
+      }
+      // Optional photo/headshot fields: leave blank + move on — don't park the job on a
+      // field that's almost always optional and can't be truthfully auto-answered.
+      if (OPTIONAL_SKIP_RX.test(u.label)) {
+        logLine('warn', `left optional field blank: "${u.label.slice(0, 40)}" (photo/headshot — not auto-answerable)`);
         continue;
       }
       setStatus(`Step ${S.step}: thinking about "${u.label.slice(0, 40)}…"`);
@@ -471,7 +498,7 @@ export async function run(task, context, helpers) {
         if (u.required || onJobBoard) park(u.label, u.fieldType, u.options, a && a.reason ? a.reason : 'no confident answer');
         continue;
       }
-      const ok = engine.fill([{ input: u.input, value: a.answer }]);
+      const ok = await engine.fill([{ input: u.input, value: a.answer }]);
       if (ok) {
         logLine('ok', `AI answered "${u.label.slice(0, 40)}" (conf ${a.confidence.toFixed(2)})`);
         await engine.recordAnswer({ question: u.label, answer: a.answer, fieldType: u.fieldType, source: 'ai', jobId: job?.id });
@@ -491,32 +518,66 @@ export async function run(task, context, helpers) {
     let btn = findAdvanceButton(root) || (!haveForm ? findEasyApplyButton() : null);
     if (!btn) {
       const opening = !everHadForm;   // the apply form has never appeared yet
-      logLine('warn', opening ? 'couldn’t open the application — waiting a bit' : 'no advance button — waiting 30s for the page (or you)');
+      // Background/occluded apply tabs get their JS timers throttled by Chrome, so
+      // LinkedIn's Easy-Apply button can hydrate LATE — or render an offsite-looking
+      // "Apply" first and swap in the real button seconds later. We therefore do NOT
+      // bail early on a "looks external" signal: wait for hydration (nudging the lazy
+      // renderer with a scroll), and only decide once the button truly never appears.
+      // Was this tab occluded/hidden? Chrome throttles timers in a tab whose window is
+      // minimized OR fully covered by another window (Windows native-occlusion), and a
+      // throttled tab's SPA (LinkedIn) often never hydrates the Easy-Apply button. Detect
+      // it so we (a) wait MUCH longer in real wall-clock and (b) report the true cause.
+      const wasHidden = (typeof document !== 'undefined' && document.visibilityState === 'hidden');
+      if (wasHidden && opening) {
+        // Ask the background to briefly raise the dedicated apply window (it restores your
+        // focus right after) so Chrome un-throttles the tab and the button can render.
+        try { chrome.runtime?.sendMessage?.({ type: 'jat11.nudge-apply-window' }); } catch {}
+      }
+      logLine('warn', opening
+        ? (wasHidden ? 'apply tab is hidden/occluded — Chrome throttled it; nudging its window to hydrate' : 'application not open yet — waiting for it to hydrate')
+        : 'no advance button — waiting for the page (or you)');
       let found = null;
-      const tries = opening ? 24 : 60;   // ~12s for a slow Easy-Apply button to hydrate; 30s once in-form
+      // A hidden/throttled tab gets ~1 timer tick/sec, so it needs far more real time —
+      // give it up to ~3 min (the pool's hard timeout still caps a truly dead tab).
+      const tries = opening ? (wasHidden ? 180 : 40) : 60;
       for (let i = 0; i < tries && !S.cancelled; i++) {
+        if (opening && i % 4 === 0) { try { window.scrollTo(0, 600); window.scrollTo(0, 0); } catch {} }
         await sleep(500);
         found = findAdvanceButton() || (!haveForm ? findEasyApplyButton() : null);
         if (found) break;
       }
       if (!found) {
-        // If we're stuck because of unanswered questions, park (self-heal) rather
-        // than a generic "needs input" — so the next run can ask + retry.
+        // If we're stuck because of unanswered questions, park (self-heal) so the
+        // next run can ask + retry.
         if (parked.length) { reportParked('no-advance'); break; }
         if (submitAttempted) {
-          // We clicked the final submit but couldn't auto-confirm it. Don't call it
-          // failed, and don't falsely stamp it submitted — flag it for a quick look.
+          // Final submit clicked but confirmation not seen — flag for a look, don't
+          // falsely stamp submitted.
           logLine('ok', 'final submit clicked — confirmation not detected; flagged for your review');
           report({ state: 'awaiting_review', lastError: 'submitted but not auto-confirmed — please verify', transcriptAppend: { note: 'submit clicked; no confirmation seen' } });
           finalState = 'awaiting_review';
-        } else {
-          // Either the Easy-Apply form never opened (likely external/verification —
-          // nothing to auto-do) or in-form validation needs a human. Leave it as
-          // awaiting_input: it's in the queue de-dup set, so discovery won't churn
-          // it into a re-skip loop.
-          report({ state: 'awaiting_input', lastError: opening ? 'application did not open (not Easy-Apply / verification)' : 'no advance button found' });
-          finalState = 'awaiting_input';
+          break;
         }
+        // The Easy-Apply form never opened this pass. Distinguish two cases:
+        const ext = opening && externalApplyPresent();
+        if (ext) {
+          // A genuinely EXTERNAL posting (apply on the company site) — JAT can't drive it.
+          // SKIP it (terminal): retrying wastes the pool + drags the success rate, and the
+          // tab is now an active/visible window so this detection is reliable.
+          report({ state: 'skipped', lastError: 'external — apply on the company site (not auto-applicable)', applyRoute: 'external' });
+          finalState = 'skipped'; break;
+        }
+        // Otherwise it's a transient non-open (late/throttled hydration, verification
+        // gate) — fail RETRIABLY so retryStaleQueue re-attempts it later (capped).
+        report({
+          state: 'failed',
+          lastError: opening
+            ? (wasHidden
+                ? 'apply window was occluded → Chrome throttled the tab so LinkedIn never hydrated — keep its window uncovered (or enable bring-to-front) — will retry'
+                : 'Easy-Apply form did not hydrate — will retry')
+            : 'no advance button found — will retry',
+        });
+        finalState = 'failed';
         break;
       }
       continue;
@@ -562,9 +623,44 @@ export async function run(task, context, helpers) {
       logLine('warn', 'page did not change after click');
       if (++noChange >= 3) {
         if (parked.length) { reportParked('stalled'); break; }
-        logLine('warn', 'stuck — the page stopped advancing; handing back to you');
-        report({ state: 'awaiting_input', lastError: 'stuck on a step (page stopped advancing)' });
-        finalState = 'awaiting_input';
+        // Find WHY the page won't advance. LinkedIn flags the offending field with an
+        // INLINE ERROR (role=alert / artdeco-inline-feedback--error) — that's the ground
+        // truth for what's blocking, even when the field isn't "empty" in a way the field
+        // scan catches (bad format, a resume that didn't attach, an un-pickable dropdown).
+        let resumeBlocked = false;
+        let blockerText = '';            // the exact on-screen reason the page won't advance
+        let blockerLabels = [];
+        await sleep(700);   // LinkedIn renders the inline errors a beat AFTER the rejected click
+        try {
+          const scope = root || document;
+          const errEls = Array.from(scope.querySelectorAll('.artdeco-inline-feedback--error, [class*="inline-feedback--error"], [class*="error-text"], [class*="form-element__error"], [data-test-form-element-error-messages], [role="alert"]'))
+            .filter((e) => isProbablyVisible(e) && (e.textContent || '').trim() && /required|invalid|select|enter|provide|valid|must|please|choose|answer/i.test(e.textContent || ''));
+          for (const er of errEls.slice(0, 6)) {
+            const errTxt = compactText(er.textContent || '').slice(0, 90);
+            const cont = er.closest('[data-test-form-element], .fb-dash-form-element, .jobs-easy-apply-form-element, fieldset, [class*="form-element"]') || er.parentElement;
+            const lbl = compactText(cont?.querySelector('label, legend, .t-bold, [class*="label"]')?.textContent || '');
+            if (!blockerText) blockerText = lbl ? `${lbl} — ${errTxt}` : errTxt;
+            if (/resume|cv\b|upload/i.test(errTxt)) { resumeBlocked = true; continue; }   // not a question — a failed attach
+            if (lbl) { blockerLabels.push(lbl); park(lbl.slice(0, 120), 'text', null, 'blocked the application: ' + errTxt); }
+          }
+        } catch {}
+        // Also park any required field still empty (a dropdown we couldn't auto-pick).
+        try {
+          const unfilled = (await engine.scanUnknown(root)).filter((u) => u && u.required);
+          for (const u of unfilled.slice(0, 5)) { if (!blockerText) blockerText = `${u.label} — required, not filled`; park(u.label, u.fieldType, u.options, 'blocked the application — needs your answer'); }
+        } catch {}
+        if (parked.length) { logLine('warn', 'blocked by: ' + (blockerLabels.join('; ') || blockerText)); reportParked('stalled'); break; }
+        if (resumeBlocked) {
+          logLine('err', 'résumé did not attach — flagged for retry');
+          report({ state: 'failed', lastError: 'résumé did not attach (LinkedIn says it is required) — will retry' });
+          finalState = 'failed'; break;
+        }
+        // Report the SPECIFIC blocker (what was on screen), not a generic "stuck", so we
+        // know exactly which field to resolve next.
+        const why = blockerText ? `blocked: ${blockerText} — will retry` : 'stuck on a step (page stopped advancing) — will retry';
+        logLine('warn', 'stuck — ' + (blockerText || 'page stopped advancing'));
+        report({ state: 'failed', lastError: why });
+        finalState = 'failed';
         break;
       }
     } else if (changed) { noChange = 0; }
@@ -607,8 +703,8 @@ export async function run(task, context, helpers) {
     if (parked.length) { reportParked('max-steps'); }
     else {
       logLine('warn', 'max steps reached — stopping for safety');
-      report({ state: 'awaiting_input', lastError: 'max steps reached' });
-      finalState = 'awaiting_input';
+      report({ state: 'failed', lastError: 'max steps reached — will retry' });
+      finalState = 'failed';
     }
   }
 

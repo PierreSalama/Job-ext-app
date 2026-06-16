@@ -109,12 +109,26 @@ async function setup({ models, cfg }) {
     const d = await detect(cfg);
     if (!d.installed) {
       const installer = await downloadInstaller();
-      set({ step: 'installing-ollama', message: 'Launching the Ollama installer — click through it, then this continues automatically.' });
-      try { spawn(installer, [], { detached: true, stdio: 'ignore' }).unref(); } catch (e) { throw new Error('could not launch installer: ' + e.message); }
-      // wait (up to ~5 min) for the user to finish the install + server to come up
+      set({ step: 'installing-ollama', message: 'Installing Ollama in the background…' });
+      // UNATTENDED install (Ollama's installer is Inno Setup) so non-technical users
+      // (Dad) don't have to click anything. Fall back to a normal launch if the silent
+      // run errors. The async ENOENT/error is handled so it can't crash the app.
+      let silentOk = false;
+      try {
+        const child = spawn(installer, ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOCANCEL'], { detached: true, stdio: 'ignore' });
+        child.on('error', (e) => { try { log.warn('silent installer error', e && e.message); } catch {} });
+        child.unref();
+        silentOk = true;
+      } catch (e) { log.warn('silent install failed, trying interactive', e.message); }
+      if (!silentOk) {
+        set({ message: 'Opening the Ollama installer — click through it, then this continues automatically.' });
+        try { const c = spawn(installer, [], { detached: true, stdio: 'ignore' }); c.on('error', () => {}); c.unref(); }
+        catch (e) { throw new Error('could not launch installer: ' + e.message); }
+      }
+      // wait (up to ~6 min) for the install to finish + the server to come up
       let up = false;
-      for (let i = 0; i < 60; i++) { await new Promise((r) => setTimeout(r, 5000)); if (await ensureServer(cfg)) { up = true; break; } }
-      if (!up) throw new Error('Ollama not detected after install — finish the installer, then click Set up again.');
+      for (let i = 0; i < 72; i++) { await new Promise((r) => setTimeout(r, 5000)); if (await ensureServer(cfg)) { up = true; break; } }
+      if (!up) throw new Error('Ollama not detected after install — open it once, then it will be picked up automatically.');
     } else if (!(await ensureServer(cfg))) {
       throw new Error('Ollama is installed but not responding — start it, then retry.');
     }

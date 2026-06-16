@@ -689,6 +689,30 @@ function mergeAttachments(prev, incoming) {
   return out;
 }
 
+// Annotate jobs with auto-apply PROVENANCE for the UI: whether the auto-apply pipeline
+// ever touched the job (`autoApply`), and HOW it was submitted (`via`: 'auto' if a
+// completed auto-apply task exists, 'manual' if it reached submitted+ without one, else
+// null = not submitted yet). One batched query, so list views stay cheap.
+const SUBMITTED_PLUS = new Set(['submitted', 'contacted', 'interview_1', 'interview_2', 'interview_final', 'offer', 'hired', 'rejected', 'ghosted']);
+function annotateAutoApply(jobs) {
+  if (!jobs || !jobs.length) return jobs || [];
+  const ids = jobs.map((j) => j.id);
+  const place = ids.map(() => '?').join(',');
+  const map = {};
+  // "Submitted via auto-apply" = the executor reached a done OR awaiting_review task
+  // (awaiting_review = submit was clicked, pending confirm). A merely failed/skipped
+  // task does NOT count — those never actually submitted.
+  for (const r of all(
+    `SELECT job_id, MAX(CASE WHEN state IN ('done','awaiting_review') THEN 1 ELSE 0 END) AS hasSubmitted
+       FROM auto_apply_tasks WHERE job_id IN (${place}) GROUP BY job_id`, ids)) map[r.job_id] = r;
+  for (const j of jobs) {
+    const m = map[j.id];
+    j.autoApply = !!m || (Array.isArray(j.tags) && j.tags.includes('auto-apply'));
+    j.via = (m && m.hasSubmitted) ? 'auto' : (SUBMITTED_PLUS.has(j.status) ? 'manual' : null);
+  }
+  return jobs;
+}
+
 function listJobs({ status, source, needsReview, q, limit, offset } = {}) {
   let sql = 'SELECT * FROM jobs WHERE 1=1';
   const args = [];
@@ -705,11 +729,12 @@ function listJobs({ status, source, needsReview, q, limit, offset } = {}) {
   if (lim) { sql += ' LIMIT ?'; args.push(lim); }
   const off = Number.isFinite(Number(offset)) && Number(offset) > 0 ? Number(offset) : 0;
   if (lim && off) { sql += ' OFFSET ?'; args.push(off); }
-  return all(sql, args).map(rowToJob);
+  return annotateAutoApply(all(sql, args).map(rowToJob));
 }
 
 function getJob(id) {
-  return rowToJob(get('SELECT * FROM jobs WHERE id = ?', [id]));
+  const j = rowToJob(get('SELECT * FROM jobs WHERE id = ?', [id]));
+  return j ? annotateAutoApply([j])[0] : j;
 }
 
 function listEvents(jobId, limit = 200) {
@@ -788,7 +813,7 @@ function upsertJob(input, opts = {}) {
       ts, ts,
       incoming.status === 'submitted' ? (incoming.submittedAt || ts) : null,   // historical date for imports
     ]);
-    if (!opts.skipHarvest) harvestAnswersToProfile(incoming.answers, { jobId: id, source: incoming.source });
+    if (!opts.skipHarvest) harvestAnswersToProfile(incoming.answers, { jobId: id, source: incoming.source, status: incoming.status });
     return { job: getJob(id), action: 'created', previousStatus: null, statusChanged: true };
   }
 
@@ -844,7 +869,7 @@ function upsertJob(input, opts = {}) {
     existing.id,
   ]);
 
-  if (!opts.skipHarvest) harvestAnswersToProfile(incoming.answers, { jobId: existing.id, source: incoming.source || prev.source });
+  if (!opts.skipHarvest) harvestAnswersToProfile(incoming.answers, { jobId: existing.id, source: incoming.source || prev.source, status: incoming.status || prev.status });
 
   const after = getJob(existing.id);
   return {
@@ -925,7 +950,55 @@ function stats() {
   for (const r of all('SELECT source, COUNT(*) AS n FROM jobs GROUP BY source')) {
     bySource[r.source || 'unknown'] = r.n;
   }
-  return { total, thisWeek, needsReview, byStatus, bySource };
+  // Manual vs auto-apply split of submitted applications (the dashboard distinction the
+  // user asked for): a job counts as AUTO if a completed auto-apply task exists for it;
+  // the rest of the submitted-or-beyond jobs were applied to by hand.
+  const submittedTotal = [...SUBMITTED_PLUS].reduce((s, st) => s + (byStatus[st] || 0), 0);
+  const submittedAuto = get(
+    `SELECT COUNT(DISTINCT t.job_id) AS n FROM auto_apply_tasks t WHERE t.state = 'done'`).n;
+  const submittedManual = Math.max(0, submittedTotal - submittedAuto);
+  const dayAgo = new Date(Date.now() - 86400 * 1000).toISOString();
+  const submittedToday = get("SELECT COUNT(*) AS n FROM auto_apply_tasks WHERE state = 'done' AND updated_at >= ?", [dayAgo]).n;
+  // Pipeline funnel + response signal for the dashboard.
+  const reached = (sts) => sts.reduce((s, st) => s + (byStatus[st] || 0), 0);
+  const responded = reached(['contacted', 'interview_1', 'interview_2', 'interview_final', 'offer', 'hired']);
+  const interviews = reached(['interview_1', 'interview_2', 'interview_final', 'offer', 'hired']);
+  const offers = reached(['offer', 'hired']);
+  const responseRate = submittedTotal ? Math.round(100 * responded / submittedTotal) : null;
+  return {
+    total, thisWeek, needsReview, byStatus, bySource,
+    submittedTotal, submittedAuto, submittedManual, submittedToday,
+    funnel: { submitted: submittedTotal, responded, interviews, offers, responseRate },
+  };
+}
+
+// Per-day submission activity for the dashboard sparkline — auto (completed auto-apply
+// tasks) vs manual (jobs that reached submitted+ without one). Last `days` days, oldest→newest.
+function activityTrend({ days = 14 } = {}) {
+  const n = Math.max(1, Math.min(60, Number(days) || 14));
+  const out = [];
+  const idx = {};
+  for (let i = n - 1; i >= 0; i--) {
+    const d = new Date(Date.now() - i * 86400 * 1000).toISOString().slice(0, 10);
+    const row = { date: d, auto: 0, manual: 0 };
+    idx[d] = row; out.push(row);
+  }
+  const since = out[0].date;
+  for (const r of all("SELECT substr(updated_at,1,10) AS d, COUNT(*) AS n FROM auto_apply_tasks WHERE state='done' AND substr(updated_at,1,10) >= ? GROUP BY d", [since])) {
+    if (idx[r.d]) idx[r.d].auto = r.n;
+  }
+  // Manual = a job's status became submitted via a NON-auto-apply event (passive capture,
+  // manual change, sync), counted on the event day.
+  for (const r of all(
+    `SELECT substr(e.timestamp,1,10) AS d, COUNT(DISTINCT e.job_id) AS n
+       FROM events e
+      WHERE e.type='status_changed' AND e.source NOT IN ('auto-apply','system')
+        AND substr(e.timestamp,1,10) >= ?
+        AND NOT EXISTS (SELECT 1 FROM auto_apply_tasks t WHERE t.job_id=e.job_id AND t.state IN ('done','awaiting_review'))
+      GROUP BY d`, [since])) {
+    if (idx[r.d]) idx[r.d].manual = r.n;
+  }
+  return out;
 }
 
 // ============================================================
@@ -1198,21 +1271,41 @@ function isSensitiveKey(key) {
   try { return SENSITIVE_RX.test(k) || SENSITIVE_RX.test(humanizeKey(k)); } catch { return SENSITIVE_RX.test(k); }
 }
 
+// UI-noise guard: passive capture occasionally scrapes job-board chrome (the search
+// box, filter sliders, nav) into "answers". Never let that pollute profile memory.
+const JUNK_KEY_RX = /^(search( search)?|filter|sort( by)?|skip to (main )?content|menu|home|messaging|notifications|my network|jobs?|sign in|join now|easy apply|save[d]?|dismiss|rd|rb|rm|show more|see more|distance|date posted)$/i;
+function isJunkAnswer(key, value) {
+  let k = '';
+  try { k = humanizeKey(String(key || '')).trim().toLowerCase(); } catch { k = String(key || '').trim().toLowerCase(); }
+  if (!k || k.length < 2) return true;
+  if (JUNK_KEY_RX.test(k)) return true;
+  const v = String(value == null ? '' : value).trim();
+  if (!v) return true;
+  if (v.toLowerCase() === k) return true;                          // "search search"-style echo
+  if (/slider|range/.test(k) && /^[\d.\s-]{1,4}$/.test(v)) return true;  // filter-slider thumb values
+  return false;
+}
+
 // Fan a job's captured answers into a profile's memory (called from upsertJob).
 // The owning profile = the source-matched profile (else the default).
-function harvestAnswersToProfile(answers, { profileId, jobId, source } = {}) {
+function harvestAnswersToProfile(answers, { profileId, jobId, source, status } = {}) {
   if (!answers || typeof answers !== 'object') return 0;
   let enabled = true;
   try { enabled = getSettings().harvest.enabled !== false; } catch {}
   if (!enabled) return 0;
   const pid = profileId || resolveProfileId(source);
+  // SELF-LEARNING: answers from an application that actually went through (submitted —
+  // manual OR auto) demonstrably worked, so learn them with HIGH confidence; in-progress
+  // captures stay tentative. High-confidence answers are preferred next time.
+  const confidence = status === 'submitted' ? 0.85 : 0.6;
   let n = 0;
   for (const [key, raw] of Object.entries(answers)) {
     if (isSensitiveKey(key)) continue;
     const value = Array.isArray(raw) ? raw.join(', ') : raw;
     if (value == null || String(value).trim() === '') continue;
+    if (isJunkAnswer(key, value)) continue;   // never harvest job-board UI noise
     try {
-      if (profileFieldUpsert({ profileId: pid, question: humanizeKey(key), value, sourceJobId: jobId, source, confidence: 0.6 })) n++;
+      if (profileFieldUpsert({ profileId: pid, question: humanizeKey(key), value, sourceJobId: jobId, source, confidence })) n++;
     } catch {}
   }
   return n;
@@ -1608,15 +1701,28 @@ function queueBreakdown({ days = 30 } = {}) {
 // parks are counted separately, honestly).
 function queueLive({ startedAt } = {}) {
   const running = all(
-    `SELECT t.*, j.title AS _title, j.company AS _company, j.source AS _src
+    `SELECT t.*, j.title AS _title, j.company AS _company, j.source AS _src, j.job_url AS _url
      FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
      WHERE t.state = 'running' ORDER BY t.scheduled_at ASC`
   ).map((r) => {
     const tk = rowToTask(r);
-    const last = tk.transcript[tk.transcript.length - 1] || null;
+    const tr = tk.transcript || [];
+    const last = tr[tr.length - 1] || null;
     return {
       taskId: tk.id, title: r._title || '', company: r._company || '', source: r._src || '',
       step: last ? String(last.text || last.note || last.step || '').slice(0, 120) : 'starting…',
+      // Rich live detail — the app's Auto-apply page renders a per-worker card from this:
+      // the last several transcript lines ARE what the runner is seeing / filling /
+      // answering right now, plus its route, attempt count, any pending questions + URL.
+      trail: tr.slice(-9).map((e) => ({
+        ts: e.ts || null,
+        level: e.level || 'info',
+        text: String(e.text || e.note || e.step || '').slice(0, 170),
+      })),
+      route: tk.applyRoute || null,
+      attempts: tk.attempts || 0,
+      pendingQuestions: (tk.pendingQuestions || []).slice(0, 6),
+      jobUrl: r._url || '',
       startedAt: tk.scheduledAt || tk.updatedAt, mode: tk.mode,
     };
   });
@@ -1652,17 +1758,78 @@ function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25 } 
        AND COALESCE(t.attempts, 0) < ? AND j.status != 'submitted'
      ORDER BY t.updated_at ASC LIMIT ?`, [cutoff, maxAttempts, limit]);
   let n = 0;
-  for (const r of rows) { if (queuePatch(r.id, { state: 'queued', lastError: null })) n++; }
+  for (const r of rows) { if (queuePatch(r.id, { state: 'queued', lastError: null, attemptsDelta: 1 })) n++; }
   return n;
 }
 
-function queueAdd(jobId, { mode } = {}) {
+// Tasks stuck in 'running'/'scheduled' (an SW eviction abandoned the launch, or the
+// executor hung on a frozen tab) never reconcile themselves — they hold the pool slot
+// and STALL the whole pipeline (zero new applies). Flip ones with no activity for
+// `olderThanMinutes` back to retriable 'failed' so the slot frees + the job retries.
+function reconcileStaleRunning({ olderThanMinutes = 8 } = {}) {
+  const cutoff = new Date(Date.now() - Math.max(1, olderThanMinutes) * 60000).toISOString();
+  const rows = all("SELECT id FROM auto_apply_tasks WHERE state IN ('running','scheduled') AND updated_at < ?", [cutoff]);
+  for (const r of rows) run("UPDATE auto_apply_tasks SET state='failed', last_error=COALESCE(NULLIF(last_error,''),'timed out / interrupted — will retry'), updated_at=? WHERE id=?", [now(), r.id]);
+  return rows.length;
+}
+
+// One-shot cleanup: tasks misfiled as awaiting_input/parked that carry NO real
+// pending question are transient automation failures (the Easy-Apply form never
+// hydrated, the page stalled, max steps, etc.) — NOT genuine "needs you" intake.
+// Flip them to 'failed' so they (a) stop blocking discovery from re-queueing the
+// job, (b) become retriable via retryStaleQueue, and (c) stop inflating a phantom
+// "needs you" count. Genuine intake (real pending questions) is left untouched.
+function reclaimDeadParks() {
+  const rows = all(
+    `SELECT id FROM auto_apply_tasks
+      WHERE state IN ('awaiting_input','parked')
+        AND (pending_questions IS NULL OR TRIM(pending_questions) IN ('', '[]', 'null'))`);
+  for (const r of rows) {
+    run("UPDATE auto_apply_tasks SET state='failed', last_error=COALESCE(NULLIF(last_error,''), park_reason, 'auto-apply could not complete'), updated_at=? WHERE id=?", [now(), r.id]);
+  }
+  return rows.length;
+}
+
+// Repair PASSIVE-CAPTURE false submits: auto-apply-discovered jobs that the page
+// detector stamped 'submitted' even though their auto-apply task never actually
+// completed (a clicked-but-failed Easy-Apply / external flow — the "I never applied to
+// that" bug). Conservative: only jobs tagged auto-apply, currently 'submitted', with at
+// least one auto-apply task but NONE done/awaiting_review, and whose submit was NOT a
+// manual user change. Reverts them to 'started' so the ledger is honest. Idempotent.
+function reconcileFalseSubmits() {
+  const rows = all(
+    `SELECT j.id FROM jobs j
+      WHERE j.status = 'submitted' AND j.tags LIKE '%auto-apply%'
+        AND EXISTS (SELECT 1 FROM auto_apply_tasks t WHERE t.job_id = j.id)
+        AND NOT EXISTS (SELECT 1 FROM auto_apply_tasks t WHERE t.job_id = j.id AND t.state IN ('done','awaiting_review'))
+        AND NOT EXISTS (SELECT 1 FROM events e WHERE e.job_id = j.id AND e.type = 'status_changed' AND e.source IN ('manual','user'))`);
+  for (const r of rows) {
+    run("UPDATE jobs SET status='started', updated_at=? WHERE id=?", [now(), r.id]);
+    recordEvent({ jobId: r.id, type: 'status_changed', source: 'system', summary: 'Reverted a false auto-apply submit (the application never actually completed)', data: {} });
+  }
+  return rows.length;
+}
+
+function queueAdd(jobId, { mode, force = false } = {}) {
   if (!getJob(jobId)) return null;
-  const dup = get(
-    `SELECT id FROM auto_apply_tasks WHERE job_id = ?
-     AND state IN ('queued','scheduled','running','awaiting_review','awaiting_input','parked') LIMIT 1`,
-    [jobId]);
-  if (dup) return rowToTask(get('SELECT * FROM auto_apply_tasks WHERE id = ?', [dup.id]));
+  // The MOST RECENT task for this job governs whether it may be (re)queued.
+  const last = get('SELECT * FROM auto_apply_tasks WHERE job_id = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1', [jobId]);
+  if (last) {
+    // Discovery path: only ever queues a BRAND-NEW job. Any existing task (in-flight,
+    // genuine intake, already applied, OR a transient failure) is left to the retry /
+    // intake systems (retryStaleQueue, queueRetryParked). This is the fix for the
+    // starvation bug: a transient failure misfiled as awaiting_input used to block
+    // re-queue forever, so a saturated search space zeroed out the whole queue.
+    if (!force) return null;
+    // force = manual "queue this job": re-attempt unless it's genuinely in flight.
+    const inFlight = ['queued', 'scheduled', 'running', 'awaiting_review'].includes(last.state);
+    if (inFlight) return rowToTask(last);
+    if (last.state !== 'done') {
+      run("UPDATE auto_apply_tasks SET state='queued', last_error=NULL, park_reason=NULL, pending_questions=NULL, updated_at=? WHERE id=?", [now(), last.id]);
+      return rowToTask(get('SELECT * FROM auto_apply_tasks WHERE id=?', [last.id]));
+    }
+    // already applied (done) + force → fall through and create a fresh task.
+  }
   const id = uid('task');
   const ts = now();
   run(`INSERT INTO auto_apply_tasks (id, job_id, state, mode, created_at, updated_at)
@@ -1715,6 +1882,32 @@ function queueParkedQuestions() {
     }
   }
   return out;
+}
+
+// Tasks that need the USER to act — surfaced in the Applications page so they can be
+// finished there: parked / awaiting_input (a missing answer) and awaiting_review
+// (a review-mode stop). Each carries its job + the still-outstanding questions (filtered
+// through the same profile-memory check as queueParkedQuestions, so we never re-ask what
+// the profile already knows).
+function queueNeedsYou() {
+  const rows = all(
+    `SELECT t.*, j.title AS _title, j.company AS _company, j.source AS _src, j.job_url AS _url, j.status AS _status
+       FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
+      WHERE t.state IN ('parked', 'awaiting_input', 'awaiting_review')
+      ORDER BY t.updated_at DESC LIMIT 100`);
+  return rows.map((r) => {
+    const tk = rowToTask(r);
+    const pid = resolveProfileId(r._src);
+    const questions = (tk.pendingQuestions || []).filter((q) => q && q.question
+      && !profileFieldLookup(pid, q.question) && !qaLookup(pid, q.question));
+    return {
+      taskId: tk.id, jobId: tk.jobId, state: tk.state, route: tk.applyRoute || null,
+      reason: tk.lastError || tk.parkReason || '',
+      title: r._title || '', company: r._company || '', source: r._src || '',
+      jobUrl: r._url || '', jobStatus: r._status || '',
+      questions, updatedAt: tk.updatedAt,
+    };
+  });
 }
 
 // Re-check every parked task; if its profile's memory now answers ALL its pending
@@ -1979,7 +2172,7 @@ function jobsForMatching() {
 module.exports = {
   open, close, backupNow, dailyBackup, maintenance, transaction,
   getSettings, patchSettings, kvGet, kvSet,
-  listJobs, getJob, upsertJob, patchJob, deleteJob, stats,
+  listJobs, getJob, upsertJob, patchJob, deleteJob, stats, activityTrend,
   listEvents, listRecentEvents, recordEvent,
   qaRecord, qaLookup, qaList, qaDelete, normalizeQuestion, guessLocale,
   profileFieldUpsert, profileFieldList, profileFieldSet, profileFieldDelete,
@@ -1989,7 +2182,7 @@ module.exports = {
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,
   extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
-  queueList, queueHistory, queueBreakdown, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueRetryParked, retryStaleQueue, saveIntakeAnswer,
+  queueList, queueHistory, queueBreakdown, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, saveIntakeAnswer,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,
   emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching,

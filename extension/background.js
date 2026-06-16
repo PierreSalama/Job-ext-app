@@ -64,6 +64,7 @@ chrome.webNavigation.onReferenceFragmentUpdated.addListener((d) => rebootTab(d.t
 chrome.alarms.create('jat11-flush', { periodInMinutes: 1 });
 chrome.alarms.create('jat11-autoapply', { periodInMinutes: 1 });
 chrome.alarms.create('jat11-extupdate', { periodInMinutes: 360 });
+chrome.alarms.create('jat11-aa-reaper', { periodInMinutes: 2 });   // close stale/excess auto-apply tabs
 
 chrome.alarms.onAlarm.addListener(async (a) => {
   if (a.name === 'jat11-flush') {
@@ -89,6 +90,9 @@ chrome.alarms.onAlarm.addListener(async (a) => {
   if (a.name === 'jat11-extupdate') {
     await checkExtUpdate().catch(() => {});
     await paintBadge();
+  }
+  if (a.name === 'jat11-aa-reaper') {
+    await reapAaTabs().catch(() => {});
   }
 });
 
@@ -147,6 +151,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await chrome.tabs.create({ url: chrome.runtime.getURL('onboarding/onboarding.html') });
         return { ok: true };
       })());
+      return true;
+    case 'jat11.nudge-apply-window':
+      // An apply tab reported itself hidden/occluded (Chrome throttled it → LinkedIn
+      // won't hydrate). Briefly raise the dedicated apply window(s) to force a visible
+      // render pass, then hand focus straight back to the user. Fire-and-forget.
+      respond(nudgeApplyWindows().then(() => ({ ok: true })).catch(() => ({ ok: true })));
       return true;
     case 'run-discovery':
       // Manual "Run discovery now" from the extension dashboard (bypasses the
@@ -432,12 +442,61 @@ let gapTimer = null;              // precise wake-up when only the pacing gap he
 let pumpDirty = false;            // a re-pump request arrived while pumping — re-run once we finish
 // Resume the right parallelism after an MV3 service-worker eviction — otherwise the
 // pool silently runs serial (1) until the next grant re-learns the concurrency.
-try { chrome.storage.session?.get('jat11.concurrency').then((o) => { const c = o && o['jat11.concurrency']; if (c) currentConcurrency = Math.max(1, Math.min(8, Number(c))); }).catch(() => {}); } catch {}
+try { chrome.storage.local?.get('jat11.concurrency').then((o) => { const c = o && o['jat11.concurrency']; if (c) currentConcurrency = Math.max(1, Math.min(8, Number(c))); }).catch(() => {}); } catch {}
 
 // Keep every auto-apply / discovery tab in ONE labelled Chrome tab group so the
 // user can see + manage them together (and they're not scattered everywhere).
 const AA_GROUP_TITLE = 'JAT Auto-apply';
 let aaGroupId = null;
+// A DEDICATED background window for auto-apply tabs. They must never open in YOUR
+// browsing window (that hijacks the tab you're working in — the "it interrupted me"
+// bug), and must be the ACTIVE/visible tab in their own window so Chrome doesn't
+// throttle the page (a hidden tab won't hydrate LinkedIn's Easy-Apply button).
+let aaWindowId = null;
+try { chrome.storage.local?.get('jat11.aaWindowId').then((o) => { const w = o && o['jat11.aaWindowId']; if (w) aaWindowId = Number(w); }).catch(() => {}); } catch {}
+let stopping = false;             // true briefly while tearing a run down, so in-flight launches bow out as 'skipped' (not 'failed')
+
+// ---------- auto-apply TAB REGISTRY (the leak fix) ----------
+// Every apply/discovery/sync tab is tracked here by id→createdAt, persisted to
+// storage.LOCAL (Firefox has no storage.session). Cleanup uses this registry, so it
+// works even where tabGroups doesn't exist (Firefox). A reaper closes stale/excess
+// tabs so they can never pile up to "90+ open tabs" again.
+const AA_TABS_KEY = 'jat11.aaTabs';
+const AA_TAB_MAX_AGE_MS = 8 * 60 * 1000;   // a single apply should never need >8 min
+const AA_TAB_CAP = 10;                       // hard ceiling on simultaneously-open AA tabs
+let aaTabs = {};                             // { [tabId]: createdAtMs }
+try { chrome.storage.local.get(AA_TABS_KEY).then((o) => { aaTabs = (o && o[AA_TABS_KEY]) || {}; }).catch(() => {}); } catch {}
+function persistAaTabs() { try { chrome.storage.local.set({ [AA_TABS_KEY]: aaTabs }); } catch {} }
+function trackAaTab(id) { if (id != null) { aaTabs[id] = Date.now(); persistAaTabs(); } }
+function untrackAaTab(id) { if (id != null && aaTabs[id] != null) { delete aaTabs[id]; persistAaTabs(); } }
+// A user (or Chrome) closing a tab must drop it from the registry too.
+chrome.tabs.onRemoved.addListener((tabId) => untrackAaTab(tabId));
+
+// Close any tracked AA tab that's too old (stuck) or over the cap (oldest first), and
+// drop ids whose tab no longer exists. Safety net beyond the per-task close paths.
+async function reapAaTabs() {
+  await reapIdleApplyWindows();   // close any empty dedicated windows the opt-in modes left behind
+  const ids = Object.keys(aaTabs).map(Number);
+  if (!ids.length) return;
+  const now = Date.now();
+  // verify existence + collect ages
+  const live = [];
+  for (const id of ids) {
+    let tab = null;
+    try { tab = await chrome.tabs.get(id); } catch { untrackAaTab(id); continue; }
+    if (!tab) { untrackAaTab(id); continue; }
+    live.push({ id, age: now - (aaTabs[id] || now) });
+  }
+  // age-out
+  for (const t of live) {
+    if (t.age > AA_TAB_MAX_AGE_MS) { try { await chrome.tabs.remove(t.id); } catch {} untrackAaTab(t.id); }
+  }
+  // cap (close oldest beyond the ceiling)
+  const remaining = live.filter((t) => aaTabs[t.id] != null).sort((x, y) => y.age - x.age);
+  for (let i = AA_TAB_CAP; i < remaining.length; i++) {
+    try { await chrome.tabs.remove(remaining[i].id); } catch {} untrackAaTab(remaining[i].id);
+  }
+}
 
 // MV3 evicts the service worker after ~30s idle, which would wipe aaGroupId and make
 // the next tick spawn a SECOND group. Recover the existing one by its title first so
@@ -453,30 +512,130 @@ async function recoverAaGroup() {
   return aaGroupId;
 }
 
-// Where the next apply/discovery tab should open. We FOLLOW the group: if the user
-// drags the "JAT Auto-apply" group to another window, new tabs open in THAT window
-// and join the same group (no more splitting into a second group). Only when no
-// group exists yet do we pick a window — preferring one that ISN'T focused, so tabs
-// don't pop up in the window you're actively working in.
+// The window auto-apply / discovery / sync tabs open in. A PERSISTENT dedicated window
+// that JAT owns — NEVER the window you're working in. It's created ONCE, on-display but
+// BEHIND your work (focused:false + focus handed straight back), and then REUSED for the
+// whole run (so it never repeatedly pops up), and closed only on Stop. The apply tab is
+// the ACTIVE tab there, so the page loads un-throttled WITHOUT ever touching your window.
 async function autoApplyTargetWindow() {
   await recoverAaGroup();
   if (aaGroupId != null && chrome.tabGroups?.get) {
-    try { const g = await chrome.tabGroups.get(aaGroupId); return g.windowId; }
-    catch { aaGroupId = null; }   // group no longer exists — pick a fresh window below
+    try { const g = await chrome.tabGroups.get(aaGroupId); aaWindowId = g.windowId; return g.windowId; }
+    catch { aaGroupId = null; }
   }
+  // Reuse our dedicated window if it's still open.
+  if (aaWindowId != null && chrome.windows?.get) {
+    try { await chrome.windows.get(aaWindowId); return aaWindowId; }
+    catch { aaWindowId = null; }
+  }
+  // Create it once, behind your work. We OWN it (safe to close on Stop) — we never
+  // borrow or close one of your own windows.
   try {
     const wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
-    const pick = wins.find((w) => !w.focused) || wins[0];
-    return pick ? pick.id : undefined;
+    const focusedId = wins.find((w) => w.focused)?.id;
+    let win = null;
+    try { win = await chrome.windows.create({ focused: false, state: 'normal' }); } catch {}
+    aaWindowId = win ? win.id : null;
+    try { if (aaWindowId != null) chrome.storage.local?.set({ 'jat11.aaWindowId': aaWindowId }); } catch {}
+    if (win && focusedId != null) { try { await chrome.windows.update(focusedId, { focused: true }); } catch {} }
+    return aaWindowId != null ? aaWindowId : (wins.find((w) => !w.focused)?.id);
   } catch { return undefined; }
 }
 
-// Keep the group COLLAPSED so its tabs stay tucked behind a single chip — out of
-// the user's way + impossible to click into by accident. (A truly hidden/minimized
-// window throttles page rendering and would break the LinkedIn/Indeed scraping, so
-// collapsed-in-a-background-window is the reliable "hidden".)
+// Briefly raise the dedicated apply window(s) so Chrome un-throttles an occluded apply
+// tab and its SPA hydrates, then restore the user's focus. Debounced so a burst of
+// stalled tabs only flashes once. Non-destructive: only ever touches windows WE own.
+let lastNudge = 0;
+async function nudgeApplyWindows() {
+  const now = Date.now();
+  if (now - lastNudge < 8000) return;   // at most once / 8s — don't strobe the user
+  lastNudge = now;
+  if (!chrome.windows?.update) return;
+  let userFocused = null;
+  try { userFocused = (await chrome.windows.getLastFocused())?.id; } catch {}
+  const ids = new Set([aaWindowId, ...aaWindowPool].filter((x) => x != null));
+  for (const id of ids) {
+    try { await chrome.windows.update(id, { focused: true, state: 'normal' }); } catch {}
+  }
+  await new Promise((r) => setTimeout(r, 700));   // let Chrome mark it visible + render a frame
+  // Hand focus straight back to where the user was (never leave them on our window).
+  if (userFocused != null && !ids.has(userFocused)) {
+    try { await chrome.windows.update(userFocused, { focused: true }); } catch {}
+  }
+}
+
+// ---------- dedicated-window POOL for the OPT-IN reliability / PARALLEL modes ----------
+// Only used when "bring window to front" is on OR concurrency > 1. Each such worker gets
+// its OWN dedicated window (one active/visible, un-throttled tab per window). Windows are
+// reused across applies; the reaper closes empty ones; Stop closes them all.
+let aaWindowPool = [];               // DEDICATED apply window ids (created by us only)
+const aaBusyWindows = new Set();     // window ids currently hosting a RUNNING apply tab
+
+async function acquireApplyWindow(focus = false) {
+  // Prune windows that no longer exist.
+  for (const id of [...aaWindowPool]) {
+    try { await chrome.windows.get(id); } catch { aaWindowPool = aaWindowPool.filter((w) => w !== id); aaBusyWindows.delete(id); }
+  }
+  // Reuse a free dedicated window…
+  let win = aaWindowPool.find((id) => !aaBusyWindows.has(id));
+  if (win == null) {
+    // …or create one, restoring focus to your window unless we're intentionally fronting.
+    try {
+      const wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
+      const focusedId = wins.find((w) => w.focused)?.id;
+      const w = await chrome.windows.create({ focused: !!focus, state: 'normal' });
+      if (w) { win = w.id; aaWindowPool.push(win); if (!focus && focusedId != null) { try { await chrome.windows.update(focusedId, { focused: true }); } catch {} } }
+    } catch {}
+  }
+  if (win != null) aaBusyWindows.add(win);
+  return win;
+}
+function releaseApplyWindow(winId) { if (winId != null) aaBusyWindows.delete(winId); }
+
+// Close dedicated apply windows that are idle (not running an apply) AND empty (no
+// auto-apply tabs left) so the opt-in reliability/parallel modes never leave a stray
+// empty Chrome window sitting around. Called from the 2-min reaper.
+async function reapIdleApplyWindows() {
+  if (!aaWindowPool.length || !chrome.windows?.get) return;
+  for (const id of [...aaWindowPool]) {
+    if (aaBusyWindows.has(id)) continue;   // running an apply — keep
+    let win = null;
+    try { win = await chrome.windows.get(id, { populate: true }); }
+    catch { aaWindowPool = aaWindowPool.filter((w) => w !== id); continue; }
+    const hasAa = ((win && win.tabs) || []).some((t) => aaTabs[t.id] != null);
+    if (!hasAa) {
+      try { await chrome.windows.remove(id); } catch {}
+      aaWindowPool = aaWindowPool.filter((w) => w !== id);
+      aaBusyWindows.delete(id);
+    }
+  }
+}
+
+// Open a tab for an auto-apply / discovery / applied-sync job in a dedicated window.
+// APPLY tabs open ACTIVE (active+visible = un-throttled, so the page + Easy-Apply
+// button hydrate). DISCOVERY/SYNC tabs open in the BACKGROUND (active:false) so they
+// never steal "active" from a running apply tab (which would re-throttle it); their
+// scraping tolerates throttling. `winId` overrides the window (used by the worker pool).
+// Returns the created tab.
+async function createAaTab(url, { active = true, focusWindow = false, winId: forceWin } = {}) {
+  const winId = forceWin != null ? forceWin : await autoApplyTargetWindow();
+  const tab = await chrome.tabs.create({ url, active, ...(winId ? { windowId: winId } : {}) });
+  trackAaTab(tab.id);   // register for cleanup/reaping (works without tabGroups, e.g. Firefox)
+  // Opt-in: bring the apply window to the FRONT so an occluded page (e.g. behind a
+  // fullscreen game) isn't throttled by Chrome and the Easy-Apply button hydrates.
+  if (focusWindow && winId != null && chrome.windows?.update) {
+    try { await chrome.windows.update(winId, { focused: true }); } catch {}
+  }
+  await groupTab(tab.id);
+  return tab;
+}
+
+// Collapse the "JAT Auto-apply" group so its background tabs stay tucked behind a single
+// chip — keeps your tab bar tidy in the default (unobtrusive) mode. (In the opt-in
+// dedicated-window modes the apply tab is the active tab in its own window, which Chrome
+// keeps visible regardless, so this is a harmless no-op there.)
 async function collapseAaGroup() {
-  if (aaGroupId == null || !chrome.tabGroups?.update) return;
+  if (aaGroupId == null || !chrome.tabGroups?.update) return;   // Firefox: no tabGroups → skip
   try { await chrome.tabGroups.update(aaGroupId, { collapsed: true }); } catch {}
 }
 async function groupTab(tabId) {
@@ -504,6 +663,11 @@ async function groupTab(tabId) {
 // (the dashboard stop-all patches queued/running → skipped before this runs), so
 // nothing is lost by closing them.
 async function closeAutoApplyTabs() {
+  // Mark the teardown FIRST so any in-flight launchOne whose tab we're about to remove
+  // bows out as 'skipped' instead of re-patching 'failed' (which fired the scary
+  // "a queued application failed" toasts on Stop).
+  stopping = true;
+  if (stopWatchdog) { clearInterval(stopWatchdog); stopWatchdog = null; }
   try {
     const ids = new Set();
     // Close EVERY "JAT Auto-apply" group's tabs — not just the cached one. An SW
@@ -518,7 +682,17 @@ async function closeAutoApplyTabs() {
     if (aaGroupId != null && chrome.tabs?.query) {   // also the cached id, in case the title query missed it
       try { const tabs = await chrome.tabs.query({ groupId: aaGroupId }); for (const t of tabs) if (t.id != null) ids.add(t.id); } catch {}
     }
+    // The TAB REGISTRY — the authoritative source, and the ONLY one that works in
+    // Firefox (no tabGroups). Union it in so cleanup never misses a tracked tab.
+    for (const id of Object.keys(aaTabs)) ids.add(Number(id));
     if (ids.size) { try { await chrome.tabs.remove([...ids]); } catch {} }
+    aaTabs = {}; persistAaTabs();
+    // Close EVERY dedicated apply window (the pool for parallel workers + the primary)
+    // so none linger empty after Stop.
+    const winIds = new Set(aaWindowPool);
+    if (aaWindowId != null) winIds.add(aaWindowId);
+    if (chrome.windows?.remove) { for (const id of winIds) { try { await chrome.windows.remove(id); } catch {} } }
+    aaWindowPool = []; aaBusyWindows.clear();
   } catch {}
   // Stop the self-driving timers too, so a queued re-pump can't pop a new tab open
   // moments after the user hit Stop.
@@ -526,6 +700,28 @@ async function closeAutoApplyTabs() {
   if (pumpTimer) { clearTimeout(pumpTimer); pumpTimer = null; }
   pumpDirty = false;
   aaGroupId = null;
+  aaWindowId = null;
+  try { chrome.storage.local?.remove('jat11.aaWindowId'); } catch {}
+  // Let in-flight launches see `stopping`, then clear it so the next Start is normal.
+  setTimeout(() => { stopping = false; }, 8000);
+}
+
+// While a run is active, the user may stop it from the DESKTOP app — where the
+// dashboard has no `chrome` and so can't reach the tabs. The app just flips
+// enabled=false; without this watchdog the tabs would linger until the next 1-min
+// alarm and the interrupted task would fail → toast. Poll the enabled flag cheaply
+// and tear the run down the moment it goes off.
+let stopWatchdog = null;
+function startStopWatchdog() {
+  if (stopWatchdog) return;
+  stopWatchdog = setInterval(async () => {
+    try {
+      if (activeCount <= 0) { clearInterval(stopWatchdog); stopWatchdog = null; return; }
+      const s = await api.call('GET', '/settings', null, 4000);
+      const enabled = s?.ok ? !!s.settings?.autoApply?.enabled : true;
+      if (!enabled) await closeAutoApplyTabs();   // clears the watchdog itself
+    } catch {}
+  }, 4000);
 }
 
 // Run ONE queued task end-to-end in its own tab. Pure per-task: opens the tab,
@@ -536,10 +732,16 @@ async function closeAutoApplyTabs() {
 async function launchOne(task, context) {
   const url = context.job.jobUrl;
   let tab = null;
+  const bringFront = !!(context && context.bringToFront);
+  const parallel = currentConcurrency > 1;
+  // The apply tab is the ACTIVE tab in a window that is NEVER the one you're working in
+  // (a persistent dedicated window — or a per-worker one when parallel). Being the active
+  // tab in an on-display window means the page loads un-throttled, and since it's not your
+  // window it never interrupts you. focusWindow (opt-in) additionally brings it to front.
+  const winId = parallel ? await acquireApplyWindow(bringFront) : await autoApplyTargetWindow();
   try {
-    const winId = await autoApplyTargetWindow();
-    tab = await chrome.tabs.create({ url, active: false, ...(winId ? { windowId: winId } : {}) });
-    await groupTab(tab.id);
+    tab = await createAaTab(url, { active: true, focusWindow: bringFront, winId });
+    try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch {}   // don't let Chrome discard it mid-apply
 
     // Wait for the page (and content script) to settle, then hand over the task.
     await new Promise((resolve) => {
@@ -566,37 +768,55 @@ async function launchOne(task, context) {
       // Target the TOP frame ONLY — otherwise an iframe (ads/embeds on
       // LinkedIn/Indeed) answers "not top frame" first and the race kills the
       // task while the real executor is still running. This was ~58% of failures.
-      result = await chrome.tabs.sendMessage(tab.id, { type: 'jat11.run-task', task, context }, { frameId: 0 });
+      // HARD TIMEOUT: a hung executor (frozen tab / infinite wait) must NOT hold the
+      // pool slot forever — that stalled the whole pipeline (tasks stuck "running" for
+      // 13+ min, zero new applies). Cap the whole run at 3.5 min, then fail + free up.
+      result = await Promise.race([
+        chrome.tabs.sendMessage(tab.id, { type: 'jat11.run-task', task, context }, { frameId: 0 }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('apply timed out after 3.5 min')), 210000)),
+      ]);
     } catch (e) {
+      // Run being torn down (user pressed Stop) → the tab was removed out from under
+      // us. That's NOT a real failure: leave the task as the dashboard set it (skipped)
+      // and bow out quietly, so no "application failed" toast fires.
+      if (stopping) return 'skipped';
       await api.call('PATCH', '/queue/' + task.id, {
         state: 'failed', attemptsDelta: 1, lastError: String(e?.message || e),
         transcriptAppend: { note: 'executor error: ' + String(e?.message || e) },
       });
       try { await chrome.tabs.remove(tab.id); } catch {}
+      untrackAaTab(tab.id);
       return 'failed';
     }
     const finalState = (result && typeof result.state === 'string') ? result.state : null;
+    if (stopping) return 'skipped';
     if (!result || result.ok === false || !finalState) {
       await api.call('PATCH', '/queue/' + task.id, {
         state: 'failed', attemptsDelta: 1, lastError: String(result?.error || 'executor returned no state'),
         transcriptAppend: { note: 'executor failed: ' + String(result?.error || 'no state') },
       });
       try { await chrome.tabs.remove(tab.id); } catch {}
+      untrackAaTab(tab.id);
       return 'failed';
     }
     if (finalState !== 'running') {
       await api.call('PATCH', '/queue/' + task.id, { state: finalState });   // idempotent reconcile
     }
-    // Close the apply tab on terminal/parked outcomes (the dashboard is the
-    // surface for those); KEEP it open for awaiting_review / awaiting_input —
-    // the user finishes those IN that tab.
-    if (['done', 'skipped', 'failed', 'parked'].includes(finalState)) {
+    // Close the apply tab on terminal outcomes AND on awaiting_input — the user now
+    // finishes parked/needs-you items from the Applications "Needs your input" panel in
+    // the dashboard, NOT in the tab, so leaving them open just piled tabs to 90+. Only
+    // awaiting_review (review-mode: the user manually clicks submit in that tab) stays
+    // open — and the reaper still closes it after the max age as a backstop.
+    if (['done', 'skipped', 'failed', 'parked', 'awaiting_input'].includes(finalState)) {
       try { await chrome.tabs.remove(tab.id); } catch {}
+      untrackAaTab(tab.id);
     }
     return finalState;
   } catch (e) {
-    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} }
-    return 'failed';
+    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} untrackAaTab(tab.id); }
+    return stopping ? 'skipped' : 'failed';
+  } finally {
+    if (parallel && winId != null) releaseApplyWindow(winId);   // free this worker's pool window (parallel only)
   }
 }
 
@@ -614,6 +834,10 @@ function schedulePump() {
 // so N tabs cycle continuously. concurrency comes back with every /queue/next.
 async function pump(force = false) {
   if (pumping) { pumpDirty = true; return { dispatched: false, reason: 'pumping' }; }
+  // Reconcile a desynced slot counter: if an SW eviction killed a launchOne before its
+  // .finally could decrement activeCount, the slot stays "stuck" and the pool stalls.
+  // With zero AA tabs actually open, nothing is in flight — reset the counter.
+  if (activeCount > 0 && Object.keys(aaTabs).length === 0) activeCount = 0;
   if (!(await api.isPaired())) return { dispatched: false, reason: 'not paired' };
   const h = await api.health();
   if (!h?.ok) return { dispatched: false, reason: 'app offline' };
@@ -627,13 +851,15 @@ async function pump(force = false) {
       const r = await api.call('GET', '/queue/next' + (force ? '?force=1' : ''), null, 8000);
       if (r && r.concurrency) {
         const c = Math.max(1, Math.min(8, r.concurrency));
-        if (c !== currentConcurrency) { currentConcurrency = c; try { chrome.storage.session?.set({ 'jat11.concurrency': c }); } catch {} }
+        if (c !== currentConcurrency) { currentConcurrency = c; try { chrome.storage.local?.set({ 'jat11.concurrency': c }); } catch {} }
       }
       if (!r?.ok || !r.task) {
         reason = r?.reason || 'nothing queued';
         if (r?.nextEligibleAt) gapEligibleAt = r.nextEligibleAt;
         break;
       }
+      stopping = false;        // actively launching → not in teardown (clears a recent Stop)
+      startStopWatchdog();     // catch a desktop-app Stop (no chrome there) while this runs
       activeCount++;
       dispatched++;
       launchOne(r.task, r.context)
@@ -677,7 +903,11 @@ async function forceApplyOne() {
 }
 
 // ---- discovery: search a board for Easy-Apply jobs + enqueue them ----
-let discoverIdx = 0;   // cycles the full board × keyword × location search space
+// Rotation cursor over the FULL board × keyword × location search space. It MUST be
+// persisted: a plain in-memory counter resets to 0 on every MV3 service-worker
+// eviction (~30s idle), which pinned discovery to combo #0 forever and saturated a
+// single search (a root cause of the queue starving to zero submits).
+const DISCOVER_IDX_KEY = 'jat11.discoverIdx';
 
 function waitTabComplete(tabId, timeoutMs) {
   return new Promise((resolve) => {
@@ -703,7 +933,11 @@ function buildSearchUrl(board, keyword, location, { easyApplyOnly = true } = {})
   const kw = encodeURIComponent(keyword);
   const loc = location ? encodeURIComponent(location) : '';
   if (board === 'indeed') {
-    return `https://www.indeed.com/jobs?q=${kw}&sort=date&fromage=7` + (loc ? `&l=${loc}` : '');
+    // Indeed's "Easily apply" filter (attr DSQF7) — the LinkedIn-only f_AL had no
+    // Indeed equivalent, so Indeed was flooding the queue with external "apply on
+    // company site" jobs the engine can't auto-drive (the bulk of "did not open").
+    const ea = easyApplyOnly ? '&sc=0kf%3Aattr(DSQF7)%3B' : '';
+    return `https://www.indeed.com/jobs?q=${kw}&sort=date&fromage=7${ea}` + (loc ? `&l=${loc}` : '');
   }
   // linkedin (default) — f_AL=true is the Easy-Apply filter; DD = sort by date.
   // When easyApplyOnly is OFF the user also wants normal/external postings, so we
@@ -744,18 +978,20 @@ async function discoverTick(force = false) {
   const locList = (aa.locations || []).filter(Boolean);
   const combos = [];
   for (const b of boards) for (const k of keywords) for (const l of (locList.length ? locList : [''])) combos.push({ b, k, l });
-  const combo = combos[discoverIdx++ % combos.length];
+  // Read → use → persist the next index, so rotation survives SW eviction.
+  let dIdx = 0;
+  try { const o = await chrome.storage.local.get(DISCOVER_IDX_KEY); dIdx = Number(o[DISCOVER_IDX_KEY]) || 0; } catch {}
+  const combo = combos[dIdx % combos.length];
+  try { await chrome.storage.local.set({ [DISCOVER_IDX_KEY]: (dIdx + 1) % 1000000 }); } catch {}
   const board = combo.b, keyword = combo.k, location = combo.l;
   const url = buildSearchUrl(board, keyword, location, { easyApplyOnly: aa.easyApplyOnly !== false });
   let resp = null, enqueued = 0;
   try {
-    const winId = await autoApplyTargetWindow();
-    tab = await chrome.tabs.create({ url, active: false, ...(winId ? { windowId: winId } : {}) });
-    await groupTab(tab.id);
+    tab = await createAaTab(url, { active: false });   // background: don't steal "active" from a running apply tab
     await waitTabComplete(tab.id, 30000);
     await new Promise((r2) => setTimeout(r2, 2000));
     try {
-      resp = await chrome.tabs.sendMessage(tab.id, { type: 'jat11.discover-search', source: board, max: aa.discovery.perRunLimit || 8 }, { frameId: 0 });
+      resp = await chrome.tabs.sendMessage(tab.id, { type: 'jat11.discover-search', source: board, max: aa.discovery.perRunLimit || 8, easyApplyOnly: aa.easyApplyOnly !== false }, { frameId: 0 });
     } catch (e) {
       resp = { ok: false, error: String(e?.message || e), jobs: [], found: 0, note: 'could not reach the search page (content script not ready?)' };
     }
@@ -767,7 +1003,7 @@ async function discoverTick(force = false) {
   } catch (e) {
     resp = { ok: false, error: String(e?.message || e), jobs: [], found: 0, note: 'discovery failed: ' + String(e?.message || e) };
   } finally {
-    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} }
+    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} untrackAaTab(tab.id); }
     scanning = false;
   }
   // Pool exhaustion: found jobs but enqueued NONE = everything this query returned was
@@ -798,9 +1034,7 @@ async function syncAppliedFor(source, maxDays) {
   if (!url) return { source, error: 'unknown source' };
   let tab = null;
   try {
-    const winId = await autoApplyTargetWindow();
-    tab = await chrome.tabs.create({ url, active: false, ...(winId ? { windowId: winId } : {}) });
-    await groupTab(tab.id);
+    tab = await createAaTab(url, { active: false });   // background: applied-sync scraping tolerates throttling
     await waitTabComplete(tab.id, 35000);
     await new Promise((r) => setTimeout(r, 3000));   // the applied list hydrates slowly
     let resp = null;
@@ -816,7 +1050,7 @@ async function syncAppliedFor(source, maxDays) {
   } catch (e) {
     return { source, error: String(e?.message || e) };
   } finally {
-    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} }
+    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} untrackAaTab(tab.id); }
   }
 }
 async function syncApplied({ sources = ['linkedin'], maxDays = 90 } = {}) {

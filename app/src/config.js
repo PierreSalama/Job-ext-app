@@ -51,7 +51,7 @@ const DEFAULTS = {
       provider: 'ollama',
       url: 'http://localhost:11434',
       autoPick: true,               // pick the model that fits this machine
-      autoSetup: false,             // auto-download Ollama + models in the background
+      autoSetup: true,              // auto-download Ollama + models in the background on first run when no cloud key is set (zero-config local AI fallback)
       structuredModel: '',          // '' = use the hardware recommendation
       proseModel: '',               // '' = use the hardware recommendation
       timeoutMs: 90000,
@@ -96,13 +96,16 @@ const DEFAULTS = {
     enabled: false,          // master switch — just ON/OFF
     startedAt: '',           // ISO time the master switch was last turned ON (live "running for" timer)
     mode: 'auto',            // default: submit for me. 'review' stops before submit
-    // Aggressive defaults (user asked for speed) — the Advanced area lets you tune.
-    // Empty window = run any time of day.
-    maxPerDay: 200,
-    maxPerHour: 60,
-    minGapMinutes: 0.25,          // ~15s between starts
-    maxGapMinutes: 0.6,           // ~36s
-    concurrency: 1,               // applications in PARALLEL (1 = aggressive serial). >1 = parallel tabs: much faster, but RAISES LinkedIn/Indeed account-flag risk (warned in the UI).
+    // SUSTAINABLE defaults — LinkedIn/Indeed throttle aggressive automation (they start
+    // serving job pages WITHOUT the Easy-Apply button to rapid background tabs, which
+    // silently zeroes out submissions). A moderate, human-like pace keeps applications
+    // actually going through. The Advanced area lets you push it (at higher flag risk).
+    maxPerDay: 150,
+    maxPerHour: 30,
+    minGapMinutes: 1,             // ~1–3 min between starts (human-like; avoids the throttle)
+    maxGapMinutes: 3,
+    concurrency: 1,               // applications in PARALLEL (1 = safest). >1 = parallel tabs: faster but RAISES throttle/flag risk.
+    bringToFrontToHydrate: false, // OFF by default. ON = the apply window is brought to the FRONT while applying, guaranteeing the page isn't throttled (Chrome throttles a fully-occluded window — e.g. behind a fullscreen game — so the Easy-Apply button never loads). Trade-off: it takes focus while each application runs. Turn ON when reliability matters more than not being interrupted (e.g. running while away).
     runAnytime: true,        // ON by default — run 24/7. Turn OFF to use the window below.
     windowStart: '',         // only used when runAnytime is false
     windowEnd: '',

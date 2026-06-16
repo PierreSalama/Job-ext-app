@@ -18,6 +18,12 @@ const { scope, log: rootLog } = require('./logger');
 const log = scope('main');
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 
+// Last-resort crash guards: a background subsystem (e.g. a child-process spawn ENOENT,
+// a rejected promise deep in the AI chain) must NEVER take the whole app down. Dad's
+// logs showed an uncaughtException from `spawn ollama ENOENT`. Log and keep running.
+process.on('uncaughtException', (e) => { try { log.error('uncaughtException (survived)', e); } catch {} });
+process.on('unhandledRejection', (e) => { try { log.warn('unhandledRejection (survived)', e); } catch {} });
+
 let mainWindow = null;
 let tray = null;
 let updateInterval = null;
@@ -464,6 +470,25 @@ app.whenReady().then(async () => {
     return;
   }
 
+  // Self-heal on startup: transient auto-apply failures that were misfiled as
+  // awaiting_input/parked with no real question used to block discovery forever
+  // (starving the queue to zero submits). Reclaim them to retriable 'failed'.
+  try {
+    const reclaimed = db.reclaimDeadParks();
+    if (reclaimed) log.info(`reclaimed ${reclaimed} dead awaiting_input/parked task(s) → failed (retriable)`);
+  } catch (e) { log.warn('reclaimDeadParks failed', e); }
+  // Repair false "submitted" stamps left by passive capture on auto-apply tabs whose
+  // application never actually completed (now prevented at the source in detector.js).
+  try {
+    const fixed = db.reconcileFalseSubmits();
+    if (fixed) log.info(`reverted ${fixed} false auto-apply submit(s) → started`);
+  } catch (e) { log.warn('reconcileFalseSubmits failed', e); }
+  // Free any pool slots held by tasks stuck 'running'/'scheduled' from a previous run.
+  try {
+    const unstuck = db.reconcileStaleRunning({ olderThanMinutes: 8 });
+    if (unstuck) log.info(`reconciled ${unstuck} stale running/scheduled task(s) → failed (retriable)`);
+  } catch (e) { log.warn('reconcileStaleRunning failed', e); }
+
   const port = db.getSettings().server.port;
   try {
     await startServer(port, {
@@ -498,12 +523,21 @@ app.whenReady().then(async () => {
   // Local-AI auto-setup (only if the user opted in) — downloads Ollama + the
   // hardware-recommended models in the background; progress shows in Settings.
   try {
-    const lc = db.getSettings().ai.local;
-    if (lc && lc.autoSetup) {
+    const ai = db.getSettings().ai;
+    const lc = ai.local;
+    // Auto-download local AI in the background ONLY when the user hasn't supplied a
+    // cloud key — so a fresh machine (e.g. Dad's) gets working AI with zero config,
+    // without forcing a multi-GB download on someone who set their own Claude/OpenAI key.
+    const hasCloudKey = !!((ai.claude && ai.claude.apiKey) || (ai.chatgpt && ai.chatgpt.apiKey));
+    if (lc && lc.autoSetup && !hasCloudKey) {
       const ls = require('./localsetup');
       const rec = require('./hardware').probe().recommend;
-      ls.setup({ models: [lc.structuredModel || rec.structured, lc.proseModel || rec.prose], cfg: lc })
-        .catch((e) => log.warn('local AI auto-setup failed', e.message));
+      // Kick off after a short delay so it never competes with launch/first-paint —
+      // it streams in the background and surfaces progress in Settings.
+      setTimeout(() => {
+        ls.setup({ models: [lc.structuredModel || rec.structured, lc.proseModel || rec.prose], cfg: lc })
+          .catch((e) => log.warn('local AI auto-setup failed', e.message));
+      }, 8000);
     }
   } catch (e) { log.warn('local AI auto-setup skipped', e.message); }
 

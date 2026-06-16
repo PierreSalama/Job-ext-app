@@ -148,6 +148,15 @@ HARD RULES:
 - ${options && options.length ? `The form is a choice field. You MUST pick exactly one of these options verbatim: ${JSON.stringify(options.slice(0, 30))}` : 'Free-text field: keep the answer short and natural (1-3 sentences for open questions, a single value for factual ones).'}
 - confidence: 0-1, how certain you are this answer is truthful and appropriate.
 
+ANSWER THESE COMMON QUESTIONS WITH HIGH CONFIDENCE (they are safe to derive from the profile):
+- LOCATION / RESIDENCY (yes/no: "are you located in / residing in / based in / a resident of <place>?", "within commuting distance of <place>?"): derive from the candidate's location (city/region/country). E.g. in "Toronto, Ontario" → "residing in BC?" = No, "in Ontario?" = Yes, "in Canada?" = Yes. Confidence ~0.9.
+- WHICH-LOCATION (fill-in/choice: "what country/province/state/city are you located in?", "where are you based?"): answer with the candidate's country / region / city from the profile (e.g. country → "Canada", province → "Ontario", city → "Toronto"). Match an option verbatim if options are given. Confidence ~0.9.
+- PREFERRED LANGUAGE ("what is your preferred language?", "language of correspondence"): answer "English" unless the profile says otherwise (pick the matching option if given). Confidence ~0.85.
+- RELOCATION / REMOTE / ONSITE ("willing to relocate?", "able to work remotely?", "comfortable with hybrid/onsite?"): use a profile preference if present, else default Yes (willing/able), ~0.8 — a candidate applying is presumed open to the job's arrangement.
+- YEARS OF EXPERIENCE with a skill/tool ("how many years of X?"): estimate from the resume's work history with that skill; if the skill clearly appears, give a concrete number (round down), ~0.75; only refuse if the resume shows no relevant experience at all. NEVER answer a "how many years" question with a URL or link — it must be a number.
+- EDUCATION ("have you completed / do you hold a <Bachelor's/Master's/Diploma/etc.> degree?", "highest level of education?", "minimum education met?"): derive from the resume's education history — if the candidate holds that level OR higher, answer Yes (or pick the matching option); if clearly lower, No; ~0.9.
+- For a Yes/No or choice field, the answer MUST be exactly one of the given options.
+
 == QUESTION ==
 ${clip(question, 500)}
 ${fieldType ? `(field type: ${fieldType})` : ''}
