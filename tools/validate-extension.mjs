@@ -38,6 +38,15 @@ const war = (mf.web_accessible_resources?.[0]?.resources || []).join(' ');
 // loader dynamically imports detector; detector imports executor + signals + sites + panel + lib
 for (const need of ['content/detector.js', 'content/panel.js', 'content/executor.js', 'content/autofill.js', 'content/signals/*.js', 'content/sites/*.js', 'content/lib/*.js'])
   ok(war.includes(need), 'WAR lists: ' + need);
+// executor.js STATICALLY imports ./replay.js (P5). A static import in a web-accessible module
+// resolves against its chrome-extension:// URL, so replay.js itself must be web-accessible —
+// otherwise the module load is blocked at runtime in BOTH Chrome and Firefox. (cross-browser P8)
+{
+  const execSrc = read('content/executor.js');
+  const importsReplay = /from\s+['"]\.\/replay\.js['"]/.test(execSrc);
+  ok(!importsReplay || war.includes('content/replay.js') || war.includes('content/*.js'),
+    'WAR covers content/replay.js (statically imported by executor.js)');
+}
 for (const f of ['content/detector.js', 'content/panel.js', 'content/executor.js', 'content/autofill.js',
   'content/signals/forms.js', 'content/signals/intent.js', 'content/signals/success.js', 'content/signals/json-ld.js',
   'content/sites/index.js', 'content/sites/linkedin.js', 'content/lib/dom.js'])

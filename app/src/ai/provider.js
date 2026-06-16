@@ -13,6 +13,7 @@ const codex = require('./codex');
 const ollama = require('./ollama');
 const anthropic = require('./anthropic');
 const openai = require('./openai');
+const deterministic = require('./deterministic');
 const db = require('../db');
 const { scope } = require('../logger');
 
@@ -112,12 +113,38 @@ async function statusAll(force = false) {
   return lastStatus;
 }
 
+// The deterministic floor UNDER `local`: a pure no-model answer for the common
+// grounded application questions (location/education/years/relocation/…). Only the
+// answer-question path passes a `deterministic` ctx ({ question, profile, resume,
+// options }); for every other kind this is a no-op and the call errors as before.
+// Best-effort + metered; an exact options match is guaranteed by deterministic.js.
+function tryDeterministic({ kind, deterministicCtx }) {
+  if (kind !== 'answer-question' || !deterministicCtx || !deterministicCtx.question) return null;
+  const started = Date.now();
+  try {
+    const det = deterministic.answer(deterministicCtx.question, deterministicCtx);
+    if (det && det.answer) {
+      const json = { answer: det.answer, confidence: det.confidence, refuse: false, reason: 'deterministic floor (no model)' };
+      try { db.aiLog({ provider: 'deterministic', model: 'rules', kind, ms: Date.now() - started, ok: true, promptChars: deterministicCtx.question.length, responseChars: det.answer.length }); } catch {}
+      return { text: det.answer, json, provider: 'deterministic', model: 'rules' };
+    }
+  } catch (e) {
+    try { db.aiLog({ provider: 'deterministic', model: 'rules', kind, ms: Date.now() - started, ok: false, error: String(e.message || e).slice(0, 300) }); } catch {}
+  }
+  return null;
+}
+
 // kind: short label for the log ('fit-score', 'cover-letter', …)
 // prose: true → prefer the local prose model when local is used
-async function run({ kind, prompt, system, schema, prose = false, modelOverride = null, providerOverride = null }) {
+// deterministic: optional no-model floor ctx for answer-question (see tryDeterministic)
+async function run({ kind, prompt, system, schema, prose = false, modelOverride = null, providerOverride = null, deterministic: deterministicCtx = null }) {
   const s = db.getSettings().ai;
   const attempts = buildAttempts(s, { prose, modelOverride, providerOverride });
   if (!attempts.length) {
+    // No cloud/local provider configured — the floor under `local` still answers
+    // the common grounded questions on a no-AI machine (Dad's laptop, offline box).
+    const det = tryDeterministic({ kind, deterministicCtx });
+    if (det) return det;
     // If local AI is still downloading in the background, say so — "unavailable until
     // ready" rather than a flat "not configured" error.
     let setupMsg = '';
@@ -140,6 +167,11 @@ async function run({ kind, prompt, system, schema, prose = false, modelOverride 
       if (e.code === 'CODEX_AUTH') { lastStatus.valid = false; }
     }
   }
+  // Every provider (incl. local) errored — drop to the deterministic floor for the
+  // answer-question path before giving up, so a weak/down local model doesn't strand
+  // the run on a question the rules can ground. Cloud order above is untouched.
+  const det = tryDeterministic({ kind, deterministicCtx });
+  if (det) return det;
   const err = new Error('All AI providers failed: ' + errors.map((e) => `${e.provider}(${e.code || 'ERR'})`).join(', '));
   err.details = errors;
   throw err;

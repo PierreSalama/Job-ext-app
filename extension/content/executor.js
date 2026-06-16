@@ -13,11 +13,12 @@
 // questions only ever come from the profile, never the AI (enforced by the
 // prompt server-side AND a local guard here).
 
-import { AutofillEngine, setNativeValue, fieldLabel } from './autofill.js';
+import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption } from './autofill.js';
 import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
 import { pageTextLooksLikeSuccess, urlLooksLikeSuccess } from './signals/success.js';
 import { qsa, isProbablyVisible, compactText } from './lib/dom.js';
+import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence } from './replay.js';
 
 const MAX_STEPS = 40;
 const STEP_TIMEOUT = 9000;
@@ -413,6 +414,264 @@ export async function run(task, context, helpers) {
     report({ state: 'parked', parkReason: `needs ${parked.length} answer(s)`, pendingQuestions: parked, transcriptAppend: { note: `parked at ${where}: ` + parked.map((p) => p.question.slice(0, 40)).join('; ') } });
     finalState = 'parked';
   };
+
+  // ============================================================
+  // Apprenticeship Engine [P5] — gated, additive recipe replay.
+  // ============================================================
+  // attemptReplay() runs ONLY when a resolved recipe rides along on the context.
+  // It is the FAST PATH: when the recipe covers every required field on the live
+  // page with high confidence, it fills from the answer ladder + the recipe and
+  // advances with the user's own learned human pacing — skipping blind
+  // re-discovery. On ANY uncertainty (planReplay says fallback) or ANY divergence
+  // (unexpected required field / inline validation error / stall), it DOWNGRADES:
+  // it stops replay, POSTs a correction (which decays the recipe), notes it in the
+  // transcript, and returns { fellBack: true } so the caller runs today's
+  // discover-every-step flow. It NEVER blind-submits on divergence and NEVER
+  // fabricates. The WHOLE attempt is wrapped in try/catch by the caller → a thrown
+  // runtime bug also degrades to today's behavior.
+  //
+  // Returns: { fellBack:true } (run the normal flow) | { done:true } (replay
+  // mechanically completed; finalState already set).
+
+  // Locate the live apply form root (mirrors the main loop's strict dialog scope).
+  function findReplayRoot() {
+    const dialog = Array.from(document.querySelectorAll('.jobs-easy-apply-modal, [data-test-modal][role="dialog"], [role="dialog"][aria-modal="true"], .ia-Modal, [data-testid="smartapply-container"]'))
+      .find((d) => isProbablyVisible(d) && d.querySelector('input, textarea, select, [role="combobox"], [contenteditable="true"]')) || null;
+    return dialog || detectApplyForm()?.form || null;
+  }
+
+  // Harvest inline validation errors in the current step (reuses the stall-detection
+  // ground truth). Returns the first human-readable error string, or ''.
+  function replayInlineError(root) {
+    try {
+      const scope = root || document;
+      const errEls = Array.from(scope.querySelectorAll('.artdeco-inline-feedback--error, [class*="inline-feedback--error"], [class*="error-text"], [class*="form-element__error"], [data-test-form-element-error-messages], [role="alert"]'))
+        .filter((e) => isProbablyVisible(e) && (e.textContent || '').trim() && /required|invalid|select|enter|provide|valid|must|please|choose|answer/i.test(e.textContent || ''));
+      if (errEls.length) return compactText(errEls[0].textContent || '').slice(0, 120);
+    } catch {}
+    return '';
+  }
+
+  // Fill ONE resolved value into a field using the existing autofill strategies
+  // (select → matchOption, combobox/typeahead → fillCombobox, radio group →
+  // pickRadioInGroup, else → setNativeValue). Returns true on a successful fill.
+  async function replayFill(input, value) {
+    try {
+      const v = String(value == null ? '' : value);
+      if (!v.trim()) return false;
+      const isCombo = input.getAttribute && (input.getAttribute('role') === 'combobox'
+        || (input.closest && input.closest('[class*="select__control"],[class*="react-select"],[class*="-control"],[class*="basic-typeahead"]')));
+      if (input.tagName === 'SELECT') {
+        const opt = matchOption(input, v);
+        if (!opt) return false;
+        setNativeValue(input, opt.value);
+        return true;
+      }
+      if (isCombo) return await fillCombobox(input, v);
+      if (input.type === 'radio') {
+        const picked = pickRadioInGroup(input, v) || (/^(yes|true|y|oui|sí|si|ja|1)$/i.test(v) ? input : null);
+        if (!picked) return false;
+        picked.checked = true;
+        picked.dispatchEvent(new Event('input', { bubbles: true }));
+        picked.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }
+      if (input.type === 'checkbox') {
+        if (!/^(yes|true|y|oui|sí|si|ja|1)$/i.test(v)) return false;
+        input.checked = true;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }
+      setNativeValue(input, v);
+      return true;
+    } catch { return false; }
+  }
+
+  // The answer-ladder ctx for resolveStepAnswer. Each rung returns a value or
+  // undefined; replay.js enforces the URL-for-quantity guard. profile/qa are sync
+  // (pre-fetched per step below); AI/deterministic share the confidence-gated
+  // /ai/answer-question route the discover path uses.
+  async function resolveReplayValue(step, root) {
+    const label = step.labelPattern || '';
+    // 1+2. profile + qa, in one server round-trip (qa/lookup already merges them
+    // server-side via profileFieldLookup precedence isn't exposed, so we ask both):
+    let profileVal = null, qaVal = null;
+    try {
+      const r = await send({ type: 'api-call', method: 'POST', path: '/qa/lookup', body: { question: label, profileId } });
+      if (r?.ok && r.match && typeof r.match.answer === 'string') qaVal = r.match.answer;
+    } catch {}
+    try {
+      const pm = await engine.scanFillable(root);
+      const hit = pm.find((s) => s.label && (s.label === label || s.label.includes(label) || label.includes(s.label)));
+      if (hit && hit.source === 'profile' && hit.value != null) profileVal = String(hit.value);
+    } catch {}
+    let aiVal = null;
+    // 4. AI — only consulted when profile/qa/recipe-default miss (resolveStepAnswer
+    // walks the ladder in order, so we lazily fetch AI to avoid a round-trip when a
+    // higher rung already answers). We pre-decide whether AI is needed.
+    const ladderCtx = {
+      profileGet: () => profileVal,
+      qaGet: () => qaVal,
+      aiGet: () => aiVal,
+      deterministicGet: () => null,   // deterministic floor is folded into /ai/answer-question server-side
+    };
+    // First pass without AI: if profile/qa/recipe-default already answer, use it.
+    let val = resolveStepAnswer(step, ladderCtx);
+    if (val != null) return val;
+    // Otherwise consult the AI route (confidence-gated, refusal-aware) once.
+    if (!LEGAL_RX.test(label) && !NEVER_AUTOFILL_RX.test(label)) {
+      try {
+        const r = await send({
+          type: 'api-call', method: 'POST', path: '/ai/answer-question', timeoutMs: 150000,
+          body: { question: label, fieldType: step.fieldType, options: step.options, jobId: job?.id, profileId },
+        });
+        const a = (r?.ok && r.result && typeof r.result.answer === 'string' && typeof r.result.confidence === 'number') ? r.result : null;
+        if (a && !a.refuse && a.confidence >= aiConfidenceMin && a.answer.trim()) aiVal = a.answer;
+      } catch {}
+    }
+    return resolveStepAnswer(step, ladderCtx);   // re-walk with aiVal now populated
+  }
+
+  async function attemptReplay() {
+    const recipe = context?.recipe;
+    if (!recipe || !Array.isArray(recipe.steps) || !recipe.steps.length) return { fellBack: true };
+    const recipeId = recipe.companyRecipeId || recipe.atsRecipeId || null;
+    const correct = (labelPattern, why) => {
+      // Decay the recipe (and the divergent step) so it self-corrects toward fall-back.
+      if (recipeId) {
+        try { send({ type: 'api-call', method: 'POST', path: '/recipe/correction', body: { recipeId, labelPattern } }); } catch {}
+      }
+      logLine('warn', `replay diverged (${why}) — falling back to discover-every-step`);
+      report({ transcriptAppend: { note: `replay divergence: ${why}${labelPattern ? ' @ ' + String(labelPattern).slice(0, 60) : ''} → fell back to discovery` } });
+    };
+
+    // Need a live form to replay against. If it hasn't opened yet, fall back so the
+    // existing flow can OPEN it (Easy-Apply button etc.) — replay isn't an opener.
+    const root = findReplayRoot();
+    if (!root) return { fellBack: true };
+    everHadForm = true; S.everHadForm = true;
+
+    // Required labels on the live page: the union of required unknowns + required
+    // fillables (mirrors the executor's own required-field notion).
+    let requiredLabels = [];
+    try {
+      const unknown = await engine.scanUnknown(root);
+      requiredLabels = unknown.filter((u) => u.required).map((u) => u.label);
+    } catch { return { fellBack: true }; }
+
+    const plan = planReplay(recipe, requiredLabels, { theta: context?.replayTheta ?? 0.6 });
+    if (plan.mode !== 'auto') {
+      logLine('ok', `replay gate: fallback (${plan.reason}${plan.missing?.length ? '; missing: ' + plan.missing.slice(0, 3).join(', ') : ''})`);
+      return { fellBack: true };   // ADDITIVE: run the existing flow unchanged.
+    }
+    logLine('ok', `replay AUTO — recipe covers ${requiredLabels.length} required field(s) (conf ${(Number(recipe.confidence) || 0).toFixed(2)})`);
+
+    let replayNoChange = 0;
+    let replayStep = 0;
+    const REPLAY_MAX = MAX_STEPS;
+    while (replayStep < REPLAY_MAX && !S.cancelled) {
+      replayStep++;
+      await untilUnpaused();
+      if (S.cancelled) return { fellBack: true };
+
+      const curRoot = findReplayRoot();
+      if (!curRoot) { correct(null, 'apply form disappeared'); return { fellBack: true }; }
+
+      // Divergence: an unexpected REQUIRED field with no covering step → don't fabricate.
+      let liveRequired = [];
+      try { liveRequired = (await engine.scanUnknown(curRoot)).filter((u) => u.required).map((u) => u.label); } catch {}
+      const recheck = planReplay(recipe, liveRequired, { theta: context?.replayTheta ?? 0.6 });
+      if (recheck.mode !== 'auto') {
+        const div = classifyDivergence({ unexpectedRequiredField: true });
+        correct(recheck.missing?.[0] || null, div || 'unexpected_field');
+        return { fellBack: true };
+      }
+
+      // Fill every step that maps to a field currently on this step of the form.
+      for (const step of recipe.steps) {
+        if (S.cancelled) return { fellBack: true };
+        if (NEVER_AUTOFILL_RX.test(step.labelPattern || '') || LEGAL_RX.test(step.labelPattern || '')) continue;
+        // Find an empty field on the live form matching this step's label.
+        let target = null;
+        try {
+          const fillables = await engine.scanUnknown(curRoot);
+          const hit = fillables.find((u) => u.label && step.labelPattern
+            && (u.label === step.labelPattern || u.label.includes(step.labelPattern) || step.labelPattern.includes(u.label)));
+          target = hit ? hit.input : null;
+        } catch {}
+        if (!target) continue;   // already filled or not on this step — skip.
+        const value = await resolveReplayValue(step, curRoot);
+        if (value == null) continue;   // no grounded answer → leave it; divergence recheck catches a required gap.
+        // Human pacing: a brief pre-action pause (mousedown→pause→mouseup feel).
+        await sleep(paceDelay(step.medianDelayMs));
+        const ok = await replayFill(target, value);
+        if (ok) {
+          logLine('ok', `replayed "${String(step.labelPattern).slice(0, 40)}"`);
+          try { await engine.recordAnswer({ question: step.labelPattern, answer: value, fieldType: step.fieldType, source: job?.source, jobId: job?.id }); } catch {}
+        }
+      }
+
+      // Inline validation error after filling → divergence (don't push past it).
+      const errTxt = replayInlineError(curRoot);
+      if (errTxt) { correct(null, 'validation_error: ' + errTxt); return { fellBack: true }; }
+
+      await untilUnpaused();
+      if (S.cancelled) return { fellBack: true };
+
+      // Advance with paced timing.
+      const btn = findAdvanceButton(curRoot) || findAdvanceButton();
+      if (!btn) {
+        // No advance button after filling — let the existing flow take over (it
+        // knows how to wait for late hydration / decide external vs transient).
+        logLine('ok', 'replay: no advance button — handing to discover flow');
+        return { fellBack: true };
+      }
+      const isFinal = isFinalSubmit(btn);
+      if (isFinal) {
+        // Replay reached the final submit cleanly. NEVER auto-submit from the replay
+        // path — hand to the existing flow, which enforces review-mode + the
+        // parked-questions safety net before any real submit. Mark the recipe's
+        // mechanical completion (success) via the app, then hand off. "Never
+        // blind-submit" stays absolute: the real submit/review decision is the
+        // existing loop's, not the replay's.
+        if (recipeId) { try { await send({ type: 'api-call', method: 'POST', path: '/recipe/outcome', body: { recipeId, success: true } }); } catch {} }
+        logLine('ok', 'replay reached final submit — handing to the submit/review gate');
+        return { fellBack: true };
+      }
+
+      const prevHash = domHash();
+      await sleep(paceDelay(0, undefined, { defaultBaseMs: 300 }));   // brief pre-click settle (paced)
+      syntheticClick(btn);
+      const changed = await waitForChange(prevHash);
+      if (!changed) {
+        if (++replayNoChange >= 3) {
+          const div = classifyDivergence({ noChangeCount: replayNoChange });
+          // Re-harvest the inline error for a precise correction label, if any.
+          const why = replayInlineError(curRoot) || 'page stopped advancing';
+          correct(null, (div || 'stalled') + ': ' + why);
+          return { fellBack: true };
+        }
+      } else { replayNoChange = 0; }
+    }
+    return { fellBack: true };   // ran out of replay steps → let the normal flow finish.
+  }
+
+  // ---- gated replay attempt (P5) — ADDITIVE: only engages when context.recipe
+  // exists and the gate passes; on any throw / fallback / divergence it degrades to
+  // exactly today's discover-every-step flow below. A replay bug never breaks apply.
+  if (context?.recipe) {
+    try {
+      const rr = await attemptReplay();
+      // attemptReplay only ever hands BACK to the normal flow (fellBack) or sets a
+      // mechanical-completion that the normal flow then submits/reviews — it never
+      // sets a terminal state itself, so we simply continue into the loop below.
+      void rr;
+    } catch (e) {
+      logLine('warn', `replay attempt threw (${e?.message || e}) — falling back to discovery`);
+      report({ transcriptAppend: { note: 'replay attempt threw → fell back to discover-every-step' } });
+    }
+  }
 
   while (S.step < MAX_STEPS && !S.cancelled && !finished) {
     S.step++;

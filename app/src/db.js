@@ -22,6 +22,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { DEFAULTS } = require('./config');
 const { scope } = require('./logger');
+const { score: fitScore } = require('./fit');   // P7: deterministic fit baseline for rankJob
 
 const log = scope('db');
 
@@ -390,6 +391,99 @@ const MIGRATIONS = [
   () => {
     exec('CREATE INDEX IF NOT EXISTS idx_tasks_updated ON auto_apply_tasks(updated_at)');
     exec('CREATE INDEX IF NOT EXISTS idx_tasks_job ON auto_apply_tasks(job_id)');
+  },
+
+  // v9 — Apprenticeship Engine foundation. Recipe store (keyed independently by ATS and
+  // by company), human navigation log, the reward ledger, user punishments, plus
+  // per-answer lineage/reward columns. ALL ids are TEXT (uid), matching the existing
+  // schema (the design doc's INTEGER sketch was wrong). New tables FK-cascade to
+  // profiles, so per-profile isolation is structural.
+  () => {
+    exec(`
+      CREATE TABLE ats_recipes (
+        id            TEXT PRIMARY KEY,
+        profile_id    TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        scope         TEXT NOT NULL,            -- 'ats' | 'company'
+        ats           TEXT NOT NULL,            -- workday|greenhouse|lever|icims|successfactors|taleo|bamboo|ashby|direct
+        company_key   TEXT,                     -- normKey(company); NULL for scope='ats'
+        site_domain   TEXT,
+        confidence    REAL    DEFAULT 0.5,
+        reward_score  REAL    DEFAULT 0,
+        success_count INTEGER DEFAULT 0,
+        fail_count    INTEGER DEFAULT 0,
+        seen_count    INTEGER DEFAULT 1,
+        created_at    TEXT,
+        updated_at    TEXT,
+        UNIQUE(profile_id, scope, ats, company_key)
+      );
+    `);
+    exec(`
+      CREATE TABLE recipe_steps (
+        id                 TEXT PRIMARY KEY,
+        recipe_id          TEXT NOT NULL REFERENCES ats_recipes(id) ON DELETE CASCADE,
+        step_index         INTEGER NOT NULL,
+        action             TEXT NOT NULL,       -- fill|select|combobox|upload|advance|wait|handoff
+        label_pattern      TEXT,                -- normalized (normalizeQuestion)
+        field_type         TEXT,
+        strategy           TEXT,
+        options            TEXT,                -- JSON
+        validation_pattern TEXT,
+        advance_text       TEXT,
+        median_delay_ms    INTEGER,             -- learned human pacing (anti-detection floor)
+        confidence         REAL,
+        updated_at         TEXT
+      );
+    `);
+    exec('CREATE INDEX idx_recipe_steps_recipe ON recipe_steps(recipe_id, step_index);');
+    exec(`
+      CREATE TABLE nav_events (
+        id            TEXT PRIMARY KEY,
+        profile_id    TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        session_id    TEXT,
+        url_norm      TEXT,
+        host          TEXT,
+        ats           TEXT,
+        company_key   TEXT,
+        referrer_norm TEXT,
+        kind          TEXT,                     -- visit|apply_click|step_advance|handoff|submit
+        ts            TEXT
+      );
+    `);
+    exec('CREATE INDEX idx_nav_events_profile_ts ON nav_events(profile_id, ts);');
+    exec(`
+      CREATE TABLE application_outcomes (
+        id          TEXT PRIMARY KEY,
+        job_id      TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        profile_id  TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        recipe_id   TEXT REFERENCES ats_recipes(id) ON DELETE SET NULL,
+        ats         TEXT,
+        company_key TEXT,
+        reward      REAL NOT NULL,              -- +interview/offer, mild-neg rejection, star delta, punish
+        reward_kind TEXT NOT NULL,              -- email_reply|rejection|star|punish|submitted
+        email_id    TEXT REFERENCES emails(id) ON DELETE SET NULL,
+        credited    TEXT,                       -- JSON {qa_ids,step_indices}
+        ts          TEXT
+      );
+    `);
+    exec('CREATE INDEX idx_outcomes_job ON application_outcomes(job_id);');
+    exec(`
+      CREATE TABLE punishments (
+        id          TEXT PRIMARY KEY,
+        profile_id  TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        kind        TEXT NOT NULL,              -- job | job_type | company
+        pattern     TEXT NOT NULL,              -- company_key | title regex | job_id
+        weight      REAL DEFAULT 1.0,
+        decay_at    TEXT,                       -- NULL = permanent
+        created_at  TEXT
+      );
+    `);
+    exec('CREATE INDEX idx_punish_profile ON punishments(profile_id, kind);');
+    // Additive columns: per-answer lineage + reward (credit assignment), light staleness.
+    exec('ALTER TABLE qa ADD COLUMN answer_lineage TEXT;');
+    exec('ALTER TABLE qa ADD COLUMN reward_score REAL DEFAULT 0;');
+    exec('ALTER TABLE profile_fields ADD COLUMN reward_score REAL DEFAULT 0;');
+    exec('ALTER TABLE profile_fields ADD COLUMN last_validated_at TEXT;');
+    exec('ALTER TABLE auto_apply_tasks ADD COLUMN recipe_id TEXT;');   // nullable; no FK (avoid lock churn)
   },
 ];
 
@@ -814,6 +908,9 @@ function upsertJob(input, opts = {}) {
       incoming.status === 'submitted' ? (incoming.submittedAt || ts) : null,   // historical date for imports
     ]);
     if (!opts.skipHarvest) harvestAnswersToProfile(incoming.answers, { jobId: id, source: incoming.source, status: incoming.status });
+    // P3: a job created already-submitted (e.g. a manual apply captured at submit) distills
+    // into recipes. Lazy-require avoids a circular load (distiller requires db); best-effort.
+    if (incoming.status === 'submitted') { try { require('./distiller').distillJob(id, resolveProfileId(incoming.source)); } catch {} }
     return { job: getJob(id), action: 'created', previousStatus: null, statusChanged: true };
   }
 
@@ -872,6 +969,11 @@ function upsertJob(input, opts = {}) {
   if (!opts.skipHarvest) harvestAnswersToProfile(incoming.answers, { jobId: existing.id, source: incoming.source || prev.source, status: incoming.status || prev.status });
 
   const after = getJob(existing.id);
+  // P3: a job that just crossed into 'submitted' distills its answers into recipes. Lazy
+  // require (distiller requires db) avoids a circular load; best-effort, never fatal.
+  if (crossedSubmitted(prev.status, nextStatus)) {
+    try { require('./distiller').distillJob(existing.id, resolveProfileId(incoming.source || prev.source)); } catch {}
+  }
   return {
     job: after,
     action,
@@ -1057,17 +1159,26 @@ function normalizeQuestion(q) {
 const FR_HINT_RX = /\b(vous|votre|vos|français|francais|combien|années|prénom|courriel|veuillez|quel|quelle|salaire|expérience|téléphone|adresse|disponibilité|formation|compétences?)\b/i;
 function guessLocale(text) { return FR_HINT_RX.test(String(text || '')) ? 'fr' : 'en'; }
 
-function qaRecord({ profileId, question, answer, source }) {
+function qaRecord({ profileId, question, answer, source, fieldType, lineageSource }) {
+  if (isSensitiveKey(question)) return null;   // write-boundary safety rail (see profileFieldUpsert)
   const qn = normalizeQuestion(question);
   if (!qn || answer == null || answer === '') return null;
   if (!profileId) { log.warn('qaRecord: missing profileId — answer not saved'); return null; }
   const cur = get('SELECT * FROM qa WHERE profile_id = ? AND question_norm = ?', [profileId, qn]);
   const ts = now();
+  // answer_lineage (P1): a capped JSON trail of HOW each answer was obtained
+  // ({source,matched_label,field_type,ts}) — the Observer stamps 'manual' for answers
+  // the user entered by hand; this powers P3/P6 credit assignment (boost answers that
+  // led to interviews) without changing the stored answer itself.
+  const lineEntry = { source: lineageSource || source || 'capture', matched_label: String(question).slice(0, 120), field_type: fieldType || null, ts };
+  const lineage = cur ? safeParse(cur.answer_lineage, []) : [];
+  lineage.push(lineEntry);
+  const lineageJson = JSON.stringify(lineage.slice(-10));
   if (cur) {
     const sources = new Set(safeParse(cur.sources, []));
     if (source) sources.add(source);
-    run('UPDATE qa SET answer = ?, seen_count = seen_count + 1, sources = ?, updated_at = ? WHERE id = ?',
-        [String(answer).slice(0, 2000), JSON.stringify([...sources]), ts, cur.id]);
+    run('UPDATE qa SET answer = ?, seen_count = seen_count + 1, sources = ?, answer_lineage = ?, updated_at = ? WHERE id = ?',
+        [String(answer).slice(0, 2000), JSON.stringify([...sources]), lineageJson, ts, cur.id]);
     return get('SELECT * FROM qa WHERE id = ?', [cur.id]);
   }
   const row = {
@@ -1075,9 +1186,9 @@ function qaRecord({ profileId, question, answer, source }) {
     answer: String(answer).slice(0, 2000),
     sources: JSON.stringify(source ? [source] : []), ts,
   };
-  run(`INSERT INTO qa (id, profile_id, question_norm, question, answer, seen_count, sources, updated_at)
-       VALUES (?, ?, ?, ?, ?, 1, ?, ?)`,
-      [row.id, profileId, row.qn, row.question, row.answer, row.sources, row.ts]);
+  run(`INSERT INTO qa (id, profile_id, question_norm, question, answer, seen_count, sources, answer_lineage, updated_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+      [row.id, profileId, row.qn, row.question, row.answer, row.sources, lineageJson, row.ts]);
   return get('SELECT * FROM qa WHERE id = ?', [row.id]);
 }
 
@@ -1132,8 +1243,12 @@ function pfRow(r) {
   };
 }
 
-function profileFieldUpsert({ profileId, question, value, locale, fieldType, sourceJobId, source, confidence, fromUser }) {
+function profileFieldUpsert({ profileId, question, value, locale, fieldType, sourceJobId, source, confidence, fromUser, lineageSource }) {
   const label = String(question || '').trim();
+  // WRITE-BOUNDARY SAFETY RAIL (non-negotiable): never persist credentials/payment/EEO,
+  // no matter who calls this (Observer, harvest, import, AI). Layered with the caller-side
+  // filters so a single missed check can't leak a password/CVV/security-answer to memory.
+  if (isSensitiveKey(label)) return null;
   const keyNorm = normalizeQuestion(label);
   const val = value == null ? '' : String(value).trim().slice(0, 2000);
   if (!keyNorm || !val) return null;
@@ -1162,7 +1277,7 @@ function profileFieldUpsert({ profileId, question, value, locale, fieldType, sou
   }
   // Keep this profile's executor free-text memory in sync, except when a locked
   // row suppressed the write.
-  if (!suppressed) { try { qaRecord({ profileId, question: label, answer: val, source }); } catch {} }
+  if (!suppressed) { try { qaRecord({ profileId, question: label, answer: val, source, fieldType, lineageSource: lineageSource || (fromUser ? 'user' : 'manual') }); } catch {} }
   return pfRow(get('SELECT * FROM profile_fields WHERE profile_id = ? AND key_norm = ?', [profileId, keyNorm]));
 }
 
@@ -1265,7 +1380,12 @@ function profileAutofillBundle(source) {
 // server-side backstop to the extension's NEVER_AUTOFILL_RX, so even a buggy or
 // malicious client can't POST protected-class answers (race/gender/disability/
 // veteran/criminal-history/SSN/DOB) into long-lived profile memory.
-const SENSITIVE_RX = /(ethnic|race\b|gender|\bsex\b|disabilit|veteran|criminal|background.?check|felony|conviction|pronoun|sexual.?orientation|\blgbtq?|\bssn\b|social.?security|date.?of.?birth|\bdob\b)/i;
+// Two classes are blocked: (1) EEO / demographic / protected-class, and (2) — added for
+// the always-on Observer — CREDENTIALS & PAYMENT. The credential terms are deliberately
+// precise so they never eat legitimate fields: `security.?(question|answer)` (NOT bare
+// "security", so "security clearance" passes), `\bpin\b` (word-bounded, so "Pinterest"/
+// "shipping" pass), `pass(word|code|phrase)` (so "passport"/"compass" don't false-match).
+const SENSITIVE_RX = /(ethnic|race\b|gender|\bsex\b|disabilit|veteran|criminal|background.?check|felony|conviction|pronoun|sexual.?orientation|\blgbtq?|\bssn\b|social.?security|date.?of.?birth|\bdob\b|pass(word|code|phrase)|\bpwd\b|payment|credit.?card|card.?number|\bcardnum|\bcvv\b|\bcvc2?\b|security.?code|\bpin\b|\biban\b|routing.?number|bank.?account|sort.?code|\bpassport\b|credential|security.?(question|answer)|secret.?(question|answer))/i;
 function isSensitiveKey(key) {
   const k = String(key || '');
   try { return SENSITIVE_RX.test(k) || SENSITIVE_RX.test(humanizeKey(k)); } catch { return SENSITIVE_RX.test(k); }
@@ -1305,10 +1425,340 @@ function harvestAnswersToProfile(answers, { profileId, jobId, source, status } =
     if (value == null || String(value).trim() === '') continue;
     if (isJunkAnswer(key, value)) continue;   // never harvest job-board UI noise
     try {
-      if (profileFieldUpsert({ profileId: pid, question: humanizeKey(key), value, sourceJobId: jobId, source, confidence })) n++;
+      if (profileFieldUpsert({ profileId: pid, question: humanizeKey(key), value, sourceJobId: jobId, source, confidence, lineageSource: 'manual' })) n++;
     } catch {}
   }
   return n;
+}
+
+// ============================================================
+// Apprenticeship Engine — Observer (navigation log + ATS classifier)  [P2]
+// ============================================================
+// The Observer records the human navigation path (page visits, board→ATS handoff
+// edges, submits) so recipes can attribute every step to an (ats, company) pair and
+// learn which boards funnel to which ATS. classifyAts is the single, node-testable
+// source of truth for "what ATS is this URL and which company does it encode" — it
+// mirrors the extension's detectSource() (sites/index.js) but adds the iCIMS/
+// SuccessFactors/Taleo/Bamboo/Ashby/SmartRecruiters/Jobvite/direct families the
+// design needs. Anything unrecognized with an apply-looking URL is 'direct'.
+
+const APPLY_URL_RX = /(apply|application|career|jobs?|gh_jid|requisition|posting)/i;
+// Boards = aggregators a human starts on; ATS = the system a real apply runs in. A
+// board→ATS transition across a referrer is a 'handoff' edge (the whole point of P2).
+const ATS_BOARDS = new Set(['linkedin', 'indeed']);
+const ATS_SYSTEMS = new Set(['workday', 'greenhouse', 'lever', 'icims', 'successfactors', 'taleo', 'bamboo', 'ashby', 'smartrecruiters', 'jobvite']);
+
+// normKey-style company canonicalization (lowercase + strip non-alphanumerics), reused
+// from the company_key convention so attribution joins the recipe tables cleanly.
+function normCompanyKey(s) {
+  const k = String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+  return k || null;
+}
+
+// classifyAts(url) → { ats, companyKey, host }. Robust to bad/relative URLs.
+// companyKey is extracted only where the ATS encodes it in the URL (greenhouse/lever/
+// workday/ashby/icims/smartrecruiters); null otherwise (the caller passes the known
+// company separately for linkedin/indeed/direct).
+function classifyAts(url) {
+  let u;
+  try { u = new URL(String(url)); } catch { return { ats: 'direct', companyKey: null, host: '' }; }
+  const host = u.hostname.replace(/^www\./, '').toLowerCase();
+  const segs = u.pathname.split('/').filter(Boolean);
+
+  // Workday — <company>.wdN.myworkdayjobs.com / wdN.myworkdaysite.com
+  let mm = host.match(/^([a-z0-9-]+)\.wd\d+\.myworkdayjobs\.com$/) || host.match(/^([a-z0-9-]+)\.wd\d+\.myworkdaysite\.com$/);
+  if (mm) return { ats: 'workday', companyKey: normCompanyKey(mm[1]), host };
+  if (/myworkdayjobs\.com$|myworkdaysite\.com$|\.workday\.com$/.test(host)) return { ats: 'workday', companyKey: null, host };
+
+  // Greenhouse — boards.greenhouse.io/<company>/... (also job-boards.* + embed host)
+  if (/(^|\.)greenhouse\.io$/.test(host)) {
+    return { ats: 'greenhouse', companyKey: (segs[0] && segs[0] !== 'embed') ? normCompanyKey(segs[0]) : null, host };
+  }
+
+  // Lever — jobs.lever.co/<company>/...
+  if (/(^|\.)lever\.co$/.test(host)) return { ats: 'lever', companyKey: normCompanyKey(segs[0]), host };
+
+  // Ashby — jobs.ashbyhq.com/<company>/...
+  if (/(^|\.)ashbyhq\.com$/.test(host)) return { ats: 'ashby', companyKey: normCompanyKey(segs[0]), host };
+
+  // iCIMS — careers-<company>.icims.com  (also <company>.icims.com)
+  if (/(^|\.)icims\.com$/.test(host)) {
+    const sub = host.replace(/\.icims\.com$/, '').replace(/^careers[-.]?/, '');
+    return { ats: 'icims', companyKey: normCompanyKey(sub), host };
+  }
+
+  // SmartRecruiters — careers.smartrecruiters.com/<company>/... / <company>.smartrecruiters.com
+  if (/(^|\.)smartrecruiters\.com$/.test(host)) {
+    const sub = host.replace(/\.smartrecruiters\.com$/, '');
+    const co = (sub && sub !== 'careers' && sub !== 'jobs' && sub !== 'www') ? sub : segs[0];
+    return { ats: 'smartrecruiters', companyKey: normCompanyKey(co), host };
+  }
+
+  // SuccessFactors — *.successfactors.com / careers*.sap (SAP-hosted)
+  if (/(^|\.)successfactors\.com$/.test(host) || /(^|\.)successfactors\.eu$/.test(host) || /^careers.*\.sap\b/.test(host)) {
+    return { ats: 'successfactors', companyKey: null, host };
+  }
+
+  // Taleo — *.taleo.net
+  if (/(^|\.)taleo\.net$/.test(host)) return { ats: 'taleo', companyKey: null, host };
+
+  // BambooHR — <company>.bamboohr.com
+  if (/(^|\.)bamboohr\.com$/.test(host)) {
+    const sub = host.replace(/\.bamboohr\.com$/, '');
+    return { ats: 'bamboo', companyKey: (sub && sub !== 'www') ? normCompanyKey(sub) : null, host };
+  }
+
+  // Jobvite — *.jobvite.com / jobs.jobvite.com/<company>/...
+  if (/(^|\.)jobvite\.com$/.test(host)) {
+    const sub = host.replace(/\.jobvite\.com$/, '');
+    const co = (sub && sub !== 'jobs' && sub !== 'app' && sub !== 'www') ? sub : segs[0];
+    return { ats: 'jobvite', companyKey: normCompanyKey(co), host };
+  }
+
+  // Boards — company lives in query/path, not the host → companyKey null (caller supplies).
+  if (/(^|\.)linkedin\.com$/.test(host)) return { ats: 'linkedin', companyKey: null, host };
+  if (/(^|\.)indeed\.[a-z.]+$/.test(host)) return { ats: 'indeed', companyKey: null, host };
+
+  // Anything else that looks like an apply/careers page → a direct company-site apply.
+  return { ats: 'direct', companyKey: null, host };
+}
+
+// nav_events rolling cap: keep the newest N events per profile, pruned on insert, so the
+// log can't grow unbounded (design Risk #8). 2000 ≈ weeks of heavy manual applying.
+const NAV_EVENTS_CAP = 2000;
+
+// recordNavEvent — write one navigation event for the Observer. Classifies the url (and
+// referrer) via classifyAts, infers 'handoff' on a board→ATS transition when kind isn't
+// given, falls back the company attribution to the caller-supplied company, then enforces
+// the rolling cap. All ids TEXT (uid). Returns the inserted row.
+function recordNavEvent({ profileId, url, referrer, kind, sessionId, company } = {}) {
+  const pid = profileId || ensureDefaultProfileId();
+  const cur = classifyAts(url);
+  const ref = referrer ? classifyAts(referrer) : { ats: null, companyKey: null, host: '' };
+  // Handoff edge: the referrer and the current page are different ATS families AND the
+  // pair is exactly board↔ATS-system (e.g. linkedin → workday) — the moment a human
+  // leaves an aggregator for the real applicant-tracking system.
+  const isHandoff = !!ref.ats && ref.ats !== cur.ats
+    && ((ATS_BOARDS.has(ref.ats) && ATS_SYSTEMS.has(cur.ats)) || (ATS_SYSTEMS.has(ref.ats) && ATS_BOARDS.has(cur.ats)));
+  const finalKind = kind || (isHandoff ? 'handoff' : 'visit');
+  const companyKey = cur.companyKey || normCompanyKey(company);
+  const row = {
+    id: uid('nav'), profile_id: pid, session_id: sessionId || null,
+    url_norm: normJobUrl(url) || (url ? String(url).toLowerCase() : null),
+    host: cur.host || null, ats: cur.ats, company_key: companyKey,
+    referrer_norm: referrer ? (normJobUrl(referrer) || String(referrer).toLowerCase()) : null,
+    kind: finalKind, ts: now(),
+  };
+  run(`INSERT INTO nav_events (id, profile_id, session_id, url_norm, host, ats, company_key, referrer_norm, kind, ts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [row.id, row.profile_id, row.session_id, row.url_norm, row.host, row.ats, row.company_key, row.referrer_norm, row.kind, row.ts]);
+  // Enforce the rolling cap: drop everything past the newest NAV_EVENTS_CAP for this profile.
+  run('DELETE FROM nav_events WHERE profile_id = ? AND id NOT IN (SELECT id FROM nav_events WHERE profile_id = ? ORDER BY ts DESC LIMIT ?)',
+      [pid, pid, NAV_EVENTS_CAP]);
+  return row;
+}
+
+// Read helper (newest-first), mainly for tests + the future distiller session grouping.
+function navEventsForProfile(profileId, limit = NAV_EVENTS_CAP) {
+  const lim = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Number(limit) : NAV_EVENTS_CAP;
+  return all('SELECT * FROM nav_events WHERE profile_id = ? ORDER BY ts DESC LIMIT ?', [profileId, lim]);
+}
+
+// ============================================================
+// Apprenticeship Engine — Recipe Store + Transfer  [P3]
+// ============================================================
+// Recipes are the transfer unit: a target page resolves to (ats, company_key), and
+// `resolveRecipe` blends the scope='ats' recipe (transfers furthest — one Workday apply
+// teaches every Workday company) with the scope='company' overlay (company-specific
+// screening), company winning on label-pattern conflict. The distiller (distiller.js)
+// synthesizes these rows from a completed application's harvested answers; replay (P5)
+// consumes them. All ids TEXT (uid), matching the rest of the schema.
+
+function rowToRecipe(r) {
+  if (!r) return null;
+  return {
+    id: r.id, profileId: r.profile_id, scope: r.scope, ats: r.ats,
+    companyKey: r.company_key || null, siteDomain: r.site_domain || null,
+    confidence: r.confidence, rewardScore: r.reward_score,
+    successCount: r.success_count, failCount: r.fail_count, seenCount: r.seen_count,
+    createdAt: r.created_at, updatedAt: r.updated_at,
+  };
+}
+
+// upsertRecipe — insert-or-update an ats_recipes row keyed by UNIQUE(profile_id, scope,
+// ats, company_key). On a repeat, bump seen_count + updated_at (and refresh site_domain
+// if newly known). company_key is normalized; NULL for scope='ats'. Returns the row.
+function upsertRecipe({ profileId, scope, ats, companyKey, siteDomain } = {}) {
+  const pid = profileId || ensureDefaultProfileId();
+  const sc = scope === 'company' ? 'company' : 'ats';
+  const at = String(ats || '').toLowerCase().trim();
+  if (!at) return null;
+  // scope='ats' recipes are company-agnostic — never key them to a company.
+  const ck = sc === 'company' ? (normCompanyKey(companyKey) || null) : null;
+  const ts = now();
+  const cur = ck == null
+    ? get('SELECT * FROM ats_recipes WHERE profile_id = ? AND scope = ? AND ats = ? AND company_key IS NULL', [pid, sc, at])
+    : get('SELECT * FROM ats_recipes WHERE profile_id = ? AND scope = ? AND ats = ? AND company_key = ?', [pid, sc, at, ck]);
+  if (cur) {
+    run('UPDATE ats_recipes SET seen_count = seen_count + 1, site_domain = COALESCE(?, site_domain), updated_at = ? WHERE id = ?',
+        [siteDomain || null, ts, cur.id]);
+    return rowToRecipe(get('SELECT * FROM ats_recipes WHERE id = ?', [cur.id]));
+  }
+  const id = uid('recipe');
+  run(`INSERT INTO ats_recipes (id, profile_id, scope, ats, company_key, site_domain, confidence, reward_score, success_count, fail_count, seen_count, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0.5, 0, 0, 0, 1, ?, ?)`,
+      [id, pid, sc, at, ck, siteDomain || null, ts, ts]);
+  return rowToRecipe(get('SELECT * FROM ats_recipes WHERE id = ?', [id]));
+}
+
+function getRecipe(profileId, scope, ats, companyKey) {
+  const pid = profileId;
+  const sc = scope === 'company' ? 'company' : 'ats';
+  const at = String(ats || '').toLowerCase().trim();
+  if (!pid || !at) return null;
+  const ck = sc === 'company' ? (normCompanyKey(companyKey) || null) : null;
+  const r = ck == null
+    ? get('SELECT * FROM ats_recipes WHERE profile_id = ? AND scope = ? AND ats = ? AND company_key IS NULL', [pid, sc, at])
+    : get('SELECT * FROM ats_recipes WHERE profile_id = ? AND scope = ? AND ats = ? AND company_key = ?', [pid, sc, at, ck]);
+  return rowToRecipe(r);
+}
+
+function rowToStep(r) {
+  if (!r) return null;
+  return {
+    id: r.id, recipeId: r.recipe_id, stepIndex: r.step_index, action: r.action,
+    labelPattern: r.label_pattern || null, fieldType: r.field_type || null,
+    strategy: r.strategy || null, options: safeParse(r.options, null),
+    validationPattern: r.validation_pattern || null, advanceText: r.advance_text || null,
+    medianDelayMs: r.median_delay_ms ?? null, confidence: r.confidence ?? null,
+    updatedAt: r.updated_at,
+  };
+}
+
+// upsertRecipeStep — a recipe's step is identified by (recipe_id, label_pattern). If a step
+// with the same label_pattern already exists, update it in place; otherwise append at the
+// next free step_index. `options` is stored as JSON. Returns the step row.
+function upsertRecipeStep({ recipeId, stepIndex, action, labelPattern, fieldType, strategy, options, advanceText, medianDelayMs, confidence } = {}) {
+  if (!recipeId) return null;
+  const lp = labelPattern != null ? String(labelPattern) : null;
+  const ts = now();
+  const opts = options == null ? null : (typeof options === 'string' ? options : JSON.stringify(options));
+  const cur = lp != null
+    ? get('SELECT * FROM recipe_steps WHERE recipe_id = ? AND label_pattern = ?', [recipeId, lp])
+    : null;
+  if (cur) {
+    run(`UPDATE recipe_steps SET
+         action=COALESCE(?, action), field_type=COALESCE(?, field_type),
+         strategy=COALESCE(?, strategy), options=COALESCE(?, options),
+         advance_text=COALESCE(?, advance_text), median_delay_ms=COALESCE(?, median_delay_ms),
+         confidence=COALESCE(?, confidence), updated_at=?
+         WHERE id=?`,
+        [action || null, fieldType || null, strategy || null, opts,
+         advanceText ?? null, medianDelayMs ?? null, confidence ?? null, ts, cur.id]);
+    return rowToStep(get('SELECT * FROM recipe_steps WHERE id = ?', [cur.id]));
+  }
+  // Append: next index = caller-supplied, else max+1 for this recipe.
+  let idx = Number.isFinite(Number(stepIndex)) ? Number(stepIndex)
+    : ((get('SELECT MAX(step_index) AS m FROM recipe_steps WHERE recipe_id = ?', [recipeId])?.m ?? -1) + 1);
+  const id = uid('step');
+  run(`INSERT INTO recipe_steps (id, recipe_id, step_index, action, label_pattern, field_type, strategy, options, validation_pattern, advance_text, median_delay_ms, confidence, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
+      [id, recipeId, idx, String(action || 'fill'), lp, fieldType || null, strategy || null, opts,
+       advanceText ?? null, medianDelayMs ?? null, confidence ?? null, ts]);
+  return rowToStep(get('SELECT * FROM recipe_steps WHERE id = ?', [id]));
+}
+
+// Ordered steps for a recipe (step_index ascending = replay order).
+function recipeSteps(recipeId) {
+  if (!recipeId) return [];
+  return all('SELECT * FROM recipe_steps WHERE recipe_id = ? ORDER BY step_index ASC', [recipeId]).map(rowToStep);
+}
+
+// markRecipeOutcome — bump the mechanical success/fail counters after a replay (or a
+// distilled completed application). Used now by the distiller; later by the replayer.
+function markRecipeOutcome(recipeId, { success } = {}) {
+  if (!recipeId) return null;
+  const col = success ? 'success_count' : 'fail_count';
+  run(`UPDATE ats_recipes SET ${col} = ${col} + 1, updated_at = ? WHERE id = ?`, [now(), recipeId]);
+  return rowToRecipe(get('SELECT * FROM ats_recipes WHERE id = ?', [recipeId]));
+}
+
+// recordRecipeCorrection(recipeId, { labelPattern }) — the replay divergence feedback
+// [P5]. When AUTO replay diverges (an unexpected required field, a validation error, a
+// stall), the executor downgrades to review and POSTs here. We DECAY the recipe's
+// confidence (*0.8, floored at 0.1 so it never hits zero and stays revivable), bump
+// fail_count, and touch updated_at; if a specific divergent label is named, that step's
+// confidence is decayed too (same *0.8 / floor 0.1) so the next resolve trusts it less.
+// This makes a stale recipe self-correct toward fall-back instead of repeating a bad fill.
+function recordRecipeCorrection(recipeId, { labelPattern } = {}) {
+  if (!recipeId) return null;
+  const ts = now();
+  const r = get('SELECT * FROM ats_recipes WHERE id = ?', [recipeId]);
+  if (!r) return null;
+  const decayed = Math.max(0.1, (Number(r.confidence) || 0.5) * 0.8);
+  run('UPDATE ats_recipes SET confidence = ?, fail_count = fail_count + 1, updated_at = ? WHERE id = ?',
+      [decayed, ts, recipeId]);
+  if (labelPattern != null && String(labelPattern).trim()) {
+    const lp = String(labelPattern);
+    const step = get('SELECT * FROM recipe_steps WHERE recipe_id = ? AND label_pattern = ?', [recipeId, lp]);
+    if (step) {
+      const sc = Math.max(0.1, (Number(step.confidence) || 0.5) * 0.8);
+      run('UPDATE recipe_steps SET confidence = ?, updated_at = ? WHERE id = ?', [sc, ts, step.id]);
+    }
+  }
+  return rowToRecipe(get('SELECT * FROM ats_recipes WHERE id = ?', [recipeId]));
+}
+
+// resolveRecipe(ats, companyKey, profileId) — the transfer engine. Fetch the scope='ats'
+// recipe (transfers across every company on that ATS) and the scope='company' overlay
+// (this company's specifics), then merge their steps by label_pattern: COMPANY OVERLAY
+// WINS on conflict, the ATS recipe fills the rest. Returns the merged ordered steps plus a
+// 0..1 coverage score and a blended confidence, so discovery can prefer ATSes it knows.
+function resolveRecipe(ats, companyKey, profileId) {
+  const pid = profileId || ensureDefaultProfileId();
+  const atsRecipe = getRecipe(pid, 'ats', ats, null);
+  const companyRecipe = companyKey ? getRecipe(pid, 'company', ats, companyKey) : null;
+  const atsSteps = atsRecipe ? recipeSteps(atsRecipe.id) : [];
+  const companySteps = companyRecipe ? recipeSteps(companyRecipe.id) : [];
+
+  // Merge by label_pattern, company overlay winning. Company steps come first (their
+  // specifics gate the flow), then any ATS steps not already covered by a company label.
+  const byLabel = new Map();
+  const merged = [];
+  for (const s of companySteps) {
+    const key = s.labelPattern || `__co_${merged.length}`;
+    if (!byLabel.has(key)) { byLabel.set(key, true); merged.push({ ...s, scope: 'company' }); }
+  }
+  for (const s of atsSteps) {
+    const key = s.labelPattern || `__ats_${merged.length}`;
+    if (byLabel.has(key)) continue;   // company overlay already provides this field
+    byLabel.set(key, true);
+    merged.push({ ...s, scope: 'ats' });
+  }
+  merged.forEach((s, i) => { s.stepIndex = i; });
+
+  // Coverage (0..1): how complete this resolution is. With no steps at all it's 0. With an
+  // ATS recipe it covers the generic fields; a company overlay adds the company specifics.
+  // Define it as the distinct merged-step count saturating toward 1 (≥6 fields ≈ a full
+  // form), with a small bonus when a company overlay is present (specifics are covered).
+  const base = merged.length ? Math.min(1, merged.length / 6) : 0;
+  const overlayBonus = (companyRecipe && companySteps.length) ? 0.15 : 0;
+  const coverage = merged.length ? Math.min(1, base * 0.85 + overlayBonus) : 0;
+  // Blend confidence: company overlay weighted toward, falling back to whichever exists.
+  const ac = atsRecipe ? (atsRecipe.confidence ?? 0.5) : null;
+  const cc = companyRecipe ? (companyRecipe.confidence ?? 0.5) : null;
+  let confidence = 0;
+  if (ac != null && cc != null) confidence = cc * 0.6 + ac * 0.4;
+  else if (cc != null) confidence = cc;
+  else if (ac != null) confidence = ac;
+
+  return {
+    steps: merged,
+    coverage,
+    confidence,
+    atsRecipeId: atsRecipe ? atsRecipe.id : null,
+    companyRecipeId: companyRecipe ? companyRecipe.id : null,
+  };
 }
 
 // One-shot backfill: harvest answers from EVERY past application into the GIVEN
@@ -2169,6 +2619,467 @@ function jobsForMatching() {
     .map((r) => ({ id: r.id, title: r.title, company: r.company, source: r.source, submittedAt: r.submitted_at, createdAt: r.created_at }));
 }
 
+// ============================================================
+// Reward Engine — credit assignment + confirm-and-train  [P6]
+// ============================================================
+// The north-star loop: an interview/offer reply matched to an application is the only signal
+// that turns "we applied" into "this WORKED". recordOutcome writes the ledger row and fans
+// FRACTIONAL, CONFIDENCE-WEIGHTED, CLIPPED credit to the answers + recipe that produced the
+// application. The guardrail (design "poisoned-reward"): effectiveReward = reward * confidence
+// clamped to [-1, 1], so one lenient mislabel can never dominate. 'suggested' (unconfirmed)
+// rewards are HELD — they are only credited once the user confirms the link.
+
+function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, Number(x) || 0)); }
+
+// Read the reward ledger for a job (newest first). Used by tests now; by P7 rankJob next, to
+// blend an application's reward history into discovery/queue ranking.
+function outcomesForJob(jobId) {
+  return all('SELECT * FROM application_outcomes WHERE job_id = ? ORDER BY ts DESC', [jobId])
+    .map((r) => ({
+      id: r.id, jobId: r.job_id, profileId: r.profile_id, recipeId: r.recipe_id || null,
+      ats: r.ats || null, companyKey: r.company_key || null, reward: r.reward,
+      rewardKind: r.reward_kind, emailId: r.email_id || null,
+      credited: safeParse(r.credited, { qa_ids: [], recipe_ids: [] }), ts: r.ts,
+    }));
+}
+
+// Locate the (ats, companyKey) for a job from its URL (so credit can find the recipe used).
+function jobAtsCompany(job) {
+  const c = classifyAts(job && job.jobUrl);
+  return { ats: c.ats, companyKey: c.companyKey || normCompanyKey(job && job.company) };
+}
+
+// Bump a qa answer's reward_score by `delta` (in place). Returns true if a row was updated.
+function bumpQaReward(qaId, delta) {
+  if (!qaId || !delta) return false;
+  return (run('UPDATE qa SET reward_score = COALESCE(reward_score, 0) + ?, updated_at = ? WHERE id = ?',
+    [delta, now(), qaId])?.changes ?? 0) > 0;
+}
+// Bump a recipe's reward_score by `delta` (in place). Returns true if a row was updated.
+function bumpRecipeReward(recipeId, delta) {
+  if (!recipeId || !delta) return false;
+  return (run('UPDATE ats_recipes SET reward_score = COALESCE(reward_score, 0) + ?, updated_at = ? WHERE id = ?',
+    [delta, now(), recipeId])?.changes ?? 0) > 0;
+}
+
+// recordOutcome — write one application_outcomes ledger row and, for POSITIVE rewards, fan
+// the clipped/confidence-weighted credit to the answers + recipe that produced it. For a
+// MILD-NEGATIVE (rejection) we write the ledger row but DO NOT dock the recipe/answer
+// mechanical credit (the application *worked* — rejection only feeds fit/relevance ranking in
+// P7). Returns the inserted row id + the credited {qa_ids, recipe_ids}.
+function recordOutcome({ jobId, profileId, recipeId, ats, companyKey, reward, rewardKind, emailId, credited } = {}) {
+  if (!jobId) return null;
+  const job = getJob(jobId);
+  if (!job) return null;
+  const pid = profileId || resolveProfileId(job.source);
+  const ac = jobAtsCompany(job);
+  const finalAts = ats || ac.ats || null;
+  const finalCompanyKey = companyKey || ac.companyKey || null;
+  const effective = clamp(reward, -1, 1);     // already-weighted reward, clipped to [-1,1]
+
+  const creditOut = (credited && typeof credited === 'object')
+    ? { qa_ids: [...(credited.qa_ids || [])], recipe_ids: [...(credited.recipe_ids || [])] }
+    : { qa_ids: [], recipe_ids: [] };
+
+  // POSITIVE → fan credit. (Negative/zero outcomes are ledger-only: rejection is fit-rank
+  // only, so the recipe/answers keep their mechanical-success credit.)
+  if (effective > 0) {
+    // (a) the qa answers used in this application — located by the job's answer labels.
+    for (const label of Object.keys(job.answers || {})) {
+      if (!label || isSensitiveKey(label)) continue;
+      const hit = qaLookup(pid, label);
+      if (hit && hit.id && !creditOut.qa_ids.includes(hit.id)) {
+        if (bumpQaReward(hit.id, effective)) creditOut.qa_ids.push(hit.id);
+      }
+    }
+    // (b) the recipe used — the task's recorded recipe_id for this job if present, else the
+    // (ats, company) the apply resolves to.
+    let credRecipeId = recipeId || null;
+    if (!credRecipeId) {
+      const task = get("SELECT recipe_id FROM auto_apply_tasks WHERE job_id = ? AND recipe_id IS NOT NULL ORDER BY updated_at DESC LIMIT 1", [jobId]);
+      credRecipeId = (task && task.recipe_id) || null;
+    }
+    if (!credRecipeId && finalAts) {
+      const resolved = resolveRecipe(finalAts, finalCompanyKey, pid);
+      credRecipeId = resolved.atsRecipeId || resolved.companyRecipeId || null;
+    }
+    if (credRecipeId && bumpRecipeReward(credRecipeId, effective) && !creditOut.recipe_ids.includes(credRecipeId)) {
+      creditOut.recipe_ids.push(credRecipeId);
+    }
+    if (credRecipeId && !recipeId) recipeId = credRecipeId;   // stamp the ledger row with it
+  }
+
+  const id = uid('outcome');
+  run(`INSERT INTO application_outcomes (id, job_id, profile_id, recipe_id, ats, company_key, reward, reward_kind, email_id, credited, ts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, jobId, pid, recipeId || null, finalAts, finalCompanyKey, effective, rewardKind || 'submitted',
+     emailId || null, JSON.stringify(creditOut), now()]);
+  return { id, jobId, profileId: pid, recipeId: recipeId || null, ats: finalAts, companyKey: finalCompanyKey,
+    reward: effective, rewardKind: rewardKind || 'submitted', emailId: emailId || null, credited: creditOut };
+}
+
+// creditOutcomeForEmail(emailId) — the email→reward entry point. An email earns/credits an
+// outcome only when it is LINKED ('auto' or 'manual') and classifies to a NON-ZERO reward.
+// 'suggested' rows are held (their reward is released by confirmEmailLink). Credit is
+// confidence-weighted: effectiveReward = baseReward * matchConfidence, clipped to [-1,1].
+function creditOutcomeForEmail(emailId) {
+  const row = get('SELECT * FROM emails WHERE id = ?', [emailId]);
+  if (!row) return { ok: false, reason: 'no-email' };
+  if (!row.matched_job_id) return { ok: false, reason: 'unlinked' };
+  if (row.match_source !== 'auto' && row.match_source !== 'manual') return { ok: false, reason: 'held' };
+  // Don't double-credit the same email.
+  if (get('SELECT id FROM application_outcomes WHERE email_id = ? LIMIT 1', [emailId])) return { ok: false, reason: 'already-credited' };
+
+  const { classifyEmailReward } = require('./email');
+  const { kind, reward } = classifyEmailReward(row.category || classifyFromEmailRow(row));
+  if (!reward) return { ok: false, reason: 'neutral' };
+
+  const conf = clamp(row.match_confidence, 0, 1) || 0;
+  const effective = clamp(reward * conf, -1, 1);   // CONFIDENCE-WEIGHTED + CLIPPED
+  if (!effective) return { ok: false, reason: 'zero-after-weight' };
+
+  const job = getJob(row.matched_job_id);
+  const pid = job ? resolveProfileId(job.source) : ensureDefaultProfileId();
+  const out = recordOutcome({
+    jobId: row.matched_job_id, profileId: pid, reward: effective,
+    rewardKind: kind === 'rejection' ? 'rejection' : 'email_reply', emailId,
+  });
+  return { ok: !!out, reward: effective, rewardKind: kind, outcome: out };
+}
+// Re-derive a category from a stored email row if `category` was never persisted.
+function classifyFromEmailRow(row) {
+  try { return require('./email').classify(row.subject || '', row.body || ''); } catch { return 'other'; }
+}
+
+// emailsNeedingConfirm(profileId) — the confirm-this-link inbox: 'suggested' emails that have
+// a candidate job, newest first. (profileId is accepted for symmetry/future per-profile
+// scoping; emails are not yet profile-scoped, so it filters only when jobs carry a profile.)
+function emailsNeedingConfirm(profileId, limit = 100) {
+  const rows = all(
+    `SELECT * FROM emails WHERE match_source = 'suggested' AND matched_job_id IS NOT NULL
+       ORDER BY sent_at DESC LIMIT ?`, [Math.min(500, limit)]);
+  return rows.map((r) => {
+    const e = rowToEmail(r);
+    const job = e.matchedJobId ? getJob(e.matchedJobId) : null;
+    return { ...e, candidate: job ? { id: job.id, title: job.title, company: job.company, status: job.status } : null };
+  }).filter((e) => !profileId || e.candidate);
+}
+
+// A compact, labeled training example the matcher can later use to tune thresholds. Stored as
+// a capped kv list (no new table needed): email-features + the human decision. Keep it simple.
+function recordMatchTrainingExample({ email, jobId, decision }) {
+  const key = 'matchTraining';
+  const list = kvGet(key) || [];
+  list.push({
+    decision,                                  // 'confirm' | 'dismiss'
+    fromDomain: (String(email.from || '').split('@')[1] || '').toLowerCase(),
+    subjectKey: normKey(email.subject || '').slice(0, 120),
+    category: email.category || null,
+    matchConfidence: email.matchConfidence ?? null,
+    jobId: jobId || email.matchedJobId || null,
+    ts: now(),
+  });
+  // Rolling cap so the kv blob can't grow unbounded.
+  kvSet(key, list.slice(-500));
+  return list.length;
+}
+
+// confirmEmailLink(emailId, { jobId, confirm }) — the confirm-and-train action. On confirm:
+//   • set match_source='manual', link to jobId (or keep the suggested candidate),
+//   • apply the forward-only STATUS_ORDER elevation to the job (the email's classified status),
+//   • persist a POSITIVE training example,
+//   • RELEASE the held reward via creditOutcomeForEmail.
+// On dismiss: set match_source='dismissed' + a NEGATIVE training example (no reward).
+function confirmEmailLink(emailId, { jobId, confirm } = {}) {
+  const row = get('SELECT * FROM emails WHERE id = ?', [emailId]);
+  if (!row) return { ok: false, error: 'no such email' };
+  const e = rowToEmail(row);
+
+  if (!confirm) {
+    run("UPDATE emails SET match_source = 'dismissed' WHERE id = ?", [emailId]);
+    recordMatchTrainingExample({ email: e, jobId: null, decision: 'dismiss' });
+    return { ok: true, email: rowToEmail(get('SELECT * FROM emails WHERE id = ?', [emailId])), credited: null };
+  }
+
+  const linkJobId = jobId || row.matched_job_id;
+  if (!linkJobId) return { ok: false, error: 'no candidate job to confirm' };
+  // Promote to a manual (user-confirmed) link at full confidence.
+  run("UPDATE emails SET matched_job_id = ?, match_source = 'manual', match_confidence = CASE WHEN match_confidence < 0.85 THEN 0.85 ELSE match_confidence END WHERE id = ?",
+    [linkJobId, emailId]);
+
+  // Forward-only status elevation from the email's classified status (reuse the existing
+  // ladder via patchJob, which enforces elevation + never demotes a terminal job).
+  const job = getJob(linkJobId);
+  if (job) {
+    const emailStatus = gmailStatusFromCategory(e.category) || null;
+    if (emailStatus) {
+      const cur = STATUS_ORDER[job.status] || 0;
+      const inc = STATUS_ORDER[emailStatus] || 0;
+      if (!TERMINAL.has(job.status) && (inc > cur || (emailStatus === 'rejected'))) {
+        const r = patchJob(linkJobId, { status: emailStatus });
+        if (r?.statusChanged) {
+          recordEvent({
+            jobId: linkJobId, type: 'status_changed', source: 'email-confirm',
+            summary: `${r.previousStatus} → ${emailStatus} (confirmed email: "${(e.subject || '').slice(0, 80)}")`,
+            data: { from: r.previousStatus, to: emailStatus, emailId },
+          });
+        }
+      }
+    }
+  }
+
+  recordMatchTrainingExample({ email: { ...e, matchedJobId: linkJobId }, jobId: linkJobId, decision: 'confirm' });
+  // RELEASE the held reward now that the link is confirmed.
+  const credited = creditOutcomeForEmail(emailId);
+  return { ok: true, email: rowToEmail(get('SELECT * FROM emails WHERE id = ?', [emailId])), credited };
+}
+
+// Map an email-integration category (email.js classify) → a job status for forward elevation.
+// Mirrors gmail.js's status ladder so the IMAP/Gmail confirm path elevates consistently.
+function gmailStatusFromCategory(category) {
+  switch (category) {
+    case 'offer':                    return 'offer';
+    case 'interview':                return 'interview_1';
+    case 'rejection':                return 'rejected';
+    case 'recruiter':                return 'contacted';
+    case 'application_confirmation': return 'submitted';
+    default:                         return null;
+  }
+}
+
+// ============================================================
+// Strict Relevance + Punishment Gate + unified rankJob  [P7]
+// ============================================================
+// The user's explicit negative signal (punish a single job, a job-type title pattern, or an
+// ENTIRE company) plus the geo/work-authorization down-rank, blended with deterministic fit +
+// reward history into ONE rankJob(job, profileId) score that discovery + queueNext consume.
+// Every id is TEXT (uid). Punishments DECAY by default (decay_at = now + decayDays*86400s);
+// a 0/null decayDays stores NULL = permanent. A matching ACTIVE punishment hard-excludes a
+// job (isPunished) and zeroes-out its rank; an EXPIRED one no longer counts (eligibility
+// restored). The geo gate is a BOUNDED ranking lever, never a punishment, gated by a TRUTHFUL
+// authorization read — it never fabricates work authorization.
+
+const PUNISH_DEFAULT_DECAY_DAYS = 90;   // the agreed decaying default (design Open-Q #8)
+
+// punish — insert one punishments row. decayDays:
+//   • undefined            → default 90-day decay
+//   • 0 | null             → PERMANENT (decay_at = NULL)
+//   • a positive number    → decay_at = now + decayDays*86400s
+function punish({ profileId, kind, pattern, weight, decayDays } = {}) {
+  const pid = profileId || ensureDefaultProfileId();
+  const k = String(kind || '').toLowerCase();
+  if (!['job', 'job_type', 'company'].includes(k)) return null;
+  const pat = String(pattern == null ? '' : pattern).trim();
+  if (!pat) return null;
+  // company punishments are keyed by company_key so they join the recipe/job attribution.
+  const storedPattern = k === 'company' ? (normCompanyKey(pat) || pat.toLowerCase()) : pat;
+  let decayAt = null;   // permanent
+  const days = decayDays === undefined ? PUNISH_DEFAULT_DECAY_DAYS : Number(decayDays);
+  if (days && Number.isFinite(days) && days > 0) decayAt = new Date(Date.now() + days * 86400 * 1000).toISOString();
+  const id = uid('punish');
+  run(`INSERT INTO punishments (id, profile_id, kind, pattern, weight, decay_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [id, pid, k, storedPattern, weight != null ? Number(weight) : 1.0, decayAt, now()]);
+  return { id, profileId: pid, kind: k, pattern: storedPattern, weight: weight != null ? Number(weight) : 1.0, decayAt, createdAt: now() };
+}
+
+function unpunish(id) { return (run('DELETE FROM punishments WHERE id = ?', [id])?.changes ?? 0) > 0; }
+
+// listPunishments(profileId) — ACTIVE punishments (decay_at NULL = permanent, or still in the
+// future), newest first. Expired rows are filtered out (they no longer apply).
+function listPunishments(profileId) {
+  const pid = profileId || ensureDefaultProfileId();
+  const nowIso = now();
+  return all('SELECT * FROM punishments WHERE profile_id = ? AND (decay_at IS NULL OR decay_at > ?) ORDER BY created_at DESC', [pid, nowIso])
+    .map((r) => ({ id: r.id, profileId: r.profile_id, kind: r.kind, pattern: r.pattern, weight: r.weight, decayAt: r.decay_at || null, createdAt: r.created_at }));
+}
+
+// punishmentPenalty(job, profileId) → number in [0,1]. 1.0 when an ACTIVE punishment matches
+// this job (company_key match, OR a job_type pattern matched against the title — tried first as
+// a regex, falling back to a case-insensitive substring, OR a job-id match), else 0. Expired
+// punishments (decay_at passed) are excluded by the query, so they never count.
+function punishmentPenalty(job, profileId) {
+  if (!job) return 0;
+  const pid = profileId || resolveProfileId(job.source);
+  const active = all('SELECT * FROM punishments WHERE profile_id = ? AND (decay_at IS NULL OR decay_at > ?)', [pid, now()]);
+  if (!active.length) return 0;
+  const companyKey = normCompanyKey(job.company) || jobAtsCompany(job).companyKey || null;
+  const title = String(job.title || '');
+  for (const p of active) {
+    if (p.kind === 'company') {
+      if (companyKey && String(p.pattern || '').toLowerCase() === String(companyKey).toLowerCase()) return 1;
+    } else if (p.kind === 'job') {
+      if (job.id && String(p.pattern) === String(job.id)) return 1;
+    } else if (p.kind === 'job_type') {
+      const pat = String(p.pattern || '');
+      if (!pat) continue;
+      let matched = false;
+      try { matched = new RegExp(pat, 'i').test(title); }
+      catch { matched = title.toLowerCase().includes(pat.toLowerCase()); }
+      if (!matched && title.toLowerCase().includes(pat.toLowerCase())) matched = true;   // substring fallback even when the regex is valid but didn't fire
+      if (matched) return 1;
+    }
+  }
+  return 0;
+}
+
+// isPunished(job, profileId) — boolean hard-exclusion gate for discovery + queueNext.
+function isPunished(job, profileId) { return punishmentPenalty(job, profileId) > 0; }
+
+// punishCompanyCascade(profileId, companyKey) — apply a fresh company punishment to the LIVE
+// queue: every QUEUED/scheduled auto_apply_task for that company's jobs is set to 'skipped'
+// with last_error 'punished company', so the block takes effect immediately (not just on the
+// next discovery pass). Returns the count of tasks skipped.
+function punishCompanyCascade(profileId, companyKey) {
+  const ck = normCompanyKey(companyKey);
+  if (!ck) return 0;
+  const ts = now();
+  // Match jobs by normalized company name OR by the company encoded in the job URL.
+  const rows = all(
+    `SELECT t.id, j.company AS company, j.job_url AS jobUrl
+       FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
+      WHERE t.state IN ('queued','scheduled')`);
+  let n = 0;
+  for (const r of rows) {
+    const jobCk = normCompanyKey(r.company) || classifyAts(r.jobUrl).companyKey || null;
+    if (jobCk && String(jobCk).toLowerCase() === ck.toLowerCase()) {
+      run("UPDATE auto_apply_tasks SET state = 'skipped', last_error = 'punished company', updated_at = ? WHERE id = ?", [ts, r.id]);
+      n++;
+    }
+  }
+  return n;
+}
+
+// ---- geo / work-authorization gate (truthful, bounded ranking lever) ----
+// Read the user's work authorization ONLY from truthful sources: the structured
+// profile.data.workAuthRegions (array | comma/semicolon string) or profile.data.workAuthorization
+// /citizenship free text, OR a LOCKED profile_fields row whose label matches the work-auth regex.
+// Never fabricated; absent → unknown → no penalty (don't over-filter).
+const WORK_AUTH_LABEL_RX = /work.?authoriz|authorized to work|authori[sz]ed.?work|citizen|visa|eligible to work|right to work|work.?permit/i;
+
+function workAuthText(profileId, profile) {
+  const parts = [];
+  const d = (profile && profile.data) || profile || null;
+  if (d && typeof d === 'object') {
+    if (Array.isArray(d.workAuthRegions)) parts.push(d.workAuthRegions.join(', '));
+    else if (typeof d.workAuthRegions === 'string') parts.push(d.workAuthRegions);
+    if (d.workAuthorization) parts.push(String(d.workAuthorization));
+    if (d.citizenship) parts.push(String(d.citizenship));
+  }
+  // A locked profile_fields row the user set themselves (truthful, user-edited).
+  if (profileId) {
+    try {
+      for (const f of all('SELECT label, value FROM profile_fields WHERE profile_id = ? AND locked = 1', [profileId])) {
+        if (f.value && WORK_AUTH_LABEL_RX.test(String(f.label || ''))) parts.push(String(f.value));
+      }
+    } catch {}
+  }
+  return parts.filter(Boolean).join(' | ').trim();
+}
+
+// Does this job look remote? (work_mode field or title/location/description text.)
+const REMOTE_RX = /\b(remote|work from home|wfh|télétravail|teletravail|distanciel)\b/i;
+const ONSITE_RX = /\b(on-?site|in-?office|in-?person|on-?premise)\b/i;
+function jobIsRemote(job) {
+  const hay = `${job?.workMode || ''} ${job?.title || ''} ${job?.location || ''}`;
+  if (REMOTE_RX.test(hay)) return true;
+  if (REMOTE_RX.test(String(job?.description || '').slice(0, 600))) return true;
+  return false;
+}
+
+// geoPenalty(job, profileId) → number in [0, GEO_PENALTY_MAX].
+//   • remote job (+ user has SOME authorization on file)  → 0  (remote expands scope)
+//   • on-site job in a region the user is NOT authorized for → GEO_PENALTY_MAX (down-rank)
+//   • unknown authorization OR unknown region              → 0  (never over-filter / fabricate)
+// This is a RANKING lever only: it never excludes a job and never asserts authorization the
+// user hasn't stated. Authorization is matched truthfully — a region token from the job's
+// location must appear in the user's stated authorization for an on-site job to be in-scope.
+const GEO_PENALTY_MAX = 0.5;
+function geoPenalty(job, profileId, profile) {
+  if (!job) return 0;
+  const pid = profileId || resolveProfileId(job.source);
+  // Resolve the profile (for its structured data.workAuthRegions/workAuthorization) when the
+  // caller didn't pass one — match by id first, else the source-matched profile.
+  let prof = profile;
+  if (!prof) {
+    try { prof = listProfiles().find((p) => p.id === pid) || profileForSource(job.source) || null; } catch { prof = null; }
+  }
+  const auth = workAuthText(pid, prof);
+  if (!auth) return 0;                       // TRUTH GATE: no authorization on file → never penalize (no guessing)
+  if (jobIsRemote(job)) return 0;            // remote + authorized somewhere → in-scope
+  const loc = String(job.location || '').trim();
+  if (!loc) return 0;                        // unknown region → don't over-filter
+  // On-site with a known region: in-scope only if a meaningful location token appears in the
+  // user's stated authorization. Otherwise it's an unauthorized-region on-site role → down-rank.
+  const authLc = auth.toLowerCase();
+  const tokens = loc.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3);
+  const inScope = tokens.some((t) => authLc.includes(t));
+  return inScope ? 0 : GEO_PENALTY_MAX;
+}
+
+// rewardBonus(job, profileId) → number in [0, REWARD_BONUS_MAX]. A bounded bonus from this
+// (ats, company)'s track record: the average application_outcomes.reward for the company plus
+// the resolved recipe's reward_score, squashed so interviews/offers float a company up without
+// letting one outcome dominate.
+const REWARD_BONUS_MAX = 0.3;
+function rewardBonus(job, profileId) {
+  if (!job) return 0;
+  const pid = profileId || resolveProfileId(job.source);
+  const ac = jobAtsCompany(job);
+  const companyKey = ac.companyKey;
+  let signal = 0;
+  if (companyKey) {
+    const agg = get(
+      'SELECT AVG(reward) AS avgR, COUNT(*) AS n FROM application_outcomes WHERE profile_id = ? AND company_key = ?',
+      [pid, companyKey]);
+    if (agg && agg.n) signal += Number(agg.avgR) || 0;
+  }
+  // The resolved recipe's reward_score (credit assignment bumps it on interview replies).
+  try {
+    const resolved = resolveRecipe(ac.ats, companyKey, pid);
+    const rid = resolved.companyRecipeId || resolved.atsRecipeId;
+    if (rid) {
+      const r = get('SELECT reward_score FROM ats_recipes WHERE id = ?', [rid]);
+      if (r && r.reward_score) signal += Number(r.reward_score) * 0.5;   // recipe signal weighted half the company-outcome signal
+    }
+  } catch {}
+  if (signal <= 0) return 0;
+  // Saturating squash so the bonus is bounded by REWARD_BONUS_MAX.
+  return REWARD_BONUS_MAX * (signal / (signal + 1));
+}
+
+// stalenessPenalty(job) → small [0, STALE_PENALTY_MAX] decay by job age (updatedAt|createdAt),
+// so an older posting ranks slightly lower than an otherwise-equal fresh one.
+const STALE_PENALTY_MAX = 0.1;
+function stalenessPenalty(job) {
+  const ref = job && (job.updatedAt || job.createdAt);
+  const t = ref ? Date.parse(ref) : NaN;
+  if (!Number.isFinite(t)) return 0;
+  const ageDays = (Date.now() - t) / 86400000;
+  if (ageDays <= 7) return 0;
+  // Linear ramp from 0 (7 days) to STALE_PENALTY_MAX (90+ days old).
+  return STALE_PENALTY_MAX * clamp((ageDays - 7) / (90 - 7), 0, 1);
+}
+
+// rankJob(job, profileId, opts?) → composite score (higher = better). Blends:
+//   base fit (fit.js, 0..1)  + rewardBonus (≤0.3)  − geoPenalty (≤0.5)  − stalenessPenalty (≤0.1)
+//   − punishment: an ACTIVE matching punishment returns a strongly negative rank (effectively
+//     excluded while active). opts may carry { profile, resumeText } so callers that already have
+//     them avoid a re-load; otherwise the source-matched profile is used.
+function rankJob(job, profileId, opts = {}) {
+  if (!job) return 0;
+  const pid = profileId || resolveProfileId(job.source);
+  // Punishment is a hard floor: while active, the job is excluded from ranking selection.
+  if (punishmentPenalty(job, pid) > 0) return -1;
+  let profile = opts.profile || null;
+  if (!profile) { try { profile = listProfiles().find((p) => p.id === pid) || profileForSource(job.source) || null; } catch { profile = null; } }
+  const resumeText = opts.resumeText || '';
+  let base = 0;
+  try { base = (fitScore(job, profile, resumeText).score || 0) / 100; } catch { base = 0; }
+  const rank = base + rewardBonus(job, pid) - geoPenalty(job, pid, profile) - stalenessPenalty(job);
+  return rank;
+}
+
 module.exports = {
   open, close, backupNow, dailyBackup, maintenance, transaction,
   getSettings, patchSettings, kvGet, kvSet,
@@ -2178,6 +3089,8 @@ module.exports = {
   profileFieldUpsert, profileFieldList, profileFieldSet, profileFieldDelete,
   profileFieldLookup, profileAutofillBundle, harvestAnswersToProfile, backfillProfileFromJobs, deriveProfileFromLearned,
   memoryToProfileData, pushProfileDataToMemory, ensureDefaultProfileId, resolveProfileId,
+  classifyAts, normCompanyKey, recordNavEvent, navEventsForProfile, isSensitiveKey,
+  upsertRecipe, getRecipe, upsertRecipeStep, recipeSteps, markRecipeOutcome, recordRecipeCorrection, resolveRecipe,
   listProfiles, saveProfile, deleteProfile, profileForSource,
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,
   extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,
@@ -2186,5 +3099,8 @@ module.exports = {
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,
   emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching,
+  recordOutcome, creditOutcomeForEmail, emailsNeedingConfirm, confirmEmailLink, outcomesForJob,
+  punish, unpunish, listPunishments, punishmentPenalty, isPunished, punishCompanyCascade,
+  geoPenalty, rankJob,
   STATUS_ORDER, TERMINAL, normJobUrl, normKey,
 };

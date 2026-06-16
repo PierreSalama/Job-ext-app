@@ -213,7 +213,10 @@ async function queueNext(force = false) {
   // Oldest-first (the list is DESC). Retire dead tasks instead of opening a tab for
   // them: a job can become 'submitted' (passive capture / Gmail / applied-sync /
   // manual apply) or be deleted AFTER it was queued, but the task stays 'queued'.
-  let task = null, job = null;
+  // P7: drop PUNISHED jobs (skipped 'punished'), then prefer the highest-rankJob
+  // candidate among what's left (reward history ↑, geo/staleness ↓) — ADDITIVE: the
+  // existing dead-task retirement + dispatch path is unchanged.
+  const candidates = [];
   for (let i = queued.length - 1; i >= 0; i--) {
     const t = queued[i];
     const j = db.getJob(t.jobId);
@@ -223,8 +226,20 @@ async function queueNext(force = false) {
       broadcast('queue.updated', { taskId: t.id, state: 'skipped' });
       continue;
     }
-    task = t; job = j; break;
+    let punished = false;
+    try { punished = db.isPunished(j, db.resolveProfileId(j.source)); } catch {}
+    if (punished) {
+      db.queuePatch(t.id, { state: 'skipped', lastError: 'punished' });
+      broadcast('queue.updated', { taskId: t.id, state: 'skipped' });
+      continue;
+    }
+    candidates.push({ t, j, order: i });   // order = oldest-first index (lower = older)
   }
+  if (!candidates.length) return { task: null, reason: 'empty', concurrency };
+  // Rank candidates: highest rankJob first; ties broken by oldest-first (stable original order).
+  for (const c of candidates) { try { c.rank = db.rankJob(c.j, db.resolveProfileId(c.j.source)); } catch { c.rank = 0; } }
+  candidates.sort((a, b) => (b.rank - a.rank) || (a.order - b.order));
+  let task = candidates[0].t, job = candidates[0].j;
   if (!task) return { task: null, reason: 'empty', concurrency };
 
   // Honour the explicit picks from the Auto-apply page; fall back to the
@@ -240,6 +255,20 @@ async function queueNext(force = false) {
   const harvested = db.profileFieldList(profileId).filter((f) => f.value);
   const siteCfg = s.sites?.[String(job.source || '').toLowerCase()] || {};
   const mode = siteCfg.mode || task.mode || s.mode;
+
+  // ---- Apprenticeship Engine [P5]: resolve a replay recipe for this (ats, company) ----
+  // Classify the live job URL to (ats, companyKey); companyKey falls back to a normalized
+  // job.company when the ATS doesn't encode one (linkedin/indeed/direct). resolveRecipe
+  // blends the ATS recipe + the company overlay. ALL of this is best-effort: a throw or a
+  // missing recipe must NOT block dispatch — the executor's replay path is gated and
+  // additive, so an absent/empty recipe simply means it runs today's discover flow.
+  let recipe = null, recipeAts = null, recipeCompany = null;
+  try {
+    const cls = db.classifyAts(job.jobUrl);
+    recipeAts = cls.ats || null;
+    recipeCompany = cls.companyKey || db.normCompanyKey(job.company) || null;
+    if (recipeAts) recipe = db.resolveRecipe(recipeAts, recipeCompany, profileId);
+  } catch (e) { log.warn && log.warn('resolveRecipe failed (replay disabled for this task):', e?.message || e); }
 
   db.queuePatch(task.id, {
     state: 'scheduled',
@@ -257,6 +286,10 @@ async function queueNext(force = false) {
       profileId,
       bringToFront: !!s.bringToFrontToHydrate,   // SW focuses the apply window so an occluded page isn't throttled
       harvested,
+      // Replay recipe (P5) — gated + additive in the executor; null when none resolves.
+      recipe,
+      recipeAts,
+      recipeCompany,
       resume: resume ? {
         id: resume.id, name: resume.name, mime: resume.mime,
       } : null,
@@ -598,6 +631,40 @@ async function handle(req, res, parsed) {
     return sendJson(res, db.qaDelete(jm[1]) ? 200 : 404, { ok: true });
   }
 
+  // ---- observe (Apprenticeship Engine: always-on nav recorder) [P2] ----
+  // The extension POSTs every top-frame navigation here; db.recordNavEvent classifies
+  // the (ats, company) and detects board→ATS handoff edges. Defensive: an unknown kind
+  // or a bad url never errors (classifyAts is try/catch-wrapped). Profile resolves from
+  // the source/company the same way /qa does, so attribution stays per-profile.
+  if (req.method === 'POST' && pathname === '/observe') {
+    const body = await readJson(req);
+    if (body.kind && body.kind !== 'nav') return sendJson(res, 400, { ok: false, error: 'unsupported observe kind' });
+    const profileId = body.profileId || db.resolveProfileId(body.company || body.source);
+    const event = db.recordNavEvent({
+      profileId, url: body.url, referrer: body.referrer,
+      kind: body.navKind, sessionId: body.sessionId, company: body.company,
+    });
+    return sendJson(res, 200, { ok: true, event });
+  }
+
+  // ---- recipe correction (Apprenticeship Engine: replay divergence feedback) [P5] ----
+  // The executor POSTs here when an AUTO replay diverges (an unexpected required field, a
+  // validation error, or a stall). recordRecipeCorrection decays the recipe's confidence
+  // and fail_count (and the named step's confidence) so the recipe self-corrects toward
+  // fall-back instead of repeating a bad fill. Token-guarded like every route below /pair.
+  if (req.method === 'POST' && pathname === '/recipe/correction') {
+    const body = await readJson(req);
+    if (!body.recipeId) return sendJson(res, 400, { ok: false, error: 'recipeId required' });
+    return sendJson(res, 200, { ok: true, recipe: db.recordRecipeCorrection(body.recipeId, { labelPattern: body.labelPattern }) });
+  }
+  // The replayer POSTs here on a clean mechanical completion of a recipe walk so the
+  // recipe's success_count is credited (markRecipeOutcome). Best-effort + token-guarded.
+  if (req.method === 'POST' && pathname === '/recipe/outcome') {
+    const body = await readJson(req);
+    if (!body.recipeId) return sendJson(res, 400, { ok: false, error: 'recipeId required' });
+    return sendJson(res, 200, { ok: true, recipe: db.markRecipeOutcome(body.recipeId, { success: body.success !== false }) });
+  }
+
   // ---- profiles ----
   if (req.method === 'GET' && pathname === '/profiles') {
     return sendJson(res, 200, { ok: true, items: db.listProfiles() });
@@ -799,12 +866,27 @@ async function handle(req, res, parsed) {
     const body = await readJson(req);
     const jobs = Array.isArray(body.jobs) ? body.jobs : [];
     const s = db.getSettings().autoApply;
-    let enqueued = 0, filtered = 0;
+    let enqueued = 0, filtered = 0, punished = 0;
+    // P7: rank the incoming candidates so the highest-rankJob (reward history ↑, geo/
+    // staleness ↓) ones are upserted+enqueued first; PUNISHED candidates are excluded
+    // outright (never discovered while a punishment is active). ADDITIVE — the existing
+    // jobFit relevance gate + dedup upsert/queueAdd are unchanged.
+    const ranked = [];
     for (const jd of jobs.slice(0, 50)) {
       if (!jd || !jd.jobUrl) continue;
       // Relevance gate — don't even queue roles above the user's level / excluded.
       const fit = jobFit(jd.title, s);
       if (!fit.ok) { filtered++; continue; }
+      // Exclude punished jobs/companies/job-types from discovery (a synthetic job shape so
+      // the gate can read company/title/url without an upsert).
+      const probe = { id: null, title: jd.title, company: jd.company, jobUrl: jd.jobUrl, location: jd.location, source: body.source || jd.source || null };
+      let isP = false, rk = 0;
+      try { const pid = db.resolveProfileId(probe.source); isP = db.isPunished(probe, pid); rk = isP ? -1 : db.rankJob(probe, pid); } catch {}
+      if (isP) { punished++; continue; }
+      ranked.push({ jd, rk });
+    }
+    ranked.sort((a, b) => b.rk - a.rk);   // highest rank first
+    for (const { jd } of ranked) {
       const r = db.transaction(() => {
         const up = db.upsertJob({
           externalId: jd.externalId, source: body.source || jd.source || null,
@@ -820,7 +902,7 @@ async function handle(req, res, parsed) {
     }
     broadcast('queue.updated', { action: 'discover' });
     broadcast('jobs.updated', { action: 'discover' });
-    return sendJson(res, 200, { ok: true, enqueued, filtered });
+    return sendJson(res, 200, { ok: true, enqueued, filtered, punished });
   }
   // The deduped list of questions parked jobs are waiting on (the intake form).
   if (req.method === 'GET' && pathname === '/queue/parked') {
@@ -902,6 +984,33 @@ async function handle(req, res, parsed) {
     const requeued = db.retryStaleQueue({});
     if (requeued) broadcast('queue.updated', { action: 'retry-stale', requeued });
     return sendJson(res, 200, { ok: true, requeued });
+  }
+
+  // ---- punishments [P7] — strict relevance: punish a job / job-type / company ----
+  // POST /punish {kind, pattern, profileId?, decayDays?} → insert a punishment; when kind is
+  // 'company', immediately cascade-skip that company's QUEUED/scheduled tasks so the block
+  // takes effect on the live queue. decayDays defaults to a 90-day decay; 0/null = permanent.
+  if (req.method === 'POST' && pathname === '/punish') {
+    const body = await readJson(req);
+    const profileId = body.profileId || db.ensureDefaultProfileId();
+    const p = db.punish({ profileId, kind: body.kind, pattern: body.pattern, weight: body.weight, decayDays: body.decayDays });
+    if (!p) return sendJson(res, 400, { ok: false, error: 'invalid kind/pattern (kind ∈ job|job_type|company)' });
+    let cascaded = 0;
+    if (p.kind === 'company') cascaded = db.punishCompanyCascade(profileId, body.pattern);
+    broadcast('queue.updated', { action: 'punish', kind: p.kind, cascaded });
+    return sendJson(res, 200, { ok: true, punishment: p, cascaded });
+  }
+  // POST /unpunish {id} → lift a punishment (restores eligibility).
+  if (req.method === 'POST' && pathname === '/unpunish') {
+    const body = await readJson(req);
+    const removed = db.unpunish(body.id);
+    if (removed) broadcast('queue.updated', { action: 'unpunish', id: body.id });
+    return sendJson(res, removed ? 200 : 404, { ok: removed });
+  }
+  // GET /punishments[?profileId=] → the ACTIVE punishments (the "punished" dashboard view).
+  if (req.method === 'GET' && pathname === '/punishments') {
+    const profileId = parsed.searchParams.get('profileId') || db.ensureDefaultProfileId();
+    return sendJson(res, 200, { ok: true, items: db.listPunishments(profileId) });
   }
 
   // ---- AI ----
@@ -1000,10 +1109,15 @@ async function handle(req, res, parsed) {
     // Graceful: if AI is unavailable, return no answer (the executor parks the question
     // for the user) instead of a 500 — keeps the run clean on Dad's no-AI machine.
     try {
-      const r = await provider.run(prompts.answerQuestion({
-        question: body.question, fieldType: body.fieldType, options: body.options,
-        job, profile, qaHistory, resumeText: resume?.textContent || '',
-      }));
+      const r = await provider.run({
+        ...prompts.answerQuestion({
+          question: body.question, fieldType: body.fieldType, options: body.options,
+          job, profile, qaHistory, resumeText: resume?.textContent || '',
+        }),
+        // Deterministic floor (P4): if every provider is down/weak, the no-model rules
+        // still ground location/education/years/relocation/… so the run keeps applying.
+        deterministic: { question: body.question, options: body.options, profile, resume: resume?.textContent || '' },
+      });
       return sendJson(res, 200, { ok: true, result: r.json, provider: r.provider });
     } catch (e) {
       return sendJson(res, 200, { ok: true, result: null, aiUnavailable: true, reason: String(e?.message || e) });
@@ -1108,6 +1222,19 @@ async function handle(req, res, parsed) {
     const r = db.setEmailMatch(b.emailId, { jobId: b.jobId || null, source: b.source, confidence: b.confidence });
     broadcast('emails.updated', {});
     return sendJson(res, r ? 200 : 404, { ok: !!r, email: r });
+  }
+  // The confirm-this-link inbox (P6): 'suggested' emails with a candidate job, for one-click
+  // confirm/dismiss. Confirming heals the link AND trains the matcher AND releases the reward.
+  if (pathname === '/emails/needs-confirm' && req.method === 'GET') {
+    const pid = parsed.searchParams.get('profileId') || null;
+    return sendJson(res, 200, { ok: true, items: db.emailsNeedingConfirm(pid) });
+  }
+  if (pathname === '/emails/confirm' && req.method === 'POST') {
+    const b = await readJson(req);
+    const r = db.confirmEmailLink(b.emailId, { jobId: b.jobId || null, confirm: b.confirm === true });
+    broadcast('emails.updated', {});
+    if (r.ok) broadcast('jobs.updated', { action: 'email-confirm' });
+    return sendJson(res, r.ok ? 200 : 400, r);
   }
 
   // ---- data ----

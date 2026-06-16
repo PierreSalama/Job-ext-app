@@ -130,6 +130,16 @@ function header(msg, name) {
   return (msg.payload?.headers || []).find((h) => h.name.toLowerCase() === name.toLowerCase())?.value || '';
 }
 
+// Split a raw RFC822 From header ("Jane Doe <jane@acme.com>" / "jane@acme.com") into
+// { address, name } so it can feed the shared emailUpsert/matchEmailToJob path.
+function parseFrom(raw) {
+  const s = String(raw || '').trim();
+  const m = s.match(/^\s*"?([^"<]*?)"?\s*<([^>]+)>\s*$/);
+  if (m) return { name: m[1].trim(), address: m[2].trim().toLowerCase() };
+  if (s.includes('@')) return { name: '', address: s.replace(/[<>]/g, '').trim().toLowerCase() };
+  return { name: s, address: '' };
+}
+
 function bodyText(payload) {
   if (!payload) return '';
   if (payload.mimeType === 'text/plain' && payload.body?.data) {
@@ -206,11 +216,14 @@ async function syncNow() {
 
   syncing = true;
   const started = Date.now();
-  let scanned = 0, matched = 0, updated = 0;
+  let scanned = 0, matched = 0, updated = 0, emailsWritten = 0;
   try {
     const watermark = db.kvGet('gmailWatermark') || 0;   // internalDate ms
     const afterSec = watermark ? Math.floor(watermark / 1000) : Math.floor((Date.now() - 30 * 86400000) / 1000);
     const q = `${s.query} after:${afterSec}`;
+    // The job set the lenient matcher associates inbound mail to (same source IMAP uses).
+    let jobsForMatch = [];
+    try { jobsForMatch = db.jobsForMatching(); } catch {}
 
     let pageToken = '';
     let newWatermark = watermark;
@@ -231,6 +244,31 @@ async function syncNow() {
       const subject = header(msg, 'Subject');
       const from = header(msg, 'From');
       const body = bodyText(msg.payload).slice(0, 8000);
+
+      // P6 — populate the `emails` table through the SAME lenient path IMAP email.js uses, so
+      // Gmail feeds the reward loop (match_confidence + match_source + category). This is
+      // ADDITIVE to the legacy status-sync below; it must never crash the sync if anything in
+      // the email module / db is unavailable.
+      try {
+        const emailMod = require('./email');
+        const f = parseFrom(from);
+        let sentAt;
+        try { sentAt = new Date(internal || Date.now()).toISOString(); } catch { sentAt = new Date().toISOString(); }
+        const parsedEmail = {
+          messageId: header(msg, 'Message-ID') || id,
+          threadId: msg.threadId || null,
+          from: f.address, fromName: f.name, to: '',
+          subject: subject || '(no subject)',
+          snippet: body.replace(/\s+/g, ' ').trim().slice(0, 220),
+          body: body.slice(0, 8000),
+          sentAt,
+        };
+        const assoc = emailMod.matchEmailToJob(parsedEmail, jobsForMatch);
+        const up = db.emailUpsert({ accountId: 'gmail', provider: 'gmail', uid: id, ...parsedEmail, ...assoc });
+        emailsWritten++;
+        // Auto-linked email → release its reward now; 'suggested' is held until confirmed.
+        if (assoc.matchSource === 'auto') { try { db.creditOutcomeForEmail(up.id); } catch (e) { log.warn('credit failed:', e.message); } }
+      } catch (e) { log.warn('emails-table write failed:', e.message); }
 
       let parsed = parseLinkedIn(subject, body);
       let status = classify(subject, body);
@@ -281,7 +319,7 @@ async function syncNow() {
     }
 
     if (newWatermark > (db.kvGet('gmailWatermark') || 0)) db.kvSet('gmailWatermark', newWatermark);
-    lastResult = { at: new Date().toISOString(), scanned, matched, updated, ms: Date.now() - started };
+    lastResult = { at: new Date().toISOString(), scanned, matched, updated, emailsWritten, ms: Date.now() - started };
     db.kvSet('gmailLastResult', lastResult);
     log.info('sync done', lastResult);
     return { ok: true, ...lastResult };

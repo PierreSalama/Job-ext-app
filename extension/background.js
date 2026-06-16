@@ -19,6 +19,16 @@
 
 import * as api from './lib/api.js';
 
+// ---------- browser capability probe (cross-browser parity, Apprenticeship Engine P8) ----------
+// Firefox lacks some Chrome MV3 surfaces (tabGroups, storage.session). The existing apply-pool
+// code already guards every chrome.tabGroups?.* call and keeps all state in storage.local; this
+// single probe makes the assumption EXPLICIT so any NEW code path (Observer nav, replay dispatch)
+// can branch on a capability instead of optimistically touching an API Firefox doesn't expose.
+const CAPS = {
+  tabGroups: !!chrome.tabGroups,
+  storageSession: !!chrome.storage?.session,
+};
+
 const GH_OWNER = 'PierreSalama';
 const GH_REPO = 'Job-ext-app';
 const UPDATE_CACHE_KEY = 'jat11.appUpdateCache';
@@ -59,6 +69,42 @@ function rebootTab(tabId, frameId, url) {
 }
 chrome.webNavigation.onHistoryStateUpdated.addListener((d) => rebootTab(d.tabId, d.frameId, d.url));
 chrome.webNavigation.onReferenceFragmentUpdated.addListener((d) => rebootTab(d.tabId, d.frameId, d.url));
+
+// ---------- Observer: always-on nav recorder (Apprenticeship Engine P2) ----------
+// Tap the SAME webNavigation events to POST every top-frame navigation to the app, which
+// classifies the (ats, company) and learns board→ATS handoff edges. Cross-browser: state
+// lives in storage.local (Firefox has no storage.session) and no tabGroups API is touched.
+// Per-tab last-URL gives us the referrer edge + dedups repeated fires. Fully guarded: if
+// the app is down api.call returns {ok:false} (never throws), so navigation never breaks.
+const NAV_LAST_KEY = 'jat11.navLast';        // { [tabId]: { url, ts } } — referrer + dedup
+const NAV_DEDUP_MS = 1500;                    // ignore the same url firing back-to-back
+
+async function recordNav(tabId, frameId, url) {
+  if (frameId !== 0) return;                                   // top frame / main navigation only
+  if (!url || !/^https?:/i.test(url)) return;                 // skip about:, chrome://, file:, etc.
+  try {
+    if (!(await api.isPaired())) return;                      // no app paired → nothing to record
+    const store = (await chrome.storage.local.get(NAV_LAST_KEY))[NAV_LAST_KEY] || {};
+    const prev = store[tabId];
+    const nowMs = Date.now();
+    // Dedup: same url in this tab within the window (history fires can double-tap).
+    if (prev && prev.url === url && (nowMs - (prev.ts || 0)) < NAV_DEDUP_MS) return;
+    const referrer = (prev && prev.url !== url) ? prev.url : undefined;   // intra-tab edge = referrer
+    store[tabId] = { url, ts: nowMs };
+    await chrome.storage.local.set({ [NAV_LAST_KEY]: store });
+    // Fire-and-forget; api.call swallows offline/unauthorized into {ok:false}.
+    api.call('POST', '/observe', { kind: 'nav', url, referrer }).catch(() => {});
+  } catch { /* never let the Observer break navigation */ }
+}
+chrome.webNavigation.onCompleted.addListener((d) => { recordNav(d.tabId, d.frameId, d.url); });
+chrome.webNavigation.onHistoryStateUpdated.addListener((d) => { recordNav(d.tabId, d.frameId, d.url); });
+// Drop a closed tab's last-URL so the registry can't grow unbounded.
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  try {
+    const store = (await chrome.storage.local.get(NAV_LAST_KEY))[NAV_LAST_KEY] || {};
+    if (store[tabId] != null) { delete store[tabId]; await chrome.storage.local.set({ [NAV_LAST_KEY]: store }); }
+  } catch {}
+});
 
 // ---------- alarms ----------
 chrome.alarms.create('jat11-flush', { periodInMinutes: 1 });
@@ -503,6 +549,7 @@ async function reapAaTabs() {
 // there's only ever one "JAT Auto-apply" group across SW restarts.
 async function recoverAaGroup() {
   if (aaGroupId != null) return aaGroupId;
+  if (!CAPS.tabGroups) return aaGroupId;   // Firefox: no tabGroups — the tab REGISTRY drives cleanup instead
   try {
     if (chrome.tabGroups?.query) {
       const groups = await chrome.tabGroups.query({ title: AA_GROUP_TITLE });

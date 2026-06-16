@@ -7,6 +7,7 @@
 // can't be fully silent/unattended reliably; everything after is automatic.
 
 const { spawn, spawnSync } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -14,6 +15,55 @@ const { scope } = require('./logger');
 const log = scope('localsetup');
 
 const OLLAMA_WIN_URL = 'https://ollama.com/download/OllamaSetup.exe';
+
+// SHA-256 a file and compare to an expected hex digest (P4 weights integrity).
+// Streams the file so a multi-GB GGUF doesn't load into memory. Best-effort:
+// any error (missing file, read error) → false, so a corrupt/partial download is
+// rejected and re-pulled rather than loaded. NEVER throws.
+function verifyChecksum(file, expectedSha256) {
+  return new Promise((resolve) => {
+    try {
+      if (!expectedSha256 || !fs.existsSync(file)) { resolve(false); return; }
+      const want = String(expectedSha256).trim().toLowerCase();
+      const hash = crypto.createHash('sha256');
+      const stream = fs.createReadStream(file);
+      stream.on('error', () => resolve(false));
+      stream.on('data', (chunk) => hash.update(chunk));
+      stream.on('end', () => resolve(hash.digest('hex').toLowerCase() === want));
+    } catch { resolve(false); }
+  });
+}
+
+// Where a true-offline / USB install can drop pre-downloaded GGUF weights so first
+// run never touches the network. Checked BEFORE any fetch. Looks next to the app
+// (resources/models for a packaged build) and in a sibling models/ dir in dev.
+function sidecarDirs() {
+  const dirs = [];
+  try { if (process.resourcesPath) dirs.push(path.join(process.resourcesPath, 'models')); } catch {}
+  try { dirs.push(path.join(path.dirname(process.execPath || ''), 'models')); } catch {}
+  try { dirs.push(path.join(__dirname, '..', 'models')); } catch {}
+  return [...new Set(dirs.filter(Boolean))];
+}
+
+// Find a sidecar weight file for a model id (e.g. 'gemma3:1b' → gemma3-1b.gguf).
+// Returns the verified path or null. Honors an optional { 'model': sha256 } map.
+async function findSidecar(model, checksums = {}) {
+  const safe = String(model || '').replace(/[^a-z0-9.]+/gi, '-').toLowerCase();
+  const names = [`${safe}.gguf`, `${safe}.bin`, `${String(model).replace(/[^a-z0-9]+/gi, '')}.gguf`];
+  for (const dir of sidecarDirs()) {
+    for (const name of names) {
+      const p = path.join(dir, name);
+      try {
+        if (!fs.existsSync(p)) continue;
+        const expected = checksums[model] || checksums[safe];
+        if (expected && !(await verifyChecksum(p, expected))) { log.warn(`sidecar ${name} failed checksum — ignoring`); continue; }
+        log.info(`using USB/offline sidecar weights: ${p}`);
+        return p;
+      } catch {}
+    }
+  }
+  return null;
+}
 
 let state = { step: 'idle', progress: 0, message: '', model: '', error: null, busy: false };
 let emit = () => {};
@@ -51,6 +101,11 @@ async function ensureServer(cfg) {
   try {
     const exe = cfg?.exePath || 'ollama';
     const child = spawn(exe, ['serve'], { detached: true, stdio: 'ignore', windowsHide: true });
+    // ENOENT-safe: a missing binary fires 'error' ASYNCHRONOUSLY (the try/catch only
+    // catches sync throws). Without this listener the ENOENT becomes an
+    // uncaughtException and crashes the app (Dad's no-Ollama machine). Swallow it; the
+    // ping loop below just reports "down" and the deterministic floor stays in charge.
+    child.on('error', (e) => { try { log.warn('ollama serve spawn error:', e && e.message); } catch {} });
     child.unref();
   } catch (e) { log.warn('spawn ollama serve failed', e.message); return false; }
   for (let i = 0; i < 12; i++) { await new Promise((r) => setTimeout(r, 800)); if (await ping(url)) return true; }
@@ -151,4 +206,40 @@ async function setup({ models, cfg }) {
   return getState();
 }
 
-module.exports = { detect, setup, pullModel, ensureServer, getState, setEmitter };
+// First-run provisioning (P4): pull/load ONLY the detected tier's model(s) — Dad's
+// laptop fetches the ~smallest pair, not every tier. Order of operations:
+//   1) resolve the tier's {structuredModel, proseModel} (hardware.recommendModels,
+//      honoring the user's Settings override),
+//   2) for each, prefer a USB/offline `models/` SIDECAR (checksum-verified) so a
+//      true-offline box never hits the network,
+//   3) only then fall back to the streaming network pull (reuses setup()).
+// Wrapped so it is ENOENT-safe and NEVER throws to main — a bad/missing runtime,
+// network, or weights leaves the deterministic floor in charge instead of crashing.
+async function provision({ cfg = {}, override = {}, checksums = {} } = {}) {
+  try {
+    let rec;
+    try { rec = require('./hardware').recommendModels(override); }
+    catch { rec = { structuredModel: 'qwen2.5:1.5b', proseModel: 'gemma3:1b', tier: 'sm' }; }
+    const want = [...new Set([rec.structuredModel, rec.proseModel].filter(Boolean))];
+
+    // Sidecar pass — if every wanted model is present on USB/offline, skip the network.
+    const fromSidecar = [];
+    for (const m of want) { const p = await findSidecar(m, checksums); if (p) fromSidecar.push({ model: m, path: p }); }
+    if (fromSidecar.length === want.length && want.length) {
+      set({ step: 'ready', progress: 100, message: 'Local AI models loaded from offline bundle.', busy: false });
+      return { tier: rec.tier, models: want, sidecar: fromSidecar, networkPull: false };
+    }
+
+    // Otherwise pull only the tier's models over the network (best-effort).
+    const st = await setup({ models: want, cfg });
+    return { tier: rec.tier, models: want, sidecar: fromSidecar, networkPull: true, state: st };
+  } catch (e) {
+    // NEVER throw to main: the documented ENOENT-safe contract. The deterministic
+    // floor keeps the engine applying even if provisioning can't complete.
+    try { log.warn('provision failed (deterministic floor remains active):', e && e.message); } catch {}
+    set({ step: 'error', error: String((e && e.message) || e), message: 'Local AI provisioning skipped — deterministic answers remain available.', busy: false });
+    return { tier: null, models: [], sidecar: [], networkPull: false, error: String((e && e.message) || e) };
+  }
+}
+
+module.exports = { detect, setup, pullModel, ensureServer, getState, setEmitter, verifyChecksum, findSidecar, sidecarDirs, provision };

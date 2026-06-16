@@ -116,9 +116,40 @@ function classify(subject, body) {
   return 'other';
 }
 
+// classifyEmailReward — map an email's category (or, if not supplied, its subject/body) to a
+// reward SIGN for the north-star loop (P6). This is the only place the category→reward
+// policy lives, so credit assignment in db.js stays mechanical.
+//   interview / assessment / phone-screen invite / OFFER → POSITIVE reward (the signal we
+//      optimize for); offers weigh more than a first interview.
+//   acknowledgement / "application received"            → small positive (it went through).
+//   rejection / "moved forward with other candidates"    → MILD-NEGATIVE (FIT only — see
+//      recordOutcome: this never docks recipe/answer mechanical credit, only ranks fit).
+//   recruiter outreach                                   → neutral (0) — cold inbound, no
+//      application outcome to credit yet.
+// Returns { kind, reward } where reward is the *base* (pre confidence-weight, pre clip).
+function classifyEmailReward(categoryOrSubject, body) {
+  // Accept either an already-classified category or a raw (subject[, body]) pair.
+  const KNOWN = new Set(['offer', 'rejection', 'interview', 'application_confirmation', 'recruiter', 'other']);
+  const cat = KNOWN.has(categoryOrSubject) ? categoryOrSubject : classify(categoryOrSubject, body);
+  switch (cat) {
+    case 'offer':                   return { kind: 'email_reply', reward: 1.0 };
+    case 'interview':               return { kind: 'email_reply', reward: 0.7 };
+    case 'application_confirmation': return { kind: 'email_reply', reward: 0.1 };
+    case 'rejection':               return { kind: 'rejection', reward: -0.3 };
+    case 'recruiter':               return { kind: 'neutral', reward: 0 };
+    default:                        return { kind: 'neutral', reward: 0 };
+  }
+}
+
 // ---------- association: which job does this email belong to? ----------
 // Sender domains that DON'T identify the company (job boards / ATS / generic mailers).
 const NON_COMPANY_DOMAIN = /(greenhouse|lever|workday|myworkday|icims|smartrecruiters|ashby|jobvite|taleo|successfactors|bamboohr|recruitee|workable|breezy|linkedin|indeed|ziprecruiter|glassdoor|gmail|outlook|hotmail|yahoo|googlemail|sendgrid|mailgun|amazonses|notification|noreply|no-reply)/i;
+// Known ATS mail systems — a sender from one of these is highly likely to be a recruiting
+// email *about an application* even though the domain isn't the company itself. We use this
+// as a distinct signal: an ATS sender + a company hint that resolves a recently-applied job
+// is a strong "this answers an application" signal (P6 sender-domain signal).
+const ATS_SENDER_DOMAIN = /(greenhouse\.io|grnh\.se|lever\.co|hire\.lever\.co|myworkday(?:jobs)?\.com|workday\.com|ashbyhq\.com|icims\.com|smartrecruiters\.com|smartrecruiters\.io|jobvite\.com|successfactors\.(?:com|eu)|taleo\.net|bamboohr\.com|recruitee\.com|workable\.com|breezy\.hr)/i;
+function senderDomain(from) { return (String(from || '').split('@')[1] || '').toLowerCase(); }
 // Free webmail — matched as a whole domain LABEL (so "acme.com" isn't read as "me.com").
 const FREE_MAIL = /(?:^|\.)(gmail|googlemail|outlook|hotmail|live|msn|yahoo|ymail|icloud|me|aol|proton|protonmail|gmx)\./i;
 function companyHints({ from, fromName, subject }) {
@@ -151,6 +182,13 @@ function matchEmailToJob(email, jobs) {
   const tkOf = (j) => db.normKey(j.title || '');
   const subjKey = db.normKey(email.subject || '');
   const bodyKey = db.normKey((email.body || '').slice(0, 1500));
+  // SENDER-DOMAIN ↔ COMPANY-DOMAIN signal (P6). The from-address domain is parsed once;
+  // a job earns a boost when (a) the sender is a known ATS mail system (greenhouse/workday/
+  // lever/ashby/icims/smartrecruiters/…) — recruiting mail about an application — or (b) the
+  // sender's own domain root matches that job's company name (the company emailed directly).
+  const domain = senderDomain(email.from);
+  const isAtsSender = !!domain && ATS_SENDER_DOMAIN.test(domain);
+  const domainRoot = db.normKey(domain.split('.').slice(-2, -1)[0] || '');
   const score = (j) => {
     const applied = Date.parse(j.submittedAt || j.createdAt) || 0;
     const dt = sentMs - applied;                       // email AFTER apply = positive
@@ -159,6 +197,11 @@ function matchEmailToJob(email, jobs) {
     let s = 1 - Math.min(days, 120) / 120;             // closer in time → higher
     const tk = tkOf(j);
     if (tk && (subjKey.includes(tk) || bodyKey.includes(tk))) s += 0.35;   // title appears → strong
+    const ck = db.normKey(j.company || '');
+    // sender-domain boost: company's own domain matching its name is the strongest single
+    // signal; a generic ATS sender (no company domain) is a solid secondary one.
+    if (domainRoot && ck && (ck.includes(domainRoot) || domainRoot.includes(ck))) s += 0.3;
+    else if (isAtsSender) s += 0.18;
     return s;
   };
   cands = cands.map((j) => ({ j, s: score(j) })).filter((x) => x.s >= 0).sort((a, b) => b.s - a.s);
@@ -226,6 +269,10 @@ async function syncAccount(a, { firstRunMax = 150, perRunMax = 400 } = {}) {
         const up = db.emailUpsert({ accountId: a.id, provider: a.provider, uid, ...parsed, ...assoc });
         if (up.action === 'created') res.created++;
         if (assoc.matchSource === 'auto') res.matched++; else if (assoc.matchSource === 'suggested') res.suggested++;
+        // North-star reward (P6): an auto-linked email releases its credit immediately;
+        // 'suggested' rewards are HELD until the user confirms the link. Guard so a bad row
+        // never breaks the sync.
+        if (assoc.matchSource === 'auto') { try { db.creditOutcomeForEmail(up.id); } catch (e) { log.warn('credit failed:', e.message); } }
         if (uid > lastUid) lastUid = uid;
       }
       db.setEmailCursor(a.id, { uid: lastUid, uidValidity, syncedAt: new Date().toISOString(), lastResult: { fetched: res.fetched, created: res.created } });
@@ -253,5 +300,5 @@ async function syncAll({ accountId } = {}) {
 
 module.exports = {
   PRESETS, presetsPublic, listAccounts, publicAccount, getAccount, addAccount, removeAccount, setEnabled,
-  testConnection, syncAccount, syncAll, classify, matchEmailToJob, companyHints, isSyncing: () => syncing,
+  testConnection, syncAccount, syncAll, classify, classifyEmailReward, matchEmailToJob, companyHints, senderDomain, isSyncing: () => syncing,
 };
