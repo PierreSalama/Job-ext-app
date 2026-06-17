@@ -18,6 +18,7 @@
 // (1m, ask app /queue/next and dispatch to a tab), jat11-extupdate (6h).
 
 import * as api from './lib/api.js';
+import { isJobPageUrl } from './lib/jobpage.js';
 
 // ---------- browser capability probe (cross-browser parity, Apprenticeship Engine P8) ----------
 // Firefox lacks some Chrome MV3 surfaces (tabGroups, storage.session). The existing apply-pool
@@ -345,23 +346,32 @@ async function handlePipelineEvent({ stage, job, eventType, summary }, sender) {
 
 // ---------- popup state ----------
 async function popupState() {
-  const [health, paired, queueN, extUpd] = await Promise.all([
+  const [health, paired, queueN, extUpd, lastHealthy] = await Promise.all([
     probeAppHealth(),
     api.isPaired(),
     api.queueLength(),
     chrome.storage.local.get(EXT_UPDATE_KEY).then((s) => s[EXT_UPDATE_KEY] || null),
+    api.lastHealthyAt(),
   ]);
   let autoApply = null;
+  let unauthorized = false;
   if (health.ok && paired) {
     const s = await api.get('/settings', 3000);
     if (s?.ok) autoApply = { enabled: s.settings.autoApply.enabled, mode: s.settings.autoApply.mode };
+    else if (s?.unauthorized) unauthorized = true;   // a real 401 → the token was rejected
   }
-  // setupNeeded → never connected (no token). The popup routes these users to
-  // the guided onboarding instead of showing the normal status panel.
+  // Resilient connection decision (decideConnectionState is PURE + unit-tested):
+  // a transient health blip must NOT flip a paired popup back to the Connect prompt.
+  // We re-prompt only when there's genuinely no token, or an authed call returned 401.
+  const conn = api.decideConnectionState({
+    paired, healthOk: health.ok, lastHealthyAt: lastHealthy, unauthorized,
+  });
   return {
     ok: true, health, paired, queueN, extUpdate: extUpd, autoApply,
-    setupNeeded: !paired,
-    appInstalledButClosed: !health.ok && paired,
+    connected: conn.connected,
+    setupNeeded: conn.setupNeeded,
+    appInstalledButClosed: conn.appInstalledButClosed,
+    connReason: conn.reason,
   };
 }
 
@@ -1002,9 +1012,21 @@ async function watchAndTeachOne() {
   if (!(await api.isPaired())) return { dispatched: false, reason: 'not paired' };
   const h = await api.health();
   if (!h?.ok) return { dispatched: false, reason: 'app offline' };
+
+  // MOST USEFUL behavior: "teach me on the job I'm looking at." If the ACTIVE tab is a
+  // job/application page, supervise THAT tab in place (Step/Run overlay + Fix-this picker)
+  // rather than yanking the next queued job into a fresh window. Only when the active tab
+  // isn't a job page do we fall back to /queue/next.
+  const active = await superviseActiveTab();
+  if (active) return active;
+
   const r = await api.call('GET', '/queue/next?force=1', null, 8000);
   if (r && r.concurrency) currentConcurrency = Math.max(1, Math.min(8, r.concurrency));
-  if (!r?.ok || !r.task) return { dispatched: false, reason: r?.reason || 'nothing queued' };
+  if (!r?.ok || !r.task) {
+    // Nothing to supervise: no job page open AND the queue is empty. Tell the popup
+    // exactly what to do instead of silently reverting to Start.
+    return { dispatched: false, reason: 'no-job', message: 'Open a job posting first, then Watch & teach' };
+  }
   const context = { ...(r.context || {}), supervised: true, bringToFront: true };
   activeCount++;
   try {
@@ -1013,6 +1035,31 @@ async function watchAndTeachOne() {
   } finally {
     activeCount = Math.max(0, activeCount - 1);
     schedulePump();
+  }
+}
+
+// If the user's active tab is a job/application page, run a SUPERVISED teach session
+// in THAT tab (no new tab/window — supervise what they're looking at). Returns a
+// result object on success, or null if the active tab isn't a job page so the caller
+// can fall back to the queue.
+async function superviseActiveTab() {
+  let tab = null;
+  try { [tab] = await chrome.tabs.query({ active: true, currentWindow: true }); } catch { return null; }
+  if (!tab?.id || !isJobPageUrl(tab.url)) return null;
+  // Minimal task/context: no queue row backing this, so it's an ad-hoc supervised run.
+  // The content engine recognizes the page identity itself; we just flag supervised.
+  const task = { id: null, mode: 'supervised', adhoc: true };
+  const context = { supervised: true, bringToFront: true, adhoc: true };
+  try {
+    const result = await chrome.tabs.sendMessage(tab.id, { type: 'jat11.supervised-run', task, context }, { frameId: 0 });
+    if (result && result.ok !== false) {
+      return { dispatched: true, scope: 'active-tab', state: result.state || 'supervised', title: tab.title || '' };
+    }
+    return { dispatched: false, reason: result?.error || 'could not start in this tab' };
+  } catch (e) {
+    // The content script may not be loaded in this tab (e.g. it was suppressed or never
+    // booted). Treat as "couldn't supervise here" and fall back to the queue.
+    return null;
   }
 }
 

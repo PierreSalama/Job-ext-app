@@ -341,6 +341,11 @@ let _toastTimer = null;
 function affirm(text) {
   try {
     if (!_toastEl) {
+      // Idempotent across double-injection: adopt an existing toast node if present.
+      const existing = document.querySelector('[data-jat11-toast="1"]');
+      if (existing) { _toastEl = existing; }
+    }
+    if (!_toastEl) {
       _toastEl = document.createElement('div');
       _toastEl.setAttribute('data-jat11-toast', '1');
       Object.assign(_toastEl.style, {
@@ -430,12 +435,19 @@ async function refreshTeach() {
   catch { _teach = false; }
 }
 
-// An always-available floating Teach-Mode toggle, injected once a recorder is live in an
-// apply context. Mirrors the popup toggle: writes chrome.storage.local['jat11.teachMode'].
+// An always-available floating Teach-Mode toggle. Mirrors the popup toggle: writes
+// chrome.storage.local['jat11.teachMode']. Visible on any plausible job page when Teach
+// Mode is ON (so the user gets feedback it's armed) — not only inside a detected apply
+// form. Idempotent across the whole document (a duplicate/second extension injection must
+// not create a second pill).
 let _toggleEl = null;
 function injectToggle() {
   try {
     if (_toggleEl) return;
+    // Idempotency across double-injection (a second copy of the extension, or two
+    // boots): if a toggle already lives in the DOM, adopt it instead of adding another.
+    const existing = document.querySelector('[data-jat11-teach-toggle="1"]');
+    if (existing) { _toggleEl = existing; return; }
     _toggleEl = document.createElement('button');
     _toggleEl.setAttribute('data-jat11-teach-toggle', '1');
     _toggleEl.type = 'button';
@@ -468,3 +480,18 @@ function injectToggle() {
 }
 
 export function isTeachMode() { return _teach; }
+
+// Show the floating Teach toggle WITHOUT requiring a detected apply form. Called by the
+// engine on any plausible job page when Teach Mode is ON, so the user gets visible
+// feedback that Teach Mode is armed even before an apply form mounts. Capture itself
+// stays scoped to apply-form interactions (start() does that) — this only relaxes the
+// VISIBILITY of the toggle. Idempotent + top-frame only. Best-effort; never throws.
+export async function ensureToggle() {
+  try {
+    if (window !== window.top) return false;       // one pill, top frame only
+    await refreshTeach();                           // reflect current Teach Mode from storage
+    if (!_teach) return false;                      // only surface the pill when armed
+    injectToggle();
+    return true;
+  } catch { return false; }
+}

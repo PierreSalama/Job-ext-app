@@ -26,6 +26,30 @@ export async function setToken(t) {
 
 export async function isPaired() { return !!(await getToken()); }
 
+// PURE decision helper (node-testable): given what we know about pairing/health,
+// decide how the popup should render the connection row. Resilient to a TRANSIENT
+// health blip — having a token AND a recent successful health means we stay
+// "connected" even if THIS probe timed out. Only a genuine no-token state, or an
+// authed request that came back 401 (token rejected), drops us to a pair/setup
+// prompt. Times in ms; graceMs defaults to ~60s.
+export function decideConnectionState({ paired, healthOk, lastHealthyAt = 0, now = Date.now(), unauthorized = false, graceMs = 60000 } = {}) {
+  // A real 401 means the stored token is no longer valid → must re-pair, even if
+  // the app is otherwise up.
+  if (unauthorized) return { connected: false, setupNeeded: true, reason: 'unauthorized', appInstalledButClosed: false };
+  if (!paired) {
+    // Never paired. If the app is answering, it's "almost there" (connect to finish);
+    // otherwise it's a not-running/not-installed setup prompt.
+    return { connected: false, setupNeeded: true, reason: healthOk ? 'connect' : 'no-app', appInstalledButClosed: false };
+  }
+  // Paired. Healthy now, or healthy within the grace window → stay connected.
+  if (healthOk) return { connected: true, setupNeeded: false, reason: 'healthy', appInstalledButClosed: false };
+  const recentlyHealthy = lastHealthyAt > 0 && (now - lastHealthyAt) <= graceMs;
+  if (recentlyHealthy) return { connected: true, setupNeeded: false, reason: 'grace', appInstalledButClosed: false };
+  // Paired but the app has been silent past the grace window → it's genuinely closed.
+  // This is NOT a re-pair prompt (the token is still good) — it's an "open the app".
+  return { connected: false, setupNeeded: false, reason: 'app-closed', appInstalledButClosed: true };
+}
+
 // Ask the app for a token. The app pops a consent dialog — only call this from
 // an explicit user action (popup "Connect" button) or right after install.
 export async function pair() {
@@ -66,11 +90,26 @@ async function fetchJson(path, opts = {}) {
 }
 
 // ---- Reads (null on failure) ----
+const LAST_HEALTHY_KEY = 'jat11.lastHealthyAt';
+// The new Teach code makes the app busier (screenshot crop, distill), so a tight
+// 1.2s probe blips more often. A blip must NOT flip a paired popup back to the
+// "Connect" prompt — so we (a) give health a roomier timeout and (b) remember the
+// last time the app answered, so the popup can ride through a brief stall.
 export async function health() {
   try {
-    const r = await fetch(BASE + '/health', { signal: AbortSignal.timeout(1200) });
-    return r.ok ? await r.json() : null;
+    const r = await fetch(BASE + '/health', { signal: AbortSignal.timeout(2500) });
+    if (!r.ok) return null;
+    const body = await r.json();
+    try { await chrome.storage.local.set({ [LAST_HEALTHY_KEY]: Date.now() }); } catch {}
+    return body;
   } catch { return null; }
+}
+
+// Last time /health answered OK (ms epoch, 0 if never). Used by the popup to keep
+// the connected UI through a brief health blip instead of re-prompting to pair.
+export async function lastHealthyAt() {
+  try { return (await chrome.storage.local.get(LAST_HEALTHY_KEY))[LAST_HEALTHY_KEY] || 0; }
+  catch { return 0; }
 }
 export async function get(path, timeoutMs) {
   try { return await fetchJson(path, { timeoutMs }); }

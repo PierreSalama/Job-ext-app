@@ -59,7 +59,9 @@ foreach ($p in $pairs) {
   $src = Join-Path $Root $p.src
   $dst = Join-Path $Publish $p.dst
   if (Test-Path $src -PathType Container) {
-    robocopy $src $dst /MIR /NFL /NDL /NJH /NJS /XD node_modules dist | Out-Null
+    # /XF: never sync local secrets into the public publish repo (GitHub push
+    # protection blocks them, and they must never leave this machine).
+    robocopy $src $dst /MIR /NFL /NDL /NJH /NJS /XD node_modules dist /XF .cws-credentials.json *.local.json | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $($p.src)" }
   } elseif (Test-Path $src) {
     New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null

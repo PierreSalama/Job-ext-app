@@ -386,6 +386,28 @@ function bootRecorder(root) {
     .catch((e) => { _recorderBooted = false; log('recorder load failed', e); });
 }
 
+// Teach Mode feedback (Teach & Correct B3): when Teach Mode is ON, the floating
+// ○ Teach / ● Teaching pill must be VISIBLE on any plausible job/application page —
+// even before an apply form is detected — so the user knows it's armed. (Actual
+// capture stays scoped to the apply form via start(); this only shows the toggle.)
+// Top-frame only, guarded, and idempotent inside the recorder.
+let _toggleArmed = false;
+async function ensureTeachToggle() {
+  if (!IS_TOP || state.autoApplyDriven || _toggleArmed) return;
+  try {
+    const teach = (await chrome.storage.local.get('jat11.teachMode'))['jat11.teachMode'];
+    if (!teach) return;
+    const m = await import(chrome.runtime.getURL('content/recorder.js'));
+    const ok = await m.ensureToggle();
+    if (ok) _toggleArmed = true;
+    // If an apply form is already present on the page, engage the full recorder now so
+    // toggling Teach Mode on a job page with a live apply form starts capturing — not
+    // only after an Apply click. start() is idempotent; bootRecorder dedups.
+    const formProbe = detectApplyForm();
+    if (formProbe?.form) bootRecorder(formProbe.form);
+  } catch (e) { log('teach toggle failed', e); }
+}
+
 function captureFormState(reason) {
   const formProbe = detectApplyForm();
   const root = formProbe?.form || document;
@@ -1101,6 +1123,15 @@ export async function init() {
   log('engine init @', location.href, IS_TOP ? '(top)' : '(frame)');
   await loadSettings();
   installWatchers();
+  // Teach Mode pill: show it as soon as the engine boots on a plausible job page (the
+  // loader only imports us when the page looked job-ish), and re-show it whenever the
+  // user flips Teach Mode ON from the popup while sitting on a job page.
+  ensureTeachToggle();
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === 'local' && changes['jat11.teachMode']?.newValue) ensureTeachToggle();
+    });
+  } catch {}
   await evaluate('init');
   // ATS/job SPAs render their form AFTER document_idle. Re-attempt recognition
   // on a backoff until the page is classified (bounded by recognitionDone).

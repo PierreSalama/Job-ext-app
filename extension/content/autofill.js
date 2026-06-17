@@ -159,6 +159,27 @@ export function isFillable(input) {
   return true;
 }
 
+// ---- résumé upload detection (B4: Glassdoor / external company-site uploads) ----
+// Affordance text/attrs that mean "this is the résumé/CV upload control". Broad on
+// purpose: Glassdoor & many ATS hide the real <input type=file> behind a styled
+// "Upload resume" / "Attach resume" button, so the resume-ish text is on a sibling and
+// the input itself may have no label. PURE (string + attrs only) so it's node-testable.
+export const RESUME_HINT_RX = /(resume|résumé|\bcv\b|curriculum|upload.*\b(resume|cv|file|document)\b|attach.*\b(resume|cv|file)\b|joindre|téléverser|drag.*drop|choose file|select file|\.pdf|\.docx?)/i;
+export const DOC_ACCEPT_RX = /(pdf|msword|officedocument|\.docx?|\.pdf|\.rtf|\.txt)/i;
+
+// isResumeFileInput(input, ctxText) — does this file input look like the résumé upload?
+// `ctxText` is the surrounding affordance text (label + nearby button/dropzone), lowered
+// by the caller. Matches on that text OR a document-typed `accept` attribute. Hidden
+// inputs still qualify (custom widgets hide the real input) — visibility is the caller's
+// call. Guarded: any error → false.
+export function isResumeFileInput(input, ctxText = '') {
+  try {
+    if (!input) return false;
+    const accept = (input.getAttribute?.('accept') || '');
+    return RESUME_HINT_RX.test(ctxText || '') || DOC_ACCEPT_RX.test(accept);
+  } catch { return false; }
+}
+
 // Pick the best <option> for a value, preferring exactness over substring so
 // '5' selects '5+ years' / '5-10 years' (longest containing match), never the
 // first DOM-order option that merely contains the digit ('3-5 years').

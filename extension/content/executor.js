@@ -13,7 +13,7 @@
 // questions only ever come from the profile, never the AI (enforced by the
 // prompt server-side AND a local guard here).
 
-import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption } from './autofill.js';
+import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput } from './autofill.js';
 import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
 import { pageTextLooksLikeSuccess, urlLooksLikeSuccess } from './signals/success.js';
@@ -185,6 +185,10 @@ function cancel(reason) {
 let reportQueue = Promise.resolve();
 function report(patch) {
   if (!S.task) return;
+  // Ad-hoc supervised run (Watch & Teach on the active tab, B2): there's no queue row
+  // backing it, so there's nothing to PATCH. The teach capture still flows via the
+  // recorder's /observe posts — we just skip the queue progress report here.
+  if (S.task.id == null) return;
   // Stamp the apply ROUTE on real outcome transitions so the dashboard chart can
   // split the "easy / in-page apply" route from "external": an apply form that
   // never opened in-page means the posting bounced us to an external ATS or a
@@ -324,16 +328,58 @@ function syntheticClick(el) {
   }
 }
 
+// Best-effort context around a (possibly hidden, custom-widget) file input: its own
+// attrs + accept, plus nearby button / label / dropzone text. Glassdoor and many ATS
+// hide the real <input type=file> behind a styled "Upload resume" button, so the input
+// itself often has NO resume-ish label — the affordance text sits on a sibling.
+function fileInputContext(input) {
+  const bits = [
+    fieldLabel(input),
+    input.getAttribute?.('name'), input.getAttribute?.('id'),
+    input.getAttribute?.('accept'),
+    input.getAttribute?.('aria-label'), input.getAttribute?.('data-test'),
+    input.getAttribute?.('data-automation-id'),
+  ];
+  try {
+    const scope = input.closest?.('[class*="upload" i], [class*="resume" i], [class*="attach" i], [data-test], [role="group"], fieldset, section, form, div');
+    if (scope) {
+      const near = scope.querySelector?.('label, button, [role="button"], [class*="label" i], [class*="title" i], [class*="dropzone" i], [class*="filename" i]');
+      if (near?.textContent) bits.push(compactText(near.textContent).slice(0, 120));
+      const al = scope.getAttribute?.('aria-label'); if (al) bits.push(al);
+    }
+  } catch {}
+  return compactText(bits.filter(Boolean).join(' ')).toLowerCase();
+}
+
+// Find the file input(s) to drop the résumé into. Broadened for Glassdoor / external
+// company sites: matches by accept-type and nearby affordance text (not just label),
+// and INCLUDES hidden inputs (custom upload widgets keep the real input display:none).
+// Falls back to the whole document when the form root has none. Best-effort + guarded.
+function findResumeFileInputs(root) {
+  try {
+    let all = qsa('input[type="file"]', root || document);
+    // Custom widgets often mount the real input outside the detected form root → widen.
+    if (!all.length && root && root !== document) all = qsa('input[type="file"]', document);
+    if (!all.length) return [];
+    const empty = all.filter((i) => !i.files?.length);
+    if (!empty.length) return [];
+    // 1) Strong matches: resume-ish context OR a document-typed accept attr.
+    const matched = empty.filter((i) => isResumeFileInput(i, fileInputContext(i)));
+    if (matched.length) return matched;
+    // 2) Only one empty file input on the page → it's the upload, attach to it.
+    if (empty.length === 1) return empty;
+    // 3) Otherwise don't guess (avoid dropping a résumé into a photo/ID upload).
+    return [];
+  } catch { return []; }
+}
+
 // ---- resume upload (the v9 hard wall, now solvable) ----
 // Returns { attempted, attached }. attempted=true means there was an empty
 // resume file input on this step that we tried to fill — the caller pauses the
 // run if attempted but attached===0 rather than silently submitting without it.
 async function tryAttachResume(root, resume) {
   if (!resume?.id) return { attempted: false, attached: 0 };
-  const allFileInputs = qsa('input[type="file"]', root || document);
-  const inputs = allFileInputs
-    .filter((i) => !i.files?.length)
-    .filter((i) => /(resume|cv|curriculum|résumé)/i.test(fieldLabel(i)) || allFileInputs.length === 1);
+  const inputs = findResumeFileInputs(root);
   if (!inputs.length) return { attempted: false, attached: 0 };
 
   const r = await send({ type: 'get-document', documentId: resume.id });

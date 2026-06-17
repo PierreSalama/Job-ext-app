@@ -39,6 +39,13 @@ async function paintConnection() {
     dot.className = 'conn-dot ok';
     $('#conn-text').textContent = `app v${st.health.app?.version || '?'}${st.queueN ? ' · ' + st.queueN + ' queued' : ''}`;
     $('#pair-row').hidden = st.paired || st.setupNeeded;
+  } else if (st.connected) {
+    // Paired + recently healthy: the app is up but this one probe blipped (the Teach
+    // crop/distill makes /health briefly slow). Keep the connected UI — do NOT drop to
+    // a re-pair/Connect prompt over a transient stall.
+    dot.className = 'conn-dot ok';
+    $('#conn-text').textContent = `app connected${st.queueN ? ' · ' + st.queueN + ' queued' : ''}`;
+    $('#pair-row').hidden = true;
   } else {
     dot.className = 'conn-dot bad';
     $('#conn-text').textContent = 'app offline';
@@ -236,10 +243,25 @@ $('#watch-teach-btn').addEventListener('click', async () => {
   btn.disabled = true;
   const label = btn.textContent;
   btn.textContent = 'Starting…';
+  const status = $('#action-status');
+  setHint(status, '');
   const r = await send({ type: 'watch-and-teach' });
-  if (r?.ok) btn.textContent = 'Watching ✓';
-  else { btn.textContent = label; setHint($('#action-status'), r?.error || 'no queued job to teach', 'bad'); }
-  setTimeout(() => { btn.disabled = false; if (r?.ok) btn.textContent = label; }, 1500);
+  // dispatched === true → a supervised run actually started (active tab or queued job).
+  // dispatched === false → nothing to teach: surface the reason instead of silently
+  // flipping back to Start.
+  if (r?.ok && r.dispatched) {
+    btn.textContent = 'Watching ✓';
+  } else {
+    btn.textContent = label;
+    const msg = r?.message || r?.reason || r?.error;
+    const friendly = (msg === 'no-job' || !msg)
+      ? 'Open a job posting first, then Watch & teach'
+      : msg === 'app offline' ? 'Open the app first'
+      : msg === 'not paired' ? 'Connect the app first'
+      : msg;
+    setHint(status, friendly, 'warn');
+  }
+  setTimeout(() => { btn.disabled = false; if (r?.ok && r.dispatched) btn.textContent = label; }, 1500);
 });
 
 $('#open-dashboard').addEventListener('click', () => openDashboard());
