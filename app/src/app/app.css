@@ -1598,6 +1598,7 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
 .aa-disco-eyebrow { font-size: 8px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--muted); }
 .aa-disco-txt { font-size: 12px; color: var(--body-text); }
 .aa-disco-note { color: var(--warn); }
+.aa-disco-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .task-last { font-size: 11px; color: var(--muted); margin-top: 6px; font-style: italic; overflow-wrap: anywhere; }
 
 /* ============================================================
@@ -1645,6 +1646,7 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
   border: 1px solid var(--border); border-radius: 2px; color: var(--body-text);
 }
 .via-badge.via-auto     { color: var(--primary2); border-color: color-mix(in srgb, var(--primary) 45%, transparent); background: var(--wash-06); }
+.via-badge.via-assisted { color: var(--primary2); border-color: color-mix(in srgb, var(--primary) 35%, transparent); border-style: dashed; background: var(--wash-06); }
 .via-badge.via-manual   { color: var(--muted); }
 .via-badge.via-pipeline { color: var(--primary2); border-color: color-mix(in srgb, var(--primary) 30%, transparent); border-style: dashed; }
 

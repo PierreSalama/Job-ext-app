@@ -265,7 +265,20 @@ async function queueNext(force = false) {
   const resume = (s.resumeDocId && db.getDocument(s.resumeDocId, { withText: true })) || db.defaultDocument('resume');
   const harvested = db.profileFieldList(profileId).filter((f) => f.value);
   const siteCfg = s.sites?.[String(job.source || '').toLowerCase()] || {};
-  const mode = siteCfg.mode || task.mode || s.mode;
+  let mode = siteCfg.mode || task.mode || s.mode;
+
+  // "Watch & Teach the next application" armed from the dashboard? Make THIS dispatch run
+  // supervised (Step/Run + Fix-this overlay, on-screen) and CLEAR the flag (one-shot). The
+  // executor already handles mode === 'supervised'; context.supervised drives the SW's
+  // supervised entry path (no 3.5-min hard cap — the human paces it).
+  let superviseThis = false;
+  try {
+    if (db.kvGet('superviseNext')) {
+      superviseThis = true;
+      mode = 'supervised';
+      db.kvSet('superviseNext', null);   // one-shot: consume it
+    }
+  } catch {}
 
   // ---- Apprenticeship Engine [P5]: resolve a replay recipe for this (ats, company) ----
   // Classify the live job URL to (ats, companyKey); companyKey falls back to a normalized
@@ -296,6 +309,10 @@ async function queueNext(force = false) {
       profile: profile || null,
       profileId,
       bringToFront: !!s.bringToFrontToHydrate,   // SW focuses the apply window so an occluded page isn't throttled
+      frontToHydrate: s.frontToHydrate !== false,  // reactive front-until-hydrated when the apply tab reports itself occluded (default ON)
+      // One-shot "Watch & Teach the next application" armed from the dashboard → run this
+      // dispatch supervised, on-screen (Step/Run + Fix-this). bringToFront so it's visible.
+      ...(superviseThis ? { supervised: true, bringToFront: true } : {}),
       harvested,
       // Replay recipe (P5) — gated + additive in the executor; null when none resolves.
       recipe,
@@ -1129,6 +1146,19 @@ async function handle(req, res, parsed) {
     db.kvSet('discoveryStatus', { ...body, at: new Date().toISOString() });
     broadcast('queue.updated', { action: 'discovery-status' });
     return sendJson(res, 200, { ok: true });
+  }
+  // "Watch & Teach the next application" FROM THE DASHBOARD. The Electron window can't send
+  // chrome.runtime messages, so it sets a one-shot kv flag here; queueNext reads + clears it
+  // on the very next dispatch and marks that task mode:'supervised' (Step/Run + Fix-this
+  // overlay, on-screen). GET peeks the flag (so the button can reflect "armed").
+  if (req.method === 'POST' && pathname === '/auto-apply/supervise-next') {
+    db.kvSet('superviseNext', { at: new Date().toISOString() });
+    broadcast('queue.updated', { action: 'supervise-next-armed' });
+    return sendJson(res, 200, { ok: true, armed: true });
+  }
+  if (req.method === 'GET' && pathname === '/auto-apply/supervise-next') {
+    const flag = db.kvGet('superviseNext') || null;
+    return sendJson(res, 200, { ok: true, armed: !!flag, at: flag?.at || null });
   }
   // Pool refresh: re-queue stale retriable (failed, transient) tasks when discovery
   // is exhausted, so the workers aren't starved by an empty queue of already-tried jobs.

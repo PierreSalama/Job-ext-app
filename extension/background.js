@@ -205,6 +205,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // render pass, then hand focus straight back to the user. Fire-and-forget.
       respond(nudgeApplyWindows().then(() => ({ ok: true })).catch(() => ({ ok: true })));
       return true;
+    case 'jat11.front-until-hydrated':
+      // An apply tab reported itself occluded AND not yet hydrated. Bring ITS window to the
+      // front and KEEP it there (sustained visible time so a heavy SPA can hydrate), then
+      // hand focus back on jat11.apply-hydrated or after a hard cap. Only ever fronts a
+      // window WE own (the apply tab's window). Fire-and-forget; never throws.
+      respond(frontUntilHydrated(sender?.tab?.windowId).then(() => ({ ok: true })).catch(() => ({ ok: true })));
+      return true;
+    case 'jat11.apply-hydrated':
+      // The apply form hydrated (or the run ended) — release the held front and restore the
+      // user's previously-focused window. Idempotent + guarded.
+      respond(releaseFrontUntilHydrated(sender?.tab?.windowId).then(() => ({ ok: true })).catch(() => ({ ok: true })));
+      return true;
     case 'run-discovery':
       // Manual "Run discovery now" from the extension dashboard (bypasses the
       // queue-low + window gates so the user can shake it out on demand).
@@ -648,6 +660,50 @@ async function nudgeApplyWindows() {
   // Hand focus straight back to where the user was (never leave them on our window).
   if (userFocused != null && !ids.has(userFocused)) {
     try { await chrome.windows.update(userFocused, { focused: true }); } catch {}
+  }
+}
+
+// ---- FRONT-UNTIL-HYDRATED (occlusion fix) -------------------------------------------
+// WINDOWS OCCLUSION LIMIT: a window is only un-throttled by Chrome while it is visible /
+// on-top, which (for chrome.windows) means FOCUSED. A non-focused apply window behind the
+// user's MAXIMIZED window is fully occluded → its timers throttle → a heavy SPA never
+// hydrates. The single 700ms nudge above re-occludes instantly. So when an apply tab
+// reports itself occluded-and-not-yet-hydrated we FRONT its window and KEEP it front until
+// the page is usable (apply-hydrated) or a hard cap elapses — giving the few seconds of
+// sustained visible time the page needs — then hand the user's focus straight back.
+// Only ever touches the apply tab's OWN window (verified against the windows we created).
+const frontHeld = new Map();   // applyWindowId → { userFocused, timer }
+const FRONT_HARD_CAP_MS = 12000;
+
+function isOurApplyWindow(winId) {
+  if (winId == null) return false;
+  return winId === aaWindowId || aaWindowPool.includes(winId);
+}
+
+async function frontUntilHydrated(applyWinId) {
+  if (applyWinId == null || !chrome.windows?.update) return;
+  if (!isOurApplyWindow(applyWinId)) return;   // never front a window we don't own
+  if (frontHeld.has(applyWinId)) return;       // already holding this one
+  let userFocused = null;
+  try { userFocused = (await chrome.windows.getLastFocused())?.id; } catch {}
+  // Don't record our own apply window as the "user" window to restore to.
+  if (userFocused != null && isOurApplyWindow(userFocused)) userFocused = null;
+  // Bring the apply window to the front and keep it there (do NOT restore after 700ms).
+  try { await chrome.windows.update(applyWinId, { focused: true, state: 'normal' }); } catch {}
+  // Hard cap so we never hold the user's focus hostage if the page is genuinely dead.
+  const timer = setTimeout(() => { try { releaseFrontUntilHydrated(applyWinId); } catch {} }, FRONT_HARD_CAP_MS);
+  frontHeld.set(applyWinId, { userFocused, timer });
+}
+
+async function releaseFrontUntilHydrated(applyWinId) {
+  if (applyWinId == null) return;
+  const held = frontHeld.get(applyWinId);
+  if (!held) return;
+  frontHeld.delete(applyWinId);
+  try { clearTimeout(held.timer); } catch {}
+  // Hand focus back to where the user was (never leave them parked on our apply window).
+  if (held.userFocused != null && held.userFocused !== applyWinId) {
+    try { await chrome.windows.update(held.userFocused, { focused: true }); } catch {}
   }
 }
 

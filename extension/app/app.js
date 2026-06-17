@@ -149,6 +149,7 @@ const fitBadgeHtml = (score) => (score == null || score === '') ? ''
 const viaBadge = (j) => {
   if (!j) return '';
   if (j.via === 'auto') return `<span class="via-badge via-auto" title="Submitted by the auto-apply pipeline">⚡ Auto</span>`;
+  if (j.via === 'auto-assisted') return `<span class="via-badge via-assisted" title="Auto-apply set it up; you finished or corrected it">⚡ Auto (assisted)</span>`;
   if (j.via === 'manual') return `<span class="via-badge via-manual" title="Applied to by hand">✋ Manual</span>`;
   if (j.autoApply) return `<span class="via-badge via-pipeline" title="In the auto-apply pipeline (not submitted yet)">⚡ Pipeline</span>`;
   return '';
@@ -1698,6 +1699,7 @@ route('/pipeline', async () => {
     if (j.source) sub.push(`<span class="kb-source">${esc(j.source)}</span>`);
     if (j.location) sub.push(`<span class="kb-loc">${esc(j.location)}</span>`);
     if (j.via === 'auto') sub.push('<span class="via-badge via-auto">⚡ Auto</span>');
+    else if (j.via === 'auto-assisted') sub.push('<span class="via-badge via-assisted">⚡ Auto (assisted)</span>');
     else if (j.via === 'manual') sub.push('<span class="via-badge via-manual">✋ Manual</span>');
     return `<div class="kb-card ${fitCls} ${stale ? 'stale' : ''}" draggable="true" data-id="${esc(j.id)}">
       <div class="kb-card-top">
@@ -1946,9 +1948,12 @@ route('/queue', async () => {
         ${disc ? `<span class="aa-disco-txt">${esc(disc.board || '?')} · "${esc(disc.keyword || '')}" — found <strong>${esc(disc.found ?? 0)}</strong>, queued <strong>${esc(disc.enqueued ?? 0)}</strong>${disc.note ? ` · <span class="aa-disco-note">${esc(disc.note)}</span>` : ''} <span class="muted">(${esc(fmtRel(disc.at))})</span></span>`
           : '<span class="muted">No search yet — turn it on (and keep Chrome open). It searches about once a minute when the queue is low.</span>'}
       </div>
-      ${state.host === 'extension'
-        ? '<button class="btn small" data-run-disco>🔍 Search now</button> <button class="btn small" data-test-apply title="TEST: apply the next queued job right now, skipping pacing. (Removed later.)">⚡ Apply next now</button>'
-        : '<span class="muted" style="font-size:11px">Search &amp; test run from the Chrome extension</span>'}
+      <div class="aa-disco-actions">
+        <button class="btn small primary" data-supervise-next title="The very next application opens ON-SCREEN in supervised mode — you watch each step and can correct any mistake (it learns from your fix). Works whether or not Chrome is in front.">👁 Watch &amp; Teach the next application</button>
+        ${state.host === 'extension'
+          ? '<button class="btn small" data-run-disco>🔍 Search now</button> <button class="btn small" data-test-apply title="TEST: apply the next queued job right now, skipping pacing. (Removed later.)">⚡ Apply next now</button>'
+          : '<span class="muted" style="font-size:11px">Search &amp; test run from the Chrome extension</span>'}
+      </div>
     </div>
 
     ${intakeHtml}
@@ -2283,6 +2288,18 @@ route('/queue', async () => {
       navigate();
     } catch (err) { errToast(err); }
     btn.disabled = false; btn.textContent = '⚡ Apply next now';
+  });
+
+  // Watch & Teach the NEXT application FROM THE DASHBOARD. The Electron window can't send
+  // chrome.runtime messages, so we arm a one-shot server flag (consumed by queueNext) that
+  // makes the next auto-apply dispatch run supervised, on-screen (Step/Run + Fix-this).
+  v.querySelector('[data-supervise-next]')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget; btn.disabled = true;
+    try {
+      await api('/auto-apply/supervise-next', { method: 'POST' });
+      btn.textContent = '✓ Armed — next application is supervised';
+      toast('The next application will open in supervised mode — watch & correct it on-screen.', 'info', { ttl: 9000 });
+    } catch (err) { errToast(err); btn.disabled = false; }
   });
 
   v.querySelector('[data-intake-save]')?.addEventListener('click', async (e) => {

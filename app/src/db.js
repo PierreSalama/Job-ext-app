@@ -847,14 +847,22 @@ function annotateAutoApply(jobs) {
   const map = {};
   // "Submitted via auto-apply" = the executor reached a done OR awaiting_review task
   // (awaiting_review = submit was clicked, pending confirm). A merely failed/skipped
-  // task does NOT count — those never actually submitted.
+  // task does NOT count — those never actually submitted. hasAutoTask flags that an AUTO
+  // (mode='auto') task existed at all, so a manual finish on top of it is "auto-assisted".
   for (const r of all(
-    `SELECT job_id, MAX(CASE WHEN state IN ('done','awaiting_review') THEN 1 ELSE 0 END) AS hasSubmitted
+    `SELECT job_id,
+            MAX(CASE WHEN state IN ('done','awaiting_review') THEN 1 ELSE 0 END) AS hasSubmitted,
+            MAX(CASE WHEN mode = 'auto' THEN 1 ELSE 0 END) AS hasAutoTask
        FROM auto_apply_tasks WHERE job_id IN (${place}) GROUP BY job_id`, ids)) map[r.job_id] = r;
   for (const j of jobs) {
     const m = map[j.id];
     j.autoApply = !!m || (Array.isArray(j.tags) && j.tags.includes('auto-apply'));
-    j.via = (m && m.hasSubmitted) ? 'auto' : (SUBMITTED_PLUS.has(j.status) ? 'manual' : null);
+    // via: 'auto' = the auto pipeline submitted it; 'auto-assisted' = an auto task ran but
+    // the human finished/stepped in to reach submitted; 'manual' = submitted with no auto
+    // task involved; null = not submitted yet.
+    if (m && m.hasSubmitted) j.via = 'auto';
+    else if (SUBMITTED_PLUS.has(j.status)) j.via = (m && m.hasAutoTask) ? 'auto-assisted' : 'manual';
+    else j.via = null;
   }
   return jobs;
 }
@@ -1470,6 +1478,19 @@ function harvestAnswersToProfile(answers, { profileId, jobId, source, status } =
   // manual OR auto) demonstrably worked, so learn them with HIGH confidence; in-progress
   // captures stay tentative. High-confidence answers are preferred next time.
   const confidence = status === 'submitted' ? 0.85 : 0.6;
+  // LINEAGE: a passive/manual capture is normally 'manual'. But if an AUTO auto-apply task
+  // exists for this job (mode='auto', regardless of how it ended), then the user finishing
+  // or stepping in on that apply is an AUTO-ASSISTED capture — the auto run set it up and a
+  // human assisted. Distinguish it so the apply-method breakdown can show "auto (assisted)"
+  // vs pure "manual". (A 'supervised'/'review' task is NOT auto — leave those as manual.)
+  let lineageSource = 'manual';
+  if (jobId) {
+    try {
+      const autoTask = get(
+        "SELECT 1 FROM auto_apply_tasks WHERE job_id = ? AND mode = 'auto' LIMIT 1", [jobId]);
+      if (autoTask) lineageSource = 'auto-assisted';
+    } catch {}
+  }
   let n = 0;
   for (const [key, raw] of Object.entries(answers)) {
     if (isSensitiveKey(key)) continue;
@@ -1477,7 +1498,7 @@ function harvestAnswersToProfile(answers, { profileId, jobId, source, status } =
     if (value == null || String(value).trim() === '') continue;
     if (isJunkAnswer(key, value)) continue;   // never harvest job-board UI noise
     try {
-      if (profileFieldUpsert({ profileId: pid, question: humanizeKey(key), value, sourceJobId: jobId, source, confidence, lineageSource: 'manual' })) n++;
+      if (profileFieldUpsert({ profileId: pid, question: humanizeKey(key), value, sourceJobId: jobId, source, confidence, lineageSource })) n++;
     } catch {}
   }
   return n;

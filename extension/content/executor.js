@@ -459,6 +459,34 @@ export async function run(task, context, helpers) {
   let noChange = 0;            // consecutive advance clicks that didn't change the page (stall)
 
   // ============================================================
+  // Front-until-hydrated [occlusion fix] — ADDITIVE, fully guarded.
+  // ============================================================
+  // WINDOWS OCCLUSION LIMIT: to be un-throttled, a window must be visible/on-top, which
+  // for chrome.windows means FOCUSED. A non-focused apply window sitting behind the user's
+  // MAXIMIZED window is fully occluded → Chrome throttles its timers → a heavy SPA
+  // (LinkedIn Easy-Apply) never hydrates and the executor times out. The old single 700ms
+  // nudge gives too little visible time and re-occludes immediately. So: when we detect the
+  // apply tab is hidden AND the form hasn't hydrated, ask the SW to keep our apply window
+  // FRONT until the form loads (jat11.front-until-hydrated); the moment the form/advance
+  // button appears we hand focus straight back (jat11.apply-hydrated). The SW also has a
+  // hard cap so it never holds focus indefinitely. Reactive: when the apply tab is NOT
+  // occluded (user doesn't run maximized) document.visibilityState is 'visible', so we
+  // never send the front request → no focus-steal. Gated by the frontToHydrate setting
+  // (default ON); when off we keep today's single-nudge behavior byte-unchanged.
+  const frontToHydrate = (context?.frontToHydrate !== false);
+  let frontRequested = false;   // did we ask the SW to front-until-hydrated this run?
+  function requestFrontUntilHydrated() {
+    if (!frontToHydrate || frontRequested) return;
+    frontRequested = true;
+    try { chrome.runtime?.sendMessage?.({ type: 'jat11.front-until-hydrated' }); } catch {}
+  }
+  function signalHydrated() {
+    if (!frontRequested) return;   // never released a front we didn't request
+    frontRequested = false;
+    try { chrome.runtime?.sendMessage?.({ type: 'jat11.apply-hydrated' }); } catch {}
+  }
+
+  // ============================================================
   // Live Teach & Correct [T4] — supervised run (ADDITIVE, fully guarded).
   // ============================================================
   // Engaged ONLY when task.mode === 'supervised' (or context.supervised). It overlays
@@ -900,7 +928,7 @@ export async function run(task, context, helpers) {
       .find((d) => isProbablyVisible(d) && d.querySelector('input, textarea, select, [role="combobox"], [contenteditable="true"]')) || null;
     const root = dialog || formProbe?.form || null;
     const haveForm = !!root;
-    if (haveForm) { everHadForm = true; S.everHadForm = true; }
+    if (haveForm) { everHadForm = true; S.everHadForm = true; signalHydrated(); }
 
     // ---- fill from profile + learned answers ----
     setStatus(`Step ${S.step}: ${haveForm ? 'filling fields…' : 'opening the application…'}`);
@@ -998,22 +1026,35 @@ export async function run(task, context, helpers) {
       // it so we (a) wait MUCH longer in real wall-clock and (b) report the true cause.
       const wasHidden = (typeof document !== 'undefined' && document.visibilityState === 'hidden');
       if (wasHidden && opening) {
-        // Ask the background to briefly raise the dedicated apply window (it restores your
-        // focus right after) so Chrome un-throttles the tab and the button can render.
-        try { chrome.runtime?.sendMessage?.({ type: 'jat11.nudge-apply-window' }); } catch {}
+        if (frontToHydrate) {
+          // FRONT-UNTIL-HYDRATED: keep our own apply window front until the form loads (the
+          // SW hands focus back the moment we signal apply-hydrated, or after its own ~12s
+          // hard cap). A single 700ms nudge re-occludes before a heavy SPA can hydrate, so we
+          // need SUSTAINED visible time. Reactive: only fires because we are actually hidden.
+          requestFrontUntilHydrated();
+        } else {
+          // Setting off → keep today's one-shot nudge (briefly raise, restore focus ~700ms).
+          try { chrome.runtime?.sendMessage?.({ type: 'jat11.nudge-apply-window' }); } catch {}
+        }
       }
       logLine('warn', opening
-        ? (wasHidden ? 'apply tab is hidden/occluded — Chrome throttled it; nudging its window to hydrate' : 'application not open yet — waiting for it to hydrate')
+        ? (wasHidden
+            ? (frontToHydrate ? 'apply tab is hidden/occluded — Chrome throttled it; fronting its window until it hydrates' : 'apply tab is hidden/occluded — Chrome throttled it; nudging its window to hydrate')
+            : 'application not open yet — waiting for it to hydrate')
         : 'no advance button — waiting for the page (or you)');
       let found = null;
       // A hidden/throttled tab gets ~1 timer tick/sec, so it needs far more real time —
-      // give it up to ~3 min (the pool's hard timeout still caps a truly dead tab).
-      const tries = opening ? (wasHidden ? 180 : 40) : 60;
+      // give it up to ~3 min (the pool's hard timeout still caps a truly dead tab). BUT once
+      // we've FRONTED the window (front-until-hydrated), the tab is no longer throttled, so a
+      // page that STILL won't hydrate within the SW's front cap (~12s) is genuinely stuck —
+      // don't burn the full 3 min; fail fast/retriably (retryStaleQueue re-attempts later).
+      const frontedCap = 28;   // ~14s of 500ms ticks — comfortably past the SW front hard-cap
+      const tries = opening ? ((wasHidden && frontToHydrate) ? frontedCap : (wasHidden ? 180 : 40)) : 60;
       for (let i = 0; i < tries && !S.cancelled; i++) {
         if (opening && i % 4 === 0) { try { window.scrollTo(0, 600); window.scrollTo(0, 0); } catch {} }
         await sleep(500);
         found = findAdvanceButton() || (!haveForm ? findEasyApplyButton() : null);
-        if (found) break;
+        if (found) { signalHydrated(); break; }
       }
       if (!found) {
         // If we're stuck because of unanswered questions, park (self-heal) so the
@@ -1185,6 +1226,9 @@ export async function run(task, context, helpers) {
   }
 
   S.running = false;
+  // Always release any held front-until-hydrated so focus is handed back even if the run
+  // ended before the form hydrated (external/failed/cancelled). No-op when none requested.
+  try { signalHydrated(); } catch {}
   try { sup?.destroy(); } catch {}
   hideOverlay(finalState === 'awaiting_review' || finalState === 'awaiting_input' || finalState === 'parked' ? 60000 : 4000);
   return { ok: true, state: finalState || (S.cancelled ? 'skipped' : 'unknown'), steps: S.step };
