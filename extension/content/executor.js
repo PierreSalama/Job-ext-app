@@ -38,6 +38,8 @@ const CAPTCHA_RX = /captcha|verify (that )?you('| a)re (a )?human|unusual activi
 // route and PIVOT to external/company-site jobs instead of wasting the cooldown trying.
 const EASYAPPLY_LIMIT_RX = /reached (today'?s )?easy apply limit/i;
 const DAILY_LIMIT_NEAR_EASYAPPLY_RX = /(daily|today'?s)[^.]{0,40}\blimit\b/i;
+const LOGIN_APPLY_RX = /(?:sign\s*in|log\s*in|connectez[- ]vous|se connecter|connexion)[^.!?\n]{0,80}(?:apply|postuler)|(?:apply|postuler)[^.!?\n]{0,80}(?:sign\s*in|log\s*in|connectez[- ]vous|se connecter|connexion)/i;
+const EXTERNAL_APPLY_RX = /apply on (?:the )?(?:company|employer)|apply externally|on company (?:site|website)|apply on .* website|postuler sur le site (?:de l['’]employeur|employeur|de l['’]entreprise|entreprise)|site (?:de l['’]employeur|employeur|de l['’]entreprise|entreprise)/i;
 const ADVANCE_KEYWORDS = [
   /^submit application$/i, /^submit$/i, /^submit & continue$/i,
   /^review your application$/i, /^review$/i,
@@ -319,13 +321,22 @@ function externalApplyPresent() {
     if (!isProbablyVisible(el)) continue;
     const t = btnText(el).toLowerCase();
     if (!t) continue;
-    if (/apply on (the )?company|apply externally|apply on employer|on company (site|website)|apply on .* website/.test(t)) return true;
+    if (EXTERNAL_APPLY_RX.test(t)) return true;
     if (el.tagName === 'A') {
       const href = el.getAttribute('href') || '';
       if (/^https?:\/\//i.test(href) && !/linkedin\.com|indeed\.com/i.test(href) && /\bapply\b/.test(t)) return true;
     }
   }
   return false;
+}
+function loginApplyPresent() {
+  for (const el of qsa('a, button, [role="button"]')) {
+    if (!isProbablyVisible(el)) continue;
+    const t = btnText(el);
+    if (t && LOGIN_APPLY_RX.test(t)) return true;
+  }
+  const text = compactText(document.body?.innerText || '').slice(0, 12000);
+  return LOGIN_APPLY_RX.test(text);
 }
 function looksExternalApplyButton(el) {
   try {
@@ -335,8 +346,8 @@ function looksExternalApplyButton(el) {
     let externalHref = false;
     try { externalHref = !!href && new URL(href, location.href).hostname.replace(/^www\./, '') !== location.hostname.replace(/^www\./, ''); } catch {}
     if (/easy apply/.test(txt)) return false;
-    return /apply on (the )?company|apply externally|apply on employer|on company (site|website)|apply on .* website|apply now|^apply$/.test(txt)
-      && (externalHref || /company|external|employer|website/.test(txt));
+    return (EXTERNAL_APPLY_RX.test(txt) || /apply now|^apply$/.test(txt))
+      && (externalHref || /company|external|employer|website|employeur|entreprise/.test(txt));
   } catch { return false; }
 }
 function findExternalApplyButton() {
@@ -1128,6 +1139,15 @@ export async function run(task, context, helpers) {
           break;
         }
         // The Easy-Apply form never opened this pass. Distinguish two cases:
+        if (opening && loginApplyPresent()) {
+          report({
+            state: 'skipped',
+            lastError: 'site sign-in required before applying — skipped',
+            applyRoute: 'external',
+            transcriptAppend: { note: 'job board requires sign-in before apply; not retriable as hydration' },
+          });
+          finalState = 'skipped'; break;
+        }
         const ext = opening && externalApplyPresent();
         if (ext) {
           // A genuinely EXTERNAL posting (apply on the company site) — JAT can't drive it.

@@ -1311,8 +1311,22 @@ async function discoverTick(force = false) {
   const aa = sres?.ok ? sres.settings?.autoApply : null;
   if (!aa || !aa.enabled || !aa.discovery?.enabled) return { ok: false, note: 'auto-apply is off' };
   const keywords = (aa.keywords || []).filter(Boolean);
-  const boards = (aa.boards || []).filter(Boolean);
-  if (!keywords.length || !boards.length) return { ok: false, note: 'add keywords + a board first' };
+  let boards = (aa.boards || []).filter(Boolean);
+  if (aa.easyApplyOnly !== false) {
+    // Glassdoor search cards do not reliably expose Easy Apply. When the user asks
+    // for Easy-Apply-only, skip Glassdoor discovery instead of burning the run on
+    // sign-in / employer-site postings that the executor will correctly skip.
+    boards = boards.filter((b) => b !== 'glassdoor');
+  }
+  if (!keywords.length) return { ok: false, note: 'add keywords first' };
+  if (!boards.length) {
+    return {
+      ok: false,
+      note: aa.easyApplyOnly !== false
+        ? 'Glassdoor is skipped in Easy-Apply-only mode because its cards do not expose a reliable Easy Apply badge'
+        : 'add a job board first',
+    };
+  }
   if (!force && !withinWindow(aa)) return { ok: false, note: 'outside the time window' };
 
   // Only auto-discover when the queue is low — never over-enqueue. A manual run

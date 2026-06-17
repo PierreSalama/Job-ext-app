@@ -250,6 +250,11 @@ async function queueNext(force = false) {
       broadcast('queue.updated', { taskId: t.id, state: 'skipped' });
       continue;
     }
+    if (s.easyApplyOnly !== false && String(j.source || '').toLowerCase() === 'glassdoor') {
+      db.queuePatch(t.id, { state: 'skipped', lastError: 'Glassdoor is skipped in Easy-Apply-only mode (no reliable Easy Apply badge)' });
+      broadcast('queue.updated', { taskId: t.id, state: 'skipped' });
+      continue;
+    }
     let punished = false;
     try { punished = db.isPunished(j, db.resolveProfileId(j.source)); } catch {}
     if (punished) {

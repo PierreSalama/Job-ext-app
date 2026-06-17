@@ -120,6 +120,12 @@ ok(/reconcileAaTabsAndSlots/.test(bg) && /await reconcileAaTabsAndSlots/.test(bg
 ok(/closeOwnedWindowIfSafe/.test(bg) && /windowHasUserTabs/.test(bg), 'owned-window cleanup will not close real user tabs');
 ok(/reapIdleApplyWindows/.test(bg) && /closeIdle: true/.test(bg), 'reaper closes empty owned apply windows');
 
+grp('Auto-apply drivability invariants');
+const discover = read('content/discover.js');
+ok(/isGlassdoor && easyApplyOnly/.test(discover) && /Glassdoor cards do not expose/.test(discover), 'Glassdoor is skipped in Easy-Apply-only discovery');
+ok(/LOGIN_APPLY_RX/.test(executor) && /loginApplyPresent/.test(executor), 'executor detects sign-in-to-apply gates');
+ok(/EXTERNAL_APPLY_RX/.test(executor) && /postuler sur le site/.test(executor), 'executor detects employer-site apply buttons including French labels');
+
 grp('Dashboard host bootstrap');
 const app = read('app/app.js');
 ok(/get-token/.test(app) && /jatDesktop/.test(app), 'dashboard resolves token in both extension + desktop hosts');

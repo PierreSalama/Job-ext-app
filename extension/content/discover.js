@@ -91,10 +91,9 @@ function scrapeIndeed(max, easyApplyOnly = true) {
 
 // Glassdoor — search results are <li data-test="jobListing"> cards; each links to a
 // /job-listing/...-JV_... detail page and carries the job id on the listing element. Best
-// effort + guarded: selector rot returns fewer jobs, never throws. Easy-Apply on Glassdoor
-// is in-page; "apply on company site" hands off — we can't tell which from the card reliably,
-// so we enqueue all and let the executor/handoff path sort drivability (mirrors Indeed's
-// permissive-then-filter posture but without a card-level "easily apply" badge to gate on).
+// effort + guarded: selector rot returns fewer jobs, never throws. Glassdoor does NOT expose
+// a reliable card-level Easy Apply badge; in Easy-Apply-only mode we skip it rather than
+// flooding the queue with sign-in / employer-site postings that cannot auto-submit.
 function scrapeGlassdoor(max) {
   const out = [];
   const seen = new Set();
@@ -144,6 +143,14 @@ export async function run({ source, max = 8, easyApplyOnly = true } = {}) {
     }
 
     const found = qsa(sel).length;
+    if (isGlassdoor && easyApplyOnly) {
+      return {
+        ok: true, source: source || host, jobs: [], found,
+        note: found
+          ? 'Glassdoor cards do not expose a reliable Easy Apply badge; skipped in Easy-Apply-only mode'
+          : 'no Glassdoor job cards rendered on the page',
+      };
+    }
     const jobs = (isLinkedIn ? scrapeLinkedIn(max) : (isGlassdoor ? scrapeGlassdoor(max) : scrapeIndeed(max, easyApplyOnly))).slice(0, max);
     const note = jobs.length ? '' : (pageNote() || (found ? `saw ${found} card(s) but couldn't read any (selectors may need tuning)` : 'no job cards rendered on the page'));
     return { ok: true, source: source || host, jobs, found, note };

@@ -2225,6 +2225,7 @@ function classifyQueueFailure(input = {}) {
     pending.map((q) => `${q?.question || ''} ${q?.reason || ''}`).join(' '),
     trail,
   ].join(' ').toLowerCase();
+  const source = String(input.source || input._src || input.job?.source || '').toLowerCase();
   const state = String(input.state || '').toLowerCase();
   const mk = (failureClass, action, label) => ({ failureClass, action, label });
   if (state === 'done') return mk('submitted', 'complete', 'Submitted');
@@ -2233,12 +2234,13 @@ function classifyQueueFailure(input = {}) {
   if (pending.length || state === 'parked' || state === 'awaiting_input' || /missing answer|needs your answer|no confident answer|legal\/eligibility|unanswered question/.test(text)) {
     return mk('missing_info', 'user', 'Needs your answer, then retries');
   }
+  if (/easyapply-limit|easy apply.*limit|daily.*limit/.test(text)) return mk('easyapply_cooldown', 'wait', 'Easy Apply cooldown');
+  if (/captcha|human|unusual activity|login required|sign into|sign-in required|sign in required|sign.?in required|site sign.?in|required before applying|connectez-vous/.test(text)) return mk('site_gate', 'user', 'Site gate needs you');
+  if (/external|company site|employer site|not auto-applicable|apply on the company site|postuler sur le site/.test(text)) return mk('external_site', 'inspect', 'External site skipped');
+  if (source === 'glassdoor' && /hydrate|no advance|did not open|application not open/.test(text)) return mk('external_site', 'inspect', 'Glassdoor posting was not auto-applicable');
   if (/occlud|throttl|hydrate|not top frame|not loaded|component|timed out|interrupted|page stopped|stuck|no advance|did not change|did not attach|max steps|resume attachment|résumé did not attach|could not complete/.test(text)) {
     return mk('transient_page', 'retry', 'Transient page/load issue, retries');
   }
-  if (/easyapply-limit|easy apply.*limit|daily.*limit/.test(text)) return mk('easyapply_cooldown', 'wait', 'Easy Apply cooldown');
-  if (/captcha|human|unusual activity|login required|sign into/.test(text)) return mk('site_gate', 'user', 'Site gate needs you');
-  if (/external|company site|not auto-applicable|apply on the company site/.test(text)) return mk('external_site', 'inspect', 'External site skipped');
   if (/already applied|punished|excluded keyword|above your level|academic\/research|relevance skip|needs ~\d+ yrs/.test(text)) return mk('relevance_skip', 'skip', 'Skipped by rules');
   if (state === 'skipped') return mk('skipped_other', 'inspect', 'Skipped, inspectable');
   if (state === 'failed') return mk('unknown_failure', 'inspect', 'Failed, needs inspection');
@@ -2437,7 +2439,7 @@ function queueLive({ startedAt } = {}) {
 function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25 } = {}) {
   const cutoff = new Date(Date.now() - Math.max(1, olderThanMinutes) * 60000).toISOString();
   const rows = all(
-    `SELECT t.* FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
+    `SELECT t.*, j.source AS _src, j.job_url AS _url FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
      WHERE t.state = 'failed' AND t.updated_at < ?
        AND COALESCE(t.attempts, 0) < ? AND j.status != 'submitted'
      ORDER BY t.updated_at ASC LIMIT ?`, [cutoff, maxAttempts, limit]);
