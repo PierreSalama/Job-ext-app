@@ -216,6 +216,13 @@ async function queueNext(force = false) {
   // P7: drop PUNISHED jobs (skipped 'punished'), then prefer the highest-rankJob
   // candidate among what's left (reward history ↑, geo/staleness ↓) — ADDITIVE: the
   // existing dead-task retirement + dispatch path is unchanged.
+  // A1: when LinkedIn's Easy Apply daily cap is cooled down, PIVOT — don't dispatch
+  // LinkedIn Easy-Apply jobs (we'd waste the cooldown), but keep flowing external/
+  // company-site jobs. Purely additive: only filters while cooled down. We LEAVE the
+  // LinkedIn tasks queued (not failed/skipped) so they resume after the cooldown.
+  let cooledDown = false;
+  try { cooledDown = db.easyApplyCooledDown(); } catch {}
+  let easyApplyDeferred = false;
   const candidates = [];
   for (let i = queued.length - 1; i >= 0; i--) {
     const t = queued[i];
@@ -233,8 +240,12 @@ async function queueNext(force = false) {
       broadcast('queue.updated', { taskId: t.id, state: 'skipped' });
       continue;
     }
+    if (cooledDown && !db.easyApplyEligible(j)) { easyApplyDeferred = true; continue; }
     candidates.push({ t, j, order: i });   // order = oldest-first index (lower = older)
   }
+  // Nothing dispatchable BUT we held back LinkedIn jobs for the cooldown → tell the pump
+  // why it's idling (it isn't out of work; it's waiting out the Easy-Apply cap).
+  if (!candidates.length && easyApplyDeferred) return { task: null, reason: 'easyapply-cooldown', concurrency };
   if (!candidates.length) return { task: null, reason: 'empty', concurrency };
   // Rank candidates: highest rankJob first; ties broken by oldest-first (stable original order).
   for (const c of candidates) { try { c.rank = db.rankJob(c.j, db.resolveProfileId(c.j.source)); } catch { c.rank = 0; } }
@@ -638,6 +649,36 @@ async function handle(req, res, parsed) {
   // the source/company the same way /qa does, so attribution stays per-profile.
   if (req.method === 'POST' && pathname === '/observe') {
     const body = await readJson(req);
+    // Teach & Correct T2: a full-fidelity manual-apply demonstration step. Resolve the
+    // profile the same way nav does, classify the (ats, company) from the apply URL
+    // (companyKey falls back to a normalized body.company), and record it. The credential
+    // rail (value/html nulling) is enforced inside db.recordDemonstration. Fully guarded.
+    if (body.kind === 'step') {
+      try {
+        const profileId = body.profileId || db.resolveProfileId(body.company || body.source);
+        const cls = db.classifyAts(body.url);
+        const companyKey = cls.companyKey || db.normCompanyKey(body.company) || null;
+        const demo = db.recordDemonstration({
+          profileId, sessionId: body.sessionId, jobId: body.jobId,
+          ats: cls.ats, companyKey,
+          stepIndex: body.stepIndex, action: body.action, label: body.label, fieldType: body.fieldType,
+          selector: body.selector, xpath: body.xpath, attrs: body.attrs, html: body.html,
+          value: body.value, screenshotId: body.screenshotId, delayMs: body.delayMs,
+          source: body.source || 'manual',
+        });
+        // T3: when a teach/apply step looks terminal (an advance/submit), fold this
+        // session's demonstrations into enriched recipes — best-effort, lazy-required,
+        // fully guarded so a distiller hiccup never breaks the observe write.
+        const act = String(body.action || '').toLowerCase();
+        if (act === 'advance' || act === 'submit') {
+          try {
+            const { distillDemonstrations } = require('./distiller');
+            distillDemonstrations(profileId, { sessionId: body.sessionId, jobId: body.jobId });
+          } catch {}
+        }
+        return sendJson(res, 200, { ok: true, demonstration: { id: demo && demo.id } });
+      } catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
+    }
     if (body.kind && body.kind !== 'nav') return sendJson(res, 400, { ok: false, error: 'unsupported observe kind' });
     const profileId = body.profileId || db.resolveProfileId(body.company || body.source);
     const event = db.recordNavEvent({
@@ -647,15 +688,73 @@ async function handle(req, res, parsed) {
     return sendJson(res, 200, { ok: true, event });
   }
 
-  // ---- recipe correction (Apprenticeship Engine: replay divergence feedback) [P5] ----
-  // The executor POSTs here when an AUTO replay diverges (an unexpected required field, a
-  // validation error, or a stall). recordRecipeCorrection decays the recipe's confidence
-  // and fail_count (and the named step's confidence) so the recipe self-corrects toward
-  // fall-back instead of repeating a bad fill. Token-guarded like every route below /pair.
+  // Teach & Correct T2 — best-effort screenshot for a Teach-Mode step. Accepts the full
+  // visible-tab PNG (dataUrl) + the apply-form rect, crops to the form via Electron
+  // nativeImage, saves a PNG under userData/teach-shots/, records the teach_screenshot
+  // row, and returns its id (the recorder posts the step separately; this only enriches
+  // it). EVERYTHING is guarded: no Electron / no permission / crop error → {ok:false} and
+  // the step simply has no screenshot.
+  if (req.method === 'POST' && pathname === '/observe/screenshot') {
+    const body = await readJson(req);
+    try {
+      if (!body.dataUrl) return sendJson(res, 200, { ok: false, error: 'no dataUrl' });
+      let nativeImage;
+      try { ({ nativeImage } = require('electron')); } catch { nativeImage = null; }
+      if (!nativeImage || !nativeImage.createFromDataURL) return sendJson(res, 200, { ok: false, error: 'no electron' });
+      let img = nativeImage.createFromDataURL(body.dataUrl);
+      if (!img || img.isEmpty()) return sendJson(res, 200, { ok: false, error: 'empty image' });
+      const full = img.getSize();
+      const r = body.rect || {};
+      // Clamp the crop rect into the captured image bounds (a partially-offscreen form
+      // would otherwise throw); skip the crop if the rect is degenerate.
+      const x = Math.max(0, Math.min(Math.round(r.x || 0), Math.max(0, full.width - 1)));
+      const y = Math.max(0, Math.min(Math.round(r.y || 0), Math.max(0, full.height - 1)));
+      const w = Math.max(1, Math.min(Math.round(r.w || full.width), full.width - x));
+      const h = Math.max(1, Math.min(Math.round(r.h || full.height), full.height - y));
+      let crop = img;
+      try { crop = img.crop({ x, y, width: w, height: h }); } catch { crop = img; }
+      const png = crop.toPNG();
+      const dir = path.join(opts.userDataDir, 'teach-shots');
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const id = `shot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const filePath = path.join(dir, `${id}.png`);
+      fs.writeFileSync(filePath, png);
+      const size = crop.getSize();
+      const profileId = body.profileId || db.resolveProfileId(body.company || body.source);
+      const screenshotId = db.recordTeachScreenshot({ profileId, path: filePath, w: size.width, h: size.height, bytes: png.length });
+      return sendJson(res, 200, { ok: true, screenshotId });
+    } catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
+  }
+
+  // ---- recipe correction (Apprenticeship Engine: replay divergence feedback) [P5 + T4] ----
+  // Two modes (recordRecipeCorrection decides by payload):
+  //   • DECAY (P5): the executor POSTs {recipeId, labelPattern} on AUTO-replay divergence
+  //     → confidence decays + fail_count++ so the recipe self-corrects toward fall-back.
+  //   • AUTHORITATIVE REWRITE (T4 Live Teach & Correct): the supervised-run overlay POSTs a
+  //     replacement bundle {labelPattern, selector, xpath, attrs, html, value, fieldType,
+  //     action} → the matching step is rewritten (right locator + value) at high confidence.
+  // The caller may name the recipe directly (recipeId) OR by {ats, companyKey, profileId}
+  // (the overlay knows the ATS/company, not the internal id) — we resolve-or-create it.
+  // Token-guarded like every route below /pair.
   if (req.method === 'POST' && pathname === '/recipe/correction') {
     const body = await readJson(req);
-    if (!body.recipeId) return sendJson(res, 400, { ok: false, error: 'recipeId required' });
-    return sendJson(res, 200, { ok: true, recipe: db.recordRecipeCorrection(body.recipeId, { labelPattern: body.labelPattern }) });
+    let recipeId = body.recipeId;
+    if (!recipeId && body.ats) {
+      // Resolve (or create) the recipe by ats/company so a correction can land even when
+      // the caller only knows the ATS/company. A named company → company overlay; else the
+      // cross-company ATS recipe.
+      const pid = body.profileId || undefined;
+      const scope = body.companyKey ? 'company' : 'ats';
+      let recipe = db.getRecipe(pid, scope, body.ats, body.companyKey || null);
+      if (!recipe) recipe = db.upsertRecipe({ profileId: pid, scope, ats: body.ats, companyKey: body.companyKey || null });
+      recipeId = recipe && recipe.id;
+    }
+    if (!recipeId) return sendJson(res, 400, { ok: false, error: 'recipeId or {ats[,companyKey]} required' });
+    return sendJson(res, 200, { ok: true, recipe: db.recordRecipeCorrection(recipeId, {
+      labelPattern: body.labelPattern,
+      selector: body.selector, xpath: body.xpath, attrs: body.attrs, html: body.html,
+      value: body.value, fieldType: body.fieldType, action: body.action,
+    }) });
   }
   // The replayer POSTs here on a clean mechanical completion of a recipe walk so the
   // recipe's success_count is credited (markRecipeOutcome). Best-effort + token-guarded.
@@ -663,6 +762,48 @@ async function handle(req, res, parsed) {
     const body = await readJson(req);
     if (!body.recipeId) return sendJson(res, 400, { ok: false, error: 'recipeId required' });
     return sendJson(res, 200, { ok: true, recipe: db.markRecipeOutcome(body.recipeId, { success: body.success !== false }) });
+  }
+
+  // ---- Taught Procedures review/audit dashboard [T5] ----
+  // GET /recipes?profileId= — every recipe (ats|company) for the profile, each with its
+  // ordered steps + per-step needsAttention flag (the full review bundle).
+  if (req.method === 'GET' && pathname === '/recipes') {
+    const pid = parsed.searchParams.get('profileId') || db.ensureDefaultProfileId();
+    return sendJson(res, 200, { ok: true, profileId: pid, recipes: db.listRecipesWithSteps(pid) });
+  }
+  // PATCH /recipe-step/:id — edit one step (value / label / scope flip / reorder / action).
+  // The credential rail (no value on a sensitive label) is enforced inside the db helper.
+  if (req.method === 'PATCH' && (jm = m(/^\/recipe-step\/([^/]+)$/))) {
+    const body = await readJson(req);
+    const step = db.updateRecipeStepFields(jm[1], {
+      defaultValue: body.defaultValue, labelPattern: body.labelPattern,
+      scope: body.scope, stepIndex: body.stepIndex, action: body.action,
+    });
+    if (!step) return sendJson(res, 404, { ok: false, error: 'not found' });
+    broadcast('recipes.updated', { stepId: jm[1] });
+    return sendJson(res, 200, { ok: true, step });
+  }
+  // DELETE /recipe-step/:id — remove a step (and clean its orphaned screenshot).
+  if (req.method === 'DELETE' && (jm = m(/^\/recipe-step\/([^/]+)$/))) {
+    const okDel = db.deleteRecipeStep(jm[1]);
+    if (okDel) broadcast('recipes.updated', { stepId: jm[1] });
+    return sendJson(res, okDel ? 200 : 404, { ok: okDel });
+  }
+  // GET /teach-shot/:id — serve a teach screenshot PNG so the dashboard can render thumbnails.
+  if (req.method === 'GET' && (jm = m(/^\/teach-shot\/([^/]+)$/))) {
+    const p = db.getTeachScreenshotPath(jm[1]);
+    if (!p) return sendJson(res, 404, { ok: false, error: 'not found' });
+    // Defense-in-depth: only ever serve from userData/teach-shots, never an arbitrary path.
+    const shotsDir = path.resolve(opts.userDataDir, 'teach-shots');
+    const real = path.resolve(p);
+    if (real !== shotsDir && !real.startsWith(shotsDir + path.sep)) {
+      return sendJson(res, 403, { ok: false, error: 'access denied' });
+    }
+    try {
+      const buf = fs.readFileSync(real);
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'private, max-age=60' });
+      return res.end(buf);
+    } catch { return sendJson(res, 404, { ok: false, error: 'file missing on disk' }); }
   }
 
   // ---- profiles ----
@@ -847,6 +988,12 @@ async function handle(req, res, parsed) {
     const body = await readJson(req);
     const task = db.queuePatch(jm[1], body);
     if (!task) return sendJson(res, 404, { ok: false, error: 'not found' });
+    // LinkedIn Easy Apply daily cap hit (executor reports `easyapply-limit …`): set the
+    // cooldown + learn the observed threshold, so queueNext pivots to external jobs.
+    if (typeof body.lastError === 'string' && /^easyapply-limit/.test(body.lastError)) {
+      try { db.setEasyApplyCooldown(); } catch {}
+      broadcast('queue.updated', { action: 'easyapply-limit' });
+    }
     broadcast('queue.updated', { taskId: task.id, state: task.state });
     if (opts.notify && ['awaiting_review', 'awaiting_input', 'parked', 'done', 'failed'].includes(task.state)) {
       opts.notify('autoApply', task);
@@ -923,6 +1070,11 @@ async function handle(req, res, parsed) {
   if (req.method === 'GET' && pathname === '/auto-apply/breakdown') {
     const days = Number(parsed.searchParams.get('days')) || 30;
     return sendJson(res, 200, { ok: true, ...db.queueBreakdown({ days }) });
+  }
+  // A1: LinkedIn Easy Apply daily-cap status — cooldown state, when it resumes, the
+  // learned per-account threshold, and the rolling 24h submit count, for the dashboard.
+  if (req.method === 'GET' && pathname === '/auto-apply/easyapply-status') {
+    return sendJson(res, 200, { ok: true, ...db.easyApplyStatus() });
   }
   // LIVE pool snapshot for the "Running now" panel — in-flight workers + their step,
   // queue depth, session tally, and the EFFECTIVE throughput (so a stale-pacing

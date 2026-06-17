@@ -173,6 +173,42 @@ export function paceDelay(medianMs, rand = Math.random, opts = {}) {
 }
 
 // ============================================================
+// resolveLocator(step)  [T3 — selector-first replay]
+// ============================================================
+// PURE precedence for HOW to find a step's target element on the live page:
+//   1. step.selector  → { by: 'selector', value }  (a CSS selector — most precise)
+//   2. step.xpath     → { by: 'xpath',    value }  (robust structural locator)
+//   3. otherwise      → { by: 'label',    value }  (today's label_pattern token-match)
+// The executor uses (1)/(2) first and FALLS BACK to (3) when the locator is absent,
+// not found, or invisible. A blank string is treated as absent.
+export function resolveLocator(step = {}) {
+  const sel = step && step.selector != null ? String(step.selector).trim() : '';
+  if (sel) return { by: 'selector', value: sel };
+  const xp = step && step.xpath != null ? String(step.xpath).trim() : '';
+  if (xp) return { by: 'xpath', value: xp };
+  const lbl = (step && (step.labelPattern || step.label)) || '';
+  return { by: 'label', value: lbl };
+}
+
+// ============================================================
+// pickRunMode(recipe, opts)  [T4 — Live Teach & Correct]
+// ============================================================
+// PURE default-mode picker for a SUPERVISED "Watch & Teach" run:
+//   • 'step' — pause before EACH action for the user's OK. Chosen when the recipe is
+//     NEW / untrusted: no steps, or confidence < (opts.trust ?? 0.7). The first time
+//     Pierre teaches a new ATS he watches every action.
+//   • 'run'  — go at pace, honoring a "Wrong" interrupt. Chosen once the recipe is
+//     TRUSTED: it has ≥1 step AND confidence ≥ trust.
+// The overlay still offers a manual Step/Run toggle; this only sets the default.
+export function pickRunMode(recipe, opts = {}) {
+  const trust = opts.trust ?? 0.7;
+  const steps = recipe && Array.isArray(recipe.steps) ? recipe.steps : [];
+  const confidence = Number(recipe && recipe.confidence) || 0;
+  if (!steps.length || confidence < trust) return 'step';
+  return 'run';
+}
+
+// ============================================================
 // classifyDivergence({ unexpectedRequiredField, validationError, noChangeCount })
 // ============================================================
 // Name WHY a replay must stop, so the executor downgrades to review + records a

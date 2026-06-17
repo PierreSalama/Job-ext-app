@@ -213,6 +213,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // TEST button: apply the next queued job RIGHT NOW (skips window/cap/gap).
       respond(forceApplyOne().then((s) => ({ ok: true, ...s })));
       return true;
+    case 'watch-and-teach':
+      // "Watch & Teach" [T4]: supervised apply of the next queued job — Step/Run overlay +
+      // on-page Fix-this picker; corrections rewrite the recipe authoritatively.
+      respond(watchAndTeachOne().then((s) => ({ ok: true, ...s })));
+      return true;
     case 'stop-autoapply':
       // Dashboard "Stop everything" → close the run's tabs + drop the group.
       respond(closeAutoApplyTabs().then(() => ({ ok: true })));
@@ -242,6 +247,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     case 'api-call':
       respond(api.call(msg.method || 'GET', msg.path, msg.body, msg.timeoutMs));
+      return true;
+    case 'teach-screenshot':
+      // Teach Mode (Teach & Correct T2): capture the visible tab, hand the full PNG +
+      // the apply-form rect to the app, which crops + saves + records the screenshot and
+      // attaches its id to the demonstration. FULLY BEST-EFFORT — any failure (no
+      // permission, capture error, app down) resolves {ok:false} and the step has already
+      // been recorded without a screenshot, so nothing is lost.
+      respond((async () => {
+        try {
+          if (!(await api.isPaired())) return { ok: false, error: 'not paired' };
+          const winId = sender?.tab?.windowId;
+          const dataUrl = await chrome.tabs.captureVisibleTab(winId, { format: 'png' });
+          if (!dataUrl) return { ok: false, error: 'no capture' };
+          return await api.call('POST', '/observe/screenshot', {
+            dataUrl, rect: msg.rect, demo: msg.demo, url: sender?.tab?.url,
+          }, 20000);
+        } catch (e) { return { ok: false, error: String(e?.message || e) }; }
+      })());
       return true;
     case 'task-progress':
       respond(api.call('PATCH', '/queue/' + encodeURIComponent(msg.taskId), msg.patch));
@@ -581,7 +604,14 @@ async function autoApplyTargetWindow() {
     const wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
     const focusedId = wins.find((w) => w.focused)?.id;
     let win = null;
-    try { win = await chrome.windows.create({ focused: false, state: 'normal' }); } catch {}
+    // Give it an explicit SIDE position + size so Chrome doesn't cascade it directly OVER
+    // the user's window. A distinct, non-overlapping placement keeps the apply page at
+    // least partially on-display (less occlusion → less throttling) without any new
+    // permission (no system.display). HARD LIMIT: if the user runs a fully-maximized
+    // window on a single monitor, a non-focused background window is occluded by the OS
+    // and Chrome still throttles it — side-placement + the load-nudge mitigate but can't
+    // fully beat a fully-covering maximized window.
+    try { win = await chrome.windows.create({ focused: false, state: 'normal', width: 1200, height: 900, left: 60, top: 60 }); } catch {}
     aaWindowId = win ? win.id : null;
     try { if (aaWindowId != null) chrome.storage.local?.set({ 'jat11.aaWindowId': aaWindowId }); } catch {}
     if (win && focusedId != null) { try { await chrome.windows.update(focusedId, { focused: true }); } catch {} }
@@ -630,7 +660,10 @@ async function acquireApplyWindow(focus = false) {
     try {
       const wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
       const focusedId = wins.find((w) => w.focused)?.id;
-      const w = await chrome.windows.create({ focused: !!focus, state: 'normal' });
+      // Explicit SIDE placement + size (same rationale as autoApplyTargetWindow): a
+      // distinct, non-cascaded window stays partially on-display so its apply tab is less
+      // likely to be occlusion-throttled. No new permission.
+      const w = await chrome.windows.create({ focused: !!focus, state: 'normal', width: 1200, height: 900, left: 60, top: 60 });
       if (w) { win = w.id; aaWindowPool.push(win); if (!focus && focusedId != null) { try { await chrome.windows.update(focusedId, { focused: true }); } catch {} } }
     } catch {}
   }
@@ -664,7 +697,7 @@ async function reapIdleApplyWindows() {
 // never steal "active" from a running apply tab (which would re-throttle it); their
 // scraping tolerates throttling. `winId` overrides the window (used by the worker pool).
 // Returns the created tab.
-async function createAaTab(url, { active = true, focusWindow = false, winId: forceWin } = {}) {
+async function createAaTab(url, { active = true, focusWindow = false, winId: forceWin, isApply = false } = {}) {
   const winId = forceWin != null ? forceWin : await autoApplyTargetWindow();
   const tab = await chrome.tabs.create({ url, active, ...(winId ? { windowId: winId } : {}) });
   trackAaTab(tab.id);   // register for cleanup/reaping (works without tabGroups, e.g. Firefox)
@@ -674,6 +707,11 @@ async function createAaTab(url, { active = true, focusWindow = false, winId: for
     try { await chrome.windows.update(winId, { focused: true }); } catch {}
   }
   await groupTab(tab.id);
+  // One-time, debounced load-nudge for APPLY tabs only (not discovery/sync): a freshly
+  // created apply page in a non-focused background window can be occlusion-throttled and
+  // never hydrate. nudgeApplyWindows() is debounced (≤1/8s) and restores the user's focus
+  // after ~700ms, so an occluded page still gets a render pass. Fully guarded.
+  if (isApply) { try { nudgeApplyWindows(); } catch {} }   // fire-and-forget; never throws
   return tab;
 }
 
@@ -787,7 +825,7 @@ async function launchOne(task, context) {
   // window it never interrupts you. focusWindow (opt-in) additionally brings it to front.
   const winId = parallel ? await acquireApplyWindow(bringFront) : await autoApplyTargetWindow();
   try {
-    tab = await createAaTab(url, { active: true, focusWindow: bringFront, winId });
+    tab = await createAaTab(url, { active: true, focusWindow: bringFront, winId, isApply: true });
     try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch {}   // don't let Chrome discard it mid-apply
 
     // Wait for the page (and content script) to settle, then hand over the task.
@@ -818,10 +856,17 @@ async function launchOne(task, context) {
       // HARD TIMEOUT: a hung executor (frozen tab / infinite wait) must NOT hold the
       // pool slot forever — that stalled the whole pipeline (tasks stuck "running" for
       // 13+ min, zero new applies). Cap the whole run at 3.5 min, then fail + free up.
-      result = await Promise.race([
-        chrome.tabs.sendMessage(tab.id, { type: 'jat11.run-task', task, context }, { frameId: 0 }),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('apply timed out after 3.5 min')), 210000)),
-      ]);
+      // SUPERVISED ("Watch & Teach") runs use the supervised entry path (Step/Run overlay
+      // + Fix-this picker) and bring the window to front so Pierre can watch + correct. No
+      // 3.5-min hard cap — a supervised run is paced by the human, not the pool. [T4]
+      const runType = context && context.supervised ? 'jat11.supervised-run' : 'jat11.run-task';
+      const dispatch = chrome.tabs.sendMessage(tab.id, { type: runType, task, context }, { frameId: 0 });
+      result = context && context.supervised
+        ? await dispatch
+        : await Promise.race([
+            dispatch,
+            new Promise((_, rej) => setTimeout(() => rej(new Error('apply timed out after 3.5 min')), 210000)),
+          ]);
     } catch (e) {
       // Run being torn down (user pressed Stop) → the tab was removed out from under
       // us. That's NOT a real failure: leave the task as the dashboard set it (skipped)
@@ -949,6 +994,28 @@ async function forceApplyOne() {
   }
 }
 
+// "Watch & Teach" [T4]: apply the next queued job in SUPERVISED mode — the executor shows
+// the Step/Run overlay and the on-page Fix-this picker, and corrections rewrite the recipe
+// authoritatively. Same /queue/next source as forceApplyOne, but flagged supervised +
+// brought to front so Pierre can watch. Awaited so the dashboard can show the outcome.
+async function watchAndTeachOne() {
+  if (!(await api.isPaired())) return { dispatched: false, reason: 'not paired' };
+  const h = await api.health();
+  if (!h?.ok) return { dispatched: false, reason: 'app offline' };
+  const r = await api.call('GET', '/queue/next?force=1', null, 8000);
+  if (r && r.concurrency) currentConcurrency = Math.max(1, Math.min(8, r.concurrency));
+  if (!r?.ok || !r.task) return { dispatched: false, reason: r?.reason || 'nothing queued' };
+  const context = { ...(r.context || {}), supervised: true, bringToFront: true };
+  activeCount++;
+  try {
+    const state = await launchOne(r.task, context);
+    return { dispatched: true, state, title: r.context?.job?.title };
+  } finally {
+    activeCount = Math.max(0, activeCount - 1);
+    schedulePump();
+  }
+}
+
 // ---- discovery: search a board for Easy-Apply jobs + enqueue them ----
 // Rotation cursor over the FULL board × keyword × location search space. It MUST be
 // persisted: a plain in-memory counter resets to 0 on every MV3 service-worker
@@ -985,6 +1052,13 @@ function buildSearchUrl(board, keyword, location, { easyApplyOnly = true } = {})
     // company site" jobs the engine can't auto-drive (the bulk of "did not open").
     const ea = easyApplyOnly ? '&sc=0kf%3Aattr(DSQF7)%3B' : '';
     return `https://www.indeed.com/jobs?q=${kw}&sort=date&fromage=7${ea}` + (loc ? `&l=${loc}` : '');
+  }
+  if (board === 'glassdoor') {
+    // Glassdoor has no public "easy apply"-only URL filter, so easyApplyOnly can't be
+    // expressed in the URL here — the discover scrape enqueues all cards and the
+    // executor/handoff path sorts drivability (Glassdoor Easy-Apply stays in-page;
+    // "apply on company site" hands off to an external ATS). fromAge=7 = last week.
+    return `https://www.glassdoor.com/Job/jobs.htm?sc.keyword=${kw}&fromAge=7` + (loc ? `&locKeyword=${loc}` : '');
   }
   // linkedin (default) — f_AL=true is the Easy-Apply filter; DD = sort by date.
   // When easyApplyOnly is OFF the user also wants normal/external postings, so we

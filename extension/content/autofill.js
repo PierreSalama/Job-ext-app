@@ -101,6 +101,28 @@ function cssEscape(s) {
   return (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/([^\w-])/g, '\\$1');
 }
 
+// Site chrome that must NEVER be filled: the global search bar / typeahead and anything
+// living in the page header/nav. Root cause of the "executor types into LinkedIn's global
+// search bar (value '0')" bug — a broad fill root (dialog || detectApplyForm container)
+// can include the site header before the apply modal opens. Shared by scanFillable,
+// scanUnknown, fill(), and fillCombobox so the guard is enforced consistently everywhere.
+// Defensive: any error → false (don't let a guard exception block real fills).
+const SITE_CHROME_SEL = 'header, nav, [role="banner"], [role="navigation"], [class*="global-nav"], [id*="global-nav"], [class*="search-global"], [class*="typeahead"][class*="search"], [data-test-global-nav], #global-nav, .search-global-typeahead';
+export function isSiteChromeInput(input) {
+  try {
+    if (!input) return false;
+    // 1) It's a search box.
+    if (input.type === 'search') return true;
+    const role = input.getAttribute?.('role');
+    const label = fieldLabel(input);
+    if (role === 'combobox' && /^\s*search\b/i.test(label)) return true;
+    if (/^\s*search(\s+search)*\s*$/i.test(label)) return true;
+    // 2) It lives inside site chrome (header/nav/global-nav/global-search typeahead).
+    if (input.closest?.(SITE_CHROME_SEL)) return true;
+    return false;
+  } catch { return false; }
+}
+
 function profileFieldFor(label, profile) {
   // Match against both the raw and accent-folded label so French fields (e.g.
   // "prénom") still hit patterns even where only the unaccented form is listed.
@@ -223,6 +245,7 @@ export function setNativeValue(el, value) {
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 export async function fillCombobox(el, value) {
   try {
+    if (isSiteChromeInput(el)) return false;   // never type into the global search typeahead
     const v = String(value == null ? '' : value).trim();
     if (!v) return false;
     const vl = v.toLowerCase();
@@ -289,6 +312,7 @@ export class AutofillEngine {
     const out = [];
     for (const input of this.fields(rootEl)) {
       if (!isFillable(input)) continue;
+      if (isSiteChromeInput(input)) continue;   // never touch the global search bar / header chrome
       if (input.tagName !== 'SELECT' && input.value && String(input.value).trim()) continue;
       if (input.tagName === 'SELECT' && input.selectedIndex > 0) continue;
       if ((input.type === 'checkbox' || input.type === 'radio') && input.checked) continue;
@@ -310,6 +334,7 @@ export class AutofillEngine {
     const seenRadioGroups = new Set();
     for (const input of this.fields(rootEl)) {
       if (!isFillable(input)) continue;
+      if (isSiteChromeInput(input)) continue;   // never surface the global search bar / header chrome
       if (input.type === 'radio') {
         const group = input.name || fieldLabel(input);
         if (seenRadioGroups.has(group)) continue;
@@ -330,11 +355,9 @@ export class AutofillEngine {
       const label = (input.type === 'radio' ? radioGroupLabel(input) : '') || fieldLabel(input);
       if (!label || label.length < 4) continue;
       if (NEVER_AUTOFILL_RX.test(label)) continue;
-      // Skip generic site-search / typeahead inputs (e.g. LinkedIn's global
-      // "Search" box). They're never a real application question, can't be
-      // answered truthfully, and would falsely park the whole job at submit.
-      if (/^\s*search(\s+search)*\s*$/.test(label) || input.type === 'search'
-          || (input.getAttribute('role') === 'combobox' && /^\s*search\b/.test(label))) continue;
+      // (Generic site-search / global-search typeahead inputs are already skipped above
+      // via isSiteChromeInput — they're never a real application question and would
+      // falsely park the whole job at submit.)
       if (profileFieldFor(label, profile || {})) continue;
       if (await this.lookupAnswer(label)) continue;
       const required = input.required || input.getAttribute('aria-required') === 'true';
@@ -354,6 +377,7 @@ export class AutofillEngine {
     let n = 0;
     for (const s of suggestions) {
       try {
+        if (isSiteChromeInput(s.input)) continue;   // belt-and-suspenders: never fill site chrome
         const v = String(s.value);
         const isCombo = s.input.getAttribute && (s.input.getAttribute('role') === 'combobox'
           || (s.input.closest && s.input.closest('[class*="select__control"],[class*="react-select"],[class*="-control"],[class*="basic-typeahead"]')));

@@ -485,6 +485,58 @@ const MIGRATIONS = [
     exec('ALTER TABLE profile_fields ADD COLUMN last_validated_at TEXT;');
     exec('ALTER TABLE auto_apply_tasks ADD COLUMN recipe_id TEXT;');   // nullable; no FK (avoid lock churn)
   },
+
+  // v10 — Teach & Correct (Apprenticeship Engine v2). Full-fidelity demonstrations
+  // (the user's real clicks/fills with the exact locator bundle + screenshot + timing),
+  // a screenshots ledger (files on disk, referenced by id, pruned), and the real locator
+  // bundle on recipe_steps so replay targets the exact element instead of a label guess.
+  () => {
+    exec(`
+      CREATE TABLE demonstrations (
+        id            TEXT PRIMARY KEY,
+        profile_id    TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        session_id    TEXT,
+        job_id        TEXT,
+        ats           TEXT,
+        company_key   TEXT,
+        step_index    INTEGER,
+        action        TEXT,                     -- click|fill|select|upload|advance
+        label         TEXT,
+        label_norm    TEXT,
+        field_type    TEXT,
+        selector      TEXT,                     -- CSS selector
+        xpath         TEXT,
+        attrs         TEXT,                     -- JSON attribute signature
+        html          TEXT,                     -- trimmed outerHTML snippet
+        value         TEXT,                     -- rail-guarded (null for sensitive)
+        screenshot_id TEXT,
+        delay_ms      INTEGER,                  -- ms before the NEXT action (human pacing)
+        source        TEXT,                     -- manual|teach|correction
+        ts            TEXT
+      );
+    `);
+    exec('CREATE INDEX idx_demos_key ON demonstrations(profile_id, ats, label_norm);');
+    exec('CREATE INDEX idx_demos_session ON demonstrations(session_id, step_index);');
+    exec(`
+      CREATE TABLE teach_screenshots (
+        id          TEXT PRIMARY KEY,
+        profile_id  TEXT,
+        path        TEXT,
+        w           INTEGER,
+        h           INTEGER,
+        bytes       INTEGER,
+        ts          TEXT
+      );
+    `);
+    // The real locator bundle on each recipe step → selector-first replay (T3).
+    exec('ALTER TABLE recipe_steps ADD COLUMN selector TEXT;');
+    exec('ALTER TABLE recipe_steps ADD COLUMN xpath TEXT;');
+    exec('ALTER TABLE recipe_steps ADD COLUMN attrs TEXT;');
+    exec('ALTER TABLE recipe_steps ADD COLUMN html TEXT;');
+    exec('ALTER TABLE recipe_steps ADD COLUMN screenshot_id TEXT;');
+    exec('ALTER TABLE recipe_steps ADD COLUMN source TEXT;');
+    exec('ALTER TABLE recipe_steps ADD COLUMN default_value TEXT;');
+  },
 ];
 
 function userVersion() {
@@ -1445,7 +1497,7 @@ function harvestAnswersToProfile(answers, { profileId, jobId, source, status } =
 const APPLY_URL_RX = /(apply|application|career|jobs?|gh_jid|requisition|posting)/i;
 // Boards = aggregators a human starts on; ATS = the system a real apply runs in. A
 // board→ATS transition across a referrer is a 'handoff' edge (the whole point of P2).
-const ATS_BOARDS = new Set(['linkedin', 'indeed']);
+const ATS_BOARDS = new Set(['linkedin', 'indeed', 'glassdoor']);
 const ATS_SYSTEMS = new Set(['workday', 'greenhouse', 'lever', 'icims', 'successfactors', 'taleo', 'bamboo', 'ashby', 'smartrecruiters', 'jobvite']);
 
 // normKey-style company canonicalization (lowercase + strip non-alphanumerics), reused
@@ -1518,6 +1570,19 @@ function classifyAts(url) {
   // Boards — company lives in query/path, not the host → companyKey null (caller supplies).
   if (/(^|\.)linkedin\.com$/.test(host)) return { ats: 'linkedin', companyKey: null, host };
   if (/(^|\.)indeed\.[a-z.]+$/.test(host)) return { ats: 'indeed', companyKey: null, host };
+  // Glassdoor — a board (like LinkedIn/Indeed). The company is encoded in the slug, not the
+  // host, so companyKey is null here UNLESS the URL exposes a derivable employer slug
+  // (/Overview/Working-at-<Company>-EI_... or job-listing/<title>-at-<company>-JV_...). When
+  // it derives one we pass it; otherwise null and the caller supplies job.company. Glassdoor
+  // frequently REDIRECTS to an external ATS — that handoff is already handled by the P2
+  // nav/handoff edge + classifyAts on the destination, so we only classify the host itself.
+  if (/(^|\.)glassdoor\.[a-z.]+$/.test(host)) {
+    let companyKey = null;
+    let m = u.pathname.match(/\/Overview\/Working-at-([\w.-]+?)-EI_/i)
+      || u.pathname.match(/\/job-listing\/.*?-at-([\w.-]+?)-(?:JV_|SRCH_)/i);
+    if (m && m[1]) companyKey = normCompanyKey(m[1]);
+    return { ats: 'glassdoor', companyKey: companyKey || null, host };
+  }
 
   // Anything else that looks like an apply/careers page → a direct company-site apply.
   return { ats: 'direct', companyKey: null, host };
@@ -1631,6 +1696,10 @@ function rowToStep(r) {
     strategy: r.strategy || null, options: safeParse(r.options, null),
     validationPattern: r.validation_pattern || null, advanceText: r.advance_text || null,
     medianDelayMs: r.median_delay_ms ?? null, confidence: r.confidence ?? null,
+    // T3 locator bundle (additive; null on pre-enrichment steps).
+    selector: r.selector || null, xpath: r.xpath || null, attrs: r.attrs || null,
+    html: r.html || null, screenshotId: r.screenshot_id || null,
+    source: r.source || null, defaultValue: r.default_value ?? null,
     updatedAt: r.updated_at,
   };
 }
@@ -1638,11 +1707,19 @@ function rowToStep(r) {
 // upsertRecipeStep — a recipe's step is identified by (recipe_id, label_pattern). If a step
 // with the same label_pattern already exists, update it in place; otherwise append at the
 // next free step_index. `options` is stored as JSON. Returns the step row.
-function upsertRecipeStep({ recipeId, stepIndex, action, labelPattern, fieldType, strategy, options, advanceText, medianDelayMs, confidence } = {}) {
+//
+// T3: ALSO accepts + persists the locator bundle (selector/xpath/attrs/html/screenshotId/
+// source/defaultValue). All optional + backward-compatible (existing answer-only callers
+// pass none, write nothing new). `attrs` is JSON-stringified if an object. On UPDATE of an
+// existing step, the locator columns are refreshed ONLY when the incoming value is non-null
+// (COALESCE) so a fresh demonstration without a selector never wipes a good one.
+function upsertRecipeStep({ recipeId, stepIndex, action, labelPattern, fieldType, strategy, options, advanceText, medianDelayMs, confidence,
+                            selector, xpath, attrs, html, screenshotId, source, defaultValue } = {}) {
   if (!recipeId) return null;
   const lp = labelPattern != null ? String(labelPattern) : null;
   const ts = now();
   const opts = options == null ? null : (typeof options === 'string' ? options : JSON.stringify(options));
+  const attrsStr = attrs == null ? null : (typeof attrs === 'string' ? attrs : JSON.stringify(attrs));
   const cur = lp != null
     ? get('SELECT * FROM recipe_steps WHERE recipe_id = ? AND label_pattern = ?', [recipeId, lp])
     : null;
@@ -1651,20 +1728,29 @@ function upsertRecipeStep({ recipeId, stepIndex, action, labelPattern, fieldType
          action=COALESCE(?, action), field_type=COALESCE(?, field_type),
          strategy=COALESCE(?, strategy), options=COALESCE(?, options),
          advance_text=COALESCE(?, advance_text), median_delay_ms=COALESCE(?, median_delay_ms),
-         confidence=COALESCE(?, confidence), updated_at=?
+         confidence=COALESCE(?, confidence),
+         selector=COALESCE(?, selector), xpath=COALESCE(?, xpath), attrs=COALESCE(?, attrs),
+         html=COALESCE(?, html), screenshot_id=COALESCE(?, screenshot_id),
+         source=COALESCE(?, source), default_value=COALESCE(?, default_value),
+         updated_at=?
          WHERE id=?`,
         [action || null, fieldType || null, strategy || null, opts,
-         advanceText ?? null, medianDelayMs ?? null, confidence ?? null, ts, cur.id]);
+         advanceText ?? null, medianDelayMs ?? null, confidence ?? null,
+         selector ?? null, xpath ?? null, attrsStr, html ?? null, screenshotId ?? null,
+         source ?? null, defaultValue ?? null, ts, cur.id]);
     return rowToStep(get('SELECT * FROM recipe_steps WHERE id = ?', [cur.id]));
   }
   // Append: next index = caller-supplied, else max+1 for this recipe.
   let idx = Number.isFinite(Number(stepIndex)) ? Number(stepIndex)
     : ((get('SELECT MAX(step_index) AS m FROM recipe_steps WHERE recipe_id = ?', [recipeId])?.m ?? -1) + 1);
   const id = uid('step');
-  run(`INSERT INTO recipe_steps (id, recipe_id, step_index, action, label_pattern, field_type, strategy, options, validation_pattern, advance_text, median_delay_ms, confidence, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
+  run(`INSERT INTO recipe_steps (id, recipe_id, step_index, action, label_pattern, field_type, strategy, options, validation_pattern, advance_text, median_delay_ms, confidence,
+       selector, xpath, attrs, html, screenshot_id, source, default_value, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [id, recipeId, idx, String(action || 'fill'), lp, fieldType || null, strategy || null, opts,
-       advanceText ?? null, medianDelayMs ?? null, confidence ?? null, ts]);
+       advanceText ?? null, medianDelayMs ?? null, confidence ?? null,
+       selector ?? null, xpath ?? null, attrsStr, html ?? null, screenshotId ?? null,
+       source ?? null, defaultValue ?? null, ts]);
   return rowToStep(get('SELECT * FROM recipe_steps WHERE id = ?', [id]));
 }
 
@@ -1683,18 +1769,63 @@ function markRecipeOutcome(recipeId, { success } = {}) {
   return rowToRecipe(get('SELECT * FROM ats_recipes WHERE id = ?', [recipeId]));
 }
 
-// recordRecipeCorrection(recipeId, { labelPattern }) — the replay divergence feedback
-// [P5]. When AUTO replay diverges (an unexpected required field, a validation error, a
-// stall), the executor downgrades to review and POSTs here. We DECAY the recipe's
-// confidence (*0.8, floored at 0.1 so it never hits zero and stays revivable), bump
-// fail_count, and touch updated_at; if a specific divergent label is named, that step's
-// confidence is decayed too (same *0.8 / floor 0.1) so the next resolve trusts it less.
-// This makes a stale recipe self-correct toward fall-back instead of repeating a bad fill.
-function recordRecipeCorrection(recipeId, { labelPattern } = {}) {
+// recordRecipeCorrection(recipeId, payload) — the replay/teach feedback surface [P5 + T4].
+//
+// TWO modes, decided by whether a REPLACEMENT bundle is supplied:
+//
+//  • AUTHORITATIVE REWRITE (T4 — Live Teach & Correct): when the user watches a
+//    supervised run, hits "Fix this", and picks the correct element / value, the
+//    payload carries a replacement locator/value
+//    ({ labelPattern, selector, xpath, attrs, html, value, fieldType, action }).
+//    We find the step matching labelPattern (or CREATE it), upsertRecipeStep it with
+//    the new selector/xpath/attrs/html/default_value/field_type, source:'correction',
+//    and HIGH confidence (0.95 — user-authoritative). A confirmed correction is a
+//    POSITIVE signal, so we BUMP the recipe's confidence (not decay) and credit it.
+//    The credential rail holds: a sensitive label NEVER stores a value or html.
+//
+//  • DECAY (today's P5 behavior): with NO replacement (a plain "this was wrong" with
+//    no fix), we DECAY the recipe's confidence (*0.8, floored at 0.1 so it stays
+//    revivable), bump fail_count, and decay the named step's confidence too.
+//
+// Backward-compatible: existing callers pass only { labelPattern } → pure decay path.
+function recordRecipeCorrection(recipeId, payload = {}) {
   if (!recipeId) return null;
   const ts = now();
   const r = get('SELECT * FROM ats_recipes WHERE id = ?', [recipeId]);
   if (!r) return null;
+
+  const { labelPattern, selector, xpath, attrs, html, value, fieldType, action } = payload || {};
+  // A replacement is given when any locator OR a value is supplied alongside a label.
+  const hasReplacement = labelPattern != null && String(labelPattern).trim() &&
+    (selector != null || xpath != null || attrs != null || html != null || value != null);
+
+  if (hasReplacement) {
+    const lp = String(labelPattern);
+    // Credential rail (authoritative): never persist a value/html for a sensitive field.
+    const sensitive = isSensitiveKey(lp);
+    const CONF = 0.95;   // user-confirmed → authoritative
+    upsertRecipeStep({
+      recipeId,
+      action: action || null,
+      labelPattern: lp,
+      fieldType: fieldType || null,
+      selector: selector != null ? String(selector) : null,
+      xpath: xpath != null ? String(xpath) : null,
+      attrs: attrs != null ? attrs : null,
+      html: sensitive ? null : (html != null ? String(html) : null),
+      defaultValue: sensitive ? null : (value != null ? String(value) : null),
+      source: 'correction',
+      confidence: CONF,
+    });
+    // A confirmed correction is a positive signal: raise the recipe's confidence
+    // toward CONF (never lower it), credit a success, and touch updated_at.
+    const bumped = Math.min(CONF, Math.max(Number(r.confidence) || 0.5, (Number(r.confidence) || 0.5) * 0.5 + CONF * 0.5));
+    run('UPDATE ats_recipes SET confidence = ?, success_count = success_count + 1, updated_at = ? WHERE id = ?',
+        [bumped, ts, recipeId]);
+    return rowToRecipe(get('SELECT * FROM ats_recipes WHERE id = ?', [recipeId]));
+  }
+
+  // --- no replacement → today's decay behavior ---
   const decayed = Math.max(0.1, (Number(r.confidence) || 0.5) * 0.8);
   run('UPDATE ats_recipes SET confidence = ?, fail_count = fail_count + 1, updated_at = ? WHERE id = ?',
       [decayed, ts, recipeId]);
@@ -2418,6 +2549,70 @@ function queueRunStats() {
 }
 
 // ============================================================
+// LinkedIn Easy Apply daily cap (~50/24h) — detect, cool down, pivot.
+// The executor reports `easyapply-limit` when LinkedIn shows its limit modal; the
+// server then sets a cooldown so queueNext skips Easy-Apply jobs (but keeps dispatching
+// external/company-site ones) until it expires. We also LEARN the per-account threshold
+// by recording how many Easy-Apply submissions landed in the rolling 24h when we hit it,
+// keeping the MAX ever observed as the best estimate of the real cap.
+// ============================================================
+
+// Rolling-24h count of Easy-Apply submissions that reached a terminal "submitted" state.
+// Easy-Apply = apply_route 'easy-apply' OR (route unknown AND the job is a LinkedIn source).
+function easyApplySubmitted24h() {
+  const dayAgo = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const r = get(
+    `SELECT COUNT(*) AS n FROM auto_apply_tasks t LEFT JOIN jobs j ON j.id = t.job_id
+     WHERE t.state IN ('done','awaiting_review') AND t.updated_at >= ?
+       AND (t.apply_route = 'easy-apply'
+            OR (t.apply_route IS NULL AND LOWER(COALESCE(j.source,'')) = 'linkedin'))`,
+    [dayAgo]);
+  return r ? r.n : 0;
+}
+
+function setEasyApplyCooldown({ hours = 24 } = {}) {
+  const until = new Date(Date.now() + Math.max(0, hours) * 3600 * 1000).toISOString();
+  kvSet('easyApplyLimitUntil', until);
+  // Learn the threshold: record the count we'd reached when the cap hit, keeping the MAX
+  // ever observed (it may not be exactly 50, and it's per-account).
+  const submitted = easyApplySubmitted24h();
+  const prev = Number(kvGet('easyApplyObservedLimit')) || 0;
+  const observed = Math.max(prev, submitted);
+  if (observed > 0) kvSet('easyApplyObservedLimit', observed);
+  return { until, observedLimit: observed, submitted24h: submitted };
+}
+
+function easyApplyCooledDown() {
+  const until = kvGet('easyApplyLimitUntil');
+  if (!until) return false;
+  return Date.now() < new Date(until).getTime();
+}
+
+function easyApplyStatus() {
+  const until = kvGet('easyApplyLimitUntil') || null;
+  return {
+    cooledDown: easyApplyCooledDown(),
+    until,
+    observedLimit: Number(kvGet('easyApplyObservedLimit')) || null,
+    submitted24h: easyApplySubmitted24h(),
+  };
+}
+
+// Is this candidate job dispatchable RIGHT NOW given the Easy-Apply cooldown? During a
+// cooldown LinkedIn Easy-Apply jobs are NOT eligible (we'd just waste the cap), but
+// external/company-site jobs (workday/greenhouse/lever/glassdoor/indeed/direct/…) still
+// flow. When not cooled down, everything is eligible (purely additive).
+function easyApplyEligible(job) {
+  if (!easyApplyCooledDown()) return true;
+  if (!job) return true;
+  if (String(job.source || '').toLowerCase() === 'linkedin') return false;
+  try {
+    if (classifyAts(job.jobUrl).ats === 'linkedin') return false;
+  } catch {}
+  return true;
+}
+
+// ============================================================
 // AI log
 // ============================================================
 function aiLog(entry) {
@@ -3080,6 +3275,202 @@ function rankJob(job, profileId, opts = {}) {
   return rank;
 }
 
+// ============================================================
+// Teach & Correct — demonstrations + screenshots [v2 T1]
+// ============================================================
+const DEMOS_KEEP_PER_KEY = 3;   // keep the newest N demonstrations per (profile, ats, label)
+
+// Record one full-fidelity demonstration step (a real click/fill the user did). The
+// credential rail is enforced HERE too: for a sensitive field we keep the locator
+// (so we know WHERE it is) but NEVER the value / HTML / screenshot.
+function recordDemonstration(d = {}) {
+  const pid = d.profileId || ensureDefaultProfileId();
+  const label = String(d.label || '');
+  const sensitive = isSensitiveKey(label);
+  const labelNorm = normalizeQuestion(label);
+  const id = uid('demo');
+  run(`INSERT INTO demonstrations
+       (id, profile_id, session_id, job_id, ats, company_key, step_index, action, label, label_norm,
+        field_type, selector, xpath, attrs, html, value, screenshot_id, delay_ms, source, ts)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [id, pid, d.sessionId || null, d.jobId || null, d.ats || null, d.companyKey || null,
+       d.stepIndex != null ? d.stepIndex : null, d.action || null, label.slice(0, 300), labelNorm,
+       d.fieldType || null, d.selector || null, d.xpath || null,
+       d.attrs ? JSON.stringify(d.attrs).slice(0, 4000) : null,
+       sensitive ? null : (d.html != null ? String(d.html).slice(0, 8000) : null),
+       sensitive ? null : (d.value != null ? String(d.value).slice(0, 2000) : null),
+       sensitive ? null : (d.screenshotId || null),
+       d.delayMs != null ? d.delayMs : null, d.source || 'manual', now()]);
+  pruneDemonstrations(pid, d.ats || null, labelNorm);
+  return get('SELECT * FROM demonstrations WHERE id = ?', [id]);
+}
+
+// Keep the newest N demonstrations per (profile, ats, label); prune older rows + their
+// now-orphaned screenshots. Bounded storage, freshest truth always retained.
+function pruneDemonstrations(profileId, ats, labelNorm, keepN = DEMOS_KEEP_PER_KEY) {
+  if (!labelNorm) return 0;
+  const stale = all(
+    `SELECT id, screenshot_id FROM demonstrations
+     WHERE profile_id = ? AND IFNULL(ats,'') = IFNULL(?, '') AND label_norm = ?
+     ORDER BY ts DESC LIMIT -1 OFFSET ?`, [profileId, ats, labelNorm, keepN]);
+  for (const r of stale) {
+    run('DELETE FROM demonstrations WHERE id = ?', [r.id]);
+    if (r.screenshot_id) maybeDeleteScreenshot(r.screenshot_id);
+  }
+  return stale.length;
+}
+
+function demonstrationsFor(profileId, { ats, companyKey, labelNorm } = {}) {
+  const pid = profileId || ensureDefaultProfileId();
+  const where = ['profile_id = ?']; const args = [pid];
+  if (ats) { where.push('ats = ?'); args.push(ats); }
+  if (companyKey) { where.push('company_key = ?'); args.push(companyKey); }
+  if (labelNorm) { where.push('label_norm = ?'); args.push(labelNorm); }
+  return all(`SELECT * FROM demonstrations WHERE ${where.join(' AND ')} ORDER BY session_id, step_index, ts`, args);
+}
+
+// demonstrationsForSession — T3 enrichment source. All demos for one teach/apply session
+// (and/or one job), ordered by step_index then ts so the distiller can walk them in
+// capture order and reason about freshness. Either filter may be omitted.
+function demonstrationsForSession(profileId, { sessionId, jobId } = {}) {
+  const pid = profileId || ensureDefaultProfileId();
+  const where = ['profile_id = ?']; const args = [pid];
+  if (sessionId != null) { where.push('session_id = ?'); args.push(sessionId); }
+  if (jobId != null) { where.push('job_id = ?'); args.push(jobId); }
+  return all(`SELECT * FROM demonstrations WHERE ${where.join(' AND ')} ORDER BY step_index, ts`, args);
+}
+
+function recordTeachScreenshot({ profileId, path: p, w, h, bytes } = {}) {
+  const id = uid('shot');
+  run('INSERT INTO teach_screenshots (id, profile_id, path, w, h, bytes, ts) VALUES (?,?,?,?,?,?,?)',
+      [id, profileId || null, p || null, w || null, h || null, bytes || null, now()]);
+  return id;
+}
+
+// Delete a screenshot file + row only when nothing references it anymore.
+function maybeDeleteScreenshot(screenshotId) {
+  if (!screenshotId) return;
+  if (get('SELECT 1 FROM demonstrations WHERE screenshot_id = ? LIMIT 1', [screenshotId])) return;
+  if (get('SELECT 1 FROM recipe_steps WHERE screenshot_id = ? LIMIT 1', [screenshotId])) return;
+  const row = get('SELECT path FROM teach_screenshots WHERE id = ?', [screenshotId]);
+  if (row && row.path) { try { fs.unlinkSync(row.path); } catch {} }
+  run('DELETE FROM teach_screenshots WHERE id = ?', [screenshotId]);
+}
+
+// ============================================================
+// Review / Audit dashboard — "Taught Procedures" [v2 T5]
+// ============================================================
+// A step "needs attention" when it's low-confidence (the replayer is unsure it picks the
+// right element), was recently CORRECTED (the user just fixed it — surface it so they can
+// verify the fix stuck), or is fail-prone (a recipe with more fails than successes drags
+// every one of its steps onto the list). Pure read-side flag; nothing is mutated.
+const NEEDS_ATTN_CONF = 0.5;                         // confidence below this → attention
+const RECENT_CORRECTION_MS = 7 * 24 * 60 * 60 * 1000; // a correction within a week is "recent"
+function stepNeedsAttention(step, recipe) {
+  const conf = Number(step.confidence);
+  if (Number.isFinite(conf) && conf < NEEDS_ATTN_CONF) return true;
+  if (step.source === 'correction' && step.updatedAt) {
+    const age = Date.now() - new Date(step.updatedAt).getTime();
+    if (Number.isFinite(age) && age >= 0 && age < RECENT_CORRECTION_MS) return true;
+  }
+  // Fail-prone: the parent recipe has diverged more than it has succeeded.
+  if (recipe && (Number(recipe.failCount) || 0) > (Number(recipe.successCount) || 0) &&
+      (Number(recipe.failCount) || 0) > 0) return true;
+  return false;
+}
+
+// listRecipesWithSteps(profileId) — the full Taught-Procedures bundle for a profile: every
+// recipe (scope ats|company) with its ordered steps, each carrying a `needsAttention` flag.
+// Steps are returned in step_index order (= replay order). `company` is the company_key for
+// scope='company' recipes, null for the cross-company ATS recipe. Read-only.
+function listRecipesWithSteps(profileId) {
+  const pid = profileId || ensureDefaultProfileId();
+  const recipes = all(
+    `SELECT * FROM ats_recipes WHERE profile_id = ?
+     ORDER BY ats ASC, (company_key IS NULL) DESC, company_key ASC`, [pid]).map(rowToRecipe);
+  return recipes.map((r) => {
+    const steps = recipeSteps(r.id).map((s) => ({ ...s, needsAttention: stepNeedsAttention(s, r) }));
+    return {
+      ...r,
+      company: r.companyKey || null,
+      steps,
+      attentionCount: steps.filter((s) => s.needsAttention).length,
+    };
+  });
+}
+
+// updateRecipeStepFields(stepId, patch) — edit ONE recipe step from the review dashboard.
+// Supported edits: defaultValue (the learned answer), labelPattern (rename the field),
+// scope (move the step to this recipe's ats↔company sibling recipe), stepIndex (reorder),
+// action. The credential rail is authoritative: a step whose (current OR new) label is
+// sensitive can NEVER be given a value — the edit is applied but defaultValue stays null.
+// Returns the updated step row, or null if the step is gone.
+function updateRecipeStepFields(stepId, { defaultValue, labelPattern, scope, stepIndex, action } = {}) {
+  if (!stepId) return null;
+  const row = get('SELECT * FROM recipe_steps WHERE id = ?', [stepId]);
+  if (!row) return null;
+  const ts = now();
+  const sets = []; const args = [];
+
+  // Resolve the effective label (after a rename) to decide the credential rail.
+  const newLabel = labelPattern !== undefined && labelPattern !== null ? String(labelPattern) : null;
+  const effectiveLabel = newLabel != null ? newLabel : (row.label_pattern || '');
+  const sensitive = isSensitiveKey(effectiveLabel);
+
+  if (newLabel != null) { sets.push('label_pattern = ?'); args.push(newLabel); }
+  if (action !== undefined && action !== null) { sets.push('action = ?'); args.push(String(action)); }
+  if (Number.isFinite(Number(stepIndex))) { sets.push('step_index = ?'); args.push(Number(stepIndex)); }
+  if (defaultValue !== undefined) {
+    // RAIL: refuse to persist a value on a sensitive field — keep it null no matter what.
+    sets.push('default_value = ?');
+    args.push(sensitive ? null : (defaultValue == null ? null : String(defaultValue)));
+  }
+
+  // scope flip: move the step into this recipe's sibling recipe of the other scope
+  // (ats↔company), creating it if needed. A scope='company' target needs a company_key —
+  // reuse the source recipe's company_key, else fall back to its ats name.
+  if (scope === 'ats' || scope === 'company') {
+    const src = get('SELECT * FROM ats_recipes WHERE id = ?', [row.recipe_id]);
+    if (src && src.scope !== scope) {
+      const companyKey = scope === 'company'
+        ? (normCompanyKey(src.company_key) || normCompanyKey(src.ats) || src.ats)
+        : null;
+      const dest = upsertRecipe({ profileId: src.profile_id, scope, ats: src.ats, companyKey });
+      if (dest && dest.id !== row.recipe_id) {
+        const nextIdx = (get('SELECT MAX(step_index) AS m FROM recipe_steps WHERE recipe_id = ?', [dest.id])?.m ?? -1) + 1;
+        sets.push('recipe_id = ?'); args.push(dest.id);
+        if (!Number.isFinite(Number(stepIndex))) { sets.push('step_index = ?'); args.push(nextIdx); }
+      }
+    }
+  }
+
+  if (!sets.length) return rowToStep(get('SELECT * FROM recipe_steps WHERE id = ?', [stepId]));
+  sets.push('updated_at = ?'); args.push(ts);
+  args.push(stepId);
+  run(`UPDATE recipe_steps SET ${sets.join(', ')} WHERE id = ?`, args);
+  return rowToStep(get('SELECT * FROM recipe_steps WHERE id = ?', [stepId]));
+}
+
+// deleteRecipeStep(stepId) — remove a step from the review dashboard and clean up its
+// now-orphaned screenshot (maybeDeleteScreenshot is a no-op if anything still points at it).
+// Returns true if a row was removed.
+function deleteRecipeStep(stepId) {
+  if (!stepId) return false;
+  const row = get('SELECT screenshot_id FROM recipe_steps WHERE id = ?', [stepId]);
+  if (!row) return false;
+  run('DELETE FROM recipe_steps WHERE id = ?', [stepId]);
+  if (row.screenshot_id) maybeDeleteScreenshot(row.screenshot_id);
+  return true;
+}
+
+// getTeachScreenshotPath(id) — the on-disk PNG path for a teach screenshot, for serving it
+// to the dashboard. Null if unknown.
+function getTeachScreenshotPath(id) {
+  if (!id) return null;
+  const row = get('SELECT path FROM teach_screenshots WHERE id = ?', [id]);
+  return (row && row.path) || null;
+}
+
 module.exports = {
   open, close, backupNow, dailyBackup, maintenance, transaction,
   getSettings, patchSettings, kvGet, kvSet,
@@ -3091,11 +3482,14 @@ module.exports = {
   memoryToProfileData, pushProfileDataToMemory, ensureDefaultProfileId, resolveProfileId,
   classifyAts, normCompanyKey, recordNavEvent, navEventsForProfile, isSensitiveKey,
   upsertRecipe, getRecipe, upsertRecipeStep, recipeSteps, markRecipeOutcome, recordRecipeCorrection, resolveRecipe,
+  recordDemonstration, pruneDemonstrations, demonstrationsFor, demonstrationsForSession, recordTeachScreenshot, maybeDeleteScreenshot,
+  listRecipesWithSteps, updateRecipeStepFields, deleteRecipeStep, getTeachScreenshotPath,
   listProfiles, saveProfile, deleteProfile, profileForSource,
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,
   extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
   queueList, queueHistory, queueBreakdown, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, saveIntakeAnswer,
+  setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,
   emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching,

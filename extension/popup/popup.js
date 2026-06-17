@@ -210,6 +210,38 @@ $('#btn-capture').addEventListener('click', async () => {
   setTimeout(() => { paintPage(); boot(); }, 700);
 });
 
+// ---- Teach Mode toggle (Teach & Correct T2) ----
+// Writes chrome.storage.local['jat11.teachMode']; the in-page recorder reads/watches it.
+const TEACH_KEY = 'jat11.teachMode';
+function paintTeach(on) {
+  const btn = $('#teach-toggle');
+  btn.textContent = on ? 'On' : 'Off';
+  btn.classList.toggle('on', !!on);
+  btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+}
+chrome.storage.local.get(TEACH_KEY).then((s) => paintTeach(!!s[TEACH_KEY])).catch(() => {});
+$('#teach-toggle').addEventListener('click', async () => {
+  const cur = (await chrome.storage.local.get(TEACH_KEY))[TEACH_KEY];
+  const next = !cur;
+  await chrome.storage.local.set({ [TEACH_KEY]: next });
+  paintTeach(next);
+});
+
+// ---- Watch & Teach (T4) — supervised run of the next queued job ----
+// Sends the SW `watch-and-teach` message (the wiring T4 added); the SW opens the next
+// queued job in a supervised run with the Step/Run + on-page Fix-this overlay.
+$('#watch-teach-btn').addEventListener('click', async () => {
+  const btn = $('#watch-teach-btn');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  const label = btn.textContent;
+  btn.textContent = 'Starting…';
+  const r = await send({ type: 'watch-and-teach' });
+  if (r?.ok) btn.textContent = 'Watching ✓';
+  else { btn.textContent = label; setHint($('#action-status'), r?.error || 'no queued job to teach', 'bad'); }
+  setTimeout(() => { btn.disabled = false; if (r?.ok) btn.textContent = label; }, 1500);
+});
+
 $('#open-dashboard').addEventListener('click', () => openDashboard());
 $('#download-app').addEventListener('click', async () => {
   const s = $('#action-status');

@@ -115,6 +115,13 @@ button { font-family: inherit; cursor: pointer; }
 .aa-state { color: var(--body); }
 .aa-state.on { color: var(--ok); }
 
+/* teach-mode toggle (button styled as a pill) */
+button.aa-state {
+  border: 1px solid var(--border); background: transparent; color: var(--body);
+  border-radius: 999px; padding: 3px 12px; font-size: 11px; cursor: pointer;
+}
+button.aa-state.on { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 60%, var(--border)); }
+
 /* recent */
 .recent { padding: 14px 16px 8px; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
 .rec-item {

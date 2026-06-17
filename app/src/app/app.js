@@ -1962,7 +1962,7 @@ route('/queue', async () => {
           <option value="auto" ${aa.mode === 'auto' ? 'selected' : ''}>Auto — submit for me</option>
           <option value="review" ${aa.mode === 'review' ? 'selected' : ''}>Review — stop before submit</option>
         </select>`)}
-        ${qc('Job boards', `<label class="aa-chk"><input type="checkbox" id="aa-li" ${boards.includes('linkedin') ? 'checked' : ''}/> LinkedIn</label> <label class="aa-chk"><input type="checkbox" id="aa-in" ${boards.includes('indeed') ? 'checked' : ''}/> Indeed</label>`)}
+        ${qc('Job boards', `<label class="aa-chk"><input type="checkbox" id="aa-li" ${boards.includes('linkedin') ? 'checked' : ''}/> LinkedIn</label> <label class="aa-chk"><input type="checkbox" id="aa-in" ${boards.includes('indeed') ? 'checked' : ''}/> Indeed</label> <label class="aa-chk"><input type="checkbox" id="aa-gd" ${boards.includes('glassdoor') ? 'checked' : ''}/> Glassdoor</label>`)}
         ${qc('Easy Apply only', `<label class="toggle"><input type="checkbox" id="aa-easy" ${aa.easyApplyOnly !== false ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">On = only 1-click / in-page applies (most reliable). Off = also surface normal &amp; external postings — the in-page ones get filled too; true external sites are flagged "needs you" in the breakdown.</div>`)}
         ${qc('Apply with profile', `<select class="select" id="aa-profile"><option value="">Default</option>${profiles.map((p) => `<option value="${esc(p.id)}" ${aa.profileId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>`)}
         ${qc('Attach résumé', `<select class="select" id="aa-resume"><option value="">Active résumé</option>${resumes.map((d) => `<option value="${esc(d.id)}" ${aa.resumeDocId === d.id ? 'selected' : ''}>${esc(d.label || d.name)}</option>`).join('')}</select>`)}
@@ -2032,6 +2032,7 @@ route('/queue', async () => {
       const boardsSel = [];
       if (v.querySelector('#aa-li').checked) boardsSel.push('linkedin');
       if (v.querySelector('#aa-in').checked) boardsSel.push('indeed');
+      if (v.querySelector('#aa-gd').checked) boardsSel.push('glassdoor');
       const conc = Math.max(1, Math.min(8, Number(v.querySelector('#aa-conc').value) || 1));
       // Parallel = more apply tabs at once = much faster, but a bigger automation
       // footprint. Warn (once) only when the user is RAISING it past safe serial.
@@ -2474,6 +2475,190 @@ function clientMapToProfileKey(label) {
   for (const [rx, key] of CLIENT_LEARNED_TO_PROFILE) if (rx.test(hay)) return key;
   return null;
 }
+
+// ============================================================
+// VIEW: Taught Procedures (#/procedures) — Review / Audit dashboard [T5]
+// ============================================================
+// Every learned recipe (grouped ATS → company) with its ordered steps. Per step: the
+// captured screenshot, label, selector (xpath on expand), field type, value, confidence,
+// and source. Controls: edit value/label, delete, move up/down (step_index reorder), flip
+// scope (ats↔company). A "Needs attention" filter surfaces low-confidence / recently-
+// corrected / fail-prone steps. Every write hits PATCH/DELETE /recipe-step and refreshes.
+const SOURCE_LABEL = { manual: 'manual', teach: 'teach', correction: 'correction', distilled: 'distilled' };
+function confChipHtml(conf) {
+  const c = Number(conf);
+  if (!Number.isFinite(c)) return '<span class="proc-conf unknown" title="no confidence yet">—</span>';
+  const pct = Math.round(c * 100);
+  const cls = c < 0.5 ? 'low' : (c < 0.75 ? 'mid' : 'high');
+  return `<span class="proc-conf ${cls}" title="replay confidence">${pct}%</span>`;
+}
+route('/procedures', async () => {
+  const profilesR = await api('/profiles').catch(() => ({ items: [] }));
+  const profiles = profilesR.items || [];
+  // Reuse the same profile selection the Profile page uses, so they stay in sync.
+  if (!state.profileSel || state.profileSel === 'new' || !profiles.find((p) => p.id === state.profileSel)) {
+    state.profileSel = (profiles.find((p) => p.isDefault) || profiles[0])?.id || '';
+  }
+  const pid = state.profileSel;
+  const onlyAttn = !!state.procOnlyAttention;
+
+  const recipesR = await api('/recipes' + (pid ? '?profileId=' + encodeURIComponent(pid) : '')).catch(() => ({ recipes: [] }));
+  const recipes = recipesR.recipes || [];
+  const totalAttn = recipes.reduce((n, r) => n + (r.attentionCount || 0), 0);
+  const totalSteps = recipes.reduce((n, r) => n + (r.steps ? r.steps.length : 0), 0);
+
+  // Group ATS → company. The ATS recipe (company null) heads each ATS group; company
+  // overlays follow. visibleRecipes respects the "Needs attention" filter.
+  const visibleRecipes = onlyAttn
+    ? recipes.map((r) => ({ ...r, steps: (r.steps || []).filter((s) => s.needsAttention) })).filter((r) => r.steps.length)
+    : recipes;
+  const byAts = new Map();
+  for (const r of visibleRecipes) {
+    if (!byAts.has(r.ats)) byAts.set(r.ats, []);
+    byAts.get(r.ats).push(r);
+  }
+
+  const stepRowHtml = (recipe, step, i, count) => {
+    const shot = step.screenshotId
+      ? `<img class="proc-shot" loading="lazy" src="${esc(state.base)}/teach-shot/${encodeURIComponent(step.screenshotId)}?token=${encodeURIComponent(state.token || '')}" alt="step screenshot" />`
+      : '<div class="proc-shot empty" aria-hidden="true">no shot</div>';
+    const val = step.defaultValue != null && step.defaultValue !== '' ? esc(step.defaultValue) : '<span class="muted">—</span>';
+    const xpathRow = step.xpath
+      ? `<details class="proc-xpath"><summary>xpath</summary><code class="mono">${esc(step.xpath)}</code></details>` : '';
+    return `<div class="proc-step ${step.needsAttention ? 'attn' : ''}" data-step="${esc(step.id)}" data-idx="${esc(step.stepIndex)}">
+      ${shot}
+      <div class="proc-body">
+        <div class="proc-line1">
+          <span class="proc-label">${esc(step.labelPattern || '(no label)')}</span>
+          <span class="proc-type">${esc(step.fieldType || step.action || '·')}</span>
+          ${confChipHtml(step.confidence)}
+          <span class="proc-source" data-src="${esc(step.source || '')}">${esc(SOURCE_LABEL[step.source] || step.source || 'learned')}</span>
+          ${step.needsAttention ? '<span class="proc-attn-flag" title="needs attention">⚠ attention</span>' : ''}
+        </div>
+        <div class="proc-line2">
+          <span class="proc-val">value: ${val}</span>
+        </div>
+        ${step.selector ? `<code class="mono proc-sel" title="CSS selector">${esc(step.selector)}</code>` : '<span class="muted proc-sel">label-match only</span>'}
+        ${xpathRow}
+      </div>
+      <div class="proc-controls">
+        <button class="btn small" data-edit-value title="Edit value">Value</button>
+        <button class="btn small" data-edit-label title="Edit label">Label</button>
+        <button class="btn small" data-flip-scope title="Flip scope (ats↔company)">↔ ${esc(recipe.scope === 'company' ? 'ats' : 'company')}</button>
+        <button class="btn small" data-move-up title="Move up" ${i === 0 ? 'disabled' : ''}>↑</button>
+        <button class="btn small" data-move-down title="Move down" ${i === count - 1 ? 'disabled' : ''}>↓</button>
+        <button class="btn small danger" data-del title="Delete step">Delete</button>
+      </div>
+    </div>`;
+  };
+
+  const recipeCardHtml = (r) => {
+    const scopeChip = r.scope === 'company'
+      ? `<span class="sys-chip">company · ${esc(r.company || '?')}</span>`
+      : '<span class="sys-chip">ATS · cross-company</span>';
+    const steps = r.steps || [];
+    const stepsHtml = steps.length
+      ? steps.map((s, i) => stepRowHtml(r, s, i, steps.length)).join('')
+      : '<div class="muted" style="padding:10px 4px;font-size:12px">No steps in this recipe.</div>';
+    return `<section class="section proc-recipe" data-recipe="${esc(r.id)}" data-scope="${esc(r.scope)}">
+      <header class="section-header">
+        <div>
+          <div class="section-eyebrow">${esc(r.ats)}</div>
+          <h2 class="section-title">${esc(r.scope === 'company' ? (r.company || 'company') : 'ATS recipe')}</h2>
+        </div>
+        <div class="proc-recipe-meta">
+          ${scopeChip}
+          ${confChipHtml(r.confidence)}
+          <span class="sys-chip" title="successes / failures">${esc(r.successCount || 0)}✓ ${esc(r.failCount || 0)}✕</span>
+        </div>
+      </header>
+      <div class="proc-steps">${stepsHtml}</div>
+    </section>`;
+  };
+
+  const groupsHtml = byAts.size
+    ? [...byAts.entries()].map(([ats, rs]) => `
+      <div class="proc-group">
+        <div class="proc-group-head"><span class="proc-group-ats">${esc(ats)}</span><span class="muted">${rs.length} recipe${rs.length === 1 ? '' : 's'}</span></div>
+        ${rs.map(recipeCardHtml).join('')}
+      </div>`).join('')
+    : emptyHtml('Nothing taught', onlyAttn ? 'No steps need attention' : 'No procedures learned yet',
+        onlyAttn ? 'Everything the system has learned looks healthy.' : 'Apply to a few jobs (or run Watch & Teach) and the steps it learns appear here, editable.');
+
+  const v = el(`<div>
+    <header class="page-header">
+      <div>
+        <div class="page-eyebrow">Automate</div>
+        <h1 class="page-title">Taught Procedures</h1>
+        <div class="page-sub">Every step the system learned, by ATS then company — view, edit, reorder, or delete.</div>
+      </div>
+      <div class="page-actions">
+        ${profiles.length > 1 ? `<select class="select" id="proc-profile">${profiles.map((p) => `<option value="${esc(p.id)}" ${p.id === pid ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>` : ''}
+        <button class="btn ${onlyAttn ? 'primary' : ''}" data-attn>${onlyAttn ? 'Showing attention' : 'Needs attention'}${totalAttn ? ` · ${totalAttn}` : ''}</button>
+        <button class="btn" data-refresh>Refresh</button>
+      </div>
+    </header>
+
+    <div class="proc-summary muted">${recipes.length} recipe${recipes.length === 1 ? '' : 's'} · ${totalSteps} step${totalSteps === 1 ? '' : 's'}${totalAttn ? ` · <span class="proc-attn-flag">${totalAttn} need${totalAttn === 1 ? 's' : ''} attention</span>` : ''}</div>
+
+    <div class="proc-list">${groupsHtml}</div>
+  </div>`);
+
+  v.querySelector('[data-refresh]').addEventListener('click', navigate);
+  v.querySelector('[data-attn]').addEventListener('click', () => { state.procOnlyAttention = !onlyAttn; navigate(); });
+  v.querySelector('#proc-profile')?.addEventListener('change', (e) => { state.profileSel = e.target.value; navigate(); });
+
+  const patchStep = async (stepId, body, okMsg) => {
+    try { await api('/recipe-step/' + encodeURIComponent(stepId), { method: 'PATCH', body }); if (okMsg) toast(okMsg); navigate(); }
+    catch (e) { errToast(e); }
+  };
+
+  v.querySelectorAll('.proc-step').forEach((row) => {
+    const stepId = row.dataset.step;
+    const recipeEl = row.closest('.proc-recipe');
+    const scope = recipeEl?.dataset.scope;
+    row.querySelector('[data-edit-value]')?.addEventListener('click', async () => {
+      const cur = row.querySelector('.proc-val')?.textContent?.replace(/^value:\s*/, '').trim() || '';
+      const val = await promptModal('Value for this step:', { title: 'Edit value', value: cur === '—' ? '' : cur });
+      if (val === null) return;
+      patchStep(stepId, { defaultValue: val }, 'Value updated');
+    });
+    row.querySelector('[data-edit-label]')?.addEventListener('click', async () => {
+      const cur = row.querySelector('.proc-label')?.textContent?.trim() || '';
+      const val = await promptModal('Label / question for this step:', { title: 'Edit label', value: cur });
+      if (val === null || !val.trim()) return;
+      patchStep(stepId, { labelPattern: val.trim() }, 'Label updated');
+    });
+    row.querySelector('[data-flip-scope]')?.addEventListener('click', () => {
+      patchStep(stepId, { scope: scope === 'company' ? 'ats' : 'company' }, 'Scope flipped');
+    });
+    row.querySelector('[data-move-up]')?.addEventListener('click', () => {
+      const prev = row.previousElementSibling;
+      if (prev && prev.classList.contains('proc-step')) reorderSwap(row, prev);
+    });
+    row.querySelector('[data-move-down]')?.addEventListener('click', () => {
+      const next = row.nextElementSibling;
+      if (next && next.classList.contains('proc-step')) reorderSwap(row, next);
+    });
+    row.querySelector('[data-del]')?.addEventListener('click', async () => {
+      if (!(await confirmModal('Delete this learned step?', { danger: true, okLabel: 'Delete' }))) return;
+      try { await api('/recipe-step/' + encodeURIComponent(stepId), { method: 'DELETE' }); toast('Step deleted'); navigate(); }
+      catch (e) { errToast(e); }
+    });
+  });
+
+  // Reorder = swap the two adjacent steps' step_index values, then refresh.
+  async function reorderSwap(a, b) {
+    const ai = Number(a.dataset.idx), bi = Number(b.dataset.idx);
+    try {
+      await api('/recipe-step/' + encodeURIComponent(a.dataset.step), { method: 'PATCH', body: { stepIndex: bi } });
+      await api('/recipe-step/' + encodeURIComponent(b.dataset.step), { method: 'PATCH', body: { stepIndex: ai } });
+      navigate();
+    } catch (e) { errToast(e); }
+  }
+
+  return v;
+});
 
 route('/profile', async () => {
   const [profilesR, settings] = await Promise.all([

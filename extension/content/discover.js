@@ -13,6 +13,7 @@ function abs(href) { try { return new URL(href, location.href).href; } catch { r
 
 const LI_CARD_SEL = 'li[data-occludable-job-id], [data-job-id], .job-card-container, .jobs-search-results__list-item, .scaffold-layout__list-item';
 const IN_CARD_SEL = '#mosaic-provider-jobcards .job_seen_beacon, [data-testid="slider_item"], .job_seen_beacon, a[data-jk], [data-jk]';
+const GD_CARD_SEL = 'li[data-test="jobListing"], [data-test="job-listing"], [data-brandviews][data-id], .react-job-listing, [class*="JobsList_jobListItem" i], a[href*="/job-listing/"]';
 
 // Poll for the result list to render (LinkedIn/Indeed hydrate after load).
 async function waitForCards(sel, ms = 12000) {
@@ -27,7 +28,7 @@ async function waitForCards(sel, ms = 12000) {
 function pageNote() {
   const t = (document.body?.innerText || '').toLowerCase();
   if (/no matching jobs found|no results found|we couldn['’]t find/i.test(t)) return 'site returned no matching jobs for this search';
-  if (/\bsign in\b/.test(t) && /\bjoin now\b/.test(t) && !qsa(LI_CARD_SEL + ',' + IN_CARD_SEL).length) return 'looks like a sign-in wall — log into the site in this browser first';
+  if (/\bsign in\b/.test(t) && /\bjoin now\b/.test(t) && !qsa(LI_CARD_SEL + ',' + IN_CARD_SEL + ',' + GD_CARD_SEL).length) return 'looks like a sign-in wall — log into the site in this browser first';
   if (/(unusual activity|verify you|are you a human|captcha)/i.test(t)) return 'a security check appeared — open the site manually and pass it';
   return '';
 }
@@ -88,24 +89,62 @@ function scrapeIndeed(max, easyApplyOnly = true) {
   return out;
 }
 
+// Glassdoor — search results are <li data-test="jobListing"> cards; each links to a
+// /job-listing/...-JV_... detail page and carries the job id on the listing element. Best
+// effort + guarded: selector rot returns fewer jobs, never throws. Easy-Apply on Glassdoor
+// is in-page; "apply on company site" hands off — we can't tell which from the card reliably,
+// so we enqueue all and let the executor/handoff path sort drivability (mirrors Indeed's
+// permissive-then-filter posture but without a card-level "easily apply" badge to gate on).
+function scrapeGlassdoor(max) {
+  const out = [];
+  const seen = new Set();
+  for (const card of qsa(GD_CARD_SEL)) {
+    if (out.length >= max) break;
+    const link = card.matches?.('a[href*="/job-listing/"]')
+      ? card
+      : card.querySelector('a[data-test="job-link"], a[href*="/job-listing/"], a[href*="/partner/jobListing"]');
+    const href = link?.getAttribute('href') || '';
+    const id = card.getAttribute('data-id')
+      || card.getAttribute('data-jobid')
+      || (href.match(/[?&]jobListingId=(\d+)/)?.[1])
+      || (href.match(/-JV_IC[\w-]*?_KO[\w-]*?(\d+)/)?.[1])
+      || (href.match(/jl=(\d+)/)?.[1])
+      || null;
+    if (id && seen.has(id)) continue;
+    if (/\bapplied\b/.test((card.textContent || '').toLowerCase())) continue;   // skip already-applied
+    const title = compactText(
+      card.querySelector('[data-test="job-title"], [data-test="jobTitle"], a[data-test="job-link"], [class*="jobTitle" i]')?.textContent
+      || link?.textContent || '');
+    const company = compactText(
+      card.querySelector('[data-test="employer-short-name"], [data-test="employer-name"], [class*="employerName" i], .EmployerProfile_compactEmployerName__')?.textContent || '');
+    const loc = compactText(card.querySelector('[data-test="emp-location"], [data-test="location"], [class*="location" i]')?.textContent || '');
+    const jobUrl = abs(href);
+    if (!jobUrl || !title) continue;
+    if (id) seen.add(id);
+    out.push({ externalId: id ? String(id) : null, title, company, location: loc, jobUrl, source: 'glassdoor' });
+  }
+  return out;
+}
+
 // Entry — wait for the list, scroll to load lazily, then scrape one page.
 // Returns { ok, source, jobs, found (raw cards seen), note }.
 export async function run({ source, max = 8, easyApplyOnly = true } = {}) {
   try {
     const host = location.hostname;
     const isLinkedIn = /linkedin/i.test(host) || source === 'linkedin';
-    const sel = isLinkedIn ? LI_CARD_SEL : IN_CARD_SEL;
+    const isGlassdoor = /glassdoor/i.test(host) || source === 'glassdoor';
+    const sel = isLinkedIn ? LI_CARD_SEL : (isGlassdoor ? GD_CARD_SEL : IN_CARD_SEL);
 
     await waitForCards(sel, 12000);
-    // nudge the lazy list (both window + the inner scroll container LinkedIn uses)
-    const scroller = document.querySelector('.jobs-search-results-list, .scaffold-layout__list, #mosaic-jobResults') || window;
+    // nudge the lazy list (both window + the inner scroll container the board uses)
+    const scroller = document.querySelector('.jobs-search-results-list, .scaffold-layout__list, #mosaic-jobResults, [data-test="jobListings"], .JobsList_wrapper__') || window;
     for (let i = 0; i < 5; i++) {
       try { (scroller === window ? window : scroller).scrollBy(0, rand(500, 1200)); } catch { window.scrollBy(0, 800); }
       await sleep(rand(600, 1400));
     }
 
     const found = qsa(sel).length;
-    const jobs = (isLinkedIn ? scrapeLinkedIn(max) : scrapeIndeed(max, easyApplyOnly)).slice(0, max);
+    const jobs = (isLinkedIn ? scrapeLinkedIn(max) : (isGlassdoor ? scrapeGlassdoor(max) : scrapeIndeed(max, easyApplyOnly))).slice(0, max);
     const note = jobs.length ? '' : (pageNote() || (found ? `saw ${found} card(s) but couldn't read any (selectors may need tuning)` : 'no job cards rendered on the page'));
     return { ok: true, source: source || host, jobs, found, note };
   } catch (e) {

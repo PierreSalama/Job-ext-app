@@ -5,11 +5,12 @@
 
 import linkedin from './linkedin.js';
 import indeed from './indeed.js';
+import glassdoor from './glassdoor.js';
 import workday from './workday.js';
 import greenhouse from './greenhouse.js';
 import lever from './lever.js';
 
-const PACKS = [linkedin, indeed, workday, greenhouse, lever];
+const PACKS = [linkedin, indeed, glassdoor, workday, greenhouse, lever];
 
 export function sitePack(hostname = location.hostname) {
   const h = hostname.replace(/^www\./, '');

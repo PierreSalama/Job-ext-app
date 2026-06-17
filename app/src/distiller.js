@@ -155,4 +155,133 @@ function distillJob(jobOrId, profileId) {
   return { recipes, steps };
 }
 
-module.exports = { distillJob };
+// median of a numeric array (null when empty). For an even count, the lower-mid is used
+// (a delay floor that errs slightly fast is fine; we only need a stable representative).
+function medianOf(nums) {
+  const xs = nums.filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
+  if (!xs.length) return null;
+  const mid = Math.floor((xs.length - 1) / 2);
+  return xs[mid];
+}
+
+// distillDemonstrations(profileId, { sessionId, jobId }) — T3 enrichment. Fold the RAW
+// high-fidelity demonstrations captured by the recorder (real elements + timing) into the
+// (ats, company) recipes, carrying the FULL locator bundle (selector/xpath/attrs/html/
+// screenshot/median_delay_ms) + a learned default_value when invariant. Stronger signal
+// than distillJob's answer-only synthesis, so confidence is higher (~0.7).
+//
+// Grouping: by (ats, company_key, label_norm). Per group we pick the FRESHEST non-null
+// locator field (selector/xpath/attrs/html/screenshot/field_type), the median delay across
+// the demos, and a default_value ONLY if every demo's value agrees (invariant) — else null,
+// so a per-application value (a cover letter, a name) never becomes a constant. Credentials
+// already arrive value-less from the rail, so they never carry a default_value.
+//
+// Scope (ats vs company): same GENERIC_RX rule as distillJob. No-op-safe: no demos, no ATS,
+// or all-sensitive → zero without throwing.
+function distillDemonstrations(profileId, { sessionId, jobId } = {}) {
+  const pid = profileId || db.ensureDefaultProfileId();
+  // Pull the session/job's demonstrations, ordered for stable freshness reasoning.
+  let rows = [];
+  try {
+    rows = (db.demonstrationsForSession
+      ? db.demonstrationsForSession(pid, { sessionId, jobId })
+      : null);
+  } catch { rows = null; }
+  if (!rows) {
+    // Fallback: scan the profile's demonstrations and filter by session/job in JS (keeps
+    // this resilient if a session-scoped query isn't present).
+    try {
+      const all = db.demonstrationsFor(pid, {}) || [];
+      rows = all.filter((r) =>
+        (sessionId == null || r.session_id === sessionId) &&
+        (jobId == null || r.job_id === jobId));
+    } catch { rows = []; }
+  }
+  if (!rows || !rows.length) return { recipes: 0, steps: 0 };
+
+  // Group by (ats, company_key, label_norm). Skip rows with no usable label or no ATS.
+  const groups = new Map();
+  for (const r of rows) {
+    const ats = r.ats ? String(r.ats).toLowerCase().trim() : '';
+    if (!ats) continue;
+    const label = r.label || '';
+    if (!label || db.isSensitiveKey(label)) {
+      // Credentials never become a recipe step (defense-in-depth with the recorder rail).
+      if (db.isSensitiveKey(label)) continue;
+    }
+    const labelNorm = r.label_norm || db.normalizeQuestion(label);
+    if (!labelNorm) continue;
+    const key = `${ats} ${r.company_key || ''} ${labelNorm}`;
+    if (!groups.has(key)) groups.set(key, { ats, companyKey: r.company_key || null, label, labelNorm, rows: [] });
+    groups.get(key).rows.push(r);
+  }
+  if (!groups.size) return { recipes: 0, steps: 0 };
+
+  // Per (ats, company_key), batch the field steps so we open each recipe once.
+  let recipes = 0, steps = 0;
+  const recipeKey = (g) => `${g.ats} ${g.companyKey || ''}`;
+  const recipeCache = new Map();   // recipeKey → { id, scope } (lazily upserted)
+  const seenRecipeIds = new Set();
+  const siteDomainFor = (g) => (g.rows.find((r) => r.html || r.selector) ? null : null); // host not on demos; recipe keeps prior
+
+  for (const g of groups.values()) {
+    // Freshest-first within the group (the recorder writes ts ascending; resolve newest).
+    const demos = g.rows.slice().sort((a, b) => String(b.ts || '').localeCompare(String(a.ts || '')));
+    const freshest = (pick) => { for (const d of demos) { const v = pick(d); if (v != null && String(v) !== '') return v; } return null; };
+
+    const selector = freshest((d) => d.selector);
+    const xpath = freshest((d) => d.xpath);
+    const attrs = freshest((d) => d.attrs);
+    const html = freshest((d) => d.html);
+    const screenshotId = freshest((d) => d.screenshot_id);
+    const fieldType = freshest((d) => d.field_type) || inferFieldType(freshest((d) => d.value));
+    const medianDelayMs = medianOf(demos.map((d) => Number(d.delay_ms)));
+
+    // default_value: invariant value across ALL demos that carried one (and at least one
+    // did). Rail-nulled credential demos have value==null, so they never set a default.
+    const vals = demos.map((d) => (d.value == null ? null : String(d.value)))
+      .filter((v) => v != null && v.trim() !== '');
+    const invariant = vals.length && vals.every((v) => v === vals[0]);
+    const defaultValue = invariant ? vals[0] : null;
+
+    const action = freshest((d) => d.action) || (looksEnumerated(defaultValue) ? 'select' : 'fill');
+    const scope = isGenericQuestion(g.label) ? 'ats' : 'company';
+    // A company-scoped field with no known company falls back to ATS scope (can't key it).
+    const effScope = (scope === 'company' && !g.companyKey) ? 'ats' : scope;
+
+    const rkey = `${g.ats} ${effScope} ${effScope === 'company' ? (g.companyKey || '') : ''}`;
+    let rec = recipeCache.get(rkey);
+    if (!rec) {
+      const upserted = db.upsertRecipe({
+        profileId: pid, scope: effScope, ats: g.ats,
+        companyKey: effScope === 'company' ? g.companyKey : null, siteDomain: siteDomainFor(g),
+      });
+      if (!upserted) continue;
+      rec = { id: upserted.id };
+      recipeCache.set(rkey, rec);
+      if (!seenRecipeIds.has(upserted.id)) { recipes++; seenRecipeIds.add(upserted.id); }
+    }
+
+    const source = freshest((d) => d.source) || 'teach';
+    const row = db.upsertRecipeStep({
+      recipeId: rec.id,
+      action,
+      labelPattern: g.labelNorm,
+      fieldType,
+      strategy: strategyFor(action, fieldType),
+      medianDelayMs,
+      confidence: 0.7,            // a real demonstrated step > an answer-only guess (0.6)
+      selector, xpath, attrs, html, screenshotId,
+      source: source === 'manual' ? 'manual' : (source === 'correction' ? 'correction' : 'teach'),
+      defaultValue,
+    });
+    if (row) steps++;
+  }
+
+  // A completed teach/apply demonstration session is, by definition, a success.
+  for (const id of seenRecipeIds) { try { db.markRecipeOutcome(id, { success: true }); } catch {} }
+
+  return { recipes, steps };
+}
+
+module.exports = { distillJob, distillDemonstrations };

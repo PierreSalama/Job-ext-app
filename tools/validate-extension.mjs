@@ -47,6 +47,42 @@ for (const need of ['content/detector.js', 'content/panel.js', 'content/executor
   ok(!importsReplay || war.includes('content/replay.js') || war.includes('content/*.js'),
     'WAR covers content/replay.js (statically imported by executor.js)');
 }
+
+// Dynamic-import WAR trap (T8): any `chrome.runtime.getURL('content/<X>.js')` referenced from a
+// content script is loaded as a chrome-extension:// module at runtime. If the referenced
+// content/*.js is NOT web-accessible, the import silently fails and the whole module never loads
+// (this is exactly how supervise.js slipped past — it was getURL-imported but missing from WAR).
+// Scan every content/*.js for these references and FAIL on any not covered by WAR (explicit entry
+// or a matching glob like content/*.js or content/<dir>/*.js).
+{
+  const warEntries = mf.web_accessible_resources?.[0]?.resources || [];
+  const covered = (rel) => warEntries.some((e) => {
+    if (e === rel) return true;                       // exact match
+    if (!e.includes('*')) return false;
+    // glob: turn content/*.js or content/signals/*.js into a regex (only '*' is special,
+    // and '*' must not cross a '/' so content/*.js does NOT match content/lib/dom.js)
+    const rx = new RegExp('^' + e.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*') + '$');
+    return rx.test(rel);
+  });
+  const contentDir = path.join(root, 'content');
+  const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((d) => {
+    const fp = path.join(dir, d.name);
+    return d.isDirectory() ? walk(fp) : [fp];
+  });
+  const scriptFiles = walk(contentDir).filter((f) => f.endsWith('.js'));
+  const getUrlRx = /getURL\(\s*['"](content\/[\w./-]+\.js)['"]\s*\)/g;
+  const missing = [];
+  for (const fp of scriptFiles) {
+    const src = fs.readFileSync(fp, 'utf8');
+    for (const m of src.matchAll(getUrlRx)) {
+      const rel = m[1];
+      if (!covered(rel) && !missing.includes(rel)) missing.push(rel);
+    }
+  }
+  ok(missing.length === 0,
+    'WAR covers every getURL("content/*.js") dynamic import' +
+    (missing.length ? ' — MISSING: ' + missing.join(', ') : ''));
+}
 for (const f of ['content/detector.js', 'content/panel.js', 'content/executor.js', 'content/autofill.js',
   'content/signals/forms.js', 'content/signals/intent.js', 'content/signals/success.js', 'content/signals/json-ld.js',
   'content/sites/index.js', 'content/sites/linkedin.js', 'content/lib/dom.js'])

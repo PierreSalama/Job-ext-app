@@ -373,9 +373,23 @@ function paintPanel() {
   });
 }
 
+// Boot the full-fidelity Recorder (Teach & Correct T2) once a real apply form is
+// detected, so the user's manual apply is captured as demonstrations. Always-on +
+// Teach Mode live in recorder.js. Suppressed in executor-driven tabs (auto-apply is
+// not a human demonstration) and guarded so a load failure never breaks capture.
+let _recorderBooted = false;
+function bootRecorder(root) {
+  if (_recorderBooted || state.autoApplyDriven || !IS_TOP || !root) return;
+  _recorderBooted = true;
+  import(chrome.runtime.getURL('content/recorder.js'))
+    .then((m) => m.start({ root }))
+    .catch((e) => { _recorderBooted = false; log('recorder load failed', e); });
+}
+
 function captureFormState(reason) {
   const formProbe = detectApplyForm();
   const root = formProbe?.form || document;
+  if (formProbe?.form) bootRecorder(formProbe.form);
   const attachments = detectAttachments(root);
   if (!attachments.length) {
     const pack = sitePack();

@@ -85,6 +85,19 @@
       });
       return true;
     }
+    // "Watch & Teach" — start a SUPERVISED apply (Step/Run overlay + on-page Fix-this
+    // picker). Same executor path as run-task, but flagged supervised so the visible,
+    // gateable step loop runs (never the silent auto-replay fast path). [T4]
+    if (msg?.type === 'jat11.supervised-run') {
+      if (!IS_TOP) { sendResponse({ ok: false, error: 'not top frame' }); return; }
+      ensureEngine().then(async (engine) => {
+        if (!engine) return sendResponse({ ok: false, error: 'engine failed to load' });
+        const task = { ...(msg.task || {}), mode: 'supervised' };
+        const context = { ...(msg.context || {}), supervised: true };
+        sendResponse(await engine.runTask(task, context));
+      });
+      return true;
+    }
     if (msg?.type === 'jat11.discover-search') {
       if (!IS_TOP) { sendResponse({ ok: false, error: 'not top frame' }); return; }
       ensureEngine().then(async (engine) => {

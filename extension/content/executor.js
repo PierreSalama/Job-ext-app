@@ -18,7 +18,7 @@ import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
 import { pageTextLooksLikeSuccess, urlLooksLikeSuccess } from './signals/success.js';
 import { qsa, isProbablyVisible, compactText } from './lib/dom.js';
-import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence } from './replay.js';
+import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence, resolveLocator } from './replay.js';
 
 const MAX_STEPS = 40;
 const STEP_TIMEOUT = 9000;
@@ -33,6 +33,11 @@ const NEVER_AUTOFILL_RX = /(ethnic|race\b|gender|\bsex\b|disabilit|veteran|crimi
 // optional, and the AI correctly refuses to invent a photo URL.
 const OPTIONAL_SKIP_RX = /(head\s?shot|profile (photo|picture|image)|upload (a )?(photo|picture|image)|\bphoto\b|\bavatar\b|picture of you|middle name|middle initial)/i;
 const CAPTCHA_RX = /captcha|verify (that )?you('| a)re (a )?human|unusual activity|are you a robot/i;
+// LinkedIn caps Easy Apply at ~50 submissions / rolling 24h. When hit it shows a modal
+// "You reached today's Easy Apply limit." Detect it so the server can cool down the
+// route and PIVOT to external/company-site jobs instead of wasting the cooldown trying.
+const EASYAPPLY_LIMIT_RX = /reached (today'?s )?easy apply limit/i;
+const DAILY_LIMIT_NEAR_EASYAPPLY_RX = /(daily|today'?s)[^.]{0,40}\blimit\b/i;
 const ADVANCE_KEYWORDS = [
   /^submit application$/i, /^submit$/i, /^submit & continue$/i,
   /^review your application$/i, /^review$/i,
@@ -222,6 +227,17 @@ function captchaOrLoginPresent() {
   return null;
 }
 
+// Detect LinkedIn's "You reached today's Easy Apply limit" modal. Narrow + guarded:
+// only fires on linkedin.com, and only on the explicit copy OR a generic "daily limit"
+// phrase that co-occurs with "Easy Apply" on the page. Returns true when the cap is hit.
+function easyApplyLimitHit() {
+  if (!/(^|\.)linkedin\.com$/i.test(location.hostname)) return false;
+  const text = (document.body?.innerText || '').slice(0, 8000);
+  if (EASYAPPLY_LIMIT_RX.test(text)) return true;
+  if (DAILY_LIMIT_NEAR_EASYAPPLY_RX.test(text) && /easy apply/i.test(text)) return true;
+  return false;
+}
+
 function btnText(el) {
   // LinkedIn's modal Next/Review/Submit buttons are often icon-only with the
   // real label in aria-label, so include it.
@@ -395,6 +411,111 @@ export async function run(task, context, helpers) {
   let everHadForm = false;     // has the apply form/modal ever appeared this run?
   let submitAttempted = false; // did we click a final submit (auto mode) at least once?
   let noChange = 0;            // consecutive advance clicks that didn't change the page (stall)
+
+  // ============================================================
+  // Live Teach & Correct [T4] — supervised run (ADDITIVE, fully guarded).
+  // ============================================================
+  // Engaged ONLY when task.mode === 'supervised' (or context.supervised). It overlays
+  // the EXISTING step loop with a Step/Run toggle, a per-action approval gate, and a
+  // "Wrong / Fix this" picker. On a correction it POSTs an AUTHORITATIVE replacement
+  // bundle to /recipe/correction (rewrites the step at high confidence) and uses the
+  // corrected value for the rest of THIS run. The normal auto path is untouched: when
+  // `sup` is null every gate below is a no-op. Every call is try/catch-guarded so a
+  // supervised-UX bug can never break the apply itself.
+  const supervised = mode === 'supervised' || !!context?.supervised;
+  let sup = null;
+  const correctionsThisRun = new Map();   // normalized label → corrected value, for live reuse
+  if (supervised) {
+    try {
+      const recipe = context?.recipe;
+      const { pickRunMode } = await import(chrome.runtime.getURL('content/replay.js'));
+      const { createSupervisor } = await import(chrome.runtime.getURL('content/supervise.js'));
+      const initialMode = (() => { try { return pickRunMode(recipe, { trust: context?.trust ?? 0.7 }); } catch { return 'step'; } })();
+      sup = createSupervisor({
+        mode: initialMode,
+        labelFn: (el) => { try { return fieldLabel(el); } catch { return ''; } },
+        // The detected-list of fillable fields + advance buttons on the current step.
+        fieldsFn: (root) => {
+          const out = [];
+          try {
+            for (const inp of qsa('input, textarea, select, [role="combobox"], [contenteditable="true"]', root || document)) {
+              if (!isProbablyVisible(inp)) continue;
+              out.push({ input: inp, label: fieldLabel(inp) || inp.name || inp.id || inp.tagName });
+            }
+            for (const b of qsa('button, [role="button"], input[type="submit"]', root || document)) {
+              if (!isProbablyVisible(b)) continue;
+              const t = compactText(b.getAttribute('aria-label') || b.textContent || b.value || '');
+              if (t) out.push({ input: b, label: '▸ ' + t.slice(0, 40) });
+            }
+          } catch {}
+          return out;
+        },
+        onStop: () => { try { cancel('teach-stop'); } catch {} },
+      });
+      sup.show();
+      logLine('ok', `supervised run — default mode "${initialMode}" (Step/Run toggle in the panel)`);
+    } catch (e) {
+      sup = null;   // overlay failed to load → run exactly as the normal auto path
+      logLine('warn', `supervised overlay unavailable (${e?.message || e}) — running unsupervised`);
+    }
+  }
+
+  // POST an authoritative correction (the user picked the right element + value) and apply
+  // it live. recipeId-first; else resolve by ats/company server-side. Never throws.
+  async function applyCorrection(stepLabel, replacement) {
+    try {
+      const recipe = context?.recipe;
+      const recipeId = recipe?.companyRecipeId || recipe?.atsRecipeId || null;
+      const labelPattern = replacement.label || stepLabel || '';
+      const body = {
+        recipeId,
+        ats: context?.ats || job?.ats || null,
+        companyKey: context?.companyKey || null,
+        profileId,
+        labelPattern,
+        selector: replacement.selector, xpath: replacement.xpath, attrs: replacement.attrs,
+        html: replacement.html, value: replacement.value, fieldType: replacement.fieldType, action: replacement.action,
+      };
+      await send({ type: 'api-call', method: 'POST', path: '/recipe/correction', body });
+      // Use the corrected value immediately for the rest of THIS run.
+      if (replacement.value != null && labelPattern) {
+        correctionsThisRun.set(String(labelPattern).toLowerCase().trim(), String(replacement.value));
+        // Also fill it into the picked element right now if it's a fillable field.
+        try {
+          const root = findReplayRoot();
+          const sel = replacement.selector;
+          const target = sel && (root || document).querySelector(sel);
+          if (target && replacement.value != null) await replayFill(target, replacement.value);
+        } catch {}
+      }
+      logLine('ok', `correction saved for "${String(labelPattern).slice(0, 40)}" — recipe rewritten (authoritative)`);
+      report({ transcriptAppend: { note: `live correction: "${String(labelPattern).slice(0, 50)}" → recipe step rewritten` } });
+      try { sup?.confirmFixed(); } catch {}
+    } catch (e) {
+      logLine('warn', `correction POST failed (${e?.message || e})`);
+    }
+  }
+
+  // The supervised gate the loop calls before acting. Returns 'go' | 'stopped'. In Step
+  // mode it waits for Approve; "Wrong / Fix this" opens the picker, saves a correction,
+  // then re-gates. Always a no-op (returns 'go') when not supervised.
+  async function superviseGate(info) {
+    if (!sup) return 'go';
+    for (let guard = 0; guard < 8; guard++) {
+      if (S.cancelled || sup.stopped()) return 'stopped';
+      const verdict = await sup.beforeAction(info);
+      if (verdict === 'stopped') return 'stopped';
+      if (verdict === 'approved') return 'go';
+      if (verdict === 'wrong') {
+        const replacement = await sup.requestCorrection({ label: info?.text || '' });
+        if (replacement) await applyCorrection(info?.label || '', replacement);
+        // re-gate (the user may approve, fix again, or stop)
+        continue;
+      }
+      return 'go';
+    }
+    return 'go';
+  }
 
   // Self-healing park: questions we couldn't answer with HIGH confidence. We
   // NEVER submit a job with these outstanding — instead we park it (with the
@@ -592,14 +713,32 @@ export async function run(task, context, helpers) {
       for (const step of recipe.steps) {
         if (S.cancelled) return { fellBack: true };
         if (NEVER_AUTOFILL_RX.test(step.labelPattern || '') || LEGAL_RX.test(step.labelPattern || '')) continue;
-        // Find an empty field on the live form matching this step's label.
+        // Find the target on the live form. SELECTOR-FIRST [T3]: try the step's resolved
+        // locator (CSS selector → XPath) against the dialog root; if it finds a visible
+        // element, use it. ADDITIVE + try/catch-guarded — a bad/stale selector must fall
+        // back to today's label-pattern token-match, never throw.
         let target = null;
         try {
-          const fillables = await engine.scanUnknown(curRoot);
-          const hit = fillables.find((u) => u.label && step.labelPattern
-            && (u.label === step.labelPattern || u.label.includes(step.labelPattern) || step.labelPattern.includes(u.label)));
-          target = hit ? hit.input : null;
-        } catch {}
+          const loc = resolveLocator(step);
+          const scope = curRoot || document;
+          if (loc.by === 'selector' && loc.value) {
+            const el = scope.querySelector(loc.value);
+            if (el && isProbablyVisible(el)) target = el;
+          } else if (loc.by === 'xpath' && loc.value) {
+            const r = document.evaluate(loc.value, scope, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+            const el = r && r.singleNodeValue;
+            if (el && el.nodeType === 1 && isProbablyVisible(el)) target = el;
+          }
+        } catch { target = null; }   // bad selector/xpath → fall through to label match
+        // Fall back to the label-pattern token-match when no locator hit.
+        if (!target) {
+          try {
+            const fillables = await engine.scanUnknown(curRoot);
+            const hit = fillables.find((u) => u.label && step.labelPattern
+              && (u.label === step.labelPattern || u.label.includes(step.labelPattern) || step.labelPattern.includes(u.label)));
+            target = hit ? hit.input : null;
+          } catch {}
+        }
         if (!target) continue;   // already filled or not on this step — skip.
         const value = await resolveReplayValue(step, curRoot);
         if (value == null) continue;   // no grounded answer → leave it; divergence recheck catches a required gap.
@@ -660,7 +799,7 @@ export async function run(task, context, helpers) {
   // ---- gated replay attempt (P5) — ADDITIVE: only engages when context.recipe
   // exists and the gate passes; on any throw / fallback / divergence it degrades to
   // exactly today's discover-every-step flow below. A replay bug never breaks apply.
-  if (context?.recipe) {
+  if (context?.recipe && !supervised) {
     try {
       const rr = await attemptReplay();
       // attemptReplay only ever hands BACK to the normal flow (fellBack) or sets a
@@ -684,6 +823,19 @@ export async function run(task, context, helpers) {
       logLine('warn', `${blocker} detected — handing back to you`);
       setStatus(blocker === 'captcha' ? 'CAPTCHA — your move' : 'Login required — your move');
       report({ state: 'failed', lastError: blocker === 'captcha' ? 'captcha — pass it in this browser, will retry' : 'login required — sign into the site in this browser, will retry' });
+      finalState = 'failed';
+      break;
+    }
+
+    // ---- LinkedIn Easy Apply daily cap (~50/24h) ----
+    // When LinkedIn shows the "reached today's Easy Apply limit" modal, don't try to
+    // submit — bail cleanly with a distinguishable marker (lastError prefix
+    // `easyapply-limit` + applyRoute:'easy-apply') so the server sets a cooldown and the
+    // pump pivots to external/company-site jobs.
+    if (easyApplyLimitHit()) {
+      logLine('warn', 'LinkedIn Easy Apply daily limit reached — pausing Easy Apply, will pivot to external jobs');
+      setStatus('Easy Apply daily limit reached — cooling down');
+      report({ state: 'failed', lastError: 'easyapply-limit — daily Easy Apply cap reached', applyRoute: 'easy-apply' });
       finalState = 'failed';
       break;
     }
@@ -766,6 +918,18 @@ export async function run(task, context, helpers) {
 
     // learn everything currently on the form
     if (haveForm) await engine.captureCurrentAnswers(root, { source: job?.source, jobId: job?.id });
+
+    // ---- supervised: honor a "Wrong" interrupt on the FILLED step (before advancing) ----
+    // In Run mode the user may have flagged a bad fill while we paced; open the picker now
+    // so the correction lands + applies before this step advances. No-op when unsupervised.
+    if (sup && haveForm) {
+      try {
+        while (sup.consumeWrong() && !S.cancelled && !sup.stopped()) {
+          const replacement = await sup.requestCorrection({ label: '' });
+          if (replacement) await applyCorrection('', replacement);
+        }
+      } catch {}
+    }
 
     await untilUnpaused();
     if (S.cancelled) break;
@@ -868,6 +1032,13 @@ export async function run(task, context, helpers) {
       if (!clickBtn) { logLine('warn', 'advance button became invalid before click — re-scanning'); continue; }
     }
     const label = compactText(clickBtn.textContent || clickBtn.value || '').slice(0, 30);
+    // ---- supervised gate [T4] ----  (no-op when not a supervised run)
+    // Pause before advancing for the user's OK (Step mode) / honor a "Wrong" interrupt
+    // (Run mode). A correction here rewrites the recipe + applies live before we advance.
+    if (sup) {
+      const verdict = await superviseGate({ root, label, text: `About to click "${label}"` });
+      if (verdict === 'stopped') { break; }
+    }
     logLine('ok', `clicking "${label}"`);
     setStatus(`Step ${S.step}: "${label}"…`);
     const prevHash = domHash();
@@ -968,6 +1139,7 @@ export async function run(task, context, helpers) {
   }
 
   S.running = false;
+  try { sup?.destroy(); } catch {}
   hideOverlay(finalState === 'awaiting_review' || finalState === 'awaiting_input' || finalState === 'parked' ? 60000 : 4000);
   return { ok: true, state: finalState || (S.cancelled ? 'skipped' : 'unknown'), steps: S.step };
 }
