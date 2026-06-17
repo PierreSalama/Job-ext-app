@@ -113,6 +113,13 @@ ok(/awaiting_review/.test(executor) && /mode === 'review'/.test(executor), 'revi
 ok(/captchaOrLoginPresent/.test(executor), 'captcha/login detection present');
 ok(/aiConfidenceMin/.test(executor), 'AI answers are confidence-gated');
 
+grp('Auto-apply resource cleanup invariants');
+ok(/AA_WINDOW_POOL_KEY/.test(bg) && /jat11\.aaWindowPool/.test(bg), 'parallel apply window pool is persisted across MV3 restarts');
+ok(/AA_WINDOW_CAP/.test(bg) && /Math\.min\(AA_WINDOW_CAP/.test(bg), 'owned apply windows are hard-capped');
+ok(/reconcileAaTabsAndSlots/.test(bg) && /await reconcileAaTabsAndSlots/.test(bg), 'dispatcher reconciles live AA tabs before launching more work');
+ok(/closeOwnedWindowIfSafe/.test(bg) && /windowHasUserTabs/.test(bg), 'owned-window cleanup will not close real user tabs');
+ok(/reapIdleApplyWindows/.test(bg) && /closeIdle: true/.test(bg), 'reaper closes empty owned apply windows');
+
 grp('Dashboard host bootstrap');
 const app = read('app/app.js');
 ok(/get-token/.test(app) && /jatDesktop/.test(app), 'dashboard resolves token in both extension + desktop hosts');

@@ -543,8 +543,6 @@ let aaGroupId = null;
 // browsing window (that hijacks the tab you're working in — the "it interrupted me"
 // bug), and must be the ACTIVE/visible tab in their own window so Chrome doesn't
 // throttle the page (a hidden tab won't hydrate LinkedIn's Easy-Apply button).
-let aaWindowId = null;
-try { chrome.storage.local?.get('jat11.aaWindowId').then((o) => { const w = o && o['jat11.aaWindowId']; if (w) aaWindowId = Number(w); }).catch(() => {}); } catch {}
 let stopping = false;             // true briefly while tearing a run down, so in-flight launches bow out as 'skipped' (not 'failed')
 
 // ---------- auto-apply TAB REGISTRY (the leak fix) ----------
@@ -553,19 +551,64 @@ let stopping = false;             // true briefly while tearing a run down, so i
 // works even where tabGroups doesn't exist (Firefox). A reaper closes stale/excess
 // tabs so they can never pile up to "90+ open tabs" again.
 const AA_TABS_KEY = 'jat11.aaTabs';
+const AA_PRIMARY_WINDOW_KEY = 'jat11.aaWindowId';
+const AA_WINDOW_POOL_KEY = 'jat11.aaWindowPool';
 const AA_TAB_MAX_AGE_MS = 8 * 60 * 1000;   // a single apply should never need >8 min
 const AA_TAB_CAP = 10;                       // hard ceiling on simultaneously-open AA tabs
+const AA_WINDOW_CAP = 3;                     // hard ceiling on owned AA windows (primary + workers)
 let aaTabs = {};                             // { [tabId]: createdAtMs }
-try { chrome.storage.local.get(AA_TABS_KEY).then((o) => { aaTabs = (o && o[AA_TABS_KEY]) || {}; }).catch(() => {}); } catch {}
+let aaWindowId = null;
+let aaWindowPool = [];                       // DEDICATED apply window ids (created by us only)
+const aaBusyWindows = new Set();             // window ids currently hosting a RUNNING apply tab
+let aaRuntimeHydrated = false;
+
+function normalizeWindowIds(ids) {
+  return [...new Set((Array.isArray(ids) ? ids : [])
+    .map((x) => Number(x))
+    .filter((x) => Number.isFinite(x) && x > 0))];
+}
+
+const aaRuntimeLoad = (async () => {
+  try {
+    const o = await chrome.storage.local.get([AA_TABS_KEY, AA_PRIMARY_WINDOW_KEY, AA_WINDOW_POOL_KEY]);
+    aaTabs = (o && o[AA_TABS_KEY]) || {};
+    aaWindowId = o && o[AA_PRIMARY_WINDOW_KEY] ? Number(o[AA_PRIMARY_WINDOW_KEY]) : null;
+    aaWindowPool = normalizeWindowIds(o && o[AA_WINDOW_POOL_KEY]);
+  } catch {}
+  aaRuntimeHydrated = true;
+})();
+
+async function hydrateAaRuntime() {
+  if (!aaRuntimeHydrated) {
+    try { await aaRuntimeLoad; } catch {}
+    aaRuntimeHydrated = true;
+  }
+}
+
 function persistAaTabs() { try { chrome.storage.local.set({ [AA_TABS_KEY]: aaTabs }); } catch {} }
 function trackAaTab(id) { if (id != null) { aaTabs[id] = Date.now(); persistAaTabs(); } }
 function untrackAaTab(id) { if (id != null && aaTabs[id] != null) { delete aaTabs[id]; persistAaTabs(); } }
+function persistAaWindowPool() { try { chrome.storage.local.set({ [AA_WINDOW_POOL_KEY]: aaWindowPool }); } catch {} }
+function persistAaWindowId() {
+  try {
+    if (aaWindowId != null) chrome.storage.local.set({ [AA_PRIMARY_WINDOW_KEY]: aaWindowId });
+    else chrome.storage.local.remove(AA_PRIMARY_WINDOW_KEY);
+  } catch {}
+}
+function allOwnedWindowIds() {
+  return normalizeWindowIds([aaWindowId, ...aaWindowPool]);
+}
+function isBlankChromeTab(t) {
+  const u = String(t?.url || '');
+  return !u || u === 'about:blank' || u.startsWith('chrome://newtab') || u.startsWith('edge://newtab');
+}
 // A user (or Chrome) closing a tab must drop it from the registry too.
 chrome.tabs.onRemoved.addListener((tabId) => untrackAaTab(tabId));
 
 // Close any tracked AA tab that's too old (stuck) or over the cap (oldest first), and
 // drop ids whose tab no longer exists. Safety net beyond the per-task close paths.
 async function reapAaTabs() {
+  await hydrateAaRuntime();
   await reapIdleApplyWindows();   // close any empty dedicated windows the opt-in modes left behind
   const ids = Object.keys(aaTabs).map(Number);
   if (!ids.length) return;
@@ -589,6 +632,83 @@ async function reapAaTabs() {
   }
 }
 
+async function windowHasUserTabs(win) {
+  return ((win && win.tabs) || []).some((t) => aaTabs[t.id] == null && !isBlankChromeTab(t));
+}
+
+async function closeOwnedWindowIfSafe(id) {
+  if (id == null || !chrome.windows?.get || !chrome.windows?.remove) return false;
+  let win = null;
+  try { win = await chrome.windows.get(id, { populate: true }); } catch { return true; }
+  if (await windowHasUserTabs(win)) return false;   // Pierre may have moved a real tab there; forget, don't close it.
+  try { await chrome.windows.remove(id); } catch {}
+  return true;
+}
+
+async function reconcileOwnedWindows({ closeIdle = false } = {}) {
+  await hydrateAaRuntime();
+  let changed = false;
+  if (aaWindowId != null && chrome.windows?.get) {
+    try { await chrome.windows.get(aaWindowId); }
+    catch { aaWindowId = null; changed = true; }
+  }
+  const livePool = [];
+  for (const id of aaWindowPool) {
+    try { if (chrome.windows?.get) await chrome.windows.get(id); livePool.push(id); }
+    catch { aaBusyWindows.delete(id); changed = true; }
+  }
+  if (livePool.length !== aaWindowPool.length) { aaWindowPool = normalizeWindowIds(livePool); changed = true; }
+
+  if (closeIdle) {
+    for (const id of allOwnedWindowIds()) {
+      if (aaBusyWindows.has(id)) continue;
+      let win = null;
+      try { win = await chrome.windows.get(id, { populate: true }); } catch { continue; }
+      const tabs = (win && win.tabs) || [];
+      const hasAa = tabs.some((t) => aaTabs[t.id] != null);
+      if (hasAa) continue;
+      if (await windowHasUserTabs(win)) {
+        if (id === aaWindowId) { aaWindowId = null; changed = true; }
+        if (aaWindowPool.includes(id)) { aaWindowPool = aaWindowPool.filter((w) => w !== id); changed = true; }
+        aaBusyWindows.delete(id);
+        continue;
+      }
+      await closeOwnedWindowIfSafe(id);
+      if (id === aaWindowId) { aaWindowId = null; changed = true; }
+      if (aaWindowPool.includes(id)) { aaWindowPool = aaWindowPool.filter((w) => w !== id); changed = true; }
+      aaBusyWindows.delete(id);
+    }
+  }
+
+  const cap = Math.max(1, Math.min(AA_WINDOW_CAP, Number(currentConcurrency) || 1));
+  const extra = aaWindowPool.filter((id) => !aaBusyWindows.has(id)).slice(cap);
+  for (const id of extra) {
+    await closeOwnedWindowIfSafe(id);
+    aaWindowPool = aaWindowPool.filter((w) => w !== id);
+    aaBusyWindows.delete(id);
+    changed = true;
+  }
+  if (changed) { persistAaWindowId(); persistAaWindowPool(); }
+}
+
+async function reconcileAaTabsAndSlots() {
+  await hydrateAaRuntime();
+  const live = [];
+  for (const id of Object.keys(aaTabs).map(Number)) {
+    try { await chrome.tabs.get(id); live.push(id); }
+    catch { untrackAaTab(id); }
+  }
+  if (!live.length) {
+    if (activeCount > 0) activeCount = 0;
+    return 0;
+  }
+  // After MV3 service-worker eviction, activeCount resets to 0 while old apply tabs
+  // are still alive. Treat persisted live AA tabs as occupied slots so the next alarm
+  // cannot launch more windows on top of them.
+  activeCount = Math.max(activeCount, Math.min(live.length, Math.max(1, currentConcurrency)));
+  return live.length;
+}
+
 // MV3 evicts the service worker after ~30s idle, which would wipe aaGroupId and make
 // the next tick spawn a SECOND group. Recover the existing one by its title first so
 // there's only ever one "JAT Auto-apply" group across SW restarts.
@@ -610,6 +730,7 @@ async function recoverAaGroup() {
 // whole run (so it never repeatedly pops up), and closed only on Stop. The apply tab is
 // the ACTIVE tab there, so the page loads un-throttled WITHOUT ever touching your window.
 async function autoApplyTargetWindow() {
+  await hydrateAaRuntime();
   await recoverAaGroup();
   if (aaGroupId != null && chrome.tabGroups?.get) {
     try { const g = await chrome.tabGroups.get(aaGroupId); aaWindowId = g.windowId; return g.windowId; }
@@ -635,7 +756,7 @@ async function autoApplyTargetWindow() {
     // fully beat a fully-covering maximized window.
     try { win = await chrome.windows.create({ focused: false, state: 'normal', width: 1200, height: 900, left: 60, top: 60 }); } catch {}
     aaWindowId = win ? win.id : null;
-    try { if (aaWindowId != null) chrome.storage.local?.set({ 'jat11.aaWindowId': aaWindowId }); } catch {}
+    persistAaWindowId();
     if (win && focusedId != null) { try { await chrome.windows.update(focusedId, { focused: true }); } catch {} }
     return aaWindowId != null ? aaWindowId : (wins.find((w) => !w.focused)?.id);
   } catch { return undefined; }
@@ -646,6 +767,7 @@ async function autoApplyTargetWindow() {
 // stalled tabs only flashes once. Non-destructive: only ever touches windows WE own.
 let lastNudge = 0;
 async function nudgeApplyWindows() {
+  await hydrateAaRuntime();
   const now = Date.now();
   if (now - lastNudge < 8000) return;   // at most once / 8s — don't strobe the user
   lastNudge = now;
@@ -681,6 +803,7 @@ function isOurApplyWindow(winId) {
 }
 
 async function frontUntilHydrated(applyWinId) {
+  await hydrateAaRuntime();
   if (applyWinId == null || !chrome.windows?.update) return;
   if (!isOurApplyWindow(applyWinId)) return;   // never front a window we don't own
   if (frontHeld.has(applyWinId)) return;       // already holding this one
@@ -696,6 +819,7 @@ async function frontUntilHydrated(applyWinId) {
 }
 
 async function releaseFrontUntilHydrated(applyWinId) {
+  await hydrateAaRuntime();
   if (applyWinId == null) return;
   const held = frontHeld.get(applyWinId);
   if (!held) return;
@@ -711,17 +835,18 @@ async function releaseFrontUntilHydrated(applyWinId) {
 // Only used when "bring window to front" is on OR concurrency > 1. Each such worker gets
 // its OWN dedicated window (one active/visible, un-throttled tab per window). Windows are
 // reused across applies; the reaper closes empty ones; Stop closes them all.
-let aaWindowPool = [];               // DEDICATED apply window ids (created by us only)
-const aaBusyWindows = new Set();     // window ids currently hosting a RUNNING apply tab
-
 async function acquireApplyWindow(focus = false) {
-  // Prune windows that no longer exist.
-  for (const id of [...aaWindowPool]) {
-    try { await chrome.windows.get(id); } catch { aaWindowPool = aaWindowPool.filter((w) => w !== id); aaBusyWindows.delete(id); }
-  }
+  await hydrateAaRuntime();
+  await reconcileOwnedWindows();
+  const cap = Math.max(1, Math.min(AA_WINDOW_CAP, Number(currentConcurrency) || 1));
   // Reuse a free dedicated window…
   let win = aaWindowPool.find((id) => !aaBusyWindows.has(id));
   if (win == null) {
+    // If an MV3 restart desynced slot accounting, stay bounded: reuse an owned
+    // window instead of creating an unbounded new Chrome window.
+    if (aaWindowPool.length >= cap && aaWindowPool.length) win = aaWindowPool[0];
+  }
+  if (win == null && aaWindowPool.length < cap) {
     // …or create one, restoring focus to your window unless we're intentionally fronting.
     try {
       const wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
@@ -730,7 +855,12 @@ async function acquireApplyWindow(focus = false) {
       // distinct, non-cascaded window stays partially on-display so its apply tab is less
       // likely to be occlusion-throttled. No new permission.
       const w = await chrome.windows.create({ focused: !!focus, state: 'normal', width: 1200, height: 900, left: 60, top: 60 });
-      if (w) { win = w.id; aaWindowPool.push(win); if (!focus && focusedId != null) { try { await chrome.windows.update(focusedId, { focused: true }); } catch {} } }
+      if (w) {
+        win = w.id;
+        aaWindowPool = normalizeWindowIds([...aaWindowPool, win]);
+        persistAaWindowPool();
+        if (!focus && focusedId != null) { try { await chrome.windows.update(focusedId, { focused: true }); } catch {} }
+      }
     } catch {}
   }
   if (win != null) aaBusyWindows.add(win);
@@ -742,19 +872,9 @@ function releaseApplyWindow(winId) { if (winId != null) aaBusyWindows.delete(win
 // auto-apply tabs left) so the opt-in reliability/parallel modes never leave a stray
 // empty Chrome window sitting around. Called from the 2-min reaper.
 async function reapIdleApplyWindows() {
-  if (!aaWindowPool.length || !chrome.windows?.get) return;
-  for (const id of [...aaWindowPool]) {
-    if (aaBusyWindows.has(id)) continue;   // running an apply — keep
-    let win = null;
-    try { win = await chrome.windows.get(id, { populate: true }); }
-    catch { aaWindowPool = aaWindowPool.filter((w) => w !== id); continue; }
-    const hasAa = ((win && win.tabs) || []).some((t) => aaTabs[t.id] != null);
-    if (!hasAa) {
-      try { await chrome.windows.remove(id); } catch {}
-      aaWindowPool = aaWindowPool.filter((w) => w !== id);
-      aaBusyWindows.delete(id);
-    }
-  }
+  await hydrateAaRuntime();
+  if (!allOwnedWindowIds().length || !chrome.windows?.get) return;
+  await reconcileOwnedWindows({ closeIdle: true });
 }
 
 // Open a tab for an auto-apply / discovery / applied-sync job in a dedicated window.
@@ -814,6 +934,7 @@ async function groupTab(tabId) {
 // (the dashboard stop-all patches queued/running → skipped before this runs), so
 // nothing is lost by closing them.
 async function closeAutoApplyTabs() {
+  await hydrateAaRuntime();
   // Mark the teardown FIRST so any in-flight launchOne whose tab we're about to remove
   // bows out as 'skipped' instead of re-patching 'failed' (which fired the scary
   // "a queued application failed" toasts on Stop).
@@ -842,7 +963,12 @@ async function closeAutoApplyTabs() {
     // so none linger empty after Stop.
     const winIds = new Set(aaWindowPool);
     if (aaWindowId != null) winIds.add(aaWindowId);
-    if (chrome.windows?.remove) { for (const id of winIds) { try { await chrome.windows.remove(id); } catch {} } }
+    if (chrome.windows?.remove) {
+      for (const id of winIds) {
+        try { await releaseFrontUntilHydrated(id); } catch {}
+        await closeOwnedWindowIfSafe(id);
+      }
+    }
     aaWindowPool = []; aaBusyWindows.clear();
   } catch {}
   // Stop the self-driving timers too, so a queued re-pump can't pop a new tab open
@@ -852,7 +978,8 @@ async function closeAutoApplyTabs() {
   pumpDirty = false;
   aaGroupId = null;
   aaWindowId = null;
-  try { chrome.storage.local?.remove('jat11.aaWindowId'); } catch {}
+  persistAaWindowId();
+  persistAaWindowPool();
   // Let in-flight launches see `stopping`, then clear it so the next Start is normal.
   setTimeout(() => { stopping = false; }, 8000);
 }
@@ -992,10 +1119,11 @@ function schedulePump() {
 // so N tabs cycle continuously. concurrency comes back with every /queue/next.
 async function pump(force = false) {
   if (pumping) { pumpDirty = true; return { dispatched: false, reason: 'pumping' }; }
-  // Reconcile a desynced slot counter: if an SW eviction killed a launchOne before its
-  // .finally could decrement activeCount, the slot stays "stuck" and the pool stalls.
-  // With zero AA tabs actually open, nothing is in flight — reset the counter.
-  if (activeCount > 0 && Object.keys(aaTabs).length === 0) activeCount = 0;
+  await hydrateAaRuntime();
+  await reapAaTabs().catch(() => {});
+  // Reconcile after MV3 service-worker eviction. If Chrome still has tracked AA tabs
+  // alive, treat them as occupied slots; if none remain, free the counter.
+  await reconcileAaTabsAndSlots().catch(() => {});
   if (!(await api.isPaired())) return { dispatched: false, reason: 'not paired' };
   const h = await api.health();
   if (!h?.ok) return { dispatched: false, reason: 'app offline' };

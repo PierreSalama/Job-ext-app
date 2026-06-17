@@ -104,7 +104,7 @@ const DEFAULTS = {
     maxPerHour: 30,
     minGapMinutes: 1,             // ~1–3 min between starts (human-like; avoids the throttle)
     maxGapMinutes: 3,
-    concurrency: 2,               // applications in PARALLEL, but never two workers on the same site/ATS at once. Lower to 1 for the safest footprint.
+    concurrency: 1,               // safest default. Raise to 2–3 for separate-site parallelism once the machine can handle it.
     bringToFrontToHydrate: false, // OFF by default. ON = the apply window is brought to the FRONT while applying, guaranteeing the page isn't throttled (Chrome throttles a fully-occluded window — e.g. behind a fullscreen game — so the Easy-Apply button never loads). Trade-off: it takes focus while each application runs. Turn ON when reliability matters more than not being interrupted (e.g. running while away).
     frontToHydrate: true,         // ON by default. When the apply tab detects it is OCCLUDED (Chrome throttled it → LinkedIn never hydrates), it asks the SW to front the apply window ONLY for the few seconds it takes the form to load, then hands your focus straight back. Unlike bringToFrontToHydrate this is reactive (no steal unless actually occluded) and self-releasing. Set false to keep the old single-nudge behavior.
     runAnytime: true,        // ON by default — run 24/7. Turn OFF to use the window below.
