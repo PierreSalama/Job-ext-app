@@ -1968,7 +1968,7 @@ route('/queue', async () => {
           <option value="review" ${aa.mode === 'review' ? 'selected' : ''}>Review — stop before submit</option>
         </select>`)}
         ${qc('Job boards', `<label class="aa-chk"><input type="checkbox" id="aa-li" ${boards.includes('linkedin') ? 'checked' : ''}/> LinkedIn</label> <label class="aa-chk"><input type="checkbox" id="aa-in" ${boards.includes('indeed') ? 'checked' : ''}/> Indeed</label> <label class="aa-chk"><input type="checkbox" id="aa-gd" ${boards.includes('glassdoor') ? 'checked' : ''}/> Glassdoor</label>`)}
-        ${qc('Easy Apply only', `<label class="toggle"><input type="checkbox" id="aa-easy" ${aa.easyApplyOnly !== false ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">On = only 1-click / in-page applies (most reliable). Off = also surface normal &amp; external postings — the in-page ones get filled too; true external sites are flagged "needs you" in the breakdown.</div>`)}
+        ${qc('Easy Apply only', `<label class="toggle"><input type="checkbox" id="aa-easy" ${aa.easyApplyOnly !== false ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">On = only 1-click / in-page applies. Off = also includes normal postings and tries the company/ATS handoff, then fills the external form when it can.</div>`)}
         ${qc('Apply with profile', `<select class="select" id="aa-profile"><option value="">Default</option>${profiles.map((p) => `<option value="${esc(p.id)}" ${aa.profileId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>`)}
         ${qc('Attach résumé', `<select class="select" id="aa-resume"><option value="">Active résumé</option>${resumes.map((d) => `<option value="${esc(d.id)}" ${aa.resumeDocId === d.id ? 'selected' : ''}>${esc(d.label || d.name)}</option>`).join('')}</select>`)}
         ${qc('Your experience (years)', `<input class="input" id="aa-exp" type="number" min="0" max="40" value="${Number(aa.experienceYears) || 0}" /><div class="form-hint">skip roles that demand many more years than this (0 = off)</div>`)}
@@ -1978,7 +1978,9 @@ route('/queue', async () => {
           <option value="mid" ${aa.seniorityMax === 'mid' ? 'selected' : ''}>Up to Mid</option>
           <option value="senior" ${aa.seniorityMax === 'senior' ? 'selected' : ''}>Up to Senior (skip Lead/Manager)</option>
         </select>`)}
-        ${qc('Exclude titles', `<input class="input" id="aa-exclude" type="text" placeholder="game, manager, sales…" value="${esc((aa.excludeKeywords || []).join(', '))}" /><div class="form-hint">comma-separated — skip any title containing these</div>`)}
+        ${qc('Exclude titles', '<div id="aa-exclude-slot"></div><div class="form-hint">skip any title containing these</div>')}
+        ${qc('Exclude companies', '<div id="aa-exclude-companies-slot"></div><div class="form-hint">skip any company containing these</div>')}
+        ${qc('Exclude locations', '<div id="aa-exclude-locations-slot"></div><div class="form-hint">skip any location containing these</div>')}
       </div>
     </section>
 
@@ -2029,6 +2031,12 @@ route('/queue', async () => {
   v.querySelector('#aa-keywords-slot').appendChild(kw.node);
   const locs = chipsInput(aa.locations || [], 'Toronto, Remote…');
   v.querySelector('#aa-locations-slot').appendChild(locs.node);
+  const exTitles = chipsInput(aa.excludeKeywords || [], 'game, manager, sales…');
+  v.querySelector('#aa-exclude-slot').appendChild(exTitles.node);
+  const exCompanies = chipsInput(aa.excludeCompanies || [], 'Acme, staffing…');
+  v.querySelector('#aa-exclude-companies-slot').appendChild(exCompanies.node);
+  const exLocations = chipsInput(aa.excludeLocations || [], 'onsite only, New York…');
+  v.querySelector('#aa-exclude-locations-slot').appendChild(exLocations.node);
   // The run-anytime toggle shows/hides #aa-window-row purely via CSS :has() — no JS
   // here, so a live morph refresh can never fight the user's toggle state.
 
@@ -2060,7 +2068,9 @@ route('/queue', async () => {
           bringToFrontToHydrate: v.querySelector('#aa-bringfront').checked,
           experienceYears: Math.max(0, Number(v.querySelector('#aa-exp').value) || 0),
           seniorityMax: v.querySelector('#aa-seniority').value,
-          excludeKeywords: (v.querySelector('#aa-exclude').value || '').split(',').map((x) => x.trim()).filter(Boolean),
+          excludeKeywords: exTitles.get(),
+          excludeCompanies: exCompanies.get(),
+          excludeLocations: exLocations.get(),
           profileId: v.querySelector('#aa-profile').value,
           resumeDocId: v.querySelector('#aa-resume').value,
           maxPerDay: Number(v.querySelector('#aa-day').value) || 50,
@@ -2127,6 +2137,11 @@ route('/queue', async () => {
       return e2.length ? e2.map(([name, m]) => line((labels && labels[name]) || name, m)).join('') : '<div class="muted" style="font-size:12px">—</div>';
     };
     const ROUTE_LABEL = { 'easy-apply': 'Easy / in-page', external: 'External (needs you)', unknown: 'Unknown' };
+    const ACTION_LABEL = { retry: 'Will retry', user: 'Needs you', inspect: 'Inspect', skip: 'Skipped by rule', wait: 'Waiting', complete: 'Complete' };
+    const actionLine = (label, n) => `<div style="display:flex;justify-content:space-between;gap:10px;font-size:12px;padding:3px 0;border-top:1px solid var(--border,#2a2a2a)"><span>${esc(label)}</span><span class="muted">${esc(n)}</span></div>`;
+    const actions = Object.entries(bd.byFailureAction || {}).length
+      ? Object.entries(bd.byFailureAction || {}).sort((a, b) => b[1] - a[1]).map(([k, n]) => actionLine(ACTION_LABEL[k] || k, n)).join('')
+      : '<div class="muted" style="font-size:12px">—</div>';
     const reasons = (bd.topReasons || []).length
       ? bd.topReasons.map((r2) => `<div style="display:flex;justify-content:space-between;gap:10px;font-size:12px;padding:3px 0;border-top:1px solid var(--border,#2a2a2a)"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r2.reason)}">${esc(r2.reason)}</span><span class="muted">${r2.count}</span></div>`).join('')
       : '<div class="muted" style="font-size:12px">No skips or failures 🎉</div>';
@@ -2138,6 +2153,7 @@ route('/queue', async () => {
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:16px;margin-top:14px">
         <div>${h('By board')}${rows(bd.byBoard)}</div>
         <div>${h('By route')}${rows(bd.byRoute, ROUTE_LABEL)}</div>
+        <div>${h('Failure policy')}${actions}</div>
         <div>${h('Why skipped / failed')}${reasons}</div>
       </div>
     </div>`;
@@ -2194,20 +2210,33 @@ route('/queue', async () => {
       const trail = (w.trail && w.trail.length)
         ? w.trail.map((e, i) => {
             const cur = i === w.trail.length - 1 ? 'cur' : '';
-            return `<div class="trail-line ${lvClass(e.level)} ${cur}"><span class="t-dot">${cur ? '▸' : '·'}</span><span>${esc(e.text || '')}</span></div>`;
+            const seen = e.kind === 'seen' ? ' lv-seen' : '';
+            return `<div class="trail-line ${lvClass(e.level)}${seen} ${cur}"><span class="t-dot">${cur ? '▸' : '·'}</span><span>${esc(e.text || '')}</span></div>`;
           }).join('')
         : `<div class="trail-line"><span class="t-dot">·</span><span class="muted">opening the application…</span></div>`;
+      const seen = (w.seen && w.seen.length) ? w.seen[w.seen.length - 1] : null;
+      const seenHtml = seen ? `<div class="aa-seen">
+        <div class="aa-seen-label">Robot sees</div>
+        <div class="aa-seen-text">${esc(seen.text || '')}</div>
+        ${(seen.fields || []).length ? `<div class="aa-seen-row"><span>Fields</span>${seen.fields.map((x) => `<b>${esc(x)}</b>`).join('')}</div>` : ''}
+        ${(seen.buttons || []).length ? `<div class="aa-seen-row"><span>Buttons</span>${seen.buttons.map((x) => `<b>${esc(x)}</b>`).join('')}</div>` : ''}
+      </div>` : '';
       const q = (w.pendingQuestions && w.pendingQuestions.length)
         ? `<div class="aa-worker-q">⏳ waiting on — ${w.pendingQuestions.map((x) => esc(x.question || '')).slice(0, 3).join(' · ')}</div>` : '';
+      const policy = w.failureLabel ? `<span title="${esc(w.failureClass || '')}">${esc(w.failureLabel)}</span>` : '';
       return `<div class="aa-worker">
         <div class="aa-worker-head">
           <div><div class="aa-worker-title">${esc(w.title || 'job')}</div><div class="aa-worker-co">${esc(w.company || '')}</div></div>
-          <div class="aa-worker-meta">${route}<span>${esc(w.source || '')}</span>${(w.attempts || 0) > 1 ? `<span>try ${w.attempts}</span>` : ''}<span class="aa-worker-elapsed">${elapsed}</span></div>
+          <div class="aa-worker-meta">${route}<span>${esc(w.source || '')}</span>${policy}${w.siteKey ? `<span>${esc(w.siteKey.replace(/^(host|ats|source):/, ''))}</span>` : ''}${(w.attempts || 0) > 1 ? `<span>try ${w.attempts}</span>` : ''}<span class="aa-worker-elapsed">${elapsed}</span></div>
         </div>
         <div class="aa-worker-trail">${trail}</div>
+        ${seenHtml}
         ${q}
       </div>`;
     };
+    const siteSpread = (d.activeSites || []).length
+      ? `<div class="muted" style="font-size:12px;margin-bottom:10px">Active sites: ${(d.activeSites || []).map((x) => `<b>${esc(String(x.siteKey || '').replace(/^(host|ats|source):/, ''))}</b>`).join(' · ')}</div>`
+      : '';
     const workers = (d.running || []).length
       ? `<div class="aa-workers">${d.running.map(workerCard).join('')}</div>`
       : `<div class="aa-empty-live">${d.enabled ? (d.queuedDepth ? 'Next application starting…' : 'No applications in flight — topping up the queue from discovery + retries.') : 'Auto-apply is stopped. Press Start to begin.'}</div>`;
@@ -2227,6 +2256,7 @@ route('/queue', async () => {
           ${stat(d.queuedDepth || 0, 'in queue', '')}
         </div>
         <div class="muted" style="font-size:12px;margin-bottom:12px">≈ <b style="color:${slow ? 'var(--danger)' : 'inherit'}">${p.effectivePerHour || 0}</b> applications/hour at current settings${p.bindingCap ? ` (capped by ${p.bindingCap === 'hourly-cap' ? 'your hourly limit' : 'the gap between applications'})` : ''}${slow ? ` — your saved pacing predates the speed update. <button class="btn small" data-aa-maxspeed style="padding:2px 9px">⚡ Max speed</button>` : ''}</div>
+        ${siteSpread}
         ${workers}
       </div>
     </section>`;

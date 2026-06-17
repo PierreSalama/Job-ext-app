@@ -382,7 +382,7 @@ function bootRecorder(root) {
   if (_recorderBooted || state.autoApplyDriven || !IS_TOP || !root) return;
   _recorderBooted = true;
   import(chrome.runtime.getURL('content/recorder.js'))
-    .then((m) => m.start({ root }))
+    .then((m) => m.start({ root, preapproved: true }))
     .catch((e) => { _recorderBooted = false; log('recorder load failed', e); });
 }
 

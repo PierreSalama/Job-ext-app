@@ -199,6 +199,7 @@ let _sessionId = null;
 let _stepIndex = 0;
 let _lastTs = 0;
 let _teach = false;
+let _preapproved = false;
 let _applyRoot = null;
 let _mods = null;        // { fieldLabel, isSiteChromeInput, isFillable, radioGroupLabel, detectApplyForm }
 
@@ -407,11 +408,12 @@ function onInput(e) {
 // is enabled). Re-reads Teach Mode from storage and listens in capture phase.
 export async function start(opts = {}) {
   try {
-    if (_started) { await refreshTeach(); return true; }
+    if (_started) { if (opts.preapproved) _preapproved = true; await refreshTeach(); return true; }
     await loadDeps();
     const found = _mods.detectApplyForm && _mods.detectApplyForm();
     _applyRoot = (found && found.form) || opts.root || null;
     if (!_applyRoot) return false;           // not in an apply context → do nothing
+    _preapproved = !!opts.preapproved;
     _started = true;
     _sessionId = genSession();
     _stepIndex = 0;
@@ -419,7 +421,7 @@ export async function start(opts = {}) {
     await refreshTeach();
     try {
       chrome.storage.onChanged.addListener((changes, area) => {
-        if (area === 'local' && changes['jat11.teachMode']) _teach = !!changes['jat11.teachMode'].newValue;
+        if (area === 'local' && changes['jat11.teachMode']) _teach = _preapproved || !!changes['jat11.teachMode'].newValue;
       });
     } catch {}
     document.addEventListener('click', onClick, true);
@@ -431,8 +433,8 @@ export async function start(opts = {}) {
 }
 
 async function refreshTeach() {
-  try { _teach = !!(await chrome.storage.local.get('jat11.teachMode'))['jat11.teachMode']; }
-  catch { _teach = false; }
+  try { _teach = _preapproved || !!(await chrome.storage.local.get('jat11.teachMode'))['jat11.teachMode']; }
+  catch { _teach = !!_preapproved; }
 }
 
 // An always-available floating Teach-Mode toggle. Mirrors the popup toggle: writes

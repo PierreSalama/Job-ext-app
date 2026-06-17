@@ -104,14 +104,14 @@ const DEFAULTS = {
     maxPerHour: 30,
     minGapMinutes: 1,             // ~1–3 min between starts (human-like; avoids the throttle)
     maxGapMinutes: 3,
-    concurrency: 1,               // applications in PARALLEL (1 = safest). >1 = parallel tabs: faster but RAISES throttle/flag risk.
+    concurrency: 2,               // applications in PARALLEL, but never two workers on the same site/ATS at once. Lower to 1 for the safest footprint.
     bringToFrontToHydrate: false, // OFF by default. ON = the apply window is brought to the FRONT while applying, guaranteeing the page isn't throttled (Chrome throttles a fully-occluded window — e.g. behind a fullscreen game — so the Easy-Apply button never loads). Trade-off: it takes focus while each application runs. Turn ON when reliability matters more than not being interrupted (e.g. running while away).
     frontToHydrate: true,         // ON by default. When the apply tab detects it is OCCLUDED (Chrome throttled it → LinkedIn never hydrates), it asks the SW to front the apply window ONLY for the few seconds it takes the form to load, then hands your focus straight back. Unlike bringToFrontToHydrate this is reactive (no steal unless actually occluded) and self-releasing. Set false to keep the old single-nudge behavior.
     runAnytime: true,        // ON by default — run 24/7. Turn OFF to use the window below.
     windowStart: '',         // only used when runAnytime is false
     windowEnd: '',
     aiAnswerConfidenceMin: 0.7,   // AI answers a screening question when reasonably confident (lower = fewer parks, more autonomy)
-    easyApplyOnly: true,          // ON + locked in the UI (non-Easy-Apply isn't supported yet)
+    easyApplyOnly: false,         // OFF = include normal/external postings and let the runner hand off to company/ATS forms when possible
     keywords: [],                 // e.g. ['software engineer', 'data analyst']
     locations: [],                // e.g. ['Toronto', 'Remote']
     boards: ['linkedin', 'indeed'],
@@ -119,6 +119,8 @@ const DEFAULTS = {
     experienceYears: 0,           // your years of experience; >0 = skip jobs that demand many more
     seniorityMax: 'any',          // 'any' | 'entry' | 'mid' | 'senior' — skip roles above this level
     excludeKeywords: [],          // title terms to always skip, e.g. ['game','manager','sales']
+    excludeCompanies: [],         // company terms to always skip
+    excludeLocations: [],         // location terms to always skip
     profileId: '',                // which profile to apply with ('' = default)
     resumeDocId: '',              // which résumé to attach ('' = default)
     discovery: {

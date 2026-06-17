@@ -142,7 +142,9 @@ const SENIORITY_CAP = { any: 99, senior: 3, mid: 2, entry: 1 };
 // fit for a software-dev candidate — they require a doctorate. Skip them outright
 // (EN + FR, since LinkedIn QC postings are bilingual) so they never reach apply.
 const ACADEMIC_RE = /\b(post-?doc|postdoctoral|post-?doctorale|ph\.?\s?d|doctorate|doctoral|doctorant|research fellow(ship)?|bourse de recherche|bourse postdoctorale|professor|professeur|faculty|tenure[- ]track|lecturer|chercheur|chercheuse|ma[iî]tre de conf)\b/i;
-function jobFit(title, aa) {
+function jobFit(jobOrTitle, aa) {
+  const job = (jobOrTitle && typeof jobOrTitle === 'object') ? jobOrTitle : { title: jobOrTitle };
+  const title = job.title || '';
   const cap = SENIORITY_CAP[aa && aa.seniorityMax] ?? 99;
   if (jobLevel(title) > cap) return { ok: false, reason: `above your level cap (${aa.seniorityMax})` };
   if (ACADEMIC_RE.test(String(title || ''))) return { ok: false, reason: 'academic/research role (postdoc/PhD/faculty) — off-target' };
@@ -150,6 +152,16 @@ function jobFit(title, aa) {
   for (const kw of (aa && aa.excludeKeywords) || []) {
     const k = String(kw || '').trim().toLowerCase();
     if (k && t.includes(k)) return { ok: false, reason: `excluded keyword "${k}"` };
+  }
+  const company = String(job.company || '').toLowerCase();
+  for (const kw of (aa && aa.excludeCompanies) || []) {
+    const k = String(kw || '').trim().toLowerCase();
+    if (k && company.includes(k)) return { ok: false, reason: `excluded company "${k}"` };
+  }
+  const location = String(job.location || '').toLowerCase();
+  for (const kw of (aa && aa.excludeLocations) || []) {
+    const k = String(kw || '').trim().toLowerCase();
+    if (k && location.includes(k)) return { ok: false, reason: `excluded location "${k}"` };
   }
   return { ok: true };
 }
@@ -223,6 +235,11 @@ async function queueNext(force = false) {
   let cooledDown = false;
   try { cooledDown = db.easyApplyCooledDown(); } catch {}
   let easyApplyDeferred = false;
+  let siteDeferred = false;
+  let activeSiteKeys = new Set();
+  if (!force && concurrency > 1) {
+    try { activeSiteKeys = new Set(db.queueActiveSiteKeys().map((x) => x.siteKey).filter(Boolean)); } catch {}
+  }
   const candidates = [];
   for (let i = queued.length - 1; i >= 0; i--) {
     const t = queued[i];
@@ -241,11 +258,17 @@ async function queueNext(force = false) {
       continue;
     }
     if (cooledDown && !db.easyApplyEligible(j)) { easyApplyDeferred = true; continue; }
+    const siteKey = db.taskSiteKey(j);
+    if (!force && concurrency > 1 && siteKey && activeSiteKeys.has(siteKey)) {
+      siteDeferred = true;
+      continue;
+    }
     candidates.push({ t, j, order: i });   // order = oldest-first index (lower = older)
   }
   // Nothing dispatchable BUT we held back LinkedIn jobs for the cooldown → tell the pump
   // why it's idling (it isn't out of work; it's waiting out the Easy-Apply cap).
   if (!candidates.length && easyApplyDeferred) return { task: null, reason: 'easyapply-cooldown', concurrency };
+  if (!candidates.length && siteDeferred) return { task: null, reason: 'site-busy', concurrency };
   if (!candidates.length) return { task: null, reason: 'empty', concurrency };
   // Rank candidates: highest rankJob first; ties broken by oldest-first (stable original order).
   for (const c of candidates) { try { c.rank = db.rankJob(c.j, db.resolveProfileId(c.j.source)); } catch { c.rank = 0; } }
@@ -310,6 +333,7 @@ async function queueNext(force = false) {
       profileId,
       bringToFront: !!s.bringToFrontToHydrate,   // SW focuses the apply window so an occluded page isn't throttled
       frontToHydrate: s.frontToHydrate !== false,  // reactive front-until-hydrated when the apply tab reports itself occluded (default ON)
+      easyApplyOnly: s.easyApplyOnly !== false,
       // One-shot "Watch & Teach the next application" armed from the dashboard → run this
       // dispatch supervised, on-screen (Step/Run + Fix-this). bringToFront so it's visible.
       ...(superviseThis ? { supervised: true, bringToFront: true } : {}),
@@ -325,7 +349,15 @@ async function queueNext(force = false) {
       // Fit filters the executor re-checks against the live job page (a manually
       // queued job can bypass the discovery gate; and only the page has the
       // "needs N years" requirement text).
-      fit: { experienceYears: s.experienceYears || 0, seniorityMax: s.seniorityMax || 'any', excludeKeywords: s.excludeKeywords || [] },
+      fit: {
+        experienceYears: s.experienceYears || 0,
+        seniorityMax: s.seniorityMax || 'any',
+        excludeKeywords: s.excludeKeywords || [],
+        excludeCompanies: s.excludeCompanies || [],
+        excludeLocations: s.excludeLocations || [],
+        company: job.company || '',
+        location: job.location || '',
+      },
     },
   };
 }
@@ -1039,7 +1071,7 @@ async function handle(req, res, parsed) {
     for (const jd of jobs.slice(0, 50)) {
       if (!jd || !jd.jobUrl) continue;
       // Relevance gate — don't even queue roles above the user's level / excluded.
-      const fit = jobFit(jd.title, s);
+      const fit = jobFit(jd, s);
       if (!fit.ok) { filtered++; continue; }
       // Exclude punished jobs/companies/job-types from discovery (a synthetic job shape so
       // the gate can read company/title/url without an upsert).

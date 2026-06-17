@@ -74,6 +74,10 @@ function checkFit(title, pageText, fit) {
   if (jobLevel(title) > cap) return `role looks above your level cap (${fit.seniorityMax})`;
   const tl = String(title || '').toLowerCase();
   for (const kw of fit.excludeKeywords || []) { const k = String(kw || '').trim().toLowerCase(); if (k && tl.includes(k)) return `excluded keyword "${k}"`; }
+  const company = String(fit.company || '').toLowerCase();
+  for (const kw of fit.excludeCompanies || []) { const k = String(kw || '').trim().toLowerCase(); if (k && company.includes(k)) return `excluded company "${k}"`; }
+  const location = String(fit.location || '').toLowerCase();
+  for (const kw of fit.excludeLocations || []) { const k = String(kw || '').trim().toLowerCase(); if (k && location.includes(k)) return `excluded location "${k}"`; }
   const yrs = Number(fit.experienceYears) || 0;
   if (yrs > 0) { const req = requiredYears(pageText); if (req && req > yrs + 3) return `needs ~${req} yrs experience (you set ${yrs})`; }
   return null;
@@ -175,6 +179,34 @@ function logLine(level, text) {
   }
   report({ transcriptAppend: { step: S.step, level, text: String(text).slice(0, 300) } });
 }
+function reportSeen(root, phase) {
+  try {
+    const scope = root || document;
+    const fields = qsa('input, textarea, select, [role="combobox"], [contenteditable="true"]', scope)
+      .filter(isProbablyVisible)
+      .map((el) => compactText(fieldLabel(el) || el.getAttribute?.('aria-label') || el.getAttribute?.('placeholder') || el.name || el.id || el.tagName || 'field'))
+      .filter(Boolean)
+      .slice(0, 10);
+    const buttons = qsa('button, [role="button"], input[type="submit"], a[role="button"]', scope)
+      .filter(isProbablyVisible)
+      .map((el) => compactText(el.getAttribute?.('aria-label') || el.textContent || el.value || ''))
+      .filter(Boolean)
+      .slice(0, 10);
+    const text = compactText(scope.innerText || document.body?.innerText || '').slice(0, 260);
+    const sig = `${phase}|${location.href}|${fields.join('|')}|${buttons.join('|')}`;
+    if (S.lastSeenSig === sig) return;
+    S.lastSeenSig = sig;
+    report({ transcriptAppend: {
+      kind: 'seen',
+      step: S.step,
+      level: 'info',
+      text: `sees ${phase}: ${text}`,
+      fields,
+      buttons,
+      url: location.href,
+    } });
+  } catch {}
+}
 function cancel(reason) {
   if (!S.running) return;
   S.cancelled = true;
@@ -194,7 +226,7 @@ function report(patch) {
   // never opened in-page means the posting bounced us to an external ATS or a
   // verification wall we can't auto-drive. Skips (relevance) get no route.
   if (patch && ROUTE_STATES.has(patch.state) && patch.applyRoute === undefined) {
-    patch.applyRoute = S.everHadForm ? 'easy-apply' : 'external';
+    patch.applyRoute = S.externalRoute ? 'external' : (S.everHadForm ? 'easy-apply' : 'external');
   }
   reportQueue = reportQueue.then(() =>
     send({ type: 'task-progress', taskId: S.task.id, patch })).catch(() => {});
@@ -294,6 +326,26 @@ function externalApplyPresent() {
     }
   }
   return false;
+}
+function looksExternalApplyButton(el) {
+  try {
+    if (!el || !isProbablyVisible(el)) return false;
+    const txt = compactText(el.getAttribute?.('aria-label') || el.textContent || el.value || '').toLowerCase();
+    const href = el.href || el.getAttribute?.('href') || '';
+    let externalHref = false;
+    try { externalHref = !!href && new URL(href, location.href).hostname.replace(/^www\./, '') !== location.hostname.replace(/^www\./, ''); } catch {}
+    if (/easy apply/.test(txt)) return false;
+    return /apply on (the )?company|apply externally|apply on employer|on company (site|website)|apply on .* website|apply now|^apply$/.test(txt)
+      && (externalHref || /company|external|employer|website/.test(txt));
+  } catch { return false; }
+}
+function findExternalApplyButton() {
+  try {
+    for (const el of qsa('a, button, [role="button"]')) {
+      if (looksExternalApplyButton(el)) return el;
+    }
+  } catch {}
+  return null;
 }
 
 // After clicking a final submit, the application is "sent" when the page shows a
@@ -417,10 +469,12 @@ async function tryAttachResume(root, resume) {
 export async function run(task, context, helpers) {
   if (S.running) return { ok: false, error: 'executor already running' };
   S.running = true; S.cancelled = false; S.paused = false; S.step = 0;
-  S.task = task; S.context = context; S.everHadForm = false;
+  S.task = task; S.context = context; S.everHadForm = false; S.externalRoute = false;
+  S.lastSeenSig = '';
 
   const { job, profile, profileId, resume, harvested, aiConfidenceMin = 0.7 } = context || {};
   const mode = task.mode || 'review';
+  const allowExternal = context?.easyApplyOnly === false;
   showOverlay(`${mode === 'review' ? 'Filling for your review' : 'Applying'} — ${job?.title || ''}`);
 
   // A structured profile is OPTIONAL — we also fill from harvested/learned
@@ -430,6 +484,7 @@ export async function run(task, context, helpers) {
   const profileData = { ...(profile?.data || {}) };
   const learnedCount = Array.isArray(harvested) ? harvested.length : 0;
   logLine('ok', `start mode=${mode} · profile=${profile ? 'loaded' : 'none'} · learned=${learnedCount} · resume=${resume?.name || 'none'}`);
+  reportSeen(document, 'job page');
 
   // ---- relevance gate: don't apply to roles above your level / excluded / that
   // demand far more experience than you set (re-checked against the live page). ----
@@ -928,7 +983,7 @@ export async function run(task, context, helpers) {
       .find((d) => isProbablyVisible(d) && d.querySelector('input, textarea, select, [role="combobox"], [contenteditable="true"]')) || null;
     const root = dialog || formProbe?.form || null;
     const haveForm = !!root;
-    if (haveForm) { everHadForm = true; S.everHadForm = true; signalHydrated(); }
+    if (haveForm) { everHadForm = true; S.everHadForm = true; signalHydrated(); reportSeen(root, 'apply form'); }
 
     // ---- fill from profile + learned answers ----
     setStatus(`Step ${S.step}: ${haveForm ? 'filling fields…' : 'opening the application…'}`);
@@ -1012,7 +1067,9 @@ export async function run(task, context, helpers) {
     setStatus(`Step ${S.step}: looking for next/submit…`);
     // In-form: prefer buttons inside the modal. Not open yet: also try LinkedIn's
     // Easy-Apply button to OPEN the form (covers postings the generic scan misses).
-    let btn = findAdvanceButton(root) || (!haveForm ? findEasyApplyButton() : null);
+    let btn = haveForm
+      ? findAdvanceButton(root)
+      : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(root));
     if (!btn) {
       const opening = !everHadForm;   // the apply form has never appeared yet
       // Background/occluded apply tabs get their JS timers throttled by Chrome, so
@@ -1053,7 +1110,9 @@ export async function run(task, context, helpers) {
       for (let i = 0; i < tries && !S.cancelled; i++) {
         if (opening && i % 4 === 0) { try { window.scrollTo(0, 600); window.scrollTo(0, 0); } catch {} }
         await sleep(500);
-        found = findAdvanceButton() || (!haveForm ? findEasyApplyButton() : null);
+        found = haveForm
+          ? findAdvanceButton(root)
+          : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton());
         if (found) { signalHydrated(); break; }
       }
       if (!found) {
@@ -1074,8 +1133,9 @@ export async function run(task, context, helpers) {
           // A genuinely EXTERNAL posting (apply on the company site) — JAT can't drive it.
           // SKIP it (terminal): retrying wastes the pool + drags the success rate, and the
           // tab is now an active/visible window so this detection is reliable.
-          report({ state: 'skipped', lastError: 'external — apply on the company site (not auto-applicable)', applyRoute: 'external' });
-          finalState = 'skipped'; break;
+          const st = allowExternal ? 'failed' : 'skipped';
+          report({ state: st, lastError: allowExternal ? 'external apply button was present but could not be opened — inspect' : 'external — apply on the company site (not auto-applicable)', applyRoute: 'external' });
+          finalState = st; break;
         }
         // Otherwise it's a transient non-open (late/throttled hydration, verification
         // gate) — fail RETRIABLY so retryStaleQueue re-attempts it later (capped).
@@ -1115,7 +1175,9 @@ export async function run(task, context, helpers) {
     // have changed since findAdvanceButton() above (validation re-render, etc.).
     let clickBtn = btn;
     if (clickBtn.disabled || !isProbablyVisible(clickBtn) || !document.contains(clickBtn)) {
-      clickBtn = findAdvanceButton(root) || findAdvanceButton() || (!haveForm ? findEasyApplyButton() : null);
+      clickBtn = haveForm
+        ? (findAdvanceButton(root) || findAdvanceButton())
+        : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton());
       if (!clickBtn) { logLine('warn', 'advance button became invalid before click — re-scanning'); continue; }
     }
     const label = compactText(clickBtn.textContent || clickBtn.value || '').slice(0, 30);
@@ -1127,6 +1189,10 @@ export async function run(task, context, helpers) {
       if (verdict === 'stopped') { break; }
     }
     logLine('ok', `clicking "${label}"`);
+    if (!haveForm && allowExternal && looksExternalApplyButton(clickBtn)) {
+      S.externalRoute = true;
+      logLine('ok', 'opening external/company apply route');
+    }
     setStatus(`Step ${S.step}: "${label}"…`);
     const prevHash = domHash();
     syntheticClick(clickBtn);

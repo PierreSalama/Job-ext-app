@@ -2202,8 +2202,52 @@ function pruneMissingFolderDocs(folderId) {
 // ============================================================
 // Auto-apply queue
 // ============================================================
+function taskSiteKey(job) {
+  const source = String(job?.source || job?._src || '').trim().toLowerCase();
+  const url = String(job?.jobUrl || job?.job_url || job?._url || '').trim();
+  try {
+    const cls = classifyAts(url);
+    if (cls?.ats && cls.ats !== 'direct') return `ats:${cls.ats}`;
+    const host = new URL(url).hostname.replace(/^www\./, '').toLowerCase();
+    if (host) return `host:${host}`;
+  } catch {}
+  if (source) return `source:${source}`;
+  return '';
+}
+
+function classifyQueueFailure(input = {}) {
+  const pending = Array.isArray(input.pendingQuestions) ? input.pendingQuestions : safeParse(input.pending_questions, []);
+  const tr = Array.isArray(input.transcript) ? input.transcript : safeParse(input.transcript, []);
+  const trail = tr.slice(-8).map((e) => e && (e.text || e.note || e.step || '')).join(' ');
+  const text = [
+    input.lastError || input.last_error || '',
+    input.parkReason || input.park_reason || '',
+    pending.map((q) => `${q?.question || ''} ${q?.reason || ''}`).join(' '),
+    trail,
+  ].join(' ').toLowerCase();
+  const state = String(input.state || '').toLowerCase();
+  const mk = (failureClass, action, label) => ({ failureClass, action, label });
+  if (state === 'done') return mk('submitted', 'complete', 'Submitted');
+  if (state === 'awaiting_review') return mk('review_gate', 'user', 'Ready for review');
+  if (['queued', 'scheduled', 'running'].includes(state)) return mk('in_flight', 'wait', 'In flight');
+  if (pending.length || state === 'parked' || state === 'awaiting_input' || /missing answer|needs your answer|no confident answer|legal\/eligibility|unanswered question/.test(text)) {
+    return mk('missing_info', 'user', 'Needs your answer, then retries');
+  }
+  if (/occlud|throttl|hydrate|not top frame|not loaded|component|timed out|interrupted|page stopped|stuck|no advance|did not change|did not attach|max steps|resume attachment|résumé did not attach|could not complete/.test(text)) {
+    return mk('transient_page', 'retry', 'Transient page/load issue, retries');
+  }
+  if (/easyapply-limit|easy apply.*limit|daily.*limit/.test(text)) return mk('easyapply_cooldown', 'wait', 'Easy Apply cooldown');
+  if (/captcha|human|unusual activity|login required|sign into/.test(text)) return mk('site_gate', 'user', 'Site gate needs you');
+  if (/external|company site|not auto-applicable|apply on the company site/.test(text)) return mk('external_site', 'inspect', 'External site skipped');
+  if (/already applied|punished|excluded keyword|above your level|academic\/research|relevance skip|needs ~\d+ yrs/.test(text)) return mk('relevance_skip', 'skip', 'Skipped by rules');
+  if (state === 'skipped') return mk('skipped_other', 'inspect', 'Skipped, inspectable');
+  if (state === 'failed') return mk('unknown_failure', 'inspect', 'Failed, needs inspection');
+  return mk('none', 'wait', 'No issue');
+}
+
 function rowToTask(r) {
   if (!r) return null;
+  const failure = classifyQueueFailure(r);
   return {
     id: r.id, jobId: r.job_id, state: r.state, mode: r.mode,
     scheduledAt: r.scheduled_at, attempts: r.attempts, lastError: r.last_error,
@@ -2211,6 +2255,9 @@ function rowToTask(r) {
     parkReason: r.park_reason || null,
     applyRoute: r.apply_route || null,
     pendingQuestions: safeParse(r.pending_questions, []),
+    failureClass: failure.failureClass,
+    failureAction: failure.action,
+    failureLabel: failure.label,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }
@@ -2225,6 +2272,23 @@ function queueList({ state } = {}) {
     ...rowToTask(r),
     job: { title: r._title, company: r._company, jobUrl: r._url, source: r._src },
   }));
+}
+
+function queueActiveSiteKeys() {
+  return all(
+    `SELECT t.id AS task_id, t.state, j.title, j.company, j.source, j.job_url
+       FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
+      WHERE t.state IN ('scheduled','running')
+      ORDER BY t.scheduled_at ASC`
+  ).map((r) => ({
+    taskId: r.task_id,
+    state: r.state,
+    siteKey: taskSiteKey(r),
+    source: r.source || '',
+    title: r.title || '',
+    company: r.company || '',
+    jobUrl: r.job_url || '',
+  })).filter((r) => r.siteKey);
 }
 
 // Auto-apply OUTCOME history for the dashboard's "submissions data" view: every
@@ -2251,6 +2315,7 @@ function queueHistory({ days = 7, state } = {}) {
     return {
       taskId: t.id, jobId: t.jobId, state: t.state, mode: t.mode,
       outcome: OUTCOME[t.state] || t.state, reason,
+      failureClass: t.failureClass, failureAction: t.failureAction, failureLabel: t.failureLabel,
       updatedAt: t.updatedAt, createdAt: t.createdAt, pendingQuestions: t.pendingQuestions,
       job: { title: r._title, company: r._company, jobUrl: r._url, source: r._src, status: r._status, submittedAt: r._submittedAt },
     };
@@ -2275,7 +2340,7 @@ function queueBreakdown({ days = 30 } = {}) {
     parked: 'needs_you', awaiting_input: 'needs_you', skipped: 'skipped',
     queued: 'pending', scheduled: 'pending', running: 'running',
   };
-  const byOutcome = {}, byBoard = {}, byRoute = {}, reasons = {};
+  const byOutcome = {}, byBoard = {}, byRoute = {}, byFailureClass = {}, byFailureAction = {}, reasons = {};
   const bump = (obj, k1, k2) => {
     if (!obj[k1]) obj[k1] = {};
     obj[k1][k2] = (obj[k1][k2] || 0) + 1;
@@ -2285,6 +2350,9 @@ function queueBreakdown({ days = 30 } = {}) {
     byOutcome[oc] = (byOutcome[oc] || 0) + 1;
     bump(byBoard, (r.src || 'other').toLowerCase(), oc);
     bump(byRoute, r.apply_route || 'unknown', oc);
+    const failure = classifyQueueFailure(r);
+    if (failure.failureClass && failure.failureClass !== 'none') byFailureClass[failure.failureClass] = (byFailureClass[failure.failureClass] || 0) + 1;
+    if (failure.action) byFailureAction[failure.action] = (byFailureAction[failure.action] || 0) + 1;
     if (oc === 'failed' || oc === 'skipped' || oc === 'needs_you') {
       const reason = String(r.last_error || r.park_reason || '').slice(0, 80) || '(unspecified)';
       reasons[reason] = (reasons[reason] || 0) + 1;
@@ -2293,7 +2361,7 @@ function queueBreakdown({ days = 30 } = {}) {
   const topReasons = Object.entries(reasons)
     .sort((a, b) => b[1] - a[1]).slice(0, 8)
     .map(([reason, count]) => ({ reason, count }));
-  return { total: rows.length, days, byOutcome, byBoard, byRoute, topReasons };
+  return { total: rows.length, days, byOutcome, byBoard, byRoute, byFailureClass, byFailureAction, topReasons };
 }
 
 // Live snapshot for the Auto-apply "Running now" panel: the in-flight workers
@@ -2310,6 +2378,7 @@ function queueLive({ startedAt } = {}) {
     const tk = rowToTask(r);
     const tr = tk.transcript || [];
     const last = tr[tr.length - 1] || null;
+    const seen = tr.filter((e) => e && e.kind === 'seen').slice(-2);
     return {
       taskId: tk.id, title: r._title || '', company: r._company || '', source: r._src || '',
       step: last ? String(last.text || last.note || last.step || '').slice(0, 120) : 'starting…',
@@ -2318,11 +2387,24 @@ function queueLive({ startedAt } = {}) {
       // answering right now, plus its route, attempt count, any pending questions + URL.
       trail: tr.slice(-9).map((e) => ({
         ts: e.ts || null,
+        kind: e.kind || 'log',
         level: e.level || 'info',
         text: String(e.text || e.note || e.step || '').slice(0, 170),
+        fields: Array.isArray(e.fields) ? e.fields.slice(0, 8) : [],
+        buttons: Array.isArray(e.buttons) ? e.buttons.slice(0, 8) : [],
+        url: e.url || '',
+      })),
+      seen: seen.map((e) => ({
+        ts: e.ts || null,
+        text: String(e.text || '').slice(0, 260),
+        fields: Array.isArray(e.fields) ? e.fields.slice(0, 10) : [],
+        buttons: Array.isArray(e.buttons) ? e.buttons.slice(0, 10) : [],
+        url: e.url || '',
       })),
       route: tk.applyRoute || null,
       attempts: tk.attempts || 0,
+      siteKey: taskSiteKey(r),
+      failureClass: tk.failureClass, failureAction: tk.failureAction, failureLabel: tk.failureLabel,
       pendingQuestions: (tk.pendingQuestions || []).slice(0, 6),
       jobUrl: r._url || '',
       startedAt: tk.scheduledAt || tk.updatedAt, mode: tk.mode,
@@ -2344,7 +2426,7 @@ function queueLive({ startedAt } = {}) {
     failed: by.failed || 0,
   };
   session.finished = session.submitted + session.readyForReview + session.parked + session.needsYou + session.skipped + session.failed;
-  return { running, active: running.length, scheduled, queuedDepth, session };
+  return { running, active: running.length, scheduled, queuedDepth, session, activeSites: queueActiveSiteKeys() };
 }
 
 // Pool refresh when discovery is exhausted (found jobs but all already tried):
@@ -2355,12 +2437,16 @@ function queueLive({ startedAt } = {}) {
 function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25 } = {}) {
   const cutoff = new Date(Date.now() - Math.max(1, olderThanMinutes) * 60000).toISOString();
   const rows = all(
-    `SELECT t.id FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
+    `SELECT t.* FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
      WHERE t.state = 'failed' AND t.updated_at < ?
        AND COALESCE(t.attempts, 0) < ? AND j.status != 'submitted'
      ORDER BY t.updated_at ASC LIMIT ?`, [cutoff, maxAttempts, limit]);
   let n = 0;
-  for (const r of rows) { if (queuePatch(r.id, { state: 'queued', lastError: null, attemptsDelta: 1 })) n++; }
+  for (const r of rows) {
+    const failure = classifyQueueFailure(r);
+    if (failure.action !== 'retry') continue;
+    if (queuePatch(r.id, { state: 'queued', lastError: null, attemptsDelta: 1, transcriptAppend: { note: `self-heal retry after ${failure.failureClass}` } })) n++;
+  }
   return n;
 }
 
@@ -3510,6 +3596,7 @@ module.exports = {
   extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
   queueList, queueHistory, queueBreakdown, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, saveIntakeAnswer,
+  classifyQueueFailure, taskSiteKey, queueActiveSiteKeys,
   setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,

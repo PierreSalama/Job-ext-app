@@ -1742,8 +1742,18 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
 .trail-line.lv-warn .t-dot { color: var(--warn); }
 .trail-line.lv-err  { color: var(--danger); }
 .trail-line.lv-err  .t-dot { color: var(--danger); }
+.trail-line.lv-seen { color: color-mix(in srgb, var(--primary) 70%, var(--body-text)); }
 .trail-line.cur { color: var(--text); }
 .trail-line.cur .t-dot { color: var(--primary); }
+.aa-seen {
+  margin: 0 16px 12px 18px; padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--primary) 24%, var(--border));
+  background: var(--wash-04);
+}
+.aa-seen-label { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--primary); margin-bottom: 5px; }
+.aa-seen-text { font-size: 12px; color: var(--body-text); overflow-wrap: anywhere; }
+.aa-seen-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 7px; font-size: 10px; color: var(--muted); }
+.aa-seen-row b { font-weight: 500; color: var(--text); background: var(--wash-08); border: 1px solid var(--border); padding: 2px 6px; border-radius: 4px; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .aa-worker-q { padding: 8px 16px 12px 18px; border-top: 1px dashed var(--border); font-size: 11px; color: var(--warn); }
 
 .aa-empty-live { padding: 20px 18px; text-align: center; color: var(--muted); font-size: 12px; border: 1px dashed var(--border); }
