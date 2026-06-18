@@ -94,7 +94,8 @@ const send = (msg) => new Promise((res) => {
 
 const S = {
   running: false, paused: false, cancelled: false,
-  step: 0, overlay: null, task: null, context: null,
+  step: 0, overlay: null, task: null, context: null, supervisor: null,
+  sessionSettings: { pace: 1, confidence: 0.7, stallLimit: 3 }, nextRequested: false,
 };
 
 // ============================================================
@@ -168,10 +169,12 @@ function hideOverlay(afterMs = 4000) {
   setTimeout(() => { S.overlay?.remove(); S.overlay = null; }, afterMs);
 }
 function setStatus(s) {
+  try { S.supervisor?.setStep({ text: s }); } catch {}
   const el = S.overlay?.querySelector('#jat11-aa-status');
   if (el) el.textContent = s;
 }
 function logLine(level, text) {
+  try { S.supervisor?.log(level, `[${S.step}] ${text}`); } catch {}
   const log = S.overlay?.querySelector('#jat11-aa-log');
   if (log) {
     const d = document.createElement('div');
@@ -199,6 +202,7 @@ function reportSeen(root, phase) {
     const sig = `${phase}|${location.href}|${fields.join('|')}|${buttons.join('|')}`;
     if (S.lastSeenSig === sig) return;
     S.lastSeenSig = sig;
+    try { S.supervisor?.setTelemetry({ stage: phase, step: S.step, fields: fields.length, seen: `${text} | Fields: ${fields.join(', ')} | Buttons: ${buttons.join(', ')}` }); } catch {}
     report({ transcriptAppend: {
       kind: 'seen',
       step: S.step,
@@ -497,9 +501,10 @@ export async function run(task, context, helpers) {
   if (S.running) return { ok: false, error: 'executor already running' };
   S.running = true; S.cancelled = false; S.paused = false; S.step = 0;
   S.task = task; S.context = context; S.everHadForm = false; S.externalRoute = false;
-  S.lastSeenSig = '';
+  S.lastSeenSig = ''; S.supervisor = null; S.nextRequested = false;
 
   const { job, profile, profileId, resume, harvested, aiConfidenceMin = 0.7 } = context || {};
+  S.sessionSettings = { pace: 1, confidence: aiConfidenceMin, stallLimit: 3 };
   const mode = task.mode || 'review';
   const allowExternal = context?.easyApplyOnly === false;
   showOverlay(`${mode === 'review' ? 'Filling for your review' : 'Applying'} — ${job?.title || ''}`);
@@ -589,6 +594,7 @@ export async function run(task, context, helpers) {
       const initialMode = (() => { try { return pickRunMode(recipe, { trust: context?.trust ?? 0.7 }); } catch { return 'step'; } })();
       sup = createSupervisor({
         mode: initialMode,
+        confidence: aiConfidenceMin,
         labelFn: (el) => { try { return fieldLabel(el); } catch { return ''; } },
         // The detected-list of fillable fields + advance buttons on the current step.
         fieldsFn: (root) => {
@@ -607,8 +613,18 @@ export async function run(task, context, helpers) {
           return out;
         },
         onStop: () => { try { cancel('teach-stop'); } catch {} },
+        onPause: (paused) => { S.paused = !!paused; report({ transcriptAppend: { kind: 'control', note: paused ? 'supervised run paused' : 'supervised run resumed' } }); },
+        onSettings: (settings) => { S.sessionSettings = { ...S.sessionSettings, ...settings }; report({ transcriptAppend: { kind: 'control', note: `session tuning pace=${settings.pace} confidence=${settings.confidence} stallLimit=${settings.stallLimit}` } }); },
+        onNextJob: () => { S.nextRequested = true; report({ transcriptAppend: { kind: 'control', note: 'user requested skip current and supervise next job' } }); },
       });
       sup.show();
+      S.supervisor = sup;
+      sup.setTelemetry({ stage: 'starting', step: 0, fields: 0, recovery: 'healthy', seen: `${job?.title || 'Current job'} at ${job?.company || location.hostname}` });
+      try { S.overlay?.remove(); S.overlay = null; } catch {}
+      try {
+        const recorder = await import(chrome.runtime.getURL('content/recorder.js'));
+        await recorder.start({ preapproved: true });
+      } catch {}
       logLine('ok', `supervised run — default mode "${initialMode}" (Step/Run toggle in the panel)`);
     } catch (e) {
       sup = null;   // overlay failed to load → run exactly as the normal auto path
@@ -803,7 +819,7 @@ export async function run(task, context, helpers) {
           body: { question: label, fieldType: step.fieldType, options: step.options, jobId: job?.id, profileId },
         });
         const a = (r?.ok && r.result && typeof r.result.answer === 'string' && typeof r.result.confidence === 'number') ? r.result : null;
-        if (a && !a.refuse && a.confidence >= aiConfidenceMin && a.answer.trim()) aiVal = a.answer;
+        if (a && !a.refuse && a.confidence >= S.sessionSettings.confidence && a.answer.trim()) aiVal = a.answer;
       } catch {}
     }
     return resolveStepAnswer(step, ladderCtx);   // re-walk with aiVal now populated
@@ -898,7 +914,7 @@ export async function run(task, context, helpers) {
         const value = await resolveReplayValue(step, curRoot);
         if (value == null) continue;   // no grounded answer → leave it; divergence recheck catches a required gap.
         // Human pacing: a brief pre-action pause (mousedown→pause→mouseup feel).
-        await sleep(paceDelay(step.medianDelayMs));
+        await sleep(paceDelay(step.medianDelayMs) * S.sessionSettings.pace);
         const ok = await replayFill(target, value);
         if (ok) {
           logLine('ok', `replayed "${String(step.labelPattern).slice(0, 40)}"`);
@@ -935,7 +951,7 @@ export async function run(task, context, helpers) {
       }
 
       const prevHash = domHash();
-      await sleep(paceDelay(0, undefined, { defaultBaseMs: 300 }));   // brief pre-click settle (paced)
+      await sleep(paceDelay(0, undefined, { defaultBaseMs: 300 }) * S.sessionSettings.pace);   // brief pre-click settle (paced)
       syntheticClick(btn);
       const changed = await waitForChange(prevHash);
       if (!changed) {
@@ -977,8 +993,9 @@ export async function run(task, context, helpers) {
     if (blocker) {
       logLine('warn', `${blocker} detected — handing back to you`);
       setStatus(blocker === 'captcha' ? 'CAPTCHA — your move' : 'Login required — your move');
-      report({ state: 'failed', lastError: blocker === 'captcha' ? 'captcha — pass it in this browser, will retry' : 'login required — sign into the site in this browser, will retry' });
-      finalState = 'failed';
+      const question = blocker === 'captcha' ? 'Complete the site CAPTCHA, then retry this application.' : 'Sign into this site in Chrome, then retry this application.';
+      report({ state: 'awaiting_input', lastError: question, parkReason: blocker, pendingQuestions: [{ question, fieldType: 'site_gate', reason: blocker }], transcriptAppend: { kind: 'recovery', note: `${blocker} requires user intervention before retry` } });
+      finalState = 'awaiting_input';
       break;
     }
 
@@ -1057,7 +1074,7 @@ export async function run(task, context, helpers) {
       // non-string answer) must NEVER be treated as a confident answer.
       const a = (r?.ok && r.result && typeof r.result.answer === 'string'
                  && typeof r.result.confidence === 'number') ? r.result : null;
-      if (!a || a.refuse || a.confidence < aiConfidenceMin || !a.answer.trim()) {
+      if (!a || a.refuse || a.confidence < S.sessionSettings.confidence || !a.answer.trim()) {
         logLine('warn', `no grounded answer for "${u.label.slice(0, 50)}" (${a ? 'conf ' + a.confidence : 'ai failed/malformed'})`);
         // Not highly confident → park it (don't guess). Required fields and any
         // job-board screening question must be answered before we submit.
@@ -1220,8 +1237,12 @@ export async function run(task, context, helpers) {
     // Pause before advancing for the user's OK (Step mode) / honor a "Wrong" interrupt
     // (Run mode). A correction here rewrites the recipe + applies live before we advance.
     if (sup) {
-      const verdict = await superviseGate({ root, label, text: `About to click "${label}"` });
+      const verdict = isFinal
+        ? await sup.beforeSubmit({ root, label, text: `Final submit ready: "${label}"` })
+        : await superviseGate({ root, label, text: `About to click "${label}"` });
       if (verdict === 'stopped') { break; }
+      if (isFinal && verdict !== 'apply') { cancel('submit-not-approved'); break; }
+      if (isFinal) report({ transcriptAppend: { kind: 'control', note: 'user explicitly approved final submit' } });
     }
     logLine('ok', `clicking "${label}"`);
     if (!haveForm && allowExternal && looksExternalApplyButton(clickBtn)) {
@@ -1239,7 +1260,21 @@ export async function run(task, context, helpers) {
     const isFinalAuto = isFinal && mode !== 'review';
     if (!changed && !isFinalAuto) {
       logLine('warn', 'page did not change after click');
-      if (++noChange >= 3) {
+      if (++noChange >= S.sessionSettings.stallLimit) {
+        if (sup) {
+          const fingerprint = `${location.hostname}|${location.pathname}|${label}|${domHash()}`;
+          report({ transcriptAppend: { kind: 'recovery', note: 'repeated unchanged screen', fingerprint, count: noChange } });
+          const decision = await sup.recoveryDecision({ reason: `stalled x${noChange}`, text: `The page did not advance after "${label}". Retry, fix the correct element, or skip.` });
+          report({ transcriptAppend: { kind: 'recovery', note: `user chose ${decision}`, fingerprint } });
+          if (decision === 'retry') { noChange = 0; continue; }
+          if (decision === 'fix') {
+            const replacement = await sup.requestCorrection({ label });
+            if (replacement) await applyCorrection(label, replacement);
+            noChange = 0; continue;
+          }
+          cancel('recovery-skip');
+          break;
+        }
         if (parked.length) { reportParked('stalled'); break; }
         // Find WHY the page won't advance. LinkedIn flags the offending field with an
         // INLINE ERROR (role=alert / artdeco-inline-feedback--error) — that's the ground
@@ -1277,7 +1312,8 @@ export async function run(task, context, helpers) {
         // know exactly which field to resolve next.
         const why = blockerText ? `blocked: ${blockerText} — will retry` : 'stuck on a step (page stopped advancing) — will retry';
         logLine('warn', 'stuck — ' + (blockerText || 'page stopped advancing'));
-        report({ state: 'failed', lastError: why });
+        const fingerprint = `${location.hostname}|${location.pathname}|${label}|${domHash()}`;
+        report({ state: 'failed', lastError: why, transcriptAppend: { kind: 'recovery', note: 'automatic recovery exhausted on unchanged screen', fingerprint, count: noChange } });
         finalState = 'failed';
         break;
       }
@@ -1331,6 +1367,7 @@ export async function run(task, context, helpers) {
   // ended before the form hydrated (external/failed/cancelled). No-op when none requested.
   try { signalHydrated(); } catch {}
   try { sup?.destroy(); } catch {}
+  S.supervisor = null;
   hideOverlay(finalState === 'awaiting_review' || finalState === 'awaiting_input' || finalState === 'parked' ? 60000 : 4000);
-  return { ok: true, state: finalState || (S.cancelled ? 'skipped' : 'unknown'), steps: S.step };
+  return { ok: true, state: finalState || (S.cancelled ? 'skipped' : 'unknown'), steps: S.step, nextRequested: S.nextRequested };
 }

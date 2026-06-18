@@ -217,26 +217,8 @@ $('#btn-capture').addEventListener('click', async () => {
   setTimeout(() => { paintPage(); boot(); }, 700);
 });
 
-// ---- Teach Mode toggle (Teach & Correct T2) ----
-// Writes chrome.storage.local['jat11.teachMode']; the in-page recorder reads/watches it.
 const TEACH_KEY = 'jat11.teachMode';
-function paintTeach(on) {
-  const btn = $('#teach-toggle');
-  btn.textContent = on ? 'On' : 'Off';
-  btn.classList.toggle('on', !!on);
-  btn.setAttribute('aria-pressed', on ? 'true' : 'false');
-}
-chrome.storage.local.get(TEACH_KEY).then((s) => paintTeach(!!s[TEACH_KEY])).catch(() => {});
-$('#teach-toggle').addEventListener('click', async () => {
-  const cur = (await chrome.storage.local.get(TEACH_KEY))[TEACH_KEY];
-  const next = !cur;
-  await chrome.storage.local.set({ [TEACH_KEY]: next });
-  paintTeach(next);
-});
-
-// ---- Watch & Teach (T4) — supervised run of the next queued job ----
-// Sends the SW `watch-and-teach` message (the wiring T4 added); the SW opens the next
-// queued job in a supervised run with the Step/Run + on-page Fix-this overlay.
+// ---- Control Studio — one entry point for record + watch + teach + heal ----
 $('#watch-teach-btn').addEventListener('click', async () => {
   const btn = $('#watch-teach-btn');
   if (btn.disabled) return;
@@ -245,17 +227,18 @@ $('#watch-teach-btn').addEventListener('click', async () => {
   btn.textContent = 'Starting…';
   const status = $('#action-status');
   setHint(status, '');
+  await chrome.storage.local.set({ [TEACH_KEY]: true });
   const r = await send({ type: 'watch-and-teach' });
   // dispatched === true → a supervised run actually started (active tab or queued job).
   // dispatched === false → nothing to teach: surface the reason instead of silently
   // flipping back to Start.
   if (r?.ok && r.dispatched) {
-    btn.textContent = 'Watching ✓';
+    btn.textContent = 'Open ✓';
   } else {
     btn.textContent = label;
     const msg = r?.message || r?.reason || r?.error;
     const friendly = (msg === 'no-job' || !msg)
-      ? 'Open a job posting first, then Watch & teach'
+      ? 'Open a job posting first, then open Control Studio'
       : msg === 'app offline' ? 'Open the app first'
       : msg === 'not paired' ? 'Connect the app first'
       : msg;

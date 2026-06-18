@@ -24,6 +24,8 @@ jobs:
         run: node tools/mirror.mjs --check
       - name: Version sync gate
         run: node tools/validate-versions.mjs
+      - name: Extension contract and safety gate
+        run: node tools/validate-extension.mjs
       - name: Install app deps (db-backed tests need node-sqlite3-wasm etc.)
         working-directory: app
         run: npm install --no-audit --no-fund

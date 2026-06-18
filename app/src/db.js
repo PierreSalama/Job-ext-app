@@ -2227,6 +2227,8 @@ function classifyQueueFailure(input = {}) {
   ].join(' ').toLowerCase();
   const source = String(input.source || input._src || input.job?.source || '').toLowerCase();
   const state = String(input.state || '').toLowerCase();
+  const fingerprints = tr.filter((e) => e?.kind === 'recovery' && e?.fingerprint).map((e) => e.fingerprint);
+  const repeatedFingerprint = fingerprints.length >= 2 && fingerprints.slice(-2).every((f) => f === fingerprints[fingerprints.length - 1]);
   const mk = (failureClass, action, label) => ({ failureClass, action, label });
   if (state === 'done') return mk('submitted', 'complete', 'Submitted');
   if (state === 'awaiting_review') return mk('review_gate', 'user', 'Ready for review');
@@ -2238,6 +2240,7 @@ function classifyQueueFailure(input = {}) {
   if (/captcha|human|unusual activity|login required|sign into|sign-in required|sign in required|sign.?in required|site sign.?in|required before applying|connectez-vous/.test(text)) return mk('site_gate', 'user', 'Site gate needs you');
   if (/external|company site|employer site|not auto-applicable|apply on the company site|postuler sur le site/.test(text)) return mk('external_site', 'inspect', 'External site skipped');
   if (source === 'glassdoor' && /hydrate|no advance|did not open|application not open/.test(text)) return mk('external_site', 'inspect', 'Glassdoor posting was not auto-applicable');
+  if (state === 'failed' && repeatedFingerprint) return mk('repeated_failure', 'inspect', 'Same screen failed repeatedly, needs inspection');
   if (/occlud|throttl|hydrate|not top frame|not loaded|component|timed out|interrupted|page stopped|stuck|no advance|did not change|did not attach|max steps|resume attachment|résumé did not attach|could not complete/.test(text)) {
     return mk('transient_page', 'retry', 'Transient page/load issue, retries');
   }
@@ -2441,19 +2444,9 @@ function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25 } 
   const rows = all(
     `SELECT t.*, j.source AS _src, j.job_url AS _url FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
      WHERE t.state = 'failed' AND t.updated_at < ?
-       AND (
-         COALESCE(t.attempts, 0) < ?
-         OR (
-           LOWER(COALESCE(j.source, '')) = 'linkedin'
-           AND COALESCE(t.attempts, 0) < (? + 3)
-           AND (
-             COALESCE(t.last_error, '') LIKE '%stuck on a step%'
-             OR COALESCE(t.last_error, '') LIKE '%page stopped advancing%'
-           )
-         )
-       )
+       AND COALESCE(t.attempts, 0) < ?
        AND j.status != 'submitted'
-     ORDER BY t.updated_at ASC LIMIT ?`, [cutoff, maxAttempts, maxAttempts, limit]);
+     ORDER BY t.updated_at ASC LIMIT ?`, [cutoff, maxAttempts, limit]);
   let n = 0;
   for (const r of rows) {
     const failure = classifyQueueFailure(r);

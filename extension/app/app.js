@@ -1949,7 +1949,7 @@ route('/queue', async () => {
           : '<span class="muted">No search yet — turn it on (and keep Chrome open). It searches about once a minute when the queue is low.</span>'}
       </div>
       <div class="aa-disco-actions">
-        <button class="btn small primary" data-supervise-next title="The very next application opens ON-SCREEN in supervised mode — you watch each step and can correct any mistake (it learns from your fix). Works whether or not Chrome is in front.">👁 Watch &amp; Teach the next application</button>
+        <button class="btn small primary" data-supervise-next title="Open the next application in Control Studio with live robot vision, pause, step, correction, recovery, skip and explicit submit controls.">Open Control Studio for next application</button>
         ${state.host === 'extension'
           ? '<button class="btn small" data-run-disco>🔍 Search now</button> <button class="btn small" data-test-apply title="TEST: apply the next queued job right now, skipping pacing. (Removed later.)">⚡ Apply next now</button>'
           : '<span class="muted" style="font-size:11px">Search &amp; test run from the Chrome extension</span>'}
@@ -2320,7 +2320,7 @@ route('/queue', async () => {
     btn.disabled = false; btn.textContent = '⚡ Apply next now';
   });
 
-  // Watch & Teach the NEXT application FROM THE DASHBOARD. The Electron window can't send
+  // Arm Control Studio for the NEXT application FROM THE DASHBOARD. The Electron window can't send
   // chrome.runtime messages, so we arm a one-shot server flag (consumed by queueNext) that
   // makes the next auto-apply dispatch run supervised, on-screen (Step/Run + Fix-this).
   v.querySelector('[data-supervise-next]')?.addEventListener('click', async (e) => {
@@ -2630,7 +2630,7 @@ route('/procedures', async () => {
         ${rs.map(recipeCardHtml).join('')}
       </div>`).join('')
     : emptyHtml('Nothing taught', onlyAttn ? 'No steps need attention' : 'No procedures learned yet',
-        onlyAttn ? 'Everything the system has learned looks healthy.' : 'Apply to a few jobs (or run Watch & Teach) and the steps it learns appear here, editable.');
+        onlyAttn ? 'Everything the system has learned looks healthy.' : 'Apply to a few jobs (or use Control Studio) and the steps it learns appear here, editable.');
 
   const v = el(`<div>
     <header class="page-header">

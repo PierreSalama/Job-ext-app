@@ -227,8 +227,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       respond(forceApplyOne().then((s) => ({ ok: true, ...s })));
       return true;
     case 'watch-and-teach':
-      // "Watch & Teach" [T4]: supervised apply of the next queued job — Step/Run overlay +
-      // on-page Fix-this picker; corrections rewrite the recipe authoritatively.
+      // Unified Control Studio: recording is preapproved for the session and the
+      // supervised overlay owns pacing, correction, recovery and submit approval.
+      try { chrome.storage.local?.set({ 'jat11.teachMode': true }); } catch {}
       respond(watchAndTeachOne().then((s) => ({ ok: true, ...s })));
       return true;
     case 'stop-autoapply':
@@ -1087,6 +1088,7 @@ async function launchOne(task, context) {
     if (finalState !== 'running') {
       await api.call('PATCH', '/queue/' + task.id, { state: finalState });   // idempotent reconcile
     }
+    if (result?.nextRequested) setTimeout(() => { watchAndTeachOne().catch(() => {}); }, 900);
     // Close the apply tab on terminal outcomes AND on awaiting_input — the user now
     // finishes parked/needs-you items from the Applications "Needs your input" panel in
     // the dashboard, NOT in the tab, so leaving them open just piled tabs to 90+. Only
@@ -1202,7 +1204,10 @@ async function watchAndTeachOne() {
   // rather than yanking the next queued job into a fresh window. Only when the active tab
   // isn't a job page do we fall back to /queue/next.
   const active = await superviseActiveTab();
-  if (active) return active;
+  if (active) {
+    if (active.nextRequested) setTimeout(() => { watchAndTeachOne().catch(() => {}); }, 900);
+    return active;
+  }
 
   const r = await api.call('GET', '/queue/next?force=1', null, 8000);
   if (r && r.concurrency) currentConcurrency = Math.max(1, Math.min(8, r.concurrency));
@@ -1237,7 +1242,7 @@ async function superviseActiveTab() {
   try {
     const result = await chrome.tabs.sendMessage(tab.id, { type: 'jat11.supervised-run', task, context }, { frameId: 0 });
     if (result && result.ok !== false) {
-      return { dispatched: true, scope: 'active-tab', state: result.state || 'supervised', title: tab.title || '' };
+      return { dispatched: true, scope: 'active-tab', state: result.state || 'supervised', title: tab.title || '', nextRequested: !!result.nextRequested };
     }
     return { dispatched: false, reason: result?.error || 'could not start in this tab' };
   } catch (e) {

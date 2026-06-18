@@ -28,6 +28,12 @@ test('classifyQueueFailure maps failures to retry/user/inspect policy', () => {
   assert.equal(db.classifyQueueFailure({ state: 'skipped', last_error: 'site sign-in required before applying — skipped' }).action, 'user');
   assert.equal(db.classifyQueueFailure({ state: 'failed', last_error: 'Postuler sur le site de l’employeur; Easy-Apply form did not hydrate' }).action, 'inspect');
   assert.equal(db.classifyQueueFailure({ state: 'failed', _src: 'glassdoor', last_error: 'Easy-Apply form did not hydrate — will retry' }).action, 'inspect');
+  const repeated = { state: 'failed', last_error: 'page stopped advancing', transcript: JSON.stringify([
+    { kind: 'recovery', fingerprint: 'linkedin|step2|next|abc' },
+    { kind: 'recovery', fingerprint: 'linkedin|step2|next|abc' },
+  ]) };
+  assert.equal(db.classifyQueueFailure(repeated).failureClass, 'repeated_failure');
+  assert.equal(db.classifyQueueFailure(repeated).action, 'inspect');
 });
 
 test('classification exposes the retry gate used by stale retry', () => {

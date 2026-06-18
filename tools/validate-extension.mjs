@@ -100,7 +100,7 @@ const senders = popup + loader + detector + executor;
 const sent = [...senders.matchAll(/type:\s*'([\w.-]+)'/g)].map((m) => m[1]);
 // SW-bound messages (not the tab-bound jat11.* ones the SW SENDS to content)
 const swBound = ['ping', 'app-health', 'pair-app', 'popup-state', 'check-app-update', 'check-ext-update',
-  'download-app-installer', 'capture-now', 'pipeline-event', 'qa-record', 'api-call', 'task-progress', 'get-token', 'get-document'];
+  'download-app-installer', 'capture-now', 'watch-and-teach', 'pipeline-event', 'qa-record', 'api-call', 'task-progress', 'get-token', 'get-document'];
 for (const t of swBound) ok(handled.includes(t), 'SW handles message: ' + t);
 ok(sent.includes('jat11.page-state'), 'popup sends jat11.page-state (page card)');
 // content-script-bound messages the SW/popup send → handled in loader
@@ -112,6 +112,12 @@ ok(/NEVER_AUTOFILL_RX/.test(executor) && /ethnic|race|gender/.test(executor), 'e
 ok(/awaiting_review/.test(executor) && /mode === 'review'/.test(executor), 'review mode stops before final submit');
 ok(/captchaOrLoginPresent/.test(executor), 'captcha/login detection present');
 ok(/aiConfidenceMin/.test(executor), 'AI answers are confidence-gated');
+const supervisor = read('content/supervise.js');
+ok(/beforeSubmit/.test(supervisor) && /Apply this job/.test(supervisor), 'supervised final submit requires an explicit Apply command');
+ok(/recoveryDecision/.test(supervisor) && /Retry step/.test(supervisor) && /Skip \+ next/.test(supervisor), 'Control Studio exposes recovery and chained-job controls');
+ok(/setTelemetry/.test(supervisor) && /Robot sees/.test(supervisor), 'Control Studio exposes live robot-view telemetry');
+ok(/session tuning/i.test(supervisor) && /stallLimit/.test(supervisor), 'Control Studio exposes session-scoped tuning');
+ok(/preapproved: true/.test(executor), 'supervised sessions preapprove the recorder learning path');
 
 grp('Auto-apply resource cleanup invariants');
 ok(/AA_WINDOW_POOL_KEY/.test(bg) && /jat11\.aaWindowPool/.test(bg), 'parallel apply window pool is persisted across MV3 restarts');

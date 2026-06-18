@@ -46,26 +46,47 @@ export function createSupervisor(opts = {}) {
     picking: false,
     root: null,        // current apply-form root (set by the executor each step)
     fieldsFn: opts.fieldsFn || null,   // () => [{ input, label }] of fillable fields + buttons
+    paused: false,
+    submitResolve: null,
+    recoveryResolve: null,
+    telemetry: {},
+    settings: {
+      pace: 1,
+      confidence: Number(opts.confidence || 0.7),
+      stallLimit: Number(opts.stallLimit || 3),
+    },
   };
 
   let panel = null, stepLine = null, modeBtn = null, nextBtn = null, fixBtn = null;
+  let pauseBtn = null, applyBtn = null, retryBtn = null, telemetryEl = null, seenEl = null, logEl = null;
 
   // ---------- panel ----------
   function buildPanel() {
     try {
       if (panel) return;
       panel = el('div', { id: 'jat11-teach' }, {
-        position: 'fixed', top: '20px', left: '50%', transform: 'translateX(-50%)',
-        zIndex: Z, width: '440px', maxWidth: '92vw', padding: '14px 16px',
+        position: 'fixed', top: '16px', right: '16px',
+        zIndex: Z, width: '520px', maxWidth: 'calc(100vw - 32px)', padding: '14px 16px',
         background: 'rgba(10,10,10,0.97)', color: '#f4efe6',
         border: '1px solid #3a342d', borderTop: '2px solid #b08a5a',
         boxShadow: '0 18px 50px rgba(0,0,0,0.55)',
         font: '500 13px "Inter", -apple-system, "Segoe UI", system-ui, sans-serif',
       });
       const head = el('div', {}, { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', fontSize: '11px', letterSpacing: '0.22em', textTransform: 'uppercase', color: '#b08a5a' });
-      head.textContent = '◉ Watch & Teach — supervised';
+      head.textContent = 'JAT Control Studio - watching, teaching and healing';
       stepLine = el('div', {}, { fontSize: '12px', color: '#d9d2c6', marginBottom: '10px', minHeight: '16px' });
       stepLine.textContent = 'Waiting for the apply form…';
+
+      telemetryEl = el('div', {}, { display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: '1px', background: '#302a24', border: '1px solid #302a24', marginBottom: '8px' });
+      for (const key of ['Stage', 'Step', 'Fields', 'Recovery']) {
+        const cell = el('div', {}, { background: '#15120f', padding: '7px', minWidth: '0' });
+        cell.setAttribute('data-metric', key.toLowerCase());
+        cell.innerHTML = `<div style="font-size:8px;color:#8b8378;text-transform:uppercase;letter-spacing:.12em">${key}</div><div data-value style="font-size:11px;color:#f4efe6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">-</div>`;
+        telemetryEl.append(cell);
+      }
+      seenEl = el('div', {}, { font: '10px/1.4 ui-monospace, Consolas, monospace', color: '#a99f92', background: '#0e0c0a', border: '1px solid #241f1a', padding: '7px', minHeight: '34px', maxHeight: '58px', overflow: 'auto', marginBottom: '8px' });
+      seenEl.textContent = 'Robot sees: waiting for page scan';
+      logEl = el('div', {}, { font: '10px/1.4 ui-monospace, Consolas, monospace', color: '#8b8378', background: '#0e0c0a', border: '1px solid #241f1a', padding: '7px', maxHeight: '76px', overflowY: 'auto', marginBottom: '8px' });
 
       const row = el('div', {}, { display: 'flex', gap: '6px' });
       const mkBtn = (label, danger) => {
@@ -82,15 +103,42 @@ export function createSupervisor(opts = {}) {
       modeBtn = mkBtn(state.mode === 'run' ? '▶ Run' : '⏸ Step');
       nextBtn = mkBtn('Next / Approve');
       fixBtn = mkBtn('Wrong / Fix this');
-      const stopBtn = mkBtn('Stop', true);
+      pauseBtn = mkBtn('Pause');
 
       modeBtn.addEventListener('click', (e) => { stopEv(e); toggleMode(); }, true);
       nextBtn.addEventListener('click', (e) => { stopEv(e); approve(); }, true);
       fixBtn.addEventListener('click', (e) => { stopEv(e); markWrong(); }, true);
-      stopBtn.addEventListener('click', (e) => { stopEv(e); stop('user'); }, true);
+      pauseBtn.addEventListener('click', (e) => { stopEv(e); setPaused(!state.paused); }, true);
 
-      row.append(modeBtn, nextBtn, fixBtn, stopBtn);
-      panel.append(head, stepLine, row);
+      row.append(modeBtn, pauseBtn, nextBtn, fixBtn);
+
+      const commandRow = el('div', {}, { display: 'flex', gap: '6px', marginTop: '6px' });
+      applyBtn = mkBtn('Apply this job');
+      retryBtn = mkBtn('Retry step');
+      const skipBtn = mkBtn('Skip job', true);
+      const nextJobBtn = mkBtn('Skip + next', true);
+      const stopBtn = mkBtn('Stop session', true);
+      applyBtn.addEventListener('click', (e) => { stopEv(e); approveSubmit(); }, true);
+      retryBtn.addEventListener('click', (e) => { stopEv(e); resolveRecovery('retry'); }, true);
+      skipBtn.addEventListener('click', (e) => { stopEv(e); stop('skip-job'); }, true);
+      nextJobBtn.addEventListener('click', (e) => { stopEv(e); try { opts.onNextJob?.(); } catch {} stop('skip-next'); }, true);
+      stopBtn.addEventListener('click', (e) => { stopEv(e); stop('user'); }, true);
+      commandRow.append(applyBtn, retryBtn, skipBtn, nextJobBtn, stopBtn);
+
+      const tuning = el('details', {}, { marginTop: '8px', color: '#8b8378' });
+      const summary = el('summary', {}, { cursor: 'pointer', fontSize: '10px', textTransform: 'uppercase', letterSpacing: '.12em', color: '#b08a5a' });
+      summary.textContent = 'Session tuning';
+      const tuneGrid = el('div', {}, { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '8px', paddingTop: '8px' });
+      const numberControl = (label, key, min, max, step) => {
+        const wrap = el('label', {}, { fontSize: '9px', textTransform: 'uppercase', letterSpacing: '.08em' });
+        const input = el('input', { type: 'number', min, max, step, value: state.settings[key] }, { width: '100%', marginTop: '4px', padding: '5px', boxSizing: 'border-box', background: '#15120e', border: '1px solid #3a342d', color: '#f4efe6' });
+        wrap.append(document.createTextNode(label), input);
+        input.addEventListener('change', () => { state.settings[key] = Math.max(min, Math.min(max, Number(input.value) || state.settings[key])); try { opts.onSettings?.({ ...state.settings }); } catch {} }, true);
+        return wrap;
+      };
+      tuneGrid.append(numberControl('Pace x', 'pace', .25, 3, .25), numberControl('AI confidence', 'confidence', .5, 1, .05), numberControl('Stall retries', 'stallLimit', 1, 6, 1));
+      tuning.append(summary, tuneGrid);
+      panel.append(head, stepLine, telemetryEl, seenEl, logEl, row, commandRow, tuning);
       (document.body || document.documentElement).appendChild(panel);
       paintMode();
     } catch {}
@@ -110,9 +158,28 @@ export function createSupervisor(opts = {}) {
     if (state.mode === 'run' && state.approveResolve) { const r = state.approveResolve; state.approveResolve = null; r('approved'); }
   }
   function approve() {
+    if (state.recoveryResolve) return resolveRecovery('retry');
     if (state.approveResolve) { const r = state.approveResolve; state.approveResolve = null; r('approved'); }
   }
+  function setPaused(paused) {
+    state.paused = !!paused;
+    if (pauseBtn) pauseBtn.textContent = state.paused ? 'Resume' : 'Pause';
+    try { opts.onPause?.(state.paused); } catch {}
+  }
+  function approveSubmit() {
+    if (!state.submitResolve) {
+      try { if (stepLine) stepLine.textContent = 'Apply command armed - it will be used at the final submit step.'; } catch {}
+      state.telemetry.submitArmed = true;
+      return;
+    }
+    const r = state.submitResolve; state.submitResolve = null; r('apply');
+  }
+  function resolveRecovery(action) {
+    if (!state.recoveryResolve) return;
+    const r = state.recoveryResolve; state.recoveryResolve = null; r(action);
+  }
   function markWrong() {
+    if (state.recoveryResolve) return resolveRecovery('fix');
     state.wrong = true;
     // Release any pending Step gate with 'wrong' so the executor enters the correction flow.
     if (state.approveResolve) { const r = state.approveResolve; state.approveResolve = null; r('wrong'); }
@@ -121,6 +188,8 @@ export function createSupervisor(opts = {}) {
     state.stopped = true;
     cancelPick();
     if (state.approveResolve) { const r = state.approveResolve; state.approveResolve = null; r('stopped'); }
+    if (state.submitResolve) { const r = state.submitResolve; state.submitResolve = null; r('stopped'); }
+    if (state.recoveryResolve) { const r = state.recoveryResolve; state.recoveryResolve = null; r('skip'); }
     try { if (stepLine) stepLine.textContent = `Stopped (${safeText(reason, 20)})`; } catch {}
     try { if (typeof opts.onStop === 'function') opts.onStop(reason); } catch {}
   }
@@ -336,6 +405,39 @@ export function createSupervisor(opts = {}) {
         state.root = (info && info.root) || state.root;
         if (stepLine) stepLine.textContent = safeText(info && info.text, 120) || 'Working…';
       } catch {}
+    },
+    setTelemetry(info = {}) {
+      state.telemetry = { ...state.telemetry, ...info };
+      try {
+        const values = {
+          stage: state.telemetry.stage || 'scanning', step: state.telemetry.step ?? '-',
+          fields: state.telemetry.fields ?? '-', recovery: state.telemetry.recovery || 'healthy',
+        };
+        for (const [key, value] of Object.entries(values)) {
+          const target = telemetryEl?.querySelector(`[data-metric="${key}"] [data-value]`);
+          if (target) target.textContent = safeText(value, 36);
+        }
+        if (seenEl && info.seen) seenEl.textContent = 'Robot sees: ' + safeText(info.seen, 420);
+      } catch {}
+    },
+    log(level, message) {
+      try {
+        if (!logEl) return;
+        const line = el('div', {}, { color: level === 'err' ? '#c25b5b' : level === 'ok' ? '#7fae7f' : level === 'warn' ? '#c9a373' : '#8b8378' });
+        line.textContent = safeText(message, 240); logEl.append(line); logEl.scrollTop = logEl.scrollHeight;
+      } catch {}
+    },
+    settings() { return { ...state.settings }; },
+    async beforeSubmit(info) {
+      this.setStep(info);
+      if (state.telemetry.submitArmed) { state.telemetry.submitArmed = false; return 'apply'; }
+      try { if (stepLine) stepLine.textContent = 'Final submit is ready. Inspect the page, then choose Apply this job.'; } catch {}
+      return await new Promise((resolve) => { state.submitResolve = resolve; });
+    },
+    async recoveryDecision(info = {}) {
+      this.setTelemetry({ recovery: info.reason || 'attention needed' });
+      try { if (stepLine) stepLine.textContent = safeText(info.text || 'The page did not advance. Retry, fix the page, or skip.', 180); } catch {}
+      return await new Promise((resolve) => { state.recoveryResolve = resolve; });
     },
     // Gate before each action. In Step mode, resolves on Approve; in Run mode, resolves
     // immediately (but a prior "Wrong" surfaces). Returns 'approved' | 'wrong' | 'stopped'.
