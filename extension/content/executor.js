@@ -49,6 +49,7 @@ const ADVANCE_KEYWORDS = [
   /^send application$/i, /^suivant$/i, /^continuer$/i, /^soumettre$/i, /^postuler$/i,
 ];
 const FINAL_SUBMIT_RX = /^(submit( application)?|send( application)?|soumettre|envoyer( ma candidature)?|confirm and submit)$/i;
+const APPLY_DIALOG_SEL = '.jobs-easy-apply-modal, [data-test-modal][role="dialog"], [role="dialog"][aria-modal="true"], .ia-Modal, [data-testid="smartapply-container"]';
 
 // ---- relevance / fit (mirror of server jobFit + a page "needs N years" scan) ----
 function jobLevel(title) {
@@ -291,6 +292,21 @@ function looksLikeAdvance(el) {
 function findAdvanceButton(root) {
   for (const el of qsa('button, input[type="submit"], a[role="button"], [role="button"]', root || document)) {
     if (looksLikeAdvance(el)) return el;
+  }
+  return null;
+}
+
+function findApplyDialog({ requireFields = false } = {}) {
+  for (const d of qsa(APPLY_DIALOG_SEL)) {
+    if (!isProbablyVisible(d)) continue;
+    const hasField = !!d.querySelector?.('input, textarea, select, [role="combobox"], [contenteditable="true"]');
+    if (requireFields && !hasField) continue;
+    const branded = !!d.matches?.('.jobs-easy-apply-modal, [data-testid="smartapply-container"]');
+    if (branded) return d;
+    const text = compactText(`${d.getAttribute?.('aria-label') || ''} ${d.innerText || d.textContent || ''}`).slice(0, 2500);
+    const buttons = qsa('button, input[type="submit"], a[role="button"], [role="button"]', d).map(btnText).filter(Boolean);
+    const hasAdvance = buttons.some((t) => ADVANCE_KEYWORDS.some((re) => re.test(t)));
+    if ((hasField || hasAdvance) && /apply|application|candidature|resume|résumé|\bcv\b|contact info|review/i.test(text)) return d;
   }
   return null;
 }
@@ -696,8 +712,7 @@ export async function run(task, context, helpers) {
 
   // Locate the live apply form root (mirrors the main loop's strict dialog scope).
   function findReplayRoot() {
-    const dialog = Array.from(document.querySelectorAll('.jobs-easy-apply-modal, [data-test-modal][role="dialog"], [role="dialog"][aria-modal="true"], .ia-Modal, [data-testid="smartapply-container"]'))
-      .find((d) => isProbablyVisible(d) && d.querySelector('input, textarea, select, [role="combobox"], [contenteditable="true"]')) || null;
+    const dialog = findApplyDialog() || null;
     return dialog || detectApplyForm()?.form || null;
   }
 
@@ -985,13 +1000,13 @@ export async function run(task, context, helpers) {
     // Easy-Apply dialog over detectApplyForm()'s container — the latter can fall
     // back to document.body (Workday-style SPAs), and on LinkedIn that let the scan
     // reach the page's global "Search" box, parking every job at submit with a
-    // phantom "search search" question. Require the dialog to actually contain
-    // fields so a cookie/consent dialog isn't mistaken for the form. NEVER fall
+    // phantom "search search" question. Keep the modal even on LinkedIn steps with
+    // no text fields (resume picker/review-only pages); otherwise we lose scope
+    // after Next and click the underlying Easy Apply opener forever. NEVER fall
     // back to `document`: with no real apply container we don't scan at all — we
     // just go find the Easy-Apply button below to OPEN the form (findAdvanceButton
     // defaults to document when root is null).
-    const dialog = Array.from(document.querySelectorAll('.jobs-easy-apply-modal, [data-test-modal][role="dialog"], [role="dialog"][aria-modal="true"], .ia-Modal, [data-testid="smartapply-container"]'))
-      .find((d) => isProbablyVisible(d) && d.querySelector('input, textarea, select, [role="combobox"], [contenteditable="true"]')) || null;
+    const dialog = findApplyDialog() || null;
     const root = dialog || formProbe?.form || null;
     const haveForm = !!root;
     if (haveForm) { everHadForm = true; S.everHadForm = true; signalHydrated(); reportSeen(root, 'apply form'); }
@@ -1200,7 +1215,7 @@ export async function run(task, context, helpers) {
         : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton());
       if (!clickBtn) { logLine('warn', 'advance button became invalid before click — re-scanning'); continue; }
     }
-    const label = compactText(clickBtn.textContent || clickBtn.value || '').slice(0, 30);
+    const label = btnText(clickBtn).slice(0, 30);
     // ---- supervised gate [T4] ----  (no-op when not a supervised run)
     // Pause before advancing for the user's OK (Step mode) / honor a "Wrong" interrupt
     // (Run mode). A correction here rewrites the recipe + applies live before we advance.

@@ -2441,8 +2441,19 @@ function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25 } 
   const rows = all(
     `SELECT t.*, j.source AS _src, j.job_url AS _url FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
      WHERE t.state = 'failed' AND t.updated_at < ?
-       AND COALESCE(t.attempts, 0) < ? AND j.status != 'submitted'
-     ORDER BY t.updated_at ASC LIMIT ?`, [cutoff, maxAttempts, limit]);
+       AND (
+         COALESCE(t.attempts, 0) < ?
+         OR (
+           LOWER(COALESCE(j.source, '')) = 'linkedin'
+           AND COALESCE(t.attempts, 0) < (? + 3)
+           AND (
+             COALESCE(t.last_error, '') LIKE '%stuck on a step%'
+             OR COALESCE(t.last_error, '') LIKE '%page stopped advancing%'
+           )
+         )
+       )
+       AND j.status != 'submitted'
+     ORDER BY t.updated_at ASC LIMIT ?`, [cutoff, maxAttempts, maxAttempts, limit]);
   let n = 0;
   for (const r of rows) {
     const failure = classifyQueueFailure(r);

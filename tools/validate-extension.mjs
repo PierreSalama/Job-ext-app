@@ -125,6 +125,8 @@ const discover = read('content/discover.js');
 ok(/isGlassdoor && easyApplyOnly/.test(discover) && /Glassdoor cards do not expose/.test(discover), 'Glassdoor is skipped in Easy-Apply-only discovery');
 ok(/LOGIN_APPLY_RX/.test(executor) && /loginApplyPresent/.test(executor), 'executor detects sign-in-to-apply gates');
 ok(/EXTERNAL_APPLY_RX/.test(executor) && /postuler sur le site/.test(executor), 'executor detects employer-site apply buttons including French labels');
+ok(/findApplyDialog/.test(executor) && /resume picker\/review-only pages/.test(executor), 'LinkedIn Easy Apply modal stays scoped on fieldless resume/review steps');
+ok(/const label = btnText\(clickBtn\)/.test(executor), 'executor logs/clicks aria-label button text, not blank icon text');
 
 grp('Dashboard host bootstrap');
 const app = read('app/app.js');
