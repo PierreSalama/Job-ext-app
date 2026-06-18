@@ -100,7 +100,8 @@ const senders = popup + loader + detector + executor;
 const sent = [...senders.matchAll(/type:\s*'([\w.-]+)'/g)].map((m) => m[1]);
 // SW-bound messages (not the tab-bound jat11.* ones the SW SENDS to content)
 const swBound = ['ping', 'app-health', 'pair-app', 'popup-state', 'check-app-update', 'check-ext-update',
-  'download-app-installer', 'capture-now', 'watch-and-teach', 'pipeline-event', 'qa-record', 'api-call', 'task-progress', 'get-token', 'get-document'];
+  'download-app-installer', 'capture-now', 'watch-and-teach', 'jat11.external-handoff-arm', 'jat11.external-handoff-run',
+  'pipeline-event', 'qa-record', 'api-call', 'task-progress', 'get-token', 'get-document'];
 for (const t of swBound) ok(handled.includes(t), 'SW handles message: ' + t);
 ok(sent.includes('jat11.page-state'), 'popup sends jat11.page-state (page card)');
 // content-script-bound messages the SW/popup send → handled in loader
@@ -133,6 +134,12 @@ ok(/LOGIN_APPLY_RX/.test(executor) && /loginApplyPresent/.test(executor), 'execu
 ok(/EXTERNAL_APPLY_RX/.test(executor) && /postuler sur le site/.test(executor), 'executor detects employer-site apply buttons including French labels');
 ok(/findApplyDialog/.test(executor) && /resume picker\/review-only pages/.test(executor), 'LinkedIn Easy Apply modal stays scoped on fieldless resume/review steps');
 ok(/const label = btnText\(clickBtn\)/.test(executor), 'executor logs/clicks aria-label button text, not blank icon text');
+ok(/external-handoff-arm/.test(executor) && /external-handoff-run/.test(executor), 'executor arms and transfers external child-tab ownership');
+ok(/onCreatedNavigationTarget/.test(bg) && /openerTabId/.test(bg) && /runExternalHandoff/.test(bg), 'service worker captures and executes external child tabs');
+ok(/broadLinkedInRoot/.test(executor) && /waitForStickyLinkedInDialog/.test(executor), 'Easy Apply scope stays sticky and rejects LinkedIn document.body fallback');
+ok(/submitAttempted && \(pageTextLooksLikeSuccess/.test(executor), 'generic success requires a real final-submit attempt');
+ok(/same page-level action repeated/.test(executor), 'duplicate page-level opener clicks are circuit-broken');
+ok(!mf.content_scripts[0].exclude_matches.includes('*://*.google.com/*'), 'Google Careers pages are eligible for external handoff execution');
 
 grp('Dashboard host bootstrap');
 const app = read('app/app.js');

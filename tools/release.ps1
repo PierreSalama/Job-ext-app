@@ -1,7 +1,7 @@
-# JAT v11 — release helper.
+# JAT v11 - release helper.
 # Bumps all three versions in lockstep, mirrors the dashboard, syncs the working
 # copy into ..\.v11-publish (the git repo for PierreSalama/Job-ext-app),
-# commits, tags, and pushes — which triggers the CI release build.
+# commits, tags, and pushes - which triggers the CI release build.
 #
 #   .\tools\release.ps1 -Version 11.0.1 -Message "capture fixes"
 #   .\tools\release.ps1 -Version 11.0.1 -Message "..." -NoPush   # stage only
@@ -26,13 +26,14 @@ $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
 $pkg = Get-Content $pkgPath -Raw | ConvertFrom-Json
 $manifest.version = $Version
 $pkg.version = $Version
-$manifest | ConvertTo-Json -Depth 20 | Set-Content $manifestPath -Encoding utf8
-$pkg | ConvertTo-Json -Depth 20 | Set-Content $pkgPath -Encoding utf8
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 20), $utf8NoBom)
+[System.IO.File]::WriteAllText($pkgPath, ($pkg | ConvertTo-Json -Depth 20), $utf8NoBom)
 $rootPkgPath = Join-Path $Root 'package.json'
 $rootPkg = Get-Content $rootPkgPath -Raw | ConvertFrom-Json
 $rootPkg.version = $Version
-$rootPkg | ConvertTo-Json -Depth 20 | Set-Content $rootPkgPath -Encoding utf8
-Write-Host "versions → $Version (extension + app + root)" -ForegroundColor Green
+[System.IO.File]::WriteAllText($rootPkgPath, ($rootPkg | ConvertTo-Json -Depth 20), $utf8NoBom)
+Write-Host "versions -> $Version (extension + app + root)" -ForegroundColor Green
 
 # 2. mirror dashboard
 node (Join-Path $Root 'tools\mirror.mjs')
@@ -42,7 +43,7 @@ if ($LASTEXITCODE -ne 0) { throw 'mirror failed' }
 node (Join-Path $Root 'tools\validate-versions.mjs')
 if ($LASTEXITCODE -ne 0) { throw 'version sync check failed' }
 
-# 3. sync working copy → publish repo (extension/, app/ sources, workflows, tools, docs)
+# 3. sync working copy -> publish repo (extension/, app/ sources, workflows, tools, docs)
 $pairs = @(
   @{ src = 'extension'; dst = 'extension' },
   @{ src = 'app\src'; dst = 'app\src' },
@@ -68,18 +69,18 @@ foreach ($p in $pairs) {
     Copy-Item $src $dst -Force
   }
 }
-Write-Host "synced → $Publish" -ForegroundColor Green
+Write-Host "synced -> $Publish" -ForegroundColor Green
 
 # 4. commit + tag + push
 Push-Location $Publish
 try {
   git add -A
-  git commit -m "v$Version — $Message"
+  git commit -m "v$Version - $Message"
   git tag "v$Version"
   if (-not $NoPush) {
     git push origin HEAD
     git push origin "v$Version"
-    Write-Host "pushed — CI is building the v$Version release" -ForegroundColor Green
+    Write-Host "pushed - CI is building the v$Version release" -ForegroundColor Green
   } else {
     Write-Host "staged locally (NoPush). Push with: git push origin HEAD; git push origin v$Version" -ForegroundColor Yellow
   }

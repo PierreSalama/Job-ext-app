@@ -217,6 +217,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // user's previously-focused window. Idempotent + guarded.
       respond(releaseFrontUntilHydrated(sender?.tab?.windowId).then(() => ({ ok: true })).catch(() => ({ ok: true })));
       return true;
+    case 'jat11.external-handoff-arm':
+      // Arm BEFORE the page clicks an external/company-site CTA. target=_blank tabs can
+      // appear within a few milliseconds, so registering after the click races and loses
+      // the child. The captured child is tracked like every other AA tab and becomes the
+      // authoritative executor for this task.
+      respond(armExternalHandoff(sender?.tab?.id).then((token) => ({ ok: !!token, token })));
+      return true;
+    case 'jat11.external-handoff-run':
+      respond(runExternalHandoff(sender?.tab?.id, msg.token, msg.task, msg.context));
+      return true;
     case 'run-discovery':
       // Manual "Run discovery now" from the extension dashboard (bypasses the
       // queue-low + window gates so the user can shake it out on demand).
@@ -563,6 +573,11 @@ let aaWindowPool = [];                       // DEDICATED apply window ids (crea
 const aaBusyWindows = new Set();             // window ids currently hosting a RUNNING apply tab
 let aaRuntimeHydrated = false;
 
+// source tab id -> { token, childTabId, createdAt }. This intentionally stays in memory:
+// the arm→click→claim transaction lasts seconds and the open message port keeps MV3 alive.
+// Stale entries are swept defensively so an intercepted click cannot leak state.
+const externalHandoffs = new Map();
+
 function normalizeWindowIds(ids) {
   return [...new Set((Array.isArray(ids) ? ids : [])
     .map((x) => Number(x))
@@ -604,7 +619,110 @@ function isBlankChromeTab(t) {
   return !u || u === 'about:blank' || u.startsWith('chrome://newtab') || u.startsWith('edge://newtab');
 }
 // A user (or Chrome) closing a tab must drop it from the registry too.
-chrome.tabs.onRemoved.addListener((tabId) => untrackAaTab(tabId));
+chrome.tabs.onRemoved.addListener((tabId) => {
+  untrackAaTab(tabId);
+  externalHandoffs.delete(tabId);
+  for (const [sourceId, handoff] of externalHandoffs) {
+    if (handoff.childTabId === tabId) externalHandoffs.delete(sourceId);
+  }
+});
+
+async function armExternalHandoff(sourceTabId) {
+  if (sourceTabId == null) return null;
+  for (const [id, stale] of externalHandoffs) {
+    if (Date.now() - stale.createdAt > 30000) externalHandoffs.delete(id);
+  }
+  const token = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  externalHandoffs.set(sourceTabId, { token, childTabId: null, createdAt: Date.now() });
+  return token;
+}
+
+function captureExternalChild(sourceTabId, childTabId) {
+  const handoff = externalHandoffs.get(sourceTabId);
+  if (!handoff || childTabId == null || Date.now() - handoff.createdAt > 30000) return;
+  handoff.childTabId = childTabId;
+  trackAaTab(childTabId);
+  try { chrome.tabs.update(childTabId, { autoDiscardable: false }).catch(() => {}); } catch {}
+  try { groupTab(childTabId).catch(() => {}); } catch {}
+}
+
+// Chrome exposes openerTabId on target=_blank. webNavigation's created-target event is
+// the stronger fallback for scripted window.open and redirector links.
+chrome.tabs.onCreated.addListener((tab) => captureExternalChild(tab?.openerTabId, tab?.id));
+try {
+  chrome.webNavigation.onCreatedNavigationTarget.addListener((d) => captureExternalChild(d?.sourceTabId, d?.tabId));
+} catch {}
+
+async function waitForExternalChild(sourceTabId, token, timeoutMs = 15000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const handoff = externalHandoffs.get(sourceTabId);
+    if (!handoff || handoff.token !== token) return null;
+    if (handoff.childTabId != null) return handoff.childTabId;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return null;
+}
+
+async function sendTaskWhenReady(tabId, message, timeoutMs = 20000) {
+  const started = Date.now();
+  let lastError = null;
+  while (Date.now() - started < timeoutMs) {
+    try { return await chrome.tabs.sendMessage(tabId, message, { frameId: 0 }); }
+    catch (e) { lastError = e; await new Promise((resolve) => setTimeout(resolve, 500)); }
+  }
+  throw lastError || new Error('external target content script did not become ready');
+}
+
+async function runExternalHandoff(sourceTabId, token, task, context) {
+  const childTabId = await waitForExternalChild(sourceTabId, token);
+  if (childTabId == null) {
+    externalHandoffs.delete(sourceTabId);
+    return { ok: true, captured: false };
+  }
+  let child = null;
+  try {
+    await waitTabComplete(childTabId, 30000);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    child = await chrome.tabs.get(childTabId);
+    const childContext = {
+      ...(context || {}),
+      externalHandoff: true,
+      sourceJobUrl: context?.job?.jobUrl || null,
+      // A recipe resolved for the LinkedIn/Indeed source page must never replay on a
+      // different ATS. The child still uses generic autofill + QA memory, while its
+      // recorder learns the real target site's recipe from this run.
+      recipe: null,
+      job: { ...(context?.job || {}), jobUrl: child?.url || context?.job?.jobUrl },
+    };
+    if (task?.id != null) {
+      await api.call('PATCH', '/queue/' + task.id, {
+        transcriptAppend: { kind: 'handoff', note: `executor transferred to external tab ${childTabId}`, url: child?.url || null },
+      }).catch(() => {});
+    }
+    const runType = childContext.supervised ? 'jat11.supervised-run' : 'jat11.run-task';
+    const dispatch = sendTaskWhenReady(childTabId, { type: runType, task, context: childContext });
+    const result = childContext.supervised
+      ? await dispatch
+      : await Promise.race([
+          dispatch,
+          new Promise((_, reject) => setTimeout(() => reject(new Error('external apply timed out after 4 min')), 240000)),
+        ]);
+    return { ok: result?.ok !== false, captured: true, childTabId, url: child?.url || null, result };
+  } catch (e) {
+    if (task?.id != null) {
+      await api.call('PATCH', '/queue/' + task.id, {
+        state: 'failed', attemptsDelta: 1, lastError: String(e?.message || e),
+        transcriptAppend: { kind: 'handoff', note: 'external executor error: ' + String(e?.message || e), url: child?.url || null },
+      }).catch(() => {});
+    }
+    return { ok: false, captured: true, childTabId, error: String(e?.message || e), result: { ok: false, state: 'failed', error: String(e?.message || e) } };
+  } finally {
+    externalHandoffs.delete(sourceTabId);
+    try { await chrome.tabs.remove(childTabId); } catch {}
+    untrackAaTab(childTabId);
+  }
+}
 
 // Close any tracked AA tab that's too old (stuck) or over the cap (oldest first), and
 // drop ids whose tab no longer exists. Safety net beyond the per-task close paths.
@@ -1049,17 +1167,19 @@ async function launchOne(task, context) {
       // task while the real executor is still running. This was ~58% of failures.
       // HARD TIMEOUT: a hung executor (frozen tab / infinite wait) must NOT hold the
       // pool slot forever — that stalled the whole pipeline (tasks stuck "running" for
-      // 13+ min, zero new applies). Cap the whole run at 3.5 min, then fail + free up.
+      // 13+ min, zero new applies). Allow enough room for one owned external handoff
+      // (target hydration + a 4-min child executor), then fail + free up before the
+      // server's 8-min stale-run reconciliation.
       // SUPERVISED ("Watch & Teach") runs use the supervised entry path (Step/Run overlay
       // + Fix-this picker) and bring the window to front so Pierre can watch + correct. No
-      // 3.5-min hard cap — a supervised run is paced by the human, not the pool. [T4]
+      // hard cap — a supervised run is paced by the human, not the pool. [T4]
       const runType = context && context.supervised ? 'jat11.supervised-run' : 'jat11.run-task';
       const dispatch = chrome.tabs.sendMessage(tab.id, { type: runType, task, context }, { frameId: 0 });
       result = context && context.supervised
         ? await dispatch
         : await Promise.race([
             dispatch,
-            new Promise((_, rej) => setTimeout(() => rej(new Error('apply timed out after 3.5 min')), 210000)),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('apply timed out after 5.5 min')), 330000)),
           ]);
     } catch (e) {
       // Run being torn down (user pressed Stop) → the tab was removed out from under
@@ -1377,18 +1497,23 @@ async function discoverTick(force = false) {
     if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} untrackAaTab(tab.id); }
     scanning = false;
   }
-  // Pool exhaustion: found jobs but enqueued NONE = everything this query returned was
-  // already tried (deduped). Re-queue stale retriable tasks so the workers have
-  // something to do, and tell the user plainly to broaden their search.
+  // Pool exhaustion: a valid search that enqueued nothing must not leave the engine
+  // silently idle for the rest of an overnight run. This includes both "all deduped"
+  // and a temporarily empty search page. Re-queue only policy-approved stale failures;
+  // the normalized fingerprint breaker prevents identical failures from churning.
   const found = resp?.found ?? 0;
   let note = resp?.note || resp?.error || '';
-  if (found > 0 && enqueued === 0) {
+  let requeued = 0;
+  if (resp?.ok !== false && enqueued === 0) {
     const rr = await api.call('POST', '/auto-apply/retry-stale', {}, 6000).catch(() => null);
-    const requeued = rr?.requeued ?? 0;
+    requeued = rr?.requeued ?? 0;
     note = requeued
-      ? `all ${found} here were already tried — re-queued ${requeued} earlier job(s) for another pass`
-      : `all ${found} jobs here were already tried — broaden your keywords/locations for fresh results`;
+      ? `${found ? `all ${found} here were already tried` : 'this search had no fresh jobs'} — re-queued ${requeued} recoverable job(s)`
+      : (found
+          ? `all ${found} jobs here were already tried — rotating to the next search`
+          : 'no fresh jobs in this search — rotating to the next search');
   }
+  if (enqueued > 0 || requeued > 0) schedulePump();
   const status = { board, keyword, url, found, enqueued, note, ok: resp?.ok !== false };
   await api.call('POST', '/auto-apply/discovery-status', status, 6000).catch(() => {});
   console.log('[JAT] discovery', board, '"' + keyword + '"@"' + location + '" found', found, 'enqueued', enqueued, note);

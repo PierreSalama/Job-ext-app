@@ -1,4 +1,4 @@
-# JAT v11 — Chrome Web Store publish helper (update the unlisted/private item).
+# JAT v11 - Chrome Web Store publish helper (update the unlisted/private item).
 #
 # This pushes a new extension version to the Chrome Web Store via the official
 # CWS API, so updating the store item becomes ONE command instead of clicking
@@ -9,15 +9,15 @@
 #   .\tools\cws-publish.ps1 -Zip path\to.zip      # use a specific zip
 #   .\tools\cws-publish.ps1 -UploadOnly           # upload a draft, don't publish yet
 #
-# ONE-TIME SETUP (you do this once — it needs your Google account, which a tool can't):
-#   1. https://console.cloud.google.com → create a project → enable "Chrome Web Store API".
-#   2. APIs & Services → Credentials → Create OAuth client ID → type "Desktop app".
+# ONE-TIME SETUP (you do this once - it needs your Google account, which a tool can't):
+#   1. https://console.cloud.google.com -> create a project -> enable "Chrome Web Store API".
+#   2. APIs & Services -> Credentials -> Create OAuth client ID -> type "Desktop app".
 #      Save the Client ID + Client secret.
 #   3. Get a refresh token (one-time consent). Easiest: https://developer.chrome.com/docs/webstore/using-api
 #      walks the oauth2 flow; or use any "get refresh token" helper with scope
 #      https://www.googleapis.com/auth/chromewebstore and your client id/secret.
 #   4. Find your item ID: the long id in the item's Dashboard URL / store URL.
-#   5. Create tools\.cws-credentials.json (this file is gitignored — secrets stay local):
+#   5. Create tools\.cws-credentials.json (this file is gitignored - secrets stay local):
 #        {
 #          "clientId":     "....apps.googleusercontent.com",
 #          "clientSecret": "....",
@@ -31,7 +31,7 @@ param(
   [string]$CredFile = "$PSScriptRoot\.cws-credentials.json",
   [switch]$UploadOnly,
   [ValidateSet('trustedTesters','default')]
-  [string]$Target = 'trustedTesters'   # private/unlisted item → trustedTesters; public → default
+  [string]$Target = 'trustedTesters'   # private/unlisted item -> trustedTesters; public -> default
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,7 +51,7 @@ if (-not $Zip) {
   $ver = $manifest.version
   $Zip = Join-Path $Root "dist\jat-extension-v$ver.zip"
   Compress-Archive -Path (Join-Path $Root 'extension\*') -DestinationPath $Zip -Force
-  Write-Host "packaged extension v$ver → $Zip" -ForegroundColor Green
+  Write-Host "packaged extension v$ver -> $Zip" -ForegroundColor Green
 }
 if (-not (Test-Path $Zip)) { throw "zip not found: $Zip" }
 
@@ -64,7 +64,7 @@ $tok = Invoke-RestMethod -Method Post -Uri 'https://oauth2.googleapis.com/token'
   grant_type    = 'refresh_token'
 }
 $access = $tok.access_token
-if (-not $access) { throw "no access_token returned — re-check the OAuth credentials / refresh token." }
+if (-not $access) { throw "no access_token returned - re-check the OAuth credentials / refresh token." }
 
 $headers = @{ Authorization = "Bearer $access"; 'x-goog-api-version' = '2' }
 
@@ -81,7 +81,7 @@ if ($up.uploadState -eq 'FAILURE') {
 
 # 4. Publish (skip with -UploadOnly to leave it as a draft you submit manually).
 if ($UploadOnly) {
-  Write-Host "uploaded as a draft (–UploadOnly). Publish from the Dashboard or re-run without the switch." -ForegroundColor Yellow
+  Write-Host "uploaded as a draft (-UploadOnly). Publish from the Dashboard or re-run without the switch." -ForegroundColor Yellow
   return
 }
 Write-Host "publishing to '$Target'..." -ForegroundColor Cyan

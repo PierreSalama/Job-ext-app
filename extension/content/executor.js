@@ -18,7 +18,7 @@ import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
 import { pageTextLooksLikeSuccess, urlLooksLikeSuccess } from './signals/success.js';
 import { qsa, isProbablyVisible, compactText } from './lib/dom.js';
-import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence, resolveLocator } from './replay.js';
+import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence, resolveLocator, recoveryFingerprint } from './replay.js';
 
 const MAX_STEPS = 40;
 const STEP_TIMEOUT = 9000;
@@ -49,7 +49,7 @@ const ADVANCE_KEYWORDS = [
   /^send application$/i, /^suivant$/i, /^continuer$/i, /^soumettre$/i, /^postuler$/i,
 ];
 const FINAL_SUBMIT_RX = /^(submit( application)?|send( application)?|soumettre|envoyer( ma candidature)?|confirm and submit)$/i;
-const APPLY_DIALOG_SEL = '.jobs-easy-apply-modal, [data-test-modal][role="dialog"], [role="dialog"][aria-modal="true"], .ia-Modal, [data-testid="smartapply-container"]';
+const APPLY_DIALOG_SEL = '.jobs-easy-apply-modal, .jobs-easy-apply-content, .jobs-easy-apply-content__wrapper, .jobs-easy-apply-modal-content, [data-test-modal][role="dialog"], [role="dialog"][aria-modal="true"], .ia-Modal, [data-testid="smartapply-container"]';
 
 // ---- relevance / fit (mirror of server jobFit + a page "needs N years" scan) ----
 function jobLevel(title) {
@@ -302,7 +302,10 @@ function findAdvanceButton(root) {
 
 function findApplyDialog({ requireFields = false } = {}) {
   for (const d of qsa(APPLY_DIALOG_SEL)) {
-    if (!isProbablyVisible(d)) continue;
+    // LinkedIn sometimes gives the stable outer Easy Apply shell no measurable box
+    // during a Next-step React transition while its children are already visible.
+    const childVisible = qsa('input, textarea, select, button, [role="button"]', d).some(isProbablyVisible);
+    if (!isProbablyVisible(d) && !childVisible) continue;
     const hasField = !!d.querySelector?.('input, textarea, select, [role="combobox"], [contenteditable="true"]');
     if (requireFields && !hasField) continue;
     const branded = !!d.matches?.('.jobs-easy-apply-modal, [data-testid="smartapply-container"]');
@@ -311,6 +314,17 @@ function findApplyDialog({ requireFields = false } = {}) {
     const buttons = qsa('button, input[type="submit"], a[role="button"], [role="button"]', d).map(btnText).filter(Boolean);
     const hasAdvance = buttons.some((t) => ADVANCE_KEYWORDS.some((re) => re.test(t)));
     if ((hasField || hasAdvance) && /apply|application|candidature|resume|résumé|\bcv\b|contact info|review/i.test(text)) return d;
+  }
+  return null;
+}
+
+async function waitForStickyLinkedInDialog(timeoutMs = 6500) {
+  if (!/(^|\.)linkedin\.com$/i.test(location.hostname)) return null;
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs && !S.cancelled) {
+    const dialog = findApplyDialog();
+    if (dialog) return dialog;
+    await sleep(150);
   }
   return null;
 }
@@ -500,7 +514,7 @@ async function tryAttachResume(root, resume) {
 export async function run(task, context, helpers) {
   if (S.running) return { ok: false, error: 'executor already running' };
   S.running = true; S.cancelled = false; S.paused = false; S.step = 0;
-  S.task = task; S.context = context; S.everHadForm = false; S.externalRoute = false;
+  S.task = task; S.context = context; S.everHadForm = false; S.externalRoute = !!context?.externalHandoff;
   S.lastSeenSig = ''; S.supervisor = null; S.nextRequested = false;
 
   const { job, profile, profileId, resume, harvested, aiConfidenceMin = 0.7 } = context || {};
@@ -544,6 +558,7 @@ export async function run(task, context, helpers) {
   let everHadForm = false;     // has the apply form/modal ever appeared this run?
   let submitAttempted = false; // did we click a final submit (auto mode) at least once?
   let noChange = 0;            // consecutive advance clicks that didn't change the page (stall)
+  let lastPageAction = '';     // blocks repeated clicks on the same page-level opener
 
   // ============================================================
   // Front-until-hydrated [occlusion fix] — ADDITIVE, fully guarded.
@@ -1012,7 +1027,7 @@ export async function run(task, context, helpers) {
       break;
     }
 
-    const formProbe = detectApplyForm();
+    let formProbe = detectApplyForm();
     // Scope the field scan STRICTLY to the apply modal/form. Prefer the tight
     // Easy-Apply dialog over detectApplyForm()'s container — the latter can fall
     // back to document.body (Workday-style SPAs), and on LinkedIn that let the scan
@@ -1023,10 +1038,30 @@ export async function run(task, context, helpers) {
     // back to `document`: with no real apply container we don't scan at all — we
     // just go find the Easy-Apply button below to OPEN the form (findAdvanceButton
     // defaults to document when root is null).
-    const dialog = findApplyDialog() || null;
-    const root = dialog || formProbe?.form || null;
+    let dialog = findApplyDialog() || null;
+    // Once Easy Apply has opened, its form owns this run. Never fall back to the
+    // underlying job-page opener during a brief React transition after Next.
+    if (!dialog && everHadForm && /(^|\.)linkedin\.com$/i.test(location.hostname)) {
+      setStatus(`Step ${S.step}: waiting for the next Easy Apply page…`);
+      dialog = await waitForStickyLinkedInDialog();
+      formProbe = detectApplyForm();
+    }
+    const probedRoot = formProbe?.form || null;
+    const broadLinkedInRoot = /(^|\.)linkedin\.com$/i.test(location.hostname)
+      && (probedRoot === document || probedRoot === document.body || probedRoot === document.documentElement);
+    // detectApplyForm may use document.body for SPA-style ATS pages. That is useful on
+    // Workday, but unsafe on LinkedIn: it exposes the underlying Easy Apply opener and
+    // global Search field while the modal is transitioning.
+    const root = dialog || (broadLinkedInRoot ? null : probedRoot);
     const haveForm = !!root;
     if (haveForm) { everHadForm = true; S.everHadForm = true; signalHydrated(); reportSeen(root, 'apply form'); }
+    if (!haveForm && everHadForm && /(^|\.)linkedin\.com$/i.test(location.hostname)) {
+      const fingerprint = recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label: 'easy apply form', stage: 'lost-after-advance' });
+      logLine('warn', 'Easy Apply form disappeared after advancing — stopping instead of re-clicking the opener');
+      report({ state: 'failed', lastError: 'Easy Apply form disappeared after advancing — will retry', applyRoute: 'easy-apply', transcriptAppend: { kind: 'recovery', note: 'sticky Easy Apply scope was lost after advance', fingerprint } });
+      finalState = 'failed';
+      break;
+    }
 
     // ---- fill from profile + learned answers ----
     setStatus(`Step ${S.step}: ${haveForm ? 'filling fields…' : 'opening the application…'}`);
@@ -1233,6 +1268,17 @@ export async function run(task, context, helpers) {
       if (!clickBtn) { logLine('warn', 'advance button became invalid before click — re-scanning'); continue; }
     }
     const label = btnText(clickBtn).slice(0, 30);
+    const externalClick = !haveForm && allowExternal && looksExternalApplyButton(clickBtn);
+    const pageAction = !haveForm
+      ? recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label, stage: externalClick ? 'external-opener' : 'apply-opener' })
+      : '';
+    if (pageAction && pageAction === lastPageAction) {
+      logLine('warn', `same page-level action repeated — stopping before another "${label}" click`);
+      report({ state: 'failed', lastError: `repeated page-level action did not transfer: ${label}`, transcriptAppend: { kind: 'recovery', note: 'duplicate opener blocked', fingerprint: pageAction } });
+      finalState = 'failed';
+      break;
+    }
+    if (pageAction) lastPageAction = pageAction;
     // ---- supervised gate [T4] ----  (no-op when not a supervised run)
     // Pause before advancing for the user's OK (Step mode) / honor a "Wrong" interrupt
     // (Run mode). A correction here rewrites the recipe + applies live before we advance.
@@ -1245,14 +1291,36 @@ export async function run(task, context, helpers) {
       if (isFinal) report({ transcriptAppend: { kind: 'control', note: 'user explicitly approved final submit' } });
     }
     logLine('ok', `clicking "${label}"`);
-    if (!haveForm && allowExternal && looksExternalApplyButton(clickBtn)) {
+    let handoffToken = null;
+    if (externalClick) {
       S.externalRoute = true;
       logLine('ok', 'opening external/company apply route');
+      const armed = await send({ type: 'jat11.external-handoff-arm' });
+      handoffToken = armed?.ok ? armed.token : null;
     }
     setStatus(`Step ${S.step}: "${label}"…`);
     const prevHash = domHash();
     syntheticClick(clickBtn);
+    if (externalClick && handoffToken) {
+      setStatus('Transferring control to the company application…');
+      const handoff = await send({ type: 'jat11.external-handoff-run', token: handoffToken, task, context });
+      if (handoff?.captured) {
+        const childResult = handoff.result || null;
+        const childState = typeof childResult?.state === 'string' ? childResult.state : 'failed';
+        logLine(childState === 'done' ? 'ok' : 'warn', `external executor finished: ${childState}`);
+        finalState = childState;
+        finished = true;
+        break;
+      }
+    }
     const changed = await waitForChange(prevHash);
+    if (externalClick && !changed) {
+      const fingerprint = recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label, stage: 'external-handoff-missing' });
+      logLine('warn', 'external target did not become an owned executor — stopping after one click');
+      report({ state: 'failed', lastError: 'external target opened without a controllable handoff — inspect', applyRoute: 'external', transcriptAppend: { kind: 'recovery', note: 'external handoff target was not captured', fingerprint } });
+      finalState = 'failed';
+      break;
+    }
     // Stall guard: 3 advance clicks in a row with no page change → we're stuck on a
     // step (validation we can't satisfy, a dead button). Stop cleanly instead of
     // spinning to MAX_STEPS. NEVER count the final-submit click — its confirmation
@@ -1262,7 +1330,7 @@ export async function run(task, context, helpers) {
       logLine('warn', 'page did not change after click');
       if (++noChange >= S.sessionSettings.stallLimit) {
         if (sup) {
-          const fingerprint = `${location.hostname}|${location.pathname}|${label}|${domHash()}`;
+          const fingerprint = recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label, stage: 'unchanged-screen' });
           report({ transcriptAppend: { kind: 'recovery', note: 'repeated unchanged screen', fingerprint, count: noChange } });
           const decision = await sup.recoveryDecision({ reason: `stalled x${noChange}`, text: `The page did not advance after "${label}". Retry, fix the correct element, or skip.` });
           report({ transcriptAppend: { kind: 'recovery', note: `user chose ${decision}`, fingerprint } });
@@ -1312,7 +1380,7 @@ export async function run(task, context, helpers) {
         // know exactly which field to resolve next.
         const why = blockerText ? `blocked: ${blockerText} — will retry` : 'stuck on a step (page stopped advancing) — will retry';
         logLine('warn', 'stuck — ' + (blockerText || 'page stopped advancing'));
-        const fingerprint = `${location.hostname}|${location.pathname}|${label}|${domHash()}`;
+        const fingerprint = recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label, stage: 'unchanged-screen' });
         report({ state: 'failed', lastError: why, transcriptAppend: { kind: 'recovery', note: 'automatic recovery exhausted on unchanged screen', fingerprint, count: noChange } });
         finalState = 'failed';
         break;
@@ -1342,7 +1410,9 @@ export async function run(task, context, helpers) {
     }
 
     // ---- success? (generic net for one-click / non-modal apply flows) ----
-    if (pageTextLooksLikeSuccess(6000) || urlLooksLikeSuccess()) {
+    // Never infer success merely because an Apply CTA opened another page. A task is
+    // complete only after THIS executor attempted a real final submit.
+    if (submitAttempted && (pageTextLooksLikeSuccess(6000) || urlLooksLikeSuccess())) {
       logLine('ok', '✓ application submitted');
       setStatus('✓ Application submitted');
       if (job?.id) await send({ type: 'api-call', method: 'PATCH', path: '/jobs/' + encodeURIComponent(job.id), body: { status: 'submitted' } });
@@ -1350,6 +1420,7 @@ export async function run(task, context, helpers) {
       finalState = 'done';
       finished = true;
     }
+    if (changed) lastPageAction = '';
     await sleep(600);
   }
 

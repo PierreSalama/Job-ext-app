@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence } from '../extension/content/replay.js';
+import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence, recoveryFingerprint } from '../extension/content/replay.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -33,6 +33,22 @@ function recipeCovering(labels, over = {}) {
     ...over,
   };
 }
+
+test('recovery fingerprints ignore tracking/render noise but preserve the workflow stage', () => {
+  const first = recoveryFingerprint({
+    hostname: 'www.linkedin.com', pathname: '/jobs/view/4430405207/apply/',
+    label: 'Easy Apply to this job', stage: 'unchanged screen', query: '?trackingId=one', domSize: 7437,
+  });
+  const second = recoveryFingerprint({
+    hostname: 'linkedin.com', pathname: '/jobs/view/4430405207/apply',
+    label: '  Easy   Apply to this job ', stage: 'unchanged screen', query: '?trackingId=two', domSize: 6679,
+  });
+  assert.equal(first, second, 'dynamic tracking and DOM changes do not defeat repeated-failure detection');
+  assert.notEqual(first, recoveryFingerprint({
+    hostname: 'linkedin.com', pathname: '/jobs/view/4430405207/apply',
+    label: 'Easy Apply to this job', stage: 'external handoff missing',
+  }), 'different recovery stages remain distinct');
+});
 
 // ---------- planReplay ----------
 test('planReplay → auto when a high-confidence recipe covers all required labels', () => {

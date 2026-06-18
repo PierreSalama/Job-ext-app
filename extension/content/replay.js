@@ -221,3 +221,16 @@ export function classifyDivergence({ unexpectedRequiredField, validationError, n
   if (Number(noChangeCount) >= 3) return 'stalled';
   return null;
 }
+
+// Stable recovery identity. Deliberately excludes query strings, DOM size, tracking ids,
+// and other render noise: two attempts at the same job/action/stage must compare equal so
+// the healer can stop repeating a functionally identical failure.
+export function recoveryFingerprint({ hostname, pathname, label, stage } = {}) {
+  const host = String(hostname || '').toLowerCase().replace(/^www\./, '');
+  const path = String(pathname || '/').toLowerCase()
+    .replace(/\/apply\/?$/, '/apply')
+    .replace(/\/+$/, '') || '/';
+  const action = String(label || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const phase = String(stage || '').toLowerCase().replace(/\s+/g, '-').trim();
+  return [host, path, action, phase].join('|');
+}
