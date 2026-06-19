@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Job Application Tracker v11",
   "short_name": "JAT v11",
-  "version": "11.24.0",
+  "version": "11.24.1",
   "description": "Capture, track, and organize your job applications across job boards, with a local desktop companion and assisted form-fill.",
   "browser_specific_settings": {
     "gecko": {
@@ -19,7 +19,8 @@
     "alarms",
     "webNavigation",
     "contextMenus",
-    "scripting"
+    "scripting",
+    "system.display"
   ],
   "host_permissions": [
     "<all_urls>",

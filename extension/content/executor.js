@@ -22,6 +22,7 @@ import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence, resolveLo
 import { classifyApplyControl, observeRoute, applyRouteForState } from './route.js';
 import { classifyInterstitial } from './lib/interstitial.js';
 import { detectBotChallenge, botChallengeLastError } from './lib/challenge.js';
+import { ADVANCE_KEYWORDS, isAdvanceLabel } from './lib/advance.js';
 
 const MAX_STEPS = 40;
 const STEP_TIMEOUT = 9000;
@@ -43,14 +44,8 @@ const EASYAPPLY_LIMIT_RX = /reached (today'?s )?easy apply limit/i;
 const DAILY_LIMIT_NEAR_EASYAPPLY_RX = /(daily|today'?s)[^.]{0,40}\blimit\b/i;
 const LOGIN_APPLY_RX = /(?:sign\s*in|log\s*in|connectez[- ]vous|se connecter|connexion)[^.!?\n]{0,80}(?:apply|postuler)|(?:apply|postuler)[^.!?\n]{0,80}(?:sign\s*in|log\s*in|connectez[- ]vous|se connecter|connexion)/i;
 const EXTERNAL_APPLY_RX = /apply on (?:the )?(?:company|employer)|apply externally|on company (?:site|website)|apply on .* website|postuler sur le site (?:de l['’]employeur|employeur|de l['’]entreprise|entreprise)|site (?:de l['’]employeur|employeur|de l['’]entreprise|entreprise)/i;
-const ADVANCE_KEYWORDS = [
-  /^submit application$/i, /^submit$/i, /^submit & continue$/i,
-  /^review your application$/i, /^review$/i,
-  /^next$/i, /^continue$/i, /^continue to/i, /^proceed/i,
-  /^save and continue$/i, /^save & continue$/i,
-  /^finish$/i, /^apply now$/i, /^apply$/i, /^easy apply/i,
-  /^send application$/i, /^suivant$/i, /^continuer$/i, /^soumettre$/i, /^postuler$/i,
-];
+// ADVANCE_KEYWORDS / OPEN_KEYWORDS / isAdvanceLabel are the pure advance-vs-opener
+// decision (BUG-1), in ./lib/advance.js so they're node-testable without a DOM.
 const FINAL_SUBMIT_RX = /^(submit( application)?|send( application)?|soumettre|envoyer( ma candidature)?|confirm and submit)$/i;
 const APPLY_DIALOG_SEL = '.jobs-easy-apply-modal, .jobs-easy-apply-content, .jobs-easy-apply-content__wrapper, .jobs-easy-apply-modal-content, [data-test-modal][role="dialog"], [role="dialog"][aria-modal="true"], .ia-Modal, [data-testid="smartapply-container"]';
 
@@ -318,16 +313,32 @@ function btnText(el) {
   // real label in aria-label, so include it.
   return compactText(el?.getAttribute?.('aria-label') || el?.textContent || el?.value || '');
 }
-function looksLikeAdvance(el) {
-  if (!el || el.disabled || !isProbablyVisible(el)) return false;
-  const text = btnText(el);
-  if (!text || text.length > 40) return false;
-  return ADVANCE_KEYWORDS.some((re) => re.test(text));
+// Structural guard: is this candidate the LinkedIn Easy Apply page-level OPENER (the
+// top-card "Easy Apply to this job" button)? We must NEVER return it from the in-form
+// advance scan — re-clicking it is exactly the multi-page stall. Belt-and-suspenders:
+// matched by its known opener container/aria signature OR route.js's classifier, so even
+// a broad root can't select it during the in-form advance path.
+function isEasyApplyOpener(el) {
+  if (!el) return false;
+  try {
+    if (el.closest?.('.jobs-apply-button, .jobs-apply-button--top-card, [data-live-test-job-apply-button]')) return true;
+    const aria = (el.getAttribute?.('aria-label') || '').toLowerCase();
+    if (/easy apply|candidature simpli/.test(aria)) return true;
+  } catch {}
+  try { if (classifyApplyControl(el).state === 'linkedin_easy_apply_modal') return true; } catch {}
+  return false;
 }
 
-function findAdvanceButton(root) {
+function looksLikeAdvance(el, { allowOpen = false } = {}) {
+  if (!el || el.disabled || !isProbablyVisible(el)) return false;
+  // The page-level Easy Apply opener is never an in-form advance, regardless of keywords.
+  if (!allowOpen && isEasyApplyOpener(el)) return false;
+  return isAdvanceLabel(btnText(el), { allowOpen });
+}
+
+function findAdvanceButton(root, { allowOpen = false } = {}) {
   for (const el of qsa('button, input[type="submit"], a[role="button"], [role="button"]', root || document)) {
-    if (looksLikeAdvance(el)) return el;
+    if (looksLikeAdvance(el, { allowOpen })) return el;
   }
   return null;
 }
@@ -669,6 +680,13 @@ export async function run(task, context, helpers) {
   let noChange = 0;            // consecutive advance clicks that didn't change the page (stall)
   let lastPageAction = '';     // blocks repeated clicks on the same page-level opener
   let interstitialAdvances = 0; // LinkedIn resume/continue interstitials advanced this run (bounded)
+  // BUG-3: external/company-ATS repeat breaker. The page-level opener breaker resets on
+  // any DOM change, so an external site that re-renders on every "Apply" click (BMO: 40×
+  // "clicking Apply" → max steps) is never caught. Track the last external advance label +
+  // URL and the consecutive no-real-progress repeat count; STOP+park cleanly at the cap.
+  let extLastLabel = '';
+  let extLastUrl = '';
+  let extRepeat = 0;
 
   // ============================================================
   // Front-until-hydrated [occlusion fix] — ADDITIVE, fully guarded.
@@ -1182,20 +1200,31 @@ export async function run(task, context, helpers) {
       formProbe = detectApplyForm();
     }
     const probedRoot = formProbe?.form || null;
-    const broadLinkedInRoot = /(^|\.)linkedin\.com$/i.test(location.hostname)
+    const onLinkedIn = /(^|\.)linkedin\.com$/i.test(location.hostname);
+    const broadLinkedInRoot = onLinkedIn
       && (probedRoot === document || probedRoot === document.body || probedRoot === document.documentElement);
     // detectApplyForm may use document.body for SPA-style ATS pages. That is useful on
     // Workday, but unsafe on LinkedIn: it exposes the underlying Easy Apply opener and
     // global Search field while the modal is transitioning.
-    const root = dialog || (broadLinkedInRoot ? null : probedRoot);
+    //
+    // BUG-1 layer 3: once the Easy Apply form has appeared on linkedin.com, the ONLY safe
+    // root is the tight dialog. A probedRoot container can be slightly broader than the
+    // modal yet not literally document/body/html (so it slips past broadLinkedInRoot),
+    // and it then contains the top-card opener — which the in-form advance scan would
+    // re-click (the 1/5-page stall). So when everHadForm && LinkedIn, NEVER fall to
+    // probedRoot: use the dialog or nothing (null → the "form disappeared → fail" path
+    // below, which retries instead of clicking the opener).
+    const root = onLinkedIn && everHadForm
+      ? dialog
+      : (dialog || (broadLinkedInRoot ? null : probedRoot));
     const haveForm = !!root;
     if (haveForm) {
       everHadForm = true; S.everHadForm = true;
-      if (dialog && /(^|\.)linkedin\.com$/i.test(location.hostname)) S.routeState = 'linkedin_easy_apply_modal';
+      if (dialog && onLinkedIn) S.routeState = 'linkedin_easy_apply_modal';
       else if (!S.externalRoute && S.routeState === 'unknown') S.routeState = 'same_tab_application';
       signalHydrated(); reportSeen(root, 'apply form');
     }
-    if (!haveForm && everHadForm && /(^|\.)linkedin\.com$/i.test(location.hostname)) {
+    if (!haveForm && everHadForm && onLinkedIn) {
       const fingerprint = recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label: 'easy apply form', stage: 'lost-after-advance' });
       logLine('warn', 'Easy Apply form disappeared after advancing — stopping instead of re-clicking the opener');
       report({ state: 'failed', lastError: 'Easy Apply form disappeared after advancing — will retry', applyRoute: 'easy-apply', transcriptAppend: { kind: 'recovery', note: 'sticky Easy Apply scope was lost after advance', fingerprint } });
@@ -1291,8 +1320,8 @@ export async function run(task, context, helpers) {
     // In-form: prefer buttons inside the modal. Not open yet: also try LinkedIn's
     // Easy-Apply button to OPEN the form (covers postings the generic scan misses).
     let btn = haveForm
-      ? findAdvanceButton(root)
-      : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(root));
+      ? findAdvanceButton(root, { allowOpen: false })
+      : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(root, { allowOpen: true }));
     if (!btn) {
       const opening = !everHadForm;   // the apply form has never appeared yet
       // Background/occluded apply tabs get their JS timers throttled by Chrome, so
@@ -1334,8 +1363,8 @@ export async function run(task, context, helpers) {
         if (opening && i % 4 === 0) { try { window.scrollTo(0, 600); window.scrollTo(0, 0); } catch {} }
         await sleep(500);
         found = haveForm
-          ? findAdvanceButton(root)
-          : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton());
+          ? findAdvanceButton(root, { allowOpen: false })
+          : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(document, { allowOpen: true }));
         if (found) { signalHydrated(); break; }
       }
       if (!found) {
@@ -1431,8 +1460,8 @@ export async function run(task, context, helpers) {
     let clickBtn = btn;
     if (clickBtn.disabled || !isProbablyVisible(clickBtn) || !document.contains(clickBtn)) {
       clickBtn = haveForm
-        ? (findAdvanceButton(root) || findAdvanceButton())
-        : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton());
+        ? findAdvanceButton(root, { allowOpen: false })
+        : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(document, { allowOpen: true }));
       if (!clickBtn) { logLine('warn', 'advance button became invalid before click — re-scanning'); continue; }
     }
     const label = btnText(clickBtn).slice(0, 30);
@@ -1461,6 +1490,36 @@ export async function run(task, context, helpers) {
       break;
     }
     if (pageAction) lastPageAction = pageAction;
+    // ---- BUG-3: external/company-ATS no-progress cap ----
+    // When driving an EXTERNAL/company site (allowExternal + an external or same-tab
+    // application route, NOT a LinkedIn Easy Apply modal), an ATS that re-renders the page
+    // on every click defeats the opener breaker (which resets on any DOM change). Count
+    // consecutive clicks of the SAME label at the SAME URL; at the stall limit, STOP and
+    // park cleanly instead of looping to MAX_STEPS (the BMO "Apply" ×40 failure). BUG-1
+    // owns the LinkedIn Easy Apply advance path, so we explicitly exclude it here.
+    const onExternalSite = allowExternal
+      && S.routeState !== 'linkedin_easy_apply_modal'
+      && !/(^|\.)linkedin\.com$/i.test(location.hostname)   // BUG-1 owns the LinkedIn path
+      && (S.externalRoute || externalClick
+          || S.routeState === 'same_tab_application'
+          || (typeof S.routeState === 'string' && S.routeState.startsWith('external_')));
+    if (onExternalSite) {
+      if (label && label === extLastLabel && location.href === extLastUrl) extRepeat++;
+      else extRepeat = 0;
+      extLastLabel = label; extLastUrl = location.href;
+      if (extRepeat >= S.sessionSettings.stallLimit) {
+        const fingerprint = recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label, stage: 'external-no-progress' });
+        logLine('warn', `external site stuck — "${label}" clicked ${extRepeat + 1}× with no progress; parking for you`);
+        report({
+          state: allowExternal ? 'skipped' : 'failed',
+          lastError: `couldn't drive the company application site — needs you (stuck on "${label}")`,
+          applyRoute: applyRouteForState(S.routeState),
+          transcriptAppend: { kind: 'recovery', note: 'external/company-ATS no-progress cap — repeated advance click did not transfer', fingerprint, count: extRepeat + 1 },
+        });
+        finalState = allowExternal ? 'skipped' : 'failed';
+        break;
+      }
+    }
     // ---- supervised gate [T4] ----  (no-op when not a supervised run)
     // Pause before advancing for the user's OK (Step mode) / honor a "Wrong" interrupt
     // (Run mode). A correction here rewrites the recipe + applies live before we advance.

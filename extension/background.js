@@ -20,6 +20,7 @@
 import * as api from './lib/api.js';
 import { isJobPageUrl } from './lib/jobpage.js';
 import { HOST_BREAKER_COOLDOWN_MS, hostOfUrl, shouldDispatchHost, trippedEntry } from './lib/host-breaker.js';
+import { pickApplyWindowBounds } from './lib/window-place.js';
 
 // ---------- browser capability probe (cross-browser parity, Apprenticeship Engine P8) ----------
 // Firefox lacks some Chrome MV3 surfaces (tabGroups, storage.session). The existing apply-pool
@@ -942,6 +943,26 @@ async function recoverAaGroup() {
 // BEHIND your work (focused:false + focus handed straight back), and then REUSED for the
 // whole run (so it never repeatedly pops up), and closed only on Stop. The apply tab is
 // the ACTIVE tab there, so the page loads un-throttled WITHOUT ever touching your window.
+// BUG-2: resolve where the dedicated apply window should be created. Queries the connected
+// displays (guarded — chrome.system.display may be absent on older/Firefox builds) and asks
+// the pure pickApplyWindowBounds helper. Returns a {left,top,width,height} placement merged
+// onto the base create options, plus `multiDisplay` so callers can decide focus behavior:
+//   • ≥2 displays → place on a NON-primary display (fully visible there ⇒ not occluded ⇒
+//     Chrome won't throttle AND it never covers the user's main-display work).
+//   • 1 display    → place out of the way (bottom-right) and DON'T steal focus.
+// Falls back to today's top-left placement if display info is unavailable.
+async function resolveApplyWindowCreate(base = {}) {
+  const fallback = { left: 60, top: 60, width: 1200, height: 900, ...base };
+  let displays = null;
+  try {
+    if (chrome.system?.display?.getInfo) displays = await chrome.system.display.getInfo();
+  } catch { displays = null; }
+  if (!Array.isArray(displays) || !displays.length) return { create: fallback, multiDisplay: false };
+  const bounds = pickApplyWindowBounds(displays);
+  if (!bounds) return { create: fallback, multiDisplay: false };
+  return { create: { ...base, ...bounds }, multiDisplay: displays.length >= 2 };
+}
+
 async function autoApplyTargetWindow() {
   await hydrateAaRuntime();
   await recoverAaGroup();
@@ -960,14 +981,13 @@ async function autoApplyTargetWindow() {
     const wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
     const focusedId = wins.find((w) => w.focused)?.id;
     let win = null;
-    // Give it an explicit SIDE position + size so Chrome doesn't cascade it directly OVER
-    // the user's window. A distinct, non-overlapping placement keeps the apply page at
-    // least partially on-display (less occlusion → less throttling) without any new
-    // permission (no system.display). HARD LIMIT: if the user runs a fully-maximized
-    // window on a single monitor, a non-focused background window is occluded by the OS
-    // and Chrome still throttles it — side-placement + the load-nudge mitigate but can't
-    // fully beat a fully-covering maximized window.
-    try { win = await chrome.windows.create({ focused: false, state: 'normal', width: 1200, height: 900, left: 60, top: 60 }); } catch {}
+    // BUG-2: place the window so it never covers the user's main-display work. On a
+    // multi-display setup it goes FULLY onto a non-primary display (visible there ⇒ not
+    // occluded ⇒ un-throttled, and off the user's screen); on a single display it goes
+    // out of the way (bottom-right). Always focused:false — we never steal foreground on
+    // create. (chrome.system.display guarded; falls back to top-left if unavailable.)
+    const placement = await resolveApplyWindowCreate({ focused: false, state: 'normal' });
+    try { win = await chrome.windows.create(placement.create); } catch {}
     aaWindowId = win ? win.id : null;
     persistAaWindowId();
     if (win && focusedId != null) { try { await chrome.windows.update(focusedId, { focused: true }); } catch {} }
@@ -1064,10 +1084,10 @@ async function acquireApplyWindow(focus = false) {
     try {
       const wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
       const focusedId = wins.find((w) => w.focused)?.id;
-      // Explicit SIDE placement + size (same rationale as autoApplyTargetWindow): a
-      // distinct, non-cascaded window stays partially on-display so its apply tab is less
-      // likely to be occlusion-throttled. No new permission.
-      const w = await chrome.windows.create({ focused: !!focus, state: 'normal', width: 1200, height: 900, left: 60, top: 60 });
+      // BUG-2: same display-aware placement as autoApplyTargetWindow — a non-primary
+      // display when available (off the user's screen + un-throttled), else out of the way.
+      const placement = await resolveApplyWindowCreate({ focused: !!focus, state: 'normal' });
+      const w = await chrome.windows.create(placement.create);
       if (w) {
         win = w.id;
         aaWindowPool = normalizeWindowIds([...aaWindowPool, win]);
