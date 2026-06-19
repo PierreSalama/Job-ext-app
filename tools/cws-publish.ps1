@@ -31,7 +31,7 @@ param(
   [string]$CredFile = "$PSScriptRoot\.cws-credentials.json",
   [switch]$UploadOnly,
   [ValidateSet('trustedTesters','default')]
-  [string]$Target = 'trustedTesters'   # private/unlisted item -> trustedTesters; public -> default
+  [string]$Target = 'default'   # this item is already published on the normal channel
 )
 
 $ErrorActionPreference = 'Stop'
