@@ -68,10 +68,11 @@ test('a transient failure misfiled as awaiting_input never permanently blocks re
   // an in-flight dup forever — so discovery could never re-queue the job.
   const job = db.upsertJob({ title: 'Q', company: 'V', source: 'linkedin', status: 'started', jobUrl: 'https://x/p4' }).job;
   const t = db.queueAdd(job.id, { mode: 'auto' });
-  db.queuePatch(t.id, { state: 'awaiting_input', lastError: 'application did not open (not Easy-Apply / verification)' });
+  const guarded = db.queuePatch(t.id, { state: 'awaiting_input', lastError: 'application did not open (not Easy-Apply / verification)' });
 
-  // reclaimDeadParks flips the dead awaiting_input (no questions) → retriable failed.
-  assert.ok(db.reclaimDeadParks() >= 1, 'dead awaiting_input reclaimed to failed');
+  // The storage boundary now prevents the dead wait-state immediately.
+  assert.equal(guarded.state, 'failed', 'empty awaiting_input is converted to failed immediately');
+  db.reclaimDeadParks();
   assert.equal(db.queueList({ state: 'awaiting_input' }).filter((x) => x.jobId === job.id).length, 0, 'no longer awaiting_input');
 
   // A GENUINE intake (real pending questions) must NOT be reclaimed.

@@ -6,6 +6,7 @@
 const SUCCESS_TEXT_RX = /(your\s*application\s*(was|has\s*been)\s*(sent|submitted|received)|application\s*(sent|submitted|received|complete|successful)|(have|'ve|has\s*been)\s*submitted\s*your\s*application|submitted\s*your\s*application|successfully\s*(submitted|applied|completed)|thank\s*you\s*for\s*(your\s*)?(applying|interest|application|consideration|submission)|thanks?\s*for\s*(your\s*)?(application|interest|applying|submission)|you['\s]?re\s*all\s*set|we['\s]?ve\s*received\s*your\s*application|we\s*have\s*received\s*your\s*application|your\s*application\s*(is\s*on\s*its\s*way|has\s*been\s*received)|application\s*(confirmation|complete)|candidature\s*(envoy[ée]e|soumise|re[çc]ue|transmise)|votre\s*candidature\s*a\s*(bien\s*)?[ée]t[ée]\s*(envoy[ée]e|soumise|re[çc]ue)|merci\s*(d['e]\s*)?(avoir\s*postul[ée]|pour\s*votre\s*candidature))/i;
 
 const SUCCESS_URL_RX = /\/(confirmation|thank[-_]?you|merci|applied|success|submitted|post[-_]?apply|apply[-_]?complete|application[-_]?(complete|received|sent|success))(\/|\?|$|#)/i;
+const NON_SUCCESS_URL_RX = /\/(login|log-in|signin|sign-in|auth|register|create-account)(\/|\?|$|#)|[?&](?:stepname|step)=?(?:login|signin|auth)\b/i;
 
 export function pageTextLooksLikeSuccess(maxLen = 5000) {
   const text = (document.body?.textContent || '').slice(0, maxLen);
@@ -13,7 +14,7 @@ export function pageTextLooksLikeSuccess(maxLen = 5000) {
 }
 
 export function urlLooksLikeSuccess(href = location.href) {
-  return SUCCESS_URL_RX.test(href);
+  return !NON_SUCCESS_URL_RX.test(href) && SUCCESS_URL_RX.test(href);
 }
 
 export function nodeLooksLikeSuccess(node) {
@@ -29,4 +30,4 @@ export function nodeLooksLikeSuccess(node) {
   return t.length < 600 && SUCCESS_TEXT_RX.test(t);
 }
 
-export { SUCCESS_TEXT_RX, SUCCESS_URL_RX };
+export { SUCCESS_TEXT_RX, SUCCESS_URL_RX, NON_SUCCESS_URL_RX };

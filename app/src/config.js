@@ -105,6 +105,8 @@ const DEFAULTS = {
     minGapMinutes: 1,             // ~1–3 min between starts (human-like; avoids the throttle)
     maxGapMinutes: 3,
     concurrency: 1,               // safest default. Raise to 2–3 for separate-site parallelism once the machine can handle it.
+    keepAwake: true,              // while auto-apply is ON, prevent system sleep (session-scoped; never edits Windows power plans)
+    keepDisplayAwake: false,      // optional stronger mode for sites that throttle occluded/off displays
     bringToFrontToHydrate: false, // OFF by default. ON = the apply window is brought to the FRONT while applying, guaranteeing the page isn't throttled (Chrome throttles a fully-occluded window — e.g. behind a fullscreen game — so the Easy-Apply button never loads). Trade-off: it takes focus while each application runs. Turn ON when reliability matters more than not being interrupted (e.g. running while away).
     frontToHydrate: true,         // ON by default. When the apply tab detects it is OCCLUDED (Chrome throttled it → LinkedIn never hydrates), it asks the SW to front the apply window ONLY for the few seconds it takes the form to load, then hands your focus straight back. Unlike bringToFrontToHydrate this is reactive (no steal unless actually occluded) and self-releasing. Set false to keep the old single-nudge behavior.
     runAnytime: true,        // ON by default — run 24/7. Turn OFF to use the window below.
@@ -125,8 +127,11 @@ const DEFAULTS = {
     resumeDocId: '',              // which résumé to attach ('' = default)
     discovery: {
       enabled: true,
-      perRunLimit: 8,             // max jobs grabbed per search pass (kept small)
+      provider: 'jobspy',         // bundled open-source primary; browser scraper is failure-only fallback
+      perRunLimit: 25,
       refillBelow: 3,             // top up the queue when it drops below this
+      intervalMinutes: 1,
+      hoursOld: 72,
     },
     sites: {},               // per-host overrides: { 'linkedin.com': { mode: 'auto' } }
   },
@@ -158,6 +163,7 @@ const DEFAULTS = {
   maintenance: {
     eventRetentionDays: 400,        // prune timeline events older than this
     taskRetentionDays: 60,          // prune terminal (skipped/failed) auto-apply tasks older than this
+    discoveryRetentionDays: 90,     // provider diagnostics/provenance are useful for tuning, but bounded
     emailRetentionDays: 365,        // prune UNMATCHED emails older than this (matched/manual are always kept)
     vacuumEveryDays: 7,             // reclaim disk by compacting the DB at most this often
     pauseBackgroundOnBattery: false,// when true, defer background email/gmail sync while on battery

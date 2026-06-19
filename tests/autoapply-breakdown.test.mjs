@@ -22,7 +22,11 @@ function queueJob({ source, url, state, applyRoute, lastError }) {
   // postings into one row (a test-data artifact, not product behaviour).
   const job = db.upsertJob({ externalId: url, title: 'Dev ' + url, company: 'Acme', source, status: 'started', jobUrl: url }).job;
   const task = db.queueAdd(job.id, { mode: 'auto' });
-  db.queuePatch(task.id, { state, applyRoute, lastError });
+  db.queuePatch(task.id, {
+    state, applyRoute, lastError,
+    submissionEvidence: state === 'done' ? { type: 'test-confirmation' } : undefined,
+    pendingQuestions: state === 'awaiting_input' || state === 'parked' ? [{ question: 'Test input?', reason: lastError || 'test' }] : undefined,
+  });
   return task;
 }
 
@@ -34,7 +38,7 @@ test('migration v7: apply_route column exists and queuePatch persists it', () =>
 
 test('a routeless patch preserves the prior route (COALESCE)', () => {
   const t = queueJob({ source: 'linkedin', url: 'https://x/2', state: 'running', applyRoute: 'easy-apply' });
-  db.queuePatch(t.id, { state: 'done' });   // no applyRoute in this patch
+  db.queuePatch(t.id, { state: 'done', submissionEvidence: { type: 'test-confirmation' } });   // no applyRoute in this patch
   const got = db.queueList({}).find((x) => x.id === t.id);
   assert.equal(got.applyRoute, 'easy-apply', 'route survives a later state-only patch');
 });
@@ -78,7 +82,11 @@ test('queueLive session counts: submitted = done ONLY, awaiting_review is separa
   const since = new Date(Date.now() - 3600 * 1000).toISOString();
   const mk = (id, state) => {
     const j = db.upsertJob({ externalId: id, title: 'Dev ' + id, company: 'Acme', source: 'indeed', status: 'started', jobUrl: 'https://x/' + id }).job;
-    db.queuePatch(db.queueAdd(j.id, { mode: 'auto' }).id, { state });
+    db.queuePatch(db.queueAdd(j.id, { mode: 'auto' }).id, {
+      state,
+      submissionEvidence: state === 'done' ? { type: 'test-confirmation' } : undefined,
+      pendingQuestions: state === 'parked' ? [{ question: 'Test question?', reason: 'test' }] : undefined,
+    });
   };
   const before = db.queueLive({ startedAt: since }).session;
   mk('sess-done', 'done');

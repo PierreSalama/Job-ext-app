@@ -127,12 +127,9 @@ chrome.alarms.onAlarm.addListener(async (a) => {
     // Auto-apply was turned OFF (from either dashboard host) → tidy up the run's
     // tabs/group. Cheap no-op once aaGroupId is cleared.
     if (r.reason === 'disabled' && aaGroupId != null) await closeAutoApplyTabs().catch(() => {});
-    // ALWAYS try to top up the queue — even when the pool just dispatched. A busy
-    // parallel pool consumes faster than one-discovery-per-idle-tick can refill, so
-    // gating refill on "dispatched nothing" starved the queue to a stall. discoverTick
-    // self-gates on queue depth (only searches when below refillBelow), so calling it
-    // every tick never over-enqueues; it just keeps N workers fed.
-    await discoverTick().catch(() => {});
+    // App-owned JobSpy is the primary discovery engine. Chrome only consumes an
+    // explicit fallback request after JobSpy reports a typed provider failure.
+    await processDiscoveryFallback().catch(() => {});
   }
   if (a.name === 'jat11-extupdate') {
     await checkExtUpdate().catch(() => {});
@@ -222,15 +219,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // appear within a few milliseconds, so registering after the click races and loses
       // the child. The captured child is tracked like every other AA tab and becomes the
       // authoritative executor for this task.
-      respond(armExternalHandoff(sender?.tab?.id).then((token) => ({ ok: !!token, token })));
+      respond(armExternalHandoff(sender?.tab?.id, msg.taskId, msg.routeState).then((token) => ({ ok: !!token, token })));
       return true;
     case 'jat11.external-handoff-run':
       respond(runExternalHandoff(sender?.tab?.id, msg.token, msg.task, msg.context));
       return true;
     case 'run-discovery':
-      // Manual "Run discovery now" from the extension dashboard (bypasses the
-      // queue-low + window gates so the user can shake it out on demand).
-      respond(discoverTick(true).then((s) => ({ ok: true, status: s })));
+      respond(api.call('POST', '/auto-apply/discover-now', {}, 180000));
       return true;
     case 'run-autoapply-now':
       // TEST button: apply the next queued job RIGHT NOW (skips window/cap/gap).
@@ -627,13 +622,21 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
 });
 
-async function armExternalHandoff(sourceTabId) {
+async function armExternalHandoff(sourceTabId, taskId, routeState) {
   if (sourceTabId == null) return null;
   for (const [id, stale] of externalHandoffs) {
     if (Date.now() - stale.createdAt > 30000) externalHandoffs.delete(id);
   }
   const token = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  externalHandoffs.set(sourceTabId, { token, childTabId: null, createdAt: Date.now() });
+  let initialUrl = '';
+  try { initialUrl = (await chrome.tabs.get(sourceTabId))?.url || ''; } catch {}
+  externalHandoffs.set(sourceTabId, { token, childTabId: null, createdAt: Date.now(), initialUrl, taskId: taskId || null });
+  if (taskId) {
+    await api.call('PATCH', '/queue/' + taskId, {
+      handoffToken: token, routeState: routeState || 'unknown', applyRoute: 'external',
+      transcriptAppend: { kind: 'handoff', note: 'external ownership armed before click' },
+    }).catch(() => {});
+  }
   return token;
 }
 
@@ -653,12 +656,20 @@ try {
   chrome.webNavigation.onCreatedNavigationTarget.addListener((d) => captureExternalChild(d?.sourceTabId, d?.tabId));
 } catch {}
 
-async function waitForExternalChild(sourceTabId, token, timeoutMs = 15000) {
+async function waitForExternalTarget(sourceTabId, token, timeoutMs = 20000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     const handoff = externalHandoffs.get(sourceTabId);
     if (!handoff || handoff.token !== token) return null;
-    if (handoff.childTabId != null) return handoff.childTabId;
+    if (handoff.childTabId != null) return { tabId: handoff.childTabId, child: true };
+    try {
+      const source = await chrome.tabs.get(sourceTabId);
+      if (source?.url && handoff.initialUrl && source.url !== handoff.initialUrl) {
+        const beforeHost = new URL(handoff.initialUrl).hostname.replace(/^www\./, '');
+        const afterHost = new URL(source.url).hostname.replace(/^www\./, '');
+        if (beforeHost !== afterHost) return { tabId: sourceTabId, child: false };
+      }
+    } catch {}
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   return null;
@@ -675,11 +686,12 @@ async function sendTaskWhenReady(tabId, message, timeoutMs = 20000) {
 }
 
 async function runExternalHandoff(sourceTabId, token, task, context) {
-  const childTabId = await waitForExternalChild(sourceTabId, token);
-  if (childTabId == null) {
+  const target = await waitForExternalTarget(sourceTabId, token);
+  if (!target) {
     externalHandoffs.delete(sourceTabId);
     return { ok: true, captured: false };
   }
+  const childTabId = target.tabId;
   let child = null;
   try {
     await waitTabComplete(childTabId, 30000);
@@ -697,6 +709,9 @@ async function runExternalHandoff(sourceTabId, token, task, context) {
     };
     if (task?.id != null) {
       await api.call('PATCH', '/queue/' + task.id, {
+        handoffToken: token,
+        routeState: target.child ? 'external_new_tab' : 'external_same_tab',
+        applyRoute: 'external',
         transcriptAppend: { kind: 'handoff', note: `executor transferred to external tab ${childTabId}`, url: child?.url || null },
       }).catch(() => {});
     }
@@ -708,7 +723,7 @@ async function runExternalHandoff(sourceTabId, token, task, context) {
           dispatch,
           new Promise((_, reject) => setTimeout(() => reject(new Error('external apply timed out after 4 min')), 240000)),
         ]);
-    return { ok: result?.ok !== false, captured: true, childTabId, url: child?.url || null, result };
+    return { ok: result?.ok !== false, captured: true, childTabId, sameTab: !target.child, url: child?.url || null, result };
   } catch (e) {
     if (task?.id != null) {
       await api.call('PATCH', '/queue/' + task.id, {
@@ -719,8 +734,10 @@ async function runExternalHandoff(sourceTabId, token, task, context) {
     return { ok: false, captured: true, childTabId, error: String(e?.message || e), result: { ok: false, state: 'failed', error: String(e?.message || e) } };
   } finally {
     externalHandoffs.delete(sourceTabId);
-    try { await chrome.tabs.remove(childTabId); } catch {}
-    untrackAaTab(childTabId);
+    if (target.child) {
+      try { await chrome.tabs.remove(childTabId); } catch {}
+      untrackAaTab(childTabId);
+    }
   }
 }
 
@@ -1186,6 +1203,27 @@ async function launchOne(task, context) {
       // us. That's NOT a real failure: leave the task as the dashboard set it (skipped)
       // and bow out quietly, so no "application failed" toast fires.
       if (stopping) return 'skipped';
+      // A same-tab external handoff intentionally navigates away from the source
+      // content script, so Chrome rejects the original sendMessage even though the
+      // service worker has already re-dispatched the task on the ATS page. If ownership
+      // is armed, wait for that authoritative result instead of racing it with a false
+      // failure patch.
+      let handedOff = null;
+      try {
+        const qr = await api.call('GET', '/queue', null, 8000);
+        handedOff = (qr?.items || []).find((x) => x.id === task.id && x.handoffToken);
+      } catch {}
+      if (handedOff) {
+        const deadline = Date.now() + 285000;
+        while (Date.now() < deadline && !stopping) {
+          try {
+            const qr = await api.call('GET', '/queue', null, 8000);
+            const current = (qr?.items || []).find((x) => x.id === task.id);
+            if (current && ['done', 'awaiting_review', 'awaiting_input', 'parked', 'failed', 'skipped'].includes(current.state)) return current.state;
+          } catch {}
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        }
+      }
       await api.call('PATCH', '/queue/' + task.id, {
         state: 'failed', attemptsDelta: 1, lastError: String(e?.message || e),
         transcriptAppend: { note: 'executor error: ' + String(e?.message || e) },
@@ -1422,6 +1460,42 @@ function buildSearchUrl(board, keyword, location, { easyApplyOnly = true } = {})
   // external redirects as "needs you / external" in the breakdown).
   const al = easyApplyOnly ? 'f_AL=true&' : '';
   return `https://www.linkedin.com/jobs/search/?${al}keywords=${kw}&sortBy=DD` + (loc ? `&location=${loc}` : '');
+}
+
+async function processDiscoveryFallback() {
+  if (scanning || pumping) return { ok: false, note: 'busy' };
+  if (!(await api.isPaired())) return { ok: false, note: 'not paired' };
+  const next = await api.call('GET', '/auto-apply/discovery-fallback/next', null, 8000);
+  const req = next?.request;
+  if (!req) return { ok: false, note: 'no fallback requested' };
+  scanning = true;
+  let tab = null, resp = null;
+  try {
+    const sres = await api.call('GET', '/settings', null, 6000);
+    const aa = sres?.settings?.autoApply || {};
+    const url = buildSearchUrl(req.source, req.keyword || '', req.location || '', { easyApplyOnly: aa.easyApplyOnly !== false });
+    tab = await createAaTab(url, { active: false });
+    await waitTabComplete(tab.id, 35000);
+    await new Promise((resolve) => setTimeout(resolve, 2200));
+    resp = await chrome.tabs.sendMessage(tab.id, {
+      type: 'jat11.discover-search', source: req.source,
+      max: Math.max(10, Math.min(50, Number(aa.discovery?.perRunLimit) || 25)),
+      easyApplyOnly: aa.easyApplyOnly !== false,
+    }, { frameId: 0 });
+    const done = await api.call('POST', `/auto-apply/discovery-fallback/${encodeURIComponent(req.id)}/complete`, {
+      ok: resp?.ok !== false, jobs: resp?.jobs || [], error: resp?.error || null,
+    }, 30000);
+    if ((done?.enqueued || 0) > 0) schedulePump();
+    return { ok: done?.ok !== false, source: req.source, found: resp?.found || 0, enqueued: done?.enqueued || 0 };
+  } catch (e) {
+    await api.call('POST', `/auto-apply/discovery-fallback/${encodeURIComponent(req.id)}/complete`, {
+      ok: false, jobs: [], error: String(e?.message || e),
+    }, 15000).catch(() => {});
+    return { ok: false, error: String(e?.message || e) };
+  } finally {
+    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} untrackAaTab(tab.id); }
+    scanning = false;
+  }
 }
 
 async function discoverTick(force = false) {

@@ -537,6 +537,66 @@ const MIGRATIONS = [
     exec('ALTER TABLE recipe_steps ADD COLUMN source TEXT;');
     exec('ALTER TABLE recipe_steps ADD COLUMN default_value TEXT;');
   },
+
+  // v11 — durable discovery ledger + provider fallback queue. Discovery now runs in
+  // the desktop app (JobSpy primary) and asks the extension to scrape only when a
+  // provider reports a typed failure. Keeping batches makes zero-results, blocking,
+  // parser drift and dedup visible instead of overwriting one opaque status value.
+  () => {
+    exec(`
+      CREATE TABLE discovery_batches (
+        id              TEXT PRIMARY KEY,
+        provider        TEXT NOT NULL,
+        source          TEXT NOT NULL,
+        keyword         TEXT,
+        location        TEXT,
+        status          TEXT NOT NULL,
+        found_count     INTEGER NOT NULL DEFAULT 0,
+        accepted_count  INTEGER NOT NULL DEFAULT 0,
+        duplicate_count INTEGER NOT NULL DEFAULT 0,
+        rejected_count  INTEGER NOT NULL DEFAULT 0,
+        error           TEXT,
+        diagnostics     TEXT,
+        fallback_of     TEXT,
+        started_at      TEXT NOT NULL,
+        completed_at    TEXT,
+        FOREIGN KEY (fallback_of) REFERENCES discovery_batches(id) ON DELETE SET NULL
+      );
+      CREATE INDEX idx_discovery_batches_time ON discovery_batches(started_at DESC);
+      CREATE INDEX idx_discovery_batches_source ON discovery_batches(source, started_at DESC);
+
+      CREATE TABLE discovery_fallbacks (
+        id          TEXT PRIMARY KEY,
+        batch_id    TEXT NOT NULL REFERENCES discovery_batches(id) ON DELETE CASCADE,
+        source      TEXT NOT NULL,
+        keyword     TEXT,
+        location    TEXT,
+        state       TEXT NOT NULL DEFAULT 'queued',
+        reason      TEXT,
+        created_at  TEXT NOT NULL,
+        claimed_at  TEXT,
+        completed_at TEXT,
+        UNIQUE(batch_id, source)
+      );
+      CREATE INDEX idx_discovery_fallback_state ON discovery_fallbacks(state, created_at);
+
+      CREATE TABLE job_discovery_provenance (
+        job_id           TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        batch_id         TEXT NOT NULL REFERENCES discovery_batches(id) ON DELETE CASCADE,
+        provider         TEXT NOT NULL,
+        source           TEXT NOT NULL,
+        raw_url          TEXT,
+        apply_capability TEXT NOT NULL DEFAULT 'unknown',
+        discovered_at    TEXT NOT NULL,
+        PRIMARY KEY (job_id, batch_id)
+      );
+      CREATE INDEX idx_job_discovery_job ON job_discovery_provenance(job_id, discovered_at DESC);
+
+      ALTER TABLE auto_apply_tasks ADD COLUMN route_state TEXT;
+      ALTER TABLE auto_apply_tasks ADD COLUMN submission_evidence TEXT;
+      ALTER TABLE auto_apply_tasks ADD COLUMN handoff_token TEXT;
+    `);
+  },
 ];
 
 function userVersion() {
@@ -618,15 +678,16 @@ function dailyBackup() {
 // vacuumEveryDays) compact the file to reclaim disk. Never touches jobs, matched/
 // manual emails, profiles, qa, documents — only churny logs. Safe to call repeatedly.
 function maintenance() {
-  if (!db) return { events: 0, tasks: 0, emails: 0, vacuumed: false };
+  if (!db) return { events: 0, tasks: 0, emails: 0, discovery: 0, vacuumed: false };
   const m = getSettings().maintenance || {};
   const cut = (days, fallback) => new Date(Date.now() - Math.max(1, days || fallback) * 86400 * 1000).toISOString();
-  let events = 0, tasks = 0, emails = 0;
+  let events = 0, tasks = 0, emails = 0, discovery = 0;
   transaction(() => {
     events = run('DELETE FROM events WHERE timestamp < ?', [cut(m.eventRetentionDays, 400)])?.changes || 0;
     tasks = run("DELETE FROM auto_apply_tasks WHERE state IN ('skipped','failed') AND updated_at < ?", [cut(m.taskRetentionDays, 60)])?.changes || 0;
     // unmatched only; keep user-dismissed ones so a stale dismissal can't resurface as a suggestion.
     emails = run("DELETE FROM emails WHERE matched_job_id IS NULL AND (match_source IS NULL OR match_source NOT IN ('dismissed','manual')) AND created_at < ?", [cut(m.emailRetentionDays, 365)])?.changes || 0;
+    discovery = run('DELETE FROM discovery_batches WHERE started_at < ?', [cut(m.discoveryRetentionDays, 90)])?.changes || 0;
   });
   // VACUUM must run OUTSIDE a transaction; gate it so it doesn't run every call.
   let vacuumed = false;
@@ -635,8 +696,8 @@ function maintenance() {
   if (!last || (Date.now() - Date.parse(last)) > everyMs) {
     try { exec('VACUUM'); kvSet('lastVacuumAt', new Date().toISOString()); vacuumed = true; } catch (e) { log.warn('VACUUM failed', e.message); }
   }
-  if (events || tasks || emails || vacuumed) log.info(`maintenance: pruned ${events} events, ${tasks} tasks, ${emails} emails${vacuumed ? ' + vacuumed' : ''}`);
-  return { events, tasks, emails, vacuumed };
+  if (events || tasks || emails || discovery || vacuumed) log.info(`maintenance: pruned ${events} events, ${tasks} tasks, ${emails} emails, ${discovery} discovery batches${vacuumed ? ' + vacuumed' : ''}`);
+  return { events, tasks, emails, discovery, vacuumed };
 }
 
 // ============================================================
@@ -2200,6 +2261,113 @@ function pruneMissingFolderDocs(folderId) {
 }
 
 // ============================================================
+// Discovery ledger (JobSpy primary, browser fallback)
+// ============================================================
+const DISCOVERY_STATUSES = new Set(['running', 'ok', 'empty', 'blocked', 'rate_limited', 'parser_drift', 'timeout', 'unavailable', 'failed']);
+
+function discoveryBatchStart({ provider, source, keyword, location, fallbackOf } = {}) {
+  const id = uid('disc');
+  run(`INSERT INTO discovery_batches
+       (id, provider, source, keyword, location, status, fallback_of, started_at)
+       VALUES (?, ?, ?, ?, ?, 'running', ?, ?)`,
+      [id, String(provider || 'unknown'), String(source || 'unknown'), keyword || '', location || '', fallbackOf || null, now()]);
+  return discoveryBatchGet(id);
+}
+
+function discoveryBatchGet(id) {
+  const r = get('SELECT * FROM discovery_batches WHERE id = ?', [id]);
+  if (!r) return null;
+  return {
+    id: r.id, provider: r.provider, source: r.source, keyword: r.keyword || '', location: r.location || '',
+    status: r.status, found: r.found_count || 0, accepted: r.accepted_count || 0,
+    duplicates: r.duplicate_count || 0, rejected: r.rejected_count || 0,
+    error: r.error || null, diagnostics: safeParse(r.diagnostics, {}), fallbackOf: r.fallback_of || null,
+    startedAt: r.started_at, completedAt: r.completed_at || null,
+  };
+}
+
+function discoveryBatchComplete(id, { status, found, accepted, duplicates, rejected, error, diagnostics } = {}) {
+  const finalStatus = DISCOVERY_STATUSES.has(status) ? status : 'failed';
+  run(`UPDATE discovery_batches SET status=?, found_count=?, accepted_count=?, duplicate_count=?, rejected_count=?,
+       error=?, diagnostics=?, completed_at=? WHERE id=?`,
+      [finalStatus, Number(found) || 0, Number(accepted) || 0, Number(duplicates) || 0, Number(rejected) || 0,
+       error ? String(error).slice(0, 2000) : null, JSON.stringify(diagnostics || {}), now(), id]);
+  return discoveryBatchGet(id);
+}
+
+function discoveryBatchList({ limit = 50, source } = {}) {
+  const n = Math.max(1, Math.min(500, Number(limit) || 50));
+  const rows = source
+    ? all('SELECT id FROM discovery_batches WHERE source=? ORDER BY started_at DESC LIMIT ?', [source, n])
+    : all('SELECT id FROM discovery_batches ORDER BY started_at DESC LIMIT ?', [n]);
+  return rows.map((r) => discoveryBatchGet(r.id));
+}
+
+function discoveryRecordJob({ jobId, batchId, provider, source, rawUrl, applyCapability = 'unknown' } = {}) {
+  if (!jobId || !batchId) return false;
+  run(`INSERT OR REPLACE INTO job_discovery_provenance
+       (job_id, batch_id, provider, source, raw_url, apply_capability, discovered_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [jobId, batchId, provider || 'unknown', source || 'unknown', rawUrl || null,
+       ['easy_apply', 'external', 'unknown'].includes(applyCapability) ? applyCapability : 'unknown', now()]);
+  return true;
+}
+
+function discoveryFallbackQueue({ batchId, source, keyword, location, reason } = {}) {
+  if (!batchId || !source) return null;
+  const id = uid('dfb');
+  run(`INSERT OR IGNORE INTO discovery_fallbacks
+       (id, batch_id, source, keyword, location, state, reason, created_at)
+       VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)`,
+      [id, batchId, source, keyword || '', location || '', reason || 'primary provider failed', now()]);
+  return get('SELECT * FROM discovery_fallbacks WHERE batch_id=? AND source=?', [batchId, source]);
+}
+
+function discoveryFallbackNext() {
+  const stale = new Date(Date.now() - 5 * 60000).toISOString();
+  run("UPDATE discovery_fallbacks SET state='queued', claimed_at=NULL WHERE state='claimed' AND claimed_at < ?", [stale]);
+  const r = get("SELECT * FROM discovery_fallbacks WHERE state='queued' ORDER BY created_at ASC LIMIT 1");
+  if (!r) return null;
+  run("UPDATE discovery_fallbacks SET state='claimed', claimed_at=? WHERE id=? AND state='queued'", [now(), r.id]);
+  return get('SELECT * FROM discovery_fallbacks WHERE id=?', [r.id]);
+}
+
+function discoveryFallbackComplete(id, { ok, error } = {}) {
+  const r = get('SELECT * FROM discovery_fallbacks WHERE id=?', [id]);
+  if (!r) return null;
+  run("UPDATE discovery_fallbacks SET state=?, reason=COALESCE(?,reason), completed_at=? WHERE id=?",
+      [ok ? 'done' : 'failed', error ? String(error).slice(0, 1000) : null, now(), id]);
+  return get('SELECT * FROM discovery_fallbacks WHERE id=?', [id]);
+}
+
+function discoveryHealth() {
+  const latest = all(`SELECT b.* FROM discovery_batches b
+    JOIN (SELECT source, MAX(started_at) AS mx FROM discovery_batches GROUP BY source) x
+      ON x.source=b.source AND x.mx=b.started_at ORDER BY b.source`).map((r) => discoveryBatchGet(r.id));
+  const pending = get("SELECT COUNT(*) AS n FROM discovery_fallbacks WHERE state IN ('queued','claimed')")?.n || 0;
+  const lastSuccess = get("SELECT MAX(completed_at) AS at FROM discovery_batches WHERE status IN ('ok','empty')")?.at || null;
+  return { providers: latest, pendingFallbacks: pending, lastSuccess };
+}
+
+function reconcileDiscovery({ olderThanMinutes = 10 } = {}) {
+  const cutoff = new Date(Date.now() - Math.max(1, olderThanMinutes) * 60000).toISOString();
+  const interrupted = run(`UPDATE discovery_batches SET status='failed', error=COALESCE(error,'discovery interrupted before completion'), completed_at=?
+    WHERE status='running' AND started_at < ?`, [now(), cutoff])?.changes || 0;
+  const staleClaims = run("UPDATE discovery_fallbacks SET state='queued', claimed_at=NULL WHERE state='claimed' AND claimed_at < ?", [cutoff])?.changes || 0;
+  return { interrupted, staleClaims };
+}
+
+function pipelineHealth() {
+  const staleCutoff = new Date(Date.now() - 8 * 60000).toISOString();
+  const lastTaskActivity = get('SELECT MAX(updated_at) AS at FROM auto_apply_tasks')?.at || null;
+  const lastSubmission = get("SELECT MAX(updated_at) AS at FROM auto_apply_tasks WHERE state='done'")?.at || null;
+  const staleTasks = get("SELECT COUNT(*) AS n FROM auto_apply_tasks WHERE state IN ('running','scheduled') AND updated_at < ?", [staleCutoff])?.n || 0;
+  const invalidWaits = get(`SELECT COUNT(*) AS n FROM auto_apply_tasks WHERE state IN ('awaiting_input','parked')
+    AND (pending_questions IS NULL OR TRIM(pending_questions) IN ('','[]','null'))`)?.n || 0;
+  return { discovery: discoveryHealth(), lastTaskActivity, lastSubmission, staleTasks, invalidWaits };
+}
+
+// ============================================================
 // Auto-apply queue
 // ============================================================
 function taskSiteKey(job) {
@@ -2259,6 +2427,9 @@ function rowToTask(r) {
     transcript: safeParse(r.transcript, []),
     parkReason: r.park_reason || null,
     applyRoute: r.apply_route || null,
+    routeState: r.route_state || null,
+    submissionEvidence: safeParse(r.submission_evidence, null),
+    handoffToken: r.handoff_token || null,
     pendingQuestions: safeParse(r.pending_questions, []),
     failureClass: failure.failureClass,
     failureAction: failure.action,
@@ -2451,7 +2622,7 @@ function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25 } 
   for (const r of rows) {
     const failure = classifyQueueFailure(r);
     if (failure.action !== 'retry') continue;
-    if (queuePatch(r.id, { state: 'queued', lastError: null, attemptsDelta: 1, transcriptAppend: { note: `self-heal retry after ${failure.failureClass}` } })) n++;
+    if (queuePatch(r.id, { state: 'queued', lastError: null, handoffToken: null, attemptsDelta: 1, transcriptAppend: { note: `self-heal retry after ${failure.failureClass}` } })) n++;
   }
   return n;
 }
@@ -2519,7 +2690,7 @@ function queueAdd(jobId, { mode, force = false } = {}) {
     const inFlight = ['queued', 'scheduled', 'running', 'awaiting_review'].includes(last.state);
     if (inFlight) return rowToTask(last);
     if (last.state !== 'done') {
-      run("UPDATE auto_apply_tasks SET state='queued', last_error=NULL, park_reason=NULL, pending_questions=NULL, updated_at=? WHERE id=?", [now(), last.id]);
+      run("UPDATE auto_apply_tasks SET state='queued', last_error=NULL, park_reason=NULL, pending_questions=NULL, handoff_token=NULL, submission_evidence=NULL, updated_at=? WHERE id=?", [now(), last.id]);
       return rowToTask(get('SELECT * FROM auto_apply_tasks WHERE id=?', [last.id]));
     }
     // already applied (done) + force → fall through and create a fresh task.
@@ -2532,10 +2703,31 @@ function queueAdd(jobId, { mode, force = false } = {}) {
   return rowToTask(get('SELECT * FROM auto_apply_tasks WHERE id = ?', [id]));
 }
 
-function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attemptsDelta, mode, parkReason, pendingQuestions, applyRoute }) {
+function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attemptsDelta, mode, parkReason, pendingQuestions, applyRoute, routeState, submissionEvidence, handoffToken }) {
   const cur = get('SELECT * FROM auto_apply_tasks WHERE id = ?', [id]);
   if (!cur) return null;
   if (state && !QUEUE_STATES.has(state)) return null;
+  let nextState = state || cur.state;
+  let nextError = lastError !== undefined ? lastError : cur.last_error;
+  let nextParkReason = parkReason !== undefined ? parkReason : cur.park_reason;
+  let nextPending = pendingQuestions !== undefined ? (pendingQuestions || []).slice(0, 40) : safeParse(cur.pending_questions, []);
+  const nextEvidence = submissionEvidence !== undefined ? submissionEvidence : safeParse(cur.submission_evidence, null);
+
+  // Terminal-state integrity is enforced at the storage boundary. Executors can be
+  // interrupted or old extension versions can omit fields, but the ledger must never
+  // contain an unexplained failure, a fake user-wait, or an unproven submission.
+  if (nextState === 'failed' && !String(nextError || '').trim()) nextError = 'auto-apply failed without a diagnostic';
+  if (nextState === 'skipped' && !String(nextError || '').trim()) nextError = 'auto-apply skipped without a diagnostic';
+  if ((nextState === 'awaiting_input' || nextState === 'parked') && !nextPending.some((q) => q && String(q.question || q.reason || '').trim())) {
+    nextState = 'failed';
+    nextError = String(nextError || nextParkReason || 'user-wait state had no actionable question');
+    nextParkReason = null;
+    nextPending = [];
+  }
+  if (nextState === 'done' && !nextEvidence) {
+    nextState = 'awaiting_review';
+    nextError = 'submit was reported without confirmation evidence — please verify';
+  }
   const transcript = safeParse(cur.transcript, []);
   if (transcriptAppend) {
     const items = Array.isArray(transcriptAppend) ? transcriptAppend : [transcriptAppend];
@@ -2543,16 +2735,21 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
   }
   run(`UPDATE auto_apply_tasks SET
        state = ?, mode = ?, scheduled_at = ?, attempts = attempts + ?, last_error = ?,
-       transcript = ?, park_reason = ?, pending_questions = ?, apply_route = COALESCE(?, apply_route), updated_at = ? WHERE id = ?`,
-      [state || cur.state,
+       transcript = ?, park_reason = ?, pending_questions = ?, apply_route = COALESCE(?, apply_route),
+       route_state = COALESCE(?, route_state), submission_evidence = ?, handoff_token = ?,
+       updated_at = ? WHERE id = ?`,
+      [nextState,
        mode || cur.mode,
        scheduledAt !== undefined ? scheduledAt : cur.scheduled_at,
        attemptsDelta || 0,
-       lastError !== undefined ? lastError : cur.last_error,
+       nextError,
        JSON.stringify(transcript.slice(-200)),
-       parkReason !== undefined ? parkReason : cur.park_reason,
-       pendingQuestions !== undefined ? JSON.stringify((pendingQuestions || []).slice(0, 40)) : cur.pending_questions,
+       nextParkReason,
+       JSON.stringify(nextPending),
        (applyRoute !== undefined && applyRoute !== null) ? String(applyRoute) : null,
+       (routeState !== undefined && routeState !== null) ? String(routeState) : null,
+       nextEvidence ? JSON.stringify(nextEvidence) : null,
+       handoffToken !== undefined ? handoffToken : cur.handoff_token,
        now(), id]);
   return rowToTask(get('SELECT * FROM auto_apply_tasks WHERE id = ?', [id]));
 }
@@ -2762,6 +2959,7 @@ function exportAll() {
     profiles: listProfiles(),
     documents: listDocuments(),
     queue: queueList(),
+    discoveryBatches: discoveryBatchList({ limit: 500 }),
   };
 }
 
@@ -2802,7 +3000,7 @@ function wipeAllData() {
   // Last-ditch recovery snapshot before the one irreversible op — the typed-DELETE
   // confirm prevents misclicks, this makes even a regretted/wrong-account wipe undoable.
   const backup = backupNow('pre-wipe-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-'));
-  const tables = ['emails', 'auto_apply_tasks', 'events', 'ai_log', 'qa', 'profile_fields', 'profiles', 'documents', 'document_folders', 'jobs'];
+  const tables = ['discovery_fallbacks', 'job_discovery_provenance', 'discovery_batches', 'emails', 'auto_apply_tasks', 'events', 'ai_log', 'qa', 'profile_fields', 'profiles', 'documents', 'document_folders', 'jobs'];
   const deleted = {};
   transaction(() => {
     for (const t of tables) deleted[t] = run(`DELETE FROM ${t}`)?.changes || 0;
@@ -3601,6 +3799,8 @@ module.exports = {
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,
   extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
+  discoveryBatchStart, discoveryBatchGet, discoveryBatchComplete, discoveryBatchList, discoveryRecordJob,
+  discoveryFallbackQueue, discoveryFallbackNext, discoveryFallbackComplete, discoveryHealth, reconcileDiscovery, pipelineHealth,
   queueList, queueHistory, queueBreakdown, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, saveIntakeAnswer,
   classifyQueueFailure, taskSiteKey, queueActiveSiteKeys,
   setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,

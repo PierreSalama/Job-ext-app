@@ -6,11 +6,12 @@
 
 const {
   app, BrowserWindow, Tray, Menu, dialog, globalShortcut,
-  ipcMain, nativeImage, shell, powerMonitor,
+  ipcMain, nativeImage, shell, powerMonitor, powerSaveBlocker,
 } = require('electron');
 const path = require('path');
 const crypto = require('crypto');
-const { startServer, stopServer, getToken, broadcast, rescanAllFolders, startFolderWatchers } = require('./server');
+const { startServer, stopServer, getToken, broadcast, rescanAllFolders, startFolderWatchers, ingestDiscoveredJobs } = require('./server');
+const { createDiscoveryService } = require('./discovery');
 const db = require('./db');
 const { autoUpdater } = require('electron-updater');
 const { scope, log: rootLog } = require('./logger');
@@ -34,6 +35,9 @@ let emailWarmup = null;
 let isQuitting = false;
 let suspended = false;       // machine asleep → pause all background work
 let maintenanceInterval = null;
+let discoveryService = null;
+let keepAwakeId = null;
+let pipelineWatchdogInterval = null;
 
 // Industry-norm guard for BACKGROUND work (email/gmail sync): don't run while the
 // machine is asleep, optionally pause on battery, and skip if our own memory is high
@@ -421,6 +425,36 @@ function applyAppSettings() {
   }
   scheduleGmail();
   scheduleEmailSync();
+  try {
+    const aa = db.getSettings().autoApply || {};
+    const shouldBlock = !!aa.enabled && aa.keepAwake !== false;
+    if (keepAwakeId != null && (!shouldBlock || !powerSaveBlocker.isStarted(keepAwakeId))) {
+      try { powerSaveBlocker.stop(keepAwakeId); } catch {}
+      keepAwakeId = null;
+    }
+    if (shouldBlock && keepAwakeId == null) {
+      keepAwakeId = powerSaveBlocker.start(aa.keepDisplayAwake ? 'prevent-display-sleep' : 'prevent-app-suspension');
+      log.info(`auto-apply keep-awake enabled (${aa.keepDisplayAwake ? 'display' : 'system'})`);
+    }
+  } catch (e) { log.warn('keep-awake update failed', e.message); }
+}
+
+async function pipelineWatchdogTick() {
+  if (!shouldRunBackground()) return;
+  const aa = db.getSettings().autoApply || {};
+  let repaired = 0;
+  try { repaired += db.reconcileStaleRunning({ olderThanMinutes: 8 }); } catch {}
+  try { repaired += db.reclaimDeadParks(); } catch {}
+  const health = db.pipelineHealth();
+  if (repaired) {
+    log.warn(`pipeline watchdog repaired ${repaired} stranded task(s)`);
+    broadcast('queue.updated', { action: 'watchdog-repair', repaired });
+  }
+  if (aa.enabled) {
+    const live = db.queueLive({ startedAt: aa.startedAt || '' });
+    if (!live.active && !live.queuedDepth && !live.scheduled) discoveryService?.runTick().catch(() => {});
+  }
+  broadcast('autoApply.health', health);
 }
 
 // ---------- IPC ----------
@@ -488,14 +522,26 @@ app.whenReady().then(async () => {
     const unstuck = db.reconcileStaleRunning({ olderThanMinutes: 8 });
     if (unstuck) log.info(`reconciled ${unstuck} stale running/scheduled task(s) → failed (retriable)`);
   } catch (e) { log.warn('reconcileStaleRunning failed', e); }
+  try {
+    const discoveryRepair = db.reconcileDiscovery({ olderThanMinutes: 10 });
+    if (discoveryRepair.interrupted || discoveryRepair.staleClaims) log.info(`reconciled discovery: ${discoveryRepair.interrupted} interrupted, ${discoveryRepair.staleClaims} stale fallback claim(s)`);
+  } catch (e) { log.warn('reconcileDiscovery failed', e); }
 
   const port = db.getSettings().server.port;
+  discoveryService = createDiscoveryService({
+    ingestJobs: (source, jobs, meta) => ingestDiscoveredJobs(source, jobs, {
+      providerName: meta?.provider || 'jobspy', batchId: meta?.batchId || null,
+    }),
+    broadcast,
+  });
   try {
     await startServer(port, {
       getVersion: () => app.getVersion(),
       userDataDir: app.getPath('userData'),
       confirmPair,
       notify: notifyEvent,
+      discovery: discoveryService,
+      onSettingsChanged: () => applyAppSettings(),
     });
     log.info(`server listening on http://127.0.0.1:${port}`);
   } catch (e) {
@@ -512,6 +558,12 @@ app.whenReady().then(async () => {
   createWindow();
   createTray();
   applyAppSettings();
+  discoveryService.start({
+    intervalMs: Math.max(1, Number(db.getSettings().autoApply?.discovery?.intervalMinutes) || 1) * 60000,
+    warmupMs: 12000,
+  });
+  pipelineWatchdogInterval = setInterval(() => pipelineWatchdogTick().catch((e) => log.warn('pipeline watchdog failed', e.message)), 60000);
+  setTimeout(() => pipelineWatchdogTick().catch(() => {}), 18000);
 
   // Auto-index linked document folders: catch up on changes since last run, then
   // watch for live edits. Fire-and-forget so it never blocks startup.
@@ -553,7 +605,7 @@ app.whenReady().then(async () => {
   // wake (each sync resumes from its own cursor, so nothing is lost or doubled).
   try {
     powerMonitor.on('suspend', () => { suspended = true; log.info('system suspend — pausing background work'); });
-    powerMonitor.on('resume', () => { suspended = false; log.info('system resume — background work re-enabled'); scheduleEmailSync(); maybeCheck(); });
+    powerMonitor.on('resume', () => { suspended = false; log.info('system resume — background work re-enabled'); scheduleEmailSync(); maybeCheck(); discoveryService?.runTick().catch(() => {}); });
   } catch (e) { log.warn('powerMonitor unavailable', e.message); }
 
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
@@ -581,6 +633,9 @@ app.on('will-quit', () => {
   if (emailInterval) clearInterval(emailInterval);
   if (emailWarmup) clearTimeout(emailWarmup);
   if (maintenanceInterval) clearInterval(maintenanceInterval);
+  if (pipelineWatchdogInterval) clearInterval(pipelineWatchdogInterval);
+  if (discoveryService) discoveryService.stop();
+  if (keepAwakeId != null) { try { powerSaveBlocker.stop(keepAwakeId); } catch {} keepAwakeId = null; }
   globalShortcut.unregisterAll();
   if (tray) { try { tray.destroy(); } catch {} tray = null; }
   stopServer();

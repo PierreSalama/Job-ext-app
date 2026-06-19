@@ -19,6 +19,7 @@ import { isSubmitClick } from './signals/intent.js';
 import { pageTextLooksLikeSuccess, urlLooksLikeSuccess } from './signals/success.js';
 import { qsa, isProbablyVisible, compactText } from './lib/dom.js';
 import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence, resolveLocator, recoveryFingerprint } from './replay.js';
+import { classifyApplyControl, observeRoute, applyRouteForState } from './route.js';
 
 const MAX_STEPS = 40;
 const STEP_TIMEOUT = 9000;
@@ -228,12 +229,14 @@ function report(patch) {
   // backing it, so there's nothing to PATCH. The teach capture still flows via the
   // recorder's /observe posts — we just skip the queue progress report here.
   if (S.task.id == null) return;
+  S.lastReport = { ...(S.lastReport || {}), ...(patch || {}) };
   // Stamp the apply ROUTE on real outcome transitions so the dashboard chart can
   // split the "easy / in-page apply" route from "external": an apply form that
   // never opened in-page means the posting bounced us to an external ATS or a
   // verification wall we can't auto-drive. Skips (relevance) get no route.
   if (patch && ROUTE_STATES.has(patch.state) && patch.applyRoute === undefined) {
-    patch.applyRoute = S.externalRoute ? 'external' : (S.everHadForm ? 'easy-apply' : 'external');
+    patch.applyRoute = applyRouteForState(S.routeState || (S.externalRoute ? 'external_new_tab' : (S.everHadForm ? 'same_tab_application' : 'unknown')));
+    patch.routeState = S.routeState || 'unknown';
   }
   reportQueue = reportQueue.then(() =>
     send({ type: 'task-progress', taskId: S.task.id, patch })).catch(() => {});
@@ -335,10 +338,10 @@ async function waitForStickyLinkedInDialog(timeoutMs = 6500) {
 // generic advance scan misses it (some postings render an icon/badged button).
 function findEasyApplyButton() {
   const sel = 'button.jobs-apply-button, .jobs-apply-button--top-card button, [data-live-test-job-apply-button], button[aria-label*="easy apply" i], button[aria-label*="candidature simpli" i]';
-  for (const el of qsa(sel)) {
+  const candidates = [...qsa(sel), ...qsa('button, a[role="button"], [role="button"]')];
+  for (const el of [...new Set(candidates)]) {
     if (!el || el.disabled || !isProbablyVisible(el)) continue;
-    const label = (btnText(el) + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
-    if (/easy apply|candidature simpli/.test(label)) return el;
+    if (classifyApplyControl(el).state === 'linkedin_easy_apply_modal') return el;
   }
   return null;
 }
@@ -373,16 +376,8 @@ function loginApplyPresent() {
   return LOGIN_APPLY_RX.test(text);
 }
 function looksExternalApplyButton(el) {
-  try {
-    if (!el || !isProbablyVisible(el)) return false;
-    const txt = compactText(el.getAttribute?.('aria-label') || el.textContent || el.value || '').toLowerCase();
-    const href = el.href || el.getAttribute?.('href') || '';
-    let externalHref = false;
-    try { externalHref = !!href && new URL(href, location.href).hostname.replace(/^www\./, '') !== location.hostname.replace(/^www\./, ''); } catch {}
-    if (/easy apply/.test(txt)) return false;
-    return (EXTERNAL_APPLY_RX.test(txt) || /apply now|^apply$/.test(txt))
-      && (externalHref || /company|external|employer|website|employeur|entreprise/.test(txt));
-  } catch { return false; }
+  if (!el || !isProbablyVisible(el)) return false;
+  return classifyApplyControl(el).state.startsWith('external_');
 }
 function findExternalApplyButton() {
   try {
@@ -515,6 +510,8 @@ export async function run(task, context, helpers) {
   if (S.running) return { ok: false, error: 'executor already running' };
   S.running = true; S.cancelled = false; S.paused = false; S.step = 0;
   S.task = task; S.context = context; S.everHadForm = false; S.externalRoute = !!context?.externalHandoff;
+  S.routeState = context?.externalHandoff ? 'external_new_tab' : 'unknown';
+  S.lastReport = null;
   S.lastSeenSig = ''; S.supervisor = null; S.nextRequested = false;
 
   const { job, profile, profileId, resume, harvested, aiConfidenceMin = 0.7 } = context || {};
@@ -1054,7 +1051,12 @@ export async function run(task, context, helpers) {
     // global Search field while the modal is transitioning.
     const root = dialog || (broadLinkedInRoot ? null : probedRoot);
     const haveForm = !!root;
-    if (haveForm) { everHadForm = true; S.everHadForm = true; signalHydrated(); reportSeen(root, 'apply form'); }
+    if (haveForm) {
+      everHadForm = true; S.everHadForm = true;
+      if (dialog && /(^|\.)linkedin\.com$/i.test(location.hostname)) S.routeState = 'linkedin_easy_apply_modal';
+      else if (!S.externalRoute && S.routeState === 'unknown') S.routeState = 'same_tab_application';
+      signalHydrated(); reportSeen(root, 'apply form');
+    }
     if (!haveForm && everHadForm && /(^|\.)linkedin\.com$/i.test(location.hostname)) {
       const fingerprint = recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label: 'easy apply form', stage: 'lost-after-advance' });
       logLine('warn', 'Easy Apply form disappeared after advancing — stopping instead of re-clicking the opener');
@@ -1268,7 +1270,9 @@ export async function run(task, context, helpers) {
       if (!clickBtn) { logLine('warn', 'advance button became invalid before click — re-scanning'); continue; }
     }
     const label = btnText(clickBtn).slice(0, 30);
-    const externalClick = !haveForm && allowExternal && looksExternalApplyButton(clickBtn);
+    const controlRoute = !haveForm ? classifyApplyControl(clickBtn) : { state: S.routeState || 'unknown' };
+    const externalClick = !haveForm && allowExternal && controlRoute.state.startsWith('external_');
+    if (!haveForm && controlRoute.state === 'linkedin_easy_apply_modal') S.routeState = 'linkedin_easy_apply_modal';
     const pageAction = !haveForm
       ? recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label, stage: externalClick ? 'external-opener' : 'apply-opener' })
       : '';
@@ -1292,21 +1296,42 @@ export async function run(task, context, helpers) {
     }
     logLine('ok', `clicking "${label}"`);
     let handoffToken = null;
+    let handoffPromise = null;
     if (externalClick) {
       S.externalRoute = true;
+      S.routeState = controlRoute.state;
       logLine('ok', 'opening external/company apply route');
-      const armed = await send({ type: 'jat11.external-handoff-arm' });
+      const armed = await send({ type: 'jat11.external-handoff-arm', taskId: task?.id, routeState: controlRoute.state });
       handoffToken = armed?.ok ? armed.token : null;
+      if (handoffToken) {
+        // Begin listening BEFORE the click. A same-tab external navigation destroys
+        // this content world immediately; the service worker must already own the
+        // transition when that happens.
+        handoffPromise = send({ type: 'jat11.external-handoff-run', token: handoffToken, task, context: { ...context, routeState: controlRoute.state } });
+      }
     }
     setStatus(`Step ${S.step}: "${label}"…`);
+    const beforeClickUrl = location.href;
     const prevHash = domHash();
     syntheticClick(clickBtn);
     if (externalClick && handoffToken) {
       setStatus('Transferring control to the company application…');
-      const handoff = await send({ type: 'jat11.external-handoff-run', token: handoffToken, task, context });
+      const handoff = await handoffPromise;
       if (handoff?.captured) {
         const childResult = handoff.result || null;
-        const childState = typeof childResult?.state === 'string' ? childResult.state : 'failed';
+        const childState = ['done', 'awaiting_review', 'awaiting_input', 'parked', 'failed', 'skipped'].includes(childResult?.state)
+          ? childResult.state : 'failed';
+        const childError = childResult?.error || childResult?.lastError || handoff?.error || null;
+        report({
+          state: childState,
+          lastError: childState === 'failed' ? (childError || 'external executor failed without a diagnostic') : childError,
+          parkReason: childResult?.parkReason,
+          pendingQuestions: childResult?.pendingQuestions,
+          applyRoute: 'external', routeState: controlRoute.state,
+          submissionEvidence: childResult?.submissionEvidence,
+          handoffToken,
+          transcriptAppend: { kind: 'handoff', note: `external child result adopted: ${childState}` },
+        });
         logLine(childState === 'done' ? 'ok' : 'warn', `external executor finished: ${childState}`);
         finalState = childState;
         finished = true;
@@ -1314,6 +1339,10 @@ export async function run(task, context, helpers) {
       }
     }
     const changed = await waitForChange(prevHash);
+    if (changed && S.routeState === 'unknown') {
+      const observed = observeRoute({ beforeUrl: beforeClickUrl, afterUrl: location.href, dialogOpen: !!findApplyDialog() });
+      S.routeState = observed.state;
+    }
     if (externalClick && !changed) {
       const fingerprint = recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label, stage: 'external-handoff-missing' });
       logLine('warn', 'external target did not become an owned executor — stopping after one click');
@@ -1401,7 +1430,7 @@ export async function run(task, context, helpers) {
         // Mark the JOB submitted too, so it's counted even if the passive capture
         // detector misses the banner (queuePatch only updates the task).
         if (job?.id) await send({ type: 'api-call', method: 'PATCH', path: '/jobs/' + encodeURIComponent(job.id), body: { status: 'submitted' } });
-        report({ state: 'done', transcriptAppend: { note: `submitted — ${how}` } });
+        report({ state: 'done', submissionEvidence: { type: 'confirmed', detail: how, url: location.href, at: new Date().toISOString() }, transcriptAppend: { note: `submitted — ${how}` } });
         finalState = 'done';
         finished = true;
         continue;
@@ -1416,7 +1445,7 @@ export async function run(task, context, helpers) {
       logLine('ok', '✓ application submitted');
       setStatus('✓ Application submitted');
       if (job?.id) await send({ type: 'api-call', method: 'PATCH', path: '/jobs/' + encodeURIComponent(job.id), body: { status: 'submitted' } });
-      report({ state: 'done', transcriptAppend: { note: 'success detected' } });
+      report({ state: 'done', submissionEvidence: { type: 'success-signal', detail: pageTextLooksLikeSuccess(6000) ? 'confirmation text' : 'confirmation URL', url: location.href, at: new Date().toISOString() }, transcriptAppend: { note: 'success detected' } });
       finalState = 'done';
       finished = true;
     }
@@ -1440,5 +1469,15 @@ export async function run(task, context, helpers) {
   try { sup?.destroy(); } catch {}
   S.supervisor = null;
   hideOverlay(finalState === 'awaiting_review' || finalState === 'awaiting_input' || finalState === 'parked' ? 60000 : 4000);
-  return { ok: true, state: finalState || (S.cancelled ? 'skipped' : 'unknown'), steps: S.step, nextRequested: S.nextRequested };
+  return {
+    ok: true,
+    state: finalState || (S.cancelled ? 'skipped' : 'unknown'),
+    steps: S.step,
+    nextRequested: S.nextRequested,
+    lastError: S.lastReport?.lastError || null,
+    parkReason: S.lastReport?.parkReason || null,
+    pendingQuestions: S.lastReport?.pendingQuestions || [],
+    submissionEvidence: S.lastReport?.submissionEvidence || null,
+    routeState: S.routeState || 'unknown',
+  };
 }

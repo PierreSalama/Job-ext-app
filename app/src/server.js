@@ -166,6 +166,49 @@ function jobFit(jobOrTitle, aa) {
   return { ok: true };
 }
 
+// One intake path for every discovery provider. JobSpy and the browser fallback
+// therefore share relevance, punishment, ranking, dedup and provenance behavior.
+function ingestDiscoveredJobs(source, jobs, { providerName = 'browser', batchId = null } = {}) {
+  const s = db.getSettings().autoApply;
+  let enqueued = 0, rejected = 0, punished = 0, duplicates = 0;
+  const ranked = [];
+  for (const jd of (Array.isArray(jobs) ? jobs : []).slice(0, 100)) {
+    if (!jd || !jd.jobUrl) { rejected++; continue; }
+    const verdict = jobFit(jd, s);
+    if (!verdict.ok) { rejected++; continue; }
+    const probe = { id: null, title: jd.title, company: jd.company, jobUrl: jd.jobUrl, location: jd.location, source: source || jd.source || null };
+    let isP = false, rank = 0;
+    try { const pid = db.resolveProfileId(probe.source); isP = db.isPunished(probe, pid); rank = isP ? -1 : db.rankJob(probe, pid); } catch {}
+    if (isP) { punished++; continue; }
+    ranked.push({ jd, rank });
+  }
+  ranked.sort((a, b) => b.rank - a.rank);
+  for (const { jd } of ranked) {
+    const result = db.transaction(() => {
+      const up = db.upsertJob({
+        externalId: jd.externalId, source: source || jd.source || null,
+        title: jd.title, company: jd.company, location: jd.location,
+        jobUrl: jd.jobUrl, description: jd.description || '',
+        compensation: jd.salary ? JSON.stringify(jd.salary) : (jd.compensation || ''),
+        employmentType: jd.employmentType || '', status: 'started', tags: ['auto-apply'],
+      });
+      if (up.action === 'created') {
+        db.recordEvent({ jobId: up.job.id, type: 'created', source: 'auto-apply', summary: `Discovered via ${providerName}`, data: { provider: providerName, batchId } });
+      }
+      if (batchId) db.discoveryRecordJob({
+        jobId: up.job.id, batchId, provider: providerName, source: source || jd.source || 'unknown',
+        rawUrl: jd.jobUrl, applyCapability: jd.applyCapability || 'unknown',
+      });
+      return { action: up.action, task: db.queueAdd(up.job.id, { mode: s.mode }) };
+    });
+    if (result.task) enqueued++;
+    else duplicates++;
+  }
+  broadcast('queue.updated', { action: 'discover', provider: providerName, batchId });
+  broadcast('jobs.updated', { action: 'discover', provider: providerName, batchId });
+  return { enqueued, rejected, punished, duplicates };
+}
+
 function withinWindow(settings) {
   if (settings.runAnytime !== false) return true;                  // 24/7 (default) — ignore the window
   if (!settings.windowStart || !settings.windowEnd) return true;   // no window = any time
@@ -324,6 +367,7 @@ async function queueNext(force = false) {
 
   db.queuePatch(task.id, {
     state: 'scheduled',
+    handoffToken: null,
     scheduledAt: new Date().toISOString(),
     transcriptAppend: { note: `scheduled (mode=${mode})` },
   });
@@ -673,6 +717,7 @@ async function handle(req, res, parsed) {
       else if (!body.autoApply.enabled) body.autoApply.startedAt = '';
     }
     db.patchSettings(body);
+    try { opts.onSettingsChanged?.(body); } catch {}
     broadcast('settings.updated', {});
     const { settings, secretsPresent } = publicSettings();   // never echo decrypted secrets back in the PATCH response
     return sendJson(res, 200, { ok: true, settings, secretsPresent });
@@ -1066,44 +1111,10 @@ async function handle(req, res, parsed) {
   if (req.method === 'POST' && pathname === '/queue/discover') {
     const body = await readJson(req);
     const jobs = Array.isArray(body.jobs) ? body.jobs : [];
-    const s = db.getSettings().autoApply;
-    let enqueued = 0, filtered = 0, punished = 0;
-    // P7: rank the incoming candidates so the highest-rankJob (reward history ↑, geo/
-    // staleness ↓) ones are upserted+enqueued first; PUNISHED candidates are excluded
-    // outright (never discovered while a punishment is active). ADDITIVE — the existing
-    // jobFit relevance gate + dedup upsert/queueAdd are unchanged.
-    const ranked = [];
-    for (const jd of jobs.slice(0, 50)) {
-      if (!jd || !jd.jobUrl) continue;
-      // Relevance gate — don't even queue roles above the user's level / excluded.
-      const fit = jobFit(jd, s);
-      if (!fit.ok) { filtered++; continue; }
-      // Exclude punished jobs/companies/job-types from discovery (a synthetic job shape so
-      // the gate can read company/title/url without an upsert).
-      const probe = { id: null, title: jd.title, company: jd.company, jobUrl: jd.jobUrl, location: jd.location, source: body.source || jd.source || null };
-      let isP = false, rk = 0;
-      try { const pid = db.resolveProfileId(probe.source); isP = db.isPunished(probe, pid); rk = isP ? -1 : db.rankJob(probe, pid); } catch {}
-      if (isP) { punished++; continue; }
-      ranked.push({ jd, rk });
-    }
-    ranked.sort((a, b) => b.rk - a.rk);   // highest rank first
-    for (const { jd } of ranked) {
-      const r = db.transaction(() => {
-        const up = db.upsertJob({
-          externalId: jd.externalId, source: body.source || jd.source || null,
-          title: jd.title, company: jd.company, location: jd.location,
-          jobUrl: jd.jobUrl, status: 'started', tags: ['auto-apply'],
-        });
-        if (up.action === 'created') {
-          db.recordEvent({ jobId: up.job.id, type: 'created', source: 'auto-apply', summary: 'Discovered via auto-apply', data: {} });
-        }
-        return { job: up.job, task: db.queueAdd(up.job.id, { mode: s.mode }) };
-      });
-      if (r.task) enqueued++;
-    }
-    broadcast('queue.updated', { action: 'discover' });
-    broadcast('jobs.updated', { action: 'discover' });
-    return sendJson(res, 200, { ok: true, enqueued, filtered, punished });
+    const result = ingestDiscoveredJobs(body.source, jobs, {
+      providerName: body.provider || 'browser', batchId: body.batchId || null,
+    });
+    return sendJson(res, 200, { ok: true, ...result, filtered: result.rejected });
   }
   // The deduped list of questions parked jobs are waiting on (the intake form).
   if (req.method === 'GET' && pathname === '/queue/parked') {
@@ -1152,6 +1163,7 @@ async function handle(req, res, parsed) {
     return sendJson(res, 200, {
       ok: true, enabled: !!s.enabled, startedAt: s.startedAt || '', mode: s.mode || 'auto',
       concurrency, status, ...live,
+      health: db.pipelineHealth(),
       pacing: {
         maxPerHour, maxPerDay: Number(s.maxPerDay) || 0,
         minGapMinutes: Number(s.minGapMinutes) || 0, maxGapMinutes: Number(s.maxGapMinutes) || 0,
@@ -1176,13 +1188,47 @@ async function handle(req, res, parsed) {
   // Discovery telemetry — the extension SW reports what each search saw so the
   // dashboard can show it (found N, enqueued N, any note) and we can tune.
   if (req.method === 'GET' && pathname === '/auto-apply/discovery-status') {
-    return sendJson(res, 200, { ok: true, status: db.kvGet('discoveryStatus') || null });
+    return sendJson(res, 200, {
+      ok: true, status: db.kvGet('discoveryStatus') || null,
+      health: db.discoveryHealth(), batches: db.discoveryBatchList({ limit: 30 }),
+    });
   }
   if (req.method === 'POST' && pathname === '/auto-apply/discovery-status') {
     const body = await readJson(req);
     db.kvSet('discoveryStatus', { ...body, at: new Date().toISOString() });
     broadcast('queue.updated', { action: 'discovery-status' });
     return sendJson(res, 200, { ok: true });
+  }
+  if (req.method === 'POST' && pathname === '/auto-apply/discover-now') {
+    if (!opts.discovery?.runTick) return sendJson(res, 503, { ok: false, error: 'app discovery service unavailable' });
+    const result = await opts.discovery.runTick({ force: true });
+    return sendJson(res, 200, result);
+  }
+  // The extension polls this small queue. It only opens a browser search after the
+  // primary provider produced a typed failure; normal/empty JobSpy results never cause
+  // duplicate browser scans.
+  if (req.method === 'GET' && pathname === '/auto-apply/discovery-fallback/next') {
+    return sendJson(res, 200, { ok: true, request: db.discoveryFallbackNext() });
+  }
+  if (req.method === 'POST' && (jm = m(/^\/auto-apply\/discovery-fallback\/([^/]+)\/complete$/))) {
+    const body = await readJson(req);
+    const fallback = db.discoveryFallbackComplete(jm[1], { ok: body.ok !== false, error: body.error });
+    if (!fallback) return sendJson(res, 404, { ok: false, error: 'fallback request not found' });
+    const batch = db.discoveryBatchStart({
+      provider: 'browser', source: fallback.source, keyword: fallback.keyword,
+      location: fallback.location, fallbackOf: fallback.batch_id,
+    });
+    let intake = { enqueued: 0, rejected: 0, duplicates: 0, punished: 0 };
+    const jobs = Array.isArray(body.jobs) ? body.jobs : [];
+    if (body.ok !== false) intake = ingestDiscoveredJobs(fallback.source, jobs, { providerName: 'browser', batchId: batch.id });
+    const done = db.discoveryBatchComplete(batch.id, {
+      status: body.ok === false ? 'failed' : (jobs.length ? 'ok' : 'empty'),
+      found: jobs.length, accepted: intake.enqueued, duplicates: intake.duplicates,
+      rejected: intake.rejected + intake.punished, error: body.error,
+      diagnostics: { fallbackFor: fallback.batch_id },
+    });
+    broadcast('discovery.updated', { batch: done });
+    return sendJson(res, 200, { ok: true, batch: done, ...intake });
   }
   // "Watch & Teach the next application" FROM THE DASHBOARD. The Electron window can't send
   // chrome.runtime messages, so it sets a one-shot kv flag here; queueNext reads + clears it
@@ -1536,4 +1582,4 @@ function stopServer() {
   if (server) { try { server.close(); } catch {} server = null; }
 }
 
-module.exports = { startServer, stopServer, broadcast, getToken, rescanAllFolders, startFolderWatchers };
+module.exports = { startServer, stopServer, broadcast, getToken, rescanAllFolders, startFolderWatchers, ingestDiscoveredJobs };

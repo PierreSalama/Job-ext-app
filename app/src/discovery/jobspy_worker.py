@@ -1,0 +1,57 @@
+"""One-request JSON bridge around the MIT-licensed python-jobspy package."""
+
+import json
+import math
+import sys
+from datetime import date, datetime
+
+
+def clean(value):
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): clean(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [clean(v) for v in value]
+    try:
+        if hasattr(value, "item"):
+            return clean(value.item())
+    except Exception:
+        pass
+    return value
+
+
+def main():
+    request = json.loads(sys.stdin.readline() or "{}")
+    from jobspy import scrape_jobs
+
+    source = str(request.get("source") or "indeed").lower()
+    wanted = max(1, min(100, int(request.get("limit") or 25)))
+    kwargs = {
+        "site_name": [source],
+        "search_term": str(request.get("keyword") or ""),
+        "location": str(request.get("location") or ""),
+        "results_wanted": wanted,
+        "hours_old": max(1, min(720, int(request.get("hours_old") or 72))),
+        "verbose": 0,
+    }
+    if source in ("indeed", "glassdoor"):
+        kwargs["country_indeed"] = str(request.get("country") or "Canada")
+    if request.get("proxies"):
+        kwargs["proxies"] = request["proxies"]
+
+    frame = scrape_jobs(**kwargs)
+    records = frame.to_dict(orient="records") if frame is not None else []
+    print(json.dumps({"ok": True, "source": source, "jobs": clean(records)}, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc), "type": exc.__class__.__name__}, ensure_ascii=True))
+        sys.exit(1)

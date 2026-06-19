@@ -1867,6 +1867,8 @@ route('/queue', async () => {
     api('/auto-apply/discovery-status').catch(() => ({ status: null })),
   ]);
   const disc = discR.status || null;
+  const discHealth = discR.health || { providers: [], pendingFallbacks: 0 };
+  const latestDiscovery = (discR.batches || [])[0] || null;
   const aa = settings.autoApply;
   const tasks = queueR.items || [];
   const profiles = profilesR.items || [];
@@ -1945,14 +1947,13 @@ route('/queue', async () => {
     <div class="aa-disco">
       <div class="aa-disco-main">
         <span class="aa-disco-eyebrow">Last search</span>
-        ${disc ? `<span class="aa-disco-txt">${esc(disc.board || '?')} · "${esc(disc.keyword || '')}" — found <strong>${esc(disc.found ?? 0)}</strong>, queued <strong>${esc(disc.enqueued ?? 0)}</strong>${disc.note ? ` · <span class="aa-disco-note">${esc(disc.note)}</span>` : ''} <span class="muted">(${esc(fmtRel(disc.at))})</span></span>`
-          : '<span class="muted">No search yet — turn it on (and keep Chrome open). It searches about once a minute when the queue is low.</span>'}
+        ${latestDiscovery ? `<span class="aa-disco-txt"><strong>${esc(latestDiscovery.provider)}</strong> / ${esc(latestDiscovery.source)} · "${esc(latestDiscovery.keyword || '')}" — ${esc(latestDiscovery.status)}, found <strong>${esc(latestDiscovery.found || 0)}</strong>, queued <strong>${esc(latestDiscovery.accepted || 0)}</strong>${latestDiscovery.error ? ` · <span class="aa-disco-note">${esc(latestDiscovery.error)}</span>` : ''} <span class="muted">(${esc(fmtRel(latestDiscovery.completedAt || latestDiscovery.startedAt))})</span>${discHealth.pendingFallbacks ? ` · ${esc(discHealth.pendingFallbacks)} browser fallback pending` : ''}</span>`
+          : '<span class="muted">No search yet. The desktop app runs JobSpy first and asks Chrome only when a board provider fails.</span>'}
       </div>
       <div class="aa-disco-actions">
         <button class="btn small primary" data-supervise-next title="Open the next application in Control Studio with live robot vision, pause, step, correction, recovery, skip and explicit submit controls.">Open Control Studio for next application</button>
-        ${state.host === 'extension'
-          ? '<button class="btn small" data-run-disco>🔍 Search now</button> <button class="btn small" data-test-apply title="TEST: apply the next queued job right now, skipping pacing. (Removed later.)">⚡ Apply next now</button>'
-          : '<span class="muted" style="font-size:11px">Search &amp; test run from the Chrome extension</span>'}
+        <button class="btn small" data-run-disco>Search now</button>
+        ${state.host === 'extension' ? '<button class="btn small" data-test-apply title="Apply the next queued job right now, skipping pacing.">Apply next now</button>' : ''}
       </div>
     </div>
 
@@ -1967,7 +1968,7 @@ route('/queue', async () => {
           <option value="auto" ${aa.mode === 'auto' ? 'selected' : ''}>Auto — submit for me</option>
           <option value="review" ${aa.mode === 'review' ? 'selected' : ''}>Review — stop before submit</option>
         </select>`)}
-        ${qc('Job boards', `<label class="aa-chk"><input type="checkbox" id="aa-li" ${boards.includes('linkedin') ? 'checked' : ''}/> LinkedIn</label> <label class="aa-chk"><input type="checkbox" id="aa-in" ${boards.includes('indeed') ? 'checked' : ''}/> Indeed</label> <label class="aa-chk"><input type="checkbox" id="aa-gd" ${boards.includes('glassdoor') ? 'checked' : ''}/> Glassdoor</label>`)}
+        ${qc('Job boards', `<label class="aa-chk"><input type="checkbox" id="aa-li" ${boards.includes('linkedin') ? 'checked' : ''}/> LinkedIn</label> <label class="aa-chk"><input type="checkbox" id="aa-in" ${boards.includes('indeed') ? 'checked' : ''}/> Indeed</label> <label class="aa-chk"><input type="checkbox" id="aa-gd" ${boards.includes('glassdoor') ? 'checked' : ''}/> Glassdoor</label> <label class="aa-chk"><input type="checkbox" id="aa-google" ${boards.includes('google') ? 'checked' : ''}/> Google Jobs</label> <label class="aa-chk"><input type="checkbox" id="aa-zip" ${boards.includes('zip_recruiter') ? 'checked' : ''}/> ZipRecruiter</label>`)}
         ${qc('Easy Apply only', `<label class="toggle"><input type="checkbox" id="aa-easy" ${aa.easyApplyOnly !== false ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">On = only 1-click / in-page applies. Off = also includes normal postings and tries the company/ATS handoff, then fills the external form when it can.</div>`)}
         ${qc('Apply with profile', `<select class="select" id="aa-profile"><option value="">Default</option>${profiles.map((p) => `<option value="${esc(p.id)}" ${aa.profileId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>`)}
         ${qc('Attach résumé', `<select class="select" id="aa-resume"><option value="">Active résumé</option>${resumes.map((d) => `<option value="${esc(d.id)}" ${aa.resumeDocId === d.id ? 'selected' : ''}>${esc(d.label || d.name)}</option>`).join('')}</select>`)}
@@ -1994,6 +1995,8 @@ route('/queue', async () => {
         ${qc('Gap max (min)', `<input class="input" id="aa-gmax" type="number" min="0" max="360" step="0.25" value="${aa.maxGapMinutes}" />`)}
         ${qc('Parallel applications', `<input class="input" id="aa-conc" type="number" min="1" max="3" value="${Math.max(1, Math.min(3, Number(aa.concurrency) || 1))}" /><div class="form-hint">1 = one at a time and is the safest default. 2–3 runs separate-site workers in owned Chrome windows, now bounded and cleaned up automatically, but it still costs more machine load. The hourly cap still binds total throughput.</div>`)}
         ${qc('Bring window to front while applying', `<label class="toggle"><input type="checkbox" id="aa-bringfront" ${aa.bringToFrontToHydrate ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">For max reliability when a fullscreen app (e.g. a game) covers the apply window — Chrome throttles a fully-hidden window so the Easy-Apply button never loads. ON brings the apply window to the front while each application runs (it takes focus). Leave OFF for unobtrusive background applying.</div>`)}
+        ${qc('Keep PC awake while running', `<label class="toggle"><input type="checkbox" id="aa-keepawake" ${aa.keepAwake !== false ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">Session-scoped. JAT does not change your Windows power plan.</div>`)}
+        ${qc('Keep display awake too', `<label class="toggle"><input type="checkbox" id="aa-keepdisplay" ${aa.keepDisplayAwake ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">Stronger mode for overnight runs on sites that throttle hidden displays.</div>`)}
         <div id="aa-window-row">
           ${qc('Window start', `<input class="input" id="aa-ws" type="time" value="${esc(aa.windowStart || '')}" />`)}
           ${qc('Window end', `<input class="input" id="aa-we" type="time" value="${esc(aa.windowEnd || '')}" />`)}
@@ -2046,6 +2049,8 @@ route('/queue', async () => {
       if (v.querySelector('#aa-li').checked) boardsSel.push('linkedin');
       if (v.querySelector('#aa-in').checked) boardsSel.push('indeed');
       if (v.querySelector('#aa-gd').checked) boardsSel.push('glassdoor');
+      if (v.querySelector('#aa-google').checked) boardsSel.push('google');
+      if (v.querySelector('#aa-zip').checked) boardsSel.push('zip_recruiter');
       const conc = Math.max(1, Math.min(8, Number(v.querySelector('#aa-conc').value) || 1));
       // Parallel = more apply tabs at once = much faster, but a bigger automation
       // footprint. Warn (once) only when the user is RAISING it past safe serial.
@@ -2066,6 +2071,8 @@ route('/queue', async () => {
           easyApplyOnly: v.querySelector('#aa-easy').checked,
           concurrency: conc,
           bringToFrontToHydrate: v.querySelector('#aa-bringfront').checked,
+          keepAwake: v.querySelector('#aa-keepawake').checked,
+          keepDisplayAwake: v.querySelector('#aa-keepdisplay').checked,
           experienceYears: Math.max(0, Number(v.querySelector('#aa-exp').value) || 0),
           seniorityMax: v.querySelector('#aa-seniority').value,
           excludeKeywords: exTitles.get(),
@@ -2240,6 +2247,9 @@ route('/queue', async () => {
     const workers = (d.running || []).length
       ? `<div class="aa-workers">${d.running.map(workerCard).join('')}</div>`
       : `<div class="aa-empty-live">${d.enabled ? (d.queuedDepth ? 'Next application starting…' : 'No applications in flight — topping up the queue from discovery + retries.') : 'Auto-apply is stopped. Press Start to begin.'}</div>`;
+    const hp = d.health || {};
+    const dh = hp.discovery || {};
+    const healthLine = `<div class="muted" style="font-size:12px;margin-bottom:10px">Watchdog: ${hp.staleTasks || hp.invalidWaits ? `<b style="color:var(--danger)">${esc((hp.staleTasks || 0) + (hp.invalidWaits || 0))} issue(s) detected</b>` : '<b>healthy</b>'} · discovery ${dh.lastSuccess ? `last healthy ${esc(fmtRel(dh.lastSuccess))}` : 'awaiting first healthy batch'}${dh.pendingFallbacks ? ` · ${esc(dh.pendingFallbacks)} fallback pending` : ''}</div>`;
     const stat = (n, lbl, cls) => `<div class="mini"><div class="mini-label">${lbl}</div><div class="mini-value ${cls || ''}">${n}</div></div>`;
     return `<section class="section" style="margin-bottom:14px">
       <header class="section-header" style="align-items:center">
@@ -2257,6 +2267,7 @@ route('/queue', async () => {
         </div>
         <div class="muted" style="font-size:12px;margin-bottom:12px">≈ <b style="color:${slow ? 'var(--danger)' : 'inherit'}">${p.effectivePerHour || 0}</b> applications/hour at current settings${p.bindingCap ? ` (capped by ${p.bindingCap === 'hourly-cap' ? 'your hourly limit' : 'the gap between applications'})` : ''}${slow ? ` — your saved pacing predates the speed update. <button class="btn small" data-aa-maxspeed style="padding:2px 9px">⚡ Max speed</button>` : ''}</div>
         ${siteSpread}
+        ${healthLine}
         ${workers}
       </div>
     </section>`;
@@ -2296,13 +2307,14 @@ route('/queue', async () => {
   }));
   if (qview === 'history') loadHistory();
 
-  // Manual "Search now" (extension host only — the search runs in the SW).
+  // Manual Search now always runs through the app-owned primary provider.
   v.querySelector('[data-run-disco]')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Searching…';
     try {
-      const r = await new Promise((res) => chrome.runtime.sendMessage({ type: 'run-discovery' }, (x) => { void chrome.runtime.lastError; res(x); }));
-      const st = r?.status || {};
-      toast(st.ok === false && st.note ? `Search: ${st.note}` : `Search: found ${st.found ?? 0}, queued ${st.enqueued ?? 0}${st.note ? ' — ' + st.note : ''}`, st.enqueued ? 'info' : 'danger', { ttl: 9000 });
+      const r = await api('/auto-apply/discover-now', { method: 'POST', body: {} });
+      const found = (r.results || []).reduce((n, x) => n + (x.found || 0), 0);
+      const queued = (r.results || []).reduce((n, x) => n + (x.accepted || 0), 0);
+      toast(r.ok === false ? `Search: ${r.reason || r.error || 'failed'}` : `Search complete: found ${found}, queued ${queued}`, queued ? 'info' : 'danger', { ttl: 9000 });
       navigate();
     } catch (err) { errToast(err); }
     btn.disabled = false; btn.textContent = '🔍 Search now';

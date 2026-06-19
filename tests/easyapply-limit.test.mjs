@@ -23,7 +23,7 @@ function seedEasyApplyDone(n) {
   for (let i = 0; i < n; i++) {
     const job = db.upsertJob({ title: `EA ${Math.random()}`, company: 'Co', source: 'linkedin', status: 'started', jobUrl: `https://x/ea/${Math.random()}` }).job;
     const t = db.queueAdd(job.id, { mode: 'review' });
-    db.queuePatch(t.id, { state: 'done', applyRoute: 'easy-apply' });
+    db.queuePatch(t.id, { state: 'done', applyRoute: 'easy-apply', submissionEvidence: { type: 'test-confirmation' } });
     ids.push(t.id);
   }
   return ids;
