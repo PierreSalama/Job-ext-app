@@ -1,28 +1,29 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { JSDOM } from 'jsdom';
 import fs from 'node:fs';
 
-const dom = new JSDOM('<!doctype html>', { url: 'https://www.linkedin.com/jobs/view/123' });
-globalThis.location = dom.window.location;
+globalThis.location = { href: 'https://www.linkedin.com/jobs/view/123' };
 const route = await import('../extension/content/route.js');
 
-function el(html) {
-  const d = new JSDOM(html, { url: 'https://www.linkedin.com/jobs/view/123' });
-  return d.window.document.body.firstElementChild;
+function el({ text = '', aria = '', href = '', target = '' } = {}) {
+  const attrs = { 'aria-label': aria, href, target };
+  return {
+    textContent: text, value: '', href,
+    getAttribute(name) { return attrs[name] || ''; },
+  };
 }
 
 test('LinkedIn Easy Apply is never classified as external handoff', () => {
-  const r = route.classifyApplyControl(el('<button class="jobs-apply-button" aria-label="Easy Apply to this job">Apply</button>'));
+  const r = route.classifyApplyControl(el({ text: 'Apply', aria: 'Easy Apply to this job' }));
   assert.equal(r.state, 'linkedin_easy_apply_modal');
   assert.equal(route.applyRouteForState(r.state), 'easy-apply');
 });
 
 test('external routes require explicit off-origin or company-site evidence', () => {
-  assert.equal(route.classifyApplyControl(el('<button>Apply</button>')).state, 'unknown');
-  assert.equal(route.classifyApplyControl(el('<a href="https://acme.com">Company homepage</a>')).state, 'unknown');
-  assert.equal(route.classifyApplyControl(el('<a href="https://jobs.acme.com/42" target="_blank">Apply</a>')).state, 'external_new_tab');
-  assert.equal(route.classifyApplyControl(el('<button>Apply on company website</button>')).state, 'external_same_tab');
+  assert.equal(route.classifyApplyControl(el({ text: 'Apply' })).state, 'unknown');
+  assert.equal(route.classifyApplyControl(el({ text: 'Company homepage', href: 'https://acme.com' })).state, 'unknown');
+  assert.equal(route.classifyApplyControl(el({ text: 'Apply', href: 'https://jobs.acme.com/42', target: '_blank' })).state, 'external_new_tab');
+  assert.equal(route.classifyApplyControl(el({ text: 'Apply on company website' })).state, 'external_same_tab');
 });
 
 test('observed transitions distinguish modal, child tab, and same-tab navigation', () => {
