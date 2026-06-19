@@ -23,6 +23,8 @@ import { classifyApplyControl, observeRoute, applyRouteForState } from './route.
 import { classifyInterstitial } from './lib/interstitial.js';
 import { detectBotChallenge, botChallengeLastError } from './lib/challenge.js';
 import { ADVANCE_KEYWORDS, isAdvanceLabel } from './lib/advance.js';
+import { sitePack } from './sites/index.js';
+import { confirmSignalsMatched } from './lib/ats-drive.js';
 
 const MAX_STEPS = 40;
 const STEP_TIMEOUT = 9000;
@@ -640,6 +642,19 @@ export async function run(task, context, helpers) {
   S.sessionSettings = { pace: 1, confidence: aiConfidenceMin, stallLimit: 3 };
   const mode = task.mode || 'review';
   const allowExternal = context?.easyApplyOnly === false;
+  // ---- per-ATS adapter (external/company-site driving) ----
+  // A recognised external ATS contributes an adapter pack (sites/index.js). It only
+  // engages when we are NOT on LinkedIn (BUG-1/F1 own the LinkedIn Easy-Apply path).
+  // `account:'required'` packs (Workday/iCIMS/Taleo) → PARK honestly instead of the
+  // old generic 40× loop. `account:'none'` packs (Lever/Greenhouse/Ashby/BambooHR) →
+  // drive the adapter flow to completion (BambooHR fills then parks for the CAPTCHA).
+  const onLinkedInHost = /(^|\.)linkedin\.com$/i.test(location.hostname);
+  const atsPack = (() => { try { return onLinkedInHost ? null : sitePack(location.hostname); } catch { return null; } })();
+  // Only drive a pack that declares the full account-less contract (formSelector +
+  // account:'none'); a bare legacy hint pack (no `account`) falls through to today's
+  // generic flow unchanged.
+  const driveablePack = atsPack && atsPack.account === 'none' && atsPack.formSelector ? atsPack : null;
+  const walledPack = atsPack && atsPack.account === 'required' ? atsPack : null;
   showOverlay(`${mode === 'review' ? 'Filling for your review' : 'Applying'} — ${job?.title || ''}`);
 
   // A structured profile is OPTIONAL — we also fill from harvested/learned
@@ -661,6 +676,35 @@ export async function run(task, context, helpers) {
     S.running = false;
     hideOverlay(3500);
     return { ok: true, state: 'skipped', steps: 0 };
+  }
+
+  // ---- account-walled ATS gate (Workday / iCIMS / Taleo) ----
+  // These platforms gate the application behind a candidate account / login, so there
+  // is no honest way to auto-submit. Park (awaiting_input) with a human-readable reason
+  // BEFORE driving — this REPLACES the old generic 40× "Apply" loop AND the prior
+  // over-eager fail-fast. Workday allows driving ONLY when a signed-in session form is
+  // already up (pack.shouldPark() === false); iCIMS/Taleo always park.
+  if (walledPack) {
+    const mustPark = typeof walledPack.shouldPark === 'function'
+      ? (() => { try { return walledPack.shouldPark(); } catch { return true; } })()
+      : true;
+    if (mustPark) {
+      const why = walledPack.parkReason || `${walledPack.id} account required — needs you`;
+      logLine('warn', `${why} — parking (not driving)`);
+      setStatus(`Needs you — ${why}`);
+      report({
+        state: 'awaiting_input',
+        lastError: why,
+        parkReason: `${walledPack.id}_account_required`,
+        applyRoute: 'external',
+        pendingQuestions: [{ question: why, fieldType: 'site_gate', reason: 'account_required' }],
+        transcriptAppend: { kind: 'recovery', note: `account-walled ATS (${walledPack.id}) — parked instead of looping` },
+      });
+      S.running = false;
+      hideOverlay(60000);
+      return { ok: true, state: 'awaiting_input', steps: 0, lastError: why, parkReason: `${walledPack.id}_account_required`, routeState: 'external' };
+    }
+    logLine('ok', `${walledPack.id}: signed-in session detected — driving the in-session application`);
   }
 
   const engine = new AutofillEngine({
@@ -1126,6 +1170,36 @@ export async function run(task, context, helpers) {
     }
   }
 
+  // ---- recognised-ATS in-form advance/submit finder ----
+  // For account-less packs the adapter knows its FINAL submit (isSubmitHint) and its
+  // multi-step Next/Continue control (advanceSelector / stepAdvanceSelector). Prefer
+  // those over the generic scan; fall back to findAdvanceButton when the adapter has
+  // no opinion. Scoped to the pack's form root (never document.body). Submit wins over
+  // a step-advance so we recognise completion correctly.
+  function findPackAdvance(root) {
+    if (!driveablePack) return null;
+    const scope = root || document;
+    try {
+      // 1) explicit final-submit recognition via the adapter.
+      if (typeof driveablePack.isSubmitHint === 'function') {
+        for (const el of qsa('button, input[type="submit"], a[role="button"], [role="button"]', scope)) {
+          if (!isProbablyVisible(el) || el.disabled) continue;
+          let hit = false;
+          try { hit = !!driveablePack.isSubmitHint(btnText(el), el); } catch {}
+          if (hit) return el;
+        }
+      }
+      // 2) adapter's in-form Next/Continue (multi-step ATS).
+      const advSel = driveablePack.advanceSelector || driveablePack.stepAdvanceSelector;
+      if (advSel) {
+        for (const el of qsa(advSel, scope)) {
+          if (isProbablyVisible(el) && !el.disabled) return el;
+        }
+      }
+    } catch {}
+    return null;
+  }
+
   while (S.step < MAX_STEPS && !S.cancelled && !finished) {
     S.step++;
     await untilUnpaused();
@@ -1158,7 +1232,17 @@ export async function run(task, context, helpers) {
     }
 
     const blocker = captchaOrLoginPresent();
-    if (blocker) {
+    // A recognised CAPTCHA-gated pack (BambooHR) owns its own outcome: fill the
+    // whole form, then PARK awaiting_review ('ready — solve the CAPTCHA and submit')
+    // via the submitGate handler below. Its reCAPTCHA anchor renders WITH the form,
+    // so the generic hard-stop would otherwise fire first on any 2nd loop iteration
+    // and park the WRONG state (awaiting_input, 'Complete the site CAPTCHA, then
+    // retry') with a misleading retry message. Skip the generic stop for that case
+    // only; keep it for login blockers and for every non-driveable host. The
+    // never-auto-solve invariant still holds — neither path ever solves/submits.
+    const captchaOwnedByPack = blocker === 'captcha'
+      && driveablePack && driveablePack.submitGate === 'captcha';
+    if (blocker && !captchaOwnedByPack) {
       logLine('warn', `${blocker} detected — handing back to you`);
       setStatus(blocker === 'captcha' ? 'CAPTCHA — your move' : 'Login required — your move');
       const question = blocker === 'captcha' ? 'Complete the site CAPTCHA, then retry this application.' : 'Sign into this site in Chrome, then retry this application.';
@@ -1178,6 +1262,20 @@ export async function run(task, context, helpers) {
       report({ state: 'failed', lastError: 'easyapply-limit — daily Easy Apply cap reached', applyRoute: 'easy-apply' });
       finalState = 'failed';
       break;
+    }
+
+    // ---- recognised account-less ATS: reveal the form (idempotent, submit-safe) ----
+    // BambooHR's "Apply for This Job" opener, Ashby/Lever job→/apply nav, Greenhouse
+    // "Apply" scroll-pill. openApply() must be a no-op once the form is present and must
+    // NEVER submit. We call it only before the form is grounded so we don't re-open after.
+    if (driveablePack && !everHadForm && typeof driveablePack.openApply === 'function') {
+      try {
+        const acted = driveablePack.openApply();
+        if (acted) {
+          logLine('ok', `${driveablePack.id}: revealed the application form`);
+          await waitForChange(domHash(), 4000);
+        }
+      } catch (e) { logLine('warn', `${driveablePack.id}: openApply failed (${e?.message || e})`); }
     }
 
     let formProbe = detectApplyForm();
@@ -1214,9 +1312,29 @@ export async function run(task, context, helpers) {
     // re-click (the 1/5-page stall). So when everHadForm && LinkedIn, NEVER fall to
     // probedRoot: use the dialog or nothing (null → the "form disappeared → fail" path
     // below, which retries instead of clicking the opener).
+    // Recognised account-less ATS: scope STRICTLY to the adapter's tight application
+    // container (formSelector), NEVER document.body. Tight-to-loose fallbacks resolve
+    // in the selector itself; if it matches the page root we reject it (the adapter
+    // contract forbids document.body). Takes priority over detectApplyForm's probedRoot.
+    let packRoot = null;
+    if (driveablePack && driveablePack.formSelector) {
+      try {
+        const el = document.querySelector(driveablePack.formSelector);
+        // Reject the page root, and reject any always-present generic container
+        // (e.g. `main`, a stray search/newsletter <form>) that holds NO fillable
+        // field: latching haveForm/everHadForm on such a container at step 1 would
+        // suppress the open-path (openApply / allowOpen nav) that reveals the real
+        // application form. Require >=1 input/textarea/select before treating it as
+        // the apply root — the unscored fallback must not beat the open-path.
+        if (el && el !== document.body && el !== document.documentElement
+            && el.querySelector('input, textarea, select')) {
+          packRoot = el;
+        }
+      } catch {}
+    }
     const root = onLinkedIn && everHadForm
       ? dialog
-      : (dialog || (broadLinkedInRoot ? null : probedRoot));
+      : (dialog || packRoot || (broadLinkedInRoot ? null : probedRoot));
     const haveForm = !!root;
     if (haveForm) {
       everHadForm = true; S.everHadForm = true;
@@ -1239,6 +1357,16 @@ export async function run(task, context, helpers) {
         logLine('warn', `left sensitive field for you: "${s.label.slice(0, 40)}"`);
         return false;
       }
+      // Recognised-ATS honeypot trap (BambooHR nickname_*, "leave this field blank"):
+      // filling it flags the application as a bot. SKIP it entirely.
+      if (driveablePack && typeof driveablePack.isHoneypot === 'function') {
+        try {
+          if (driveablePack.isHoneypot(s.input)) {
+            logLine('warn', `skipped honeypot field "${(s.label || '').slice(0, 40)}" (${driveablePack.id} anti-bot trap)`);
+            return false;
+          }
+        } catch {}
+      }
       return true;
     }) : [];
     const filled = await engine.fill(suggestions);
@@ -1259,7 +1387,18 @@ export async function run(task, context, helpers) {
     }
 
     // ---- unknown questions → AI ladder ----
-    const unknown = haveForm ? (await engine.scanUnknown(root)).slice(0, 5) : [];
+    const unknownAll = haveForm ? await engine.scanUnknown(root) : [];
+    const unknown = unknownAll.filter((u) => {
+      if (driveablePack && typeof driveablePack.isHoneypot === 'function') {
+        try {
+          if (driveablePack.isHoneypot(u.input)) {
+            logLine('warn', `skipped honeypot field "${(u.label || '').slice(0, 40)}" (${driveablePack.id} anti-bot trap)`);
+            return false;
+          }
+        } catch {}
+      }
+      return true;
+    }).slice(0, 5);
     for (const u of unknown) {
       if (S.cancelled) break;
       if (LEGAL_RX.test(u.label)) {
@@ -1320,7 +1459,7 @@ export async function run(task, context, helpers) {
     // In-form: prefer buttons inside the modal. Not open yet: also try LinkedIn's
     // Easy-Apply button to OPEN the form (covers postings the generic scan misses).
     let btn = haveForm
-      ? findAdvanceButton(root, { allowOpen: false })
+      ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }))
       : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(root, { allowOpen: true }));
     if (!btn) {
       const opening = !everHadForm;   // the apply form has never appeared yet
@@ -1363,7 +1502,7 @@ export async function run(task, context, helpers) {
         if (opening && i % 4 === 0) { try { window.scrollTo(0, 600); window.scrollTo(0, 0); } catch {} }
         await sleep(500);
         found = haveForm
-          ? findAdvanceButton(root, { allowOpen: false })
+          ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }))
           : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(document, { allowOpen: true }));
         if (found) { signalHydrated(); break; }
       }
@@ -1437,10 +1576,32 @@ export async function run(task, context, helpers) {
       continue;
     }
 
-    const isFinal = isFinalSubmit(btn);
+    // FINAL-submit recognition: the adapter's isSubmitHint wins for recognised ATS
+    // (it knows the platform's exact submit button), else the generic recognizer.
+    let packSubmit = false;
+    if (driveablePack && typeof driveablePack.isSubmitHint === 'function') {
+      try { packSubmit = !!driveablePack.isSubmitHint(btnText(btn), btn); } catch {}
+    }
+    const isFinal = packSubmit || isFinalSubmit(btn);
     if (isFinal) {
       // SAFETY NET: never submit a job that still has unanswered questions.
       if (parked.length) { reportParked('final-submit'); break; }
+      // ---- CAPTCHA-gated ATS (BambooHR): fill everything, DO NOT submit ----
+      // A reCAPTCHA sits above the submit button. We've filled the whole form; now we
+      // PARK for a human to solve the CAPTCHA and click submit. Never auto-solve.
+      if (driveablePack && driveablePack.submitGate === 'captcha') {
+        const why = 'ready — solve the CAPTCHA and submit';
+        logLine('ok', `${driveablePack.id}: form filled — ${why}`);
+        setStatus('Ready — solve the CAPTCHA and submit');
+        report({
+          state: 'awaiting_review',
+          lastError: why,
+          applyRoute: 'external',
+          transcriptAppend: { kind: 'recovery', note: `${driveablePack.id} CAPTCHA gate — filled, parked for human submit` },
+        });
+        finalState = 'awaiting_review';
+        break;
+      }
       if (mode === 'review') {
         logLine('ok', 'reached the final submit — stopping for your review');
         setStatus('Ready for your review — press submit yourself when happy.');
@@ -1452,15 +1613,16 @@ export async function run(task, context, helpers) {
     }
     // Snapshot the VERIFIED apply modal (the field-bearing `dialog`, never a loose
     // fallback) before clicking submit, so detecting it close can't be tricked by
-    // an unrelated modal (cookie/consent) closing.
-    const submitDialog = isFinal ? dialog : null;
+    // an unrelated modal (cookie/consent) closing. For a recognised account-less
+    // pack the snapshot scope is the adapter form root (no LinkedIn dialog).
+    const submitDialog = isFinal ? (dialog || (driveablePack ? root : null)) : null;
 
     // Re-verify the button is still clickable right before acting — the DOM may
     // have changed since findAdvanceButton() above (validation re-render, etc.).
     let clickBtn = btn;
     if (clickBtn.disabled || !isProbablyVisible(clickBtn) || !document.contains(clickBtn)) {
       clickBtn = haveForm
-        ? findAdvanceButton(root, { allowOpen: false })
+        ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }))
         : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(document, { allowOpen: true }));
       if (!clickBtn) { logLine('warn', 'advance button became invalid before click — re-scanning'); continue; }
     }
@@ -1497,7 +1659,11 @@ export async function run(task, context, helpers) {
     // consecutive clicks of the SAME label at the SAME URL; at the stall limit, STOP and
     // park cleanly instead of looping to MAX_STEPS (the BMO "Apply" ×40 failure). BUG-1
     // owns the LinkedIn Easy Apply advance path, so we explicitly exclude it here.
+    // RECOGNISED account-less ATS (driveablePack) is EXCLUDED: it has a known multi-step
+    // flow we now drive to completion, so the no-progress cap must not kill it mid-form.
+    // The cap stays the fallback ONLY for UNRECOGNISED external hosts.
     const onExternalSite = allowExternal
+      && !driveablePack
       && S.routeState !== 'linkedin_easy_apply_modal'
       && !/(^|\.)linkedin\.com$/i.test(location.hostname)   // BUG-1 owns the LinkedIn path
       && (S.externalRoute || externalClick
@@ -1707,8 +1873,17 @@ export async function run(task, context, helpers) {
       // confirmSubmitted's "apply form closed" is corroborating, but only counts when
       // the form was grounded — a closed unrelated modal is not proof.
       const formClosed = how === 'apply form closed' && formGrounded;
-      if (verdict.verified || formClosed) {
-        const reason = verdict.verified ? verdict.reason : 'apply-form-closed';
+      // ADDITIONAL (recognised-ATS) confirmation: the adapter's confirmSignals — but ONLY
+      // when they are NEW (present AFTER the submit click, absent in the pre-click baseline).
+      // This NEVER weakens R1: it requires a grounded form (R1's gate) AND a genuinely new
+      // signal, so pre-existing static "thank you" copy can't mint a false done.
+      let packSignalReason = null;
+      if (driveablePack && formGrounded && Array.isArray(driveablePack.confirmSignals)) {
+        const src = confirmSignalsMatched(driveablePack.confirmSignals, (submitBaseline?.text || ''), (after?.text || ''));
+        if (src) packSignalReason = `confirm-signal:${src}`;
+      }
+      if (verdict.verified || formClosed || packSignalReason) {
+        const reason = verdict.verified ? verdict.reason : (packSignalReason || 'apply-form-closed');
         logLine('ok', `✓ application submitted (${reason})`);
         setStatus('✓ Application submitted');
         // Mark the JOB submitted too, so it's counted even if the passive capture

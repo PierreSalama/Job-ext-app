@@ -9,8 +9,17 @@ import glassdoor from './glassdoor.js';
 import workday from './workday.js';
 import greenhouse from './greenhouse.js';
 import lever from './lever.js';
+import ashby from './ashby.js';
+import bamboohr from './bamboohr.js';
+import { wallAdapters } from './walls.js';
 
-const PACKS = [linkedin, indeed, glassdoor, workday, greenhouse, lever];
+// walls.js exports the account-walled trio (workday/icims/taleo). The new
+// walls.js `workday` carries the richer account:'required' contract, so it
+// supersedes the legacy ./workday.js hint pack for host matching — list the
+// wall adapters BEFORE the legacy workday pack so sitePack() returns the
+// account-aware one first. (The legacy pack stays imported for detectSource
+// parity but never wins the match for myworkdayjobs.com.)
+const PACKS = [linkedin, indeed, glassdoor, ...wallAdapters, greenhouse, lever, ashby, bamboohr, workday];
 
 export function sitePack(hostname = location.hostname) {
   const h = hostname.replace(/^www\./, '');
