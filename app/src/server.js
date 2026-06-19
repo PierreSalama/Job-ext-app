@@ -1134,7 +1134,11 @@ async function handle(req, res, parsed) {
   // Aggregated breakdown for the Auto-apply chart (outcome / board / route / reasons): ?days=N
   if (req.method === 'GET' && pathname === '/auto-apply/breakdown') {
     const days = Number(parsed.searchParams.get('days')) || 30;
-    return sendJson(res, 200, { ok: true, ...db.queueBreakdown({ days }) });
+    // R3: additively attach the honest run-scoped summary (current run, or fall back to the
+    // window). Existing fields (total/byOutcome/byBoard/…) are untouched for back-compat.
+    const s = db.getSettings().autoApply;
+    const runSummary = db.queueRunSummary({ startedAt: s.startedAt || '' });
+    return sendJson(res, 200, { ok: true, ...db.queueBreakdown({ days }), runSummary });
   }
   // A1: LinkedIn Easy Apply daily-cap status — cooldown state, when it resumes, the
   // learned per-account threshold, and the rolling 24h submit count, for the dashboard.
@@ -1149,6 +1153,8 @@ async function handle(req, res, parsed) {
     const concurrency = Math.max(1, Math.min(3, Number(s.concurrency) || 1));   // per-worker windows (see queueNext)
     const live = db.queueLive({ startedAt: s.startedAt || '' });
     const stats = db.queueRunStats();
+    // R3 — honest, run-scoped breakdown (verified submits vs. site-gates vs. our failures).
+    const runSummary = db.queueRunSummary({ startedAt: s.startedAt || '' });
     const maxPerHour = Number(s.maxPerHour) || 0;
     const avgGap = Math.max(0.05, (Number(s.minGapMinutes) + Number(s.maxGapMinutes)) / 2);
     const gapPerHour = Math.round((60 / avgGap) * concurrency);   // gap divides by concurrency now
@@ -1163,6 +1169,7 @@ async function handle(req, res, parsed) {
     return sendJson(res, 200, {
       ok: true, enabled: !!s.enabled, startedAt: s.startedAt || '', mode: s.mode || 'auto',
       concurrency, status, ...live,
+      runSummary,
       health: db.pipelineHealth(),
       pacing: {
         maxPerHour, maxPerDay: Number(s.maxPerDay) || 0,

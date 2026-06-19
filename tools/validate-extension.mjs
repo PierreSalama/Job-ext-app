@@ -137,7 +137,11 @@ ok(/const label = btnText\(clickBtn\)/.test(executor), 'executor logs/clicks ari
 ok(/external-handoff-arm/.test(executor) && /external-handoff-run/.test(executor), 'executor arms and transfers external child-tab ownership');
 ok(/onCreatedNavigationTarget/.test(bg) && /openerTabId/.test(bg) && /runExternalHandoff/.test(bg), 'service worker captures and executes external child tabs');
 ok(/broadLinkedInRoot/.test(executor) && /waitForStickyLinkedInDialog/.test(executor), 'Easy Apply scope stays sticky and rejects LinkedIn document.body fallback');
-ok(/submitAttempted && \(pageTextLooksLikeSuccess/.test(executor), 'generic success requires a real final-submit attempt');
+// SUCCESS-TRUTH: a "done" is minted ONLY from the post-click evidence evaluator
+// diffed against a pre-click baseline — never from pre-existing static page text.
+ok(/evaluateSubmitEvidence/.test(executor) && /submitSnapshot/.test(executor), 'submit verification uses baseline-diff evidence evaluator');
+ok(!/type: 'success-signal'/.test(executor) && !/type:"success-signal"/.test(executor), 'executor no longer fabricates static success-signal evidence');
+ok(/state: 'awaiting_review'.*could not be verified/s.test(executor), 'unverified submit is reported awaiting_review, not done');
 ok(/same page-level action repeated/.test(executor), 'duplicate page-level opener clicks are circuit-broken');
 ok(!mf.content_scripts[0].exclude_matches.includes('*://*.google.com/*'), 'Google Careers pages are eligible for external handoff execution');
 

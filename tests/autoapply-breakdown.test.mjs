@@ -104,3 +104,70 @@ test('queueBreakdown no longer folds awaiting_review into submitted', () => {
   const bd = db.queueBreakdown({ days: 30 });
   assert.ok((bd.byOutcome.needs_you || 0) >= 1, 'awaiting_review now maps to needs_you, not submitted');
 });
+
+// ---- R3: honest, run-scoped summarizeRun (pure) — one fixture per bucket + both rates ----
+test('summarizeRun buckets every category and keeps awaiting_review out of verified', () => {
+  // Raw task-row shape (state/last_error/park_reason/pending_questions/transcript) — exactly
+  // what classifyQueueFailure reads, so this is a pure unit test with no DB.
+  const rows = [
+    { state: 'done' },                                                                      // verified_done
+    { state: 'done' },                                                                      // verified_done
+    { state: 'awaiting_review' },                                                           // awaiting_review (the honest "maybe")
+    { state: 'skipped', park_reason: 'bot_challenge', last_error: 'bot challenge (cloudflare) — needs human verification' }, // bot_challenge
+    { state: 'skipped', last_error: 'site sign-in required before applying — skipped' },     // site_gate
+    { state: 'failed', last_error: 'page stopped advancing — did not change' },              // flow_failed (transient_page)
+    { state: 'failed', last_error: 'auto-apply failed without a diagnostic' },               // flow_failed (unknown_failure)
+    { state: 'parked', pending_questions: JSON.stringify([{ question: 'Salary?', reason: 'missing answer' }]) }, // needs_you
+    { state: 'skipped', last_error: 'external — apply on the company site (not auto-applicable)' }, // skipped (out of scope)
+    { state: 'running' },                                                                   // in_flight
+  ];
+  const { counts, rawRate, supportedRate, drivable } = db.summarizeRun(rows);
+  assert.equal(counts.dispatched, 10);
+  assert.equal(counts.verified_done, 2);
+  assert.equal(counts.awaiting_review, 1, 'awaiting_review is its own bucket, never verified');
+  assert.equal(counts.bot_challenge, 1);
+  assert.equal(counts.site_gate, 1);
+  assert.equal(counts.flow_failed, 2, 'transient + unknown both count as our flow failure');
+  assert.equal(counts.needs_you, 1);
+  assert.equal(counts.skipped, 1);
+  assert.equal(counts.in_flight, 1);
+  // Raw verified rate = verified ÷ dispatched (brutally honest) = 2/10.
+  assert.equal(rawRate, 0.2);
+  // Supported rate = verified ÷ (dispatched − bot − site − skipped − in_flight) = 2/(10−1−1−1−1)=2/6.
+  assert.equal(drivable, 6);
+  assert.equal(Math.round(supportedRate * 1000), Math.round((2 / 6) * 1000));
+});
+
+test('summarizeRun edge cases: zero dispatched and an all-gated run', () => {
+  const empty = db.summarizeRun([]);
+  assert.equal(empty.counts.dispatched, 0);
+  assert.equal(empty.rawRate, 0, 'no divide-by-zero on an empty run');
+  assert.equal(empty.supportedRate, 0);
+  assert.equal(empty.drivable, 0);
+  // All-gated run: every job blocked by the site → drivable is 0, both rates are honestly 0
+  // (NOT a misleading 100% or NaN), and none of it reads as our failure.
+  const gated = db.summarizeRun([
+    { state: 'skipped', park_reason: 'bot_challenge', last_error: 'bot-challenge cooldown — verification wall' },
+    { state: 'skipped', last_error: 'captcha — needs you to sign in' },
+  ]);
+  assert.equal(gated.counts.flow_failed, 0, 'gates are not counted as our failures');
+  assert.equal(gated.drivable, 0);
+  assert.equal(gated.rawRate, 0);
+  assert.equal(gated.supportedRate, 0, 'all-gated run is 0% supported, not NaN/100%');
+});
+
+test('queueRunSummary scopes to the run (since) and matches the endpoint shape', () => {
+  // Anything before `since` must NOT count toward the current run.
+  const old = db.upsertJob({ externalId: 'run-old', title: 'Dev run-old', company: 'Acme', source: 'linkedin', status: 'started', jobUrl: 'https://x/run-old' }).job;
+  db.queuePatch(db.queueAdd(old.id, { mode: 'auto' }).id, { state: 'done', submissionEvidence: { type: 'test-confirmation' } });
+  const runStart = new Date(Date.now() + 5).toISOString();   // mark the run start AFTER the old task
+  const j = db.upsertJob({ externalId: 'run-new', title: 'Dev run-new', company: 'Acme', source: 'linkedin', status: 'started', jobUrl: 'https://x/run-new' }).job;
+  db.queuePatch(db.queueAdd(j.id, { mode: 'auto' }).id, { state: 'done', submissionEvidence: { type: 'test-confirmation' } });
+  const sum = db.queueRunSummary({ startedAt: runStart });
+  // endpoint shape: { since, counts:{…}, rawRate, supportedRate, drivable }
+  assert.equal(sum.since, runStart);
+  assert.ok(sum.counts && typeof sum.counts.dispatched === 'number', 'has counts.dispatched');
+  assert.ok('rawRate' in sum && 'supportedRate' in sum && 'drivable' in sum, 'has both rates + drivable');
+  assert.equal(sum.counts.verified_done, 1, 'only the in-run verified submit counts (the older one is out of scope)');
+  assert.equal(sum.counts.dispatched, 1, 'run scoping excludes pre-run tasks');
+});

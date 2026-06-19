@@ -4,6 +4,7 @@ import fs from 'node:fs';
 
 globalThis.location = { href: 'https://www.linkedin.com/jobs/view/123' };
 const route = await import('../extension/content/route.js');
+const { classifyInterstitial } = await import('../extension/content/lib/interstitial.js');
 
 function el({ text = '', aria = '', href = '', target = '' } = {}) {
   const attrs = { 'aria-label': aria, href, target };
@@ -37,6 +38,68 @@ test('service worker owns same-tab external navigation before the source executo
   assert.match(src, /waitForExternalTarget/);
   assert.match(src, /beforeHost\s*!==\s*afterHost/);
   assert.match(src, /same-tab external handoff/i);
+});
+
+test('a LinkedIn resume-choice interstitial advances (picks most-recent resume, clicks Continue)', () => {
+  const d = classifyInterstitial({
+    onLinkedIn: true, present: true, hasAnswerableFields: false,
+    dialogText: 'Be sure to include an updated resume',
+    buttons: [{ label: 'Continue', index: 0 }],
+    resumeChoices: [
+      { label: 'resume_2023.pdf', index: 0, recent: false },
+      { label: 'resume_latest.pdf most recent', index: 1, recent: true },
+    ],
+  });
+  assert.equal(d.isInterstitial, true);
+  assert.equal(d.advanceIndex, 0);
+  assert.equal(d.pickResumeIndex, 1);   // most-recent preferred
+});
+
+test('a "Continue applying" interstitial with no resume choices still advances', () => {
+  const d = classifyInterstitial({
+    onLinkedIn: true, present: true, hasAnswerableFields: false,
+    dialogText: 'Continue applying to this job',
+    buttons: [{ label: 'Continue applying', index: 2 }],
+    resumeChoices: [],
+  });
+  assert.equal(d.isInterstitial, true);
+  assert.equal(d.advanceIndex, 2);
+  assert.equal(d.pickResumeIndex, null);
+});
+
+test('a field-bearing apply form is NOT treated as an interstitial', () => {
+  const d = classifyInterstitial({
+    onLinkedIn: true, present: true, hasAnswerableFields: true,
+    dialogText: 'Phone number', buttons: [{ label: 'Next', index: 0 }],
+  });
+  assert.equal(d.isInterstitial, false);
+});
+
+test('the final submit is never treated as an interstitial advance', () => {
+  const d = classifyInterstitial({
+    onLinkedIn: true, present: true, hasAnswerableFields: false,
+    dialogText: 'Review your application before you submit',
+    buttons: [{ label: 'Submit application', index: 0 }],
+  });
+  assert.equal(d.isInterstitial, false);
+});
+
+test('an unrelated modal (cookie consent) is not advanced as an interstitial', () => {
+  const d = classifyInterstitial({
+    onLinkedIn: true, present: true, hasAnswerableFields: false,
+    dialogText: 'We use cookies to improve your experience',
+    buttons: [{ label: 'Got it', index: 0 }],
+    resumeChoices: [],
+  });
+  assert.equal(d.isInterstitial, false);
+});
+
+test('interstitial handling is LinkedIn-scoped only', () => {
+  const d = classifyInterstitial({
+    onLinkedIn: false, present: true, hasAnswerableFields: false,
+    dialogText: 'Continue applying', buttons: [{ label: 'Continue', index: 0 }],
+  });
+  assert.equal(d.isInterstitial, false);
 });
 
 test('login URLs can never count as submission confirmation', async () => {

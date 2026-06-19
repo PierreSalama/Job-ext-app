@@ -99,13 +99,36 @@ function runProcess(candidate, request, timeoutMs) {
   });
 }
 
-async function defaultRunner(request, timeoutMs = 90000) {
+// A candidate is "non-viable" — try the NEXT one — when the launcher couldn't run
+// (enoent) OR it ran but lacks the jobspy module / produced no usable JSON. The
+// `py -3` launcher exists on Windows but its interpreter often has no jobspy, so it
+// exits non-zero with an ImportError ("No module named jobspy") rather than enoent.
+// Treating only enoent as fall-through made that throw and discovery silently
+// produced zero jobs instead of trying `python`/`python3`. Real provider failures
+// (rate-limit, captcha, network) must still surface, so only the launcher-not-viable
+// signatures fall through.
+const WORKER_NONVIABLE_RX = /enoent|not found|no module named|cannot find module|modulenotfounderror|importerror|is not recognized|no such file|cannot run program|worker exited|spawn .* failed/i;
+
+// Pure candidate-walk (exported for tests): try each launcher in order; fall through to
+// the next ONLY when the current one is non-viable (couldn't launch / lacks jobspy).
+// Any other error is a genuine provider failure and propagates so the typed classifier
+// can queue a fallback. `runProcessFn` is injected so this is testable without spawning.
+async function runWithCandidates(candidates, runProcessFn, request, timeoutMs = 90000) {
   let last = null;
-  for (const candidate of workerCandidates()) {
-    try { return await runProcess(candidate, request, timeoutMs); }
-    catch (e) { last = e; if (!/enoent|not found/i.test(text(e?.message))) throw e; }
+  for (let i = 0; i < candidates.length; i++) {
+    try { return await runProcessFn(candidates[i], request, timeoutMs); }
+    catch (e) {
+      last = e;
+      const moreCandidates = i < candidates.length - 1;
+      if (moreCandidates && WORKER_NONVIABLE_RX.test(text(e?.message))) continue;
+      throw e;
+    }
   }
   throw last || new Error('JobSpy worker unavailable');
+}
+
+async function defaultRunner(request, timeoutMs = 90000) {
+  return runWithCandidates(workerCandidates(), runProcess, request, timeoutMs);
 }
 
 function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = defaultRunner } = {}) {
@@ -181,4 +204,4 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
   return { runTick, searchBoard, start, stop, isRunning: () => running };
 }
 
-module.exports = { normalizeJobSpyRecord, classifyProviderError, planner, defaultRunner, createDiscoveryService };
+module.exports = { normalizeJobSpyRecord, classifyProviderError, planner, defaultRunner, runWithCandidates, workerCandidates, createDiscoveryService };

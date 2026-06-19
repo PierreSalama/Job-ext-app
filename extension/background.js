@@ -19,6 +19,7 @@
 
 import * as api from './lib/api.js';
 import { isJobPageUrl } from './lib/jobpage.js';
+import { HOST_BREAKER_COOLDOWN_MS, hostOfUrl, shouldDispatchHost, trippedEntry } from './lib/host-breaker.js';
 
 // ---------- browser capability probe (cross-browser parity, Apprenticeship Engine P8) ----------
 // Firefox lacks some Chrome MV3 surfaces (tabGroups, storage.session). The existing apply-pool
@@ -285,9 +286,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         } catch (e) { return { ok: false, error: String(e?.message || e) }; }
       })());
       return true;
-    case 'task-progress':
-      respond(api.call('PATCH', '/queue/' + encodeURIComponent(msg.taskId), msg.patch));
+    case 'task-progress': {
+      // A bot-challenge outcome trips the per-run host circuit breaker so we stop feeding
+      // same-host jobs into the same wall. The botChallenge hint is breaker-only state —
+      // strip it from the PATCH so the queue row stores just the honest lastError/parkReason.
+      let patch = msg.patch || {};
+      const bc = patch.botChallenge;
+      if (bc && (bc.host || bc.kind)) {
+        const host = hostOfUrl(bc.url) || (bc.host ? String(bc.host).replace(/^www\./, '').toLowerCase() : '');
+        if (host) tripHostBreaker(host, bc.kind);
+        const { botChallenge, ...rest } = patch;   // eslint-disable-line no-unused-vars
+        patch = rest;
+      }
+      respond(api.call('PATCH', '/queue/' + encodeURIComponent(msg.taskId), patch));
       return true;
+    }
     case 'get-token':
       respond(api.getToken().then((t) => ({ ok: true, token: t })));
       return true;
@@ -541,6 +554,38 @@ let pumpDirty = false;            // a re-pump request arrived while pumping —
 // pool silently runs serial (1) until the next grant re-learns the concurrency.
 try { chrome.storage.local?.get('jat11.concurrency').then((o) => { const c = o && o['jat11.concurrency']; if (c) currentConcurrency = Math.max(1, Math.min(8, Number(c))); }).catch(() => {}); } catch {}
 
+// ---------- host bot-challenge circuit breaker (per-run, in-memory) ----------
+// When the executor reports a bot-challenge (Cloudflare / CAPTCHA / verify wall) on a host,
+// we record it here and STOP dispatching further queued jobs for THAT host for a cooldown
+// window. Rationale: one Cloudflare wall on indeed.com is host-wide — without a breaker the
+// pool would feed every queued Indeed job straight into the same wall, burning the whole run
+// and tanking the success rate. While the breaker is tripped, same-host jobs are parked with
+// an honest "host under bot-challenge cooldown" reason instead of each hitting the wall.
+//
+// In-memory ONLY (per run): the map is plain SW state, so an MV3 eviction / browser restart
+// clears it — exactly what we want (a fresh run gets to re-probe the host). The decision is a
+// pure, node-testable function (`shouldDispatchHost`) so the cooldown logic is covered by tests.
+const hostBreaker = new Map();                     // host → { trippedAt, until, kind, hits }
+
+// Trip (or extend) the breaker for a host after a challenge was detected on it.
+function tripHostBreaker(host, kind, now = Date.now()) {
+  const h = String(host || '').toLowerCase();
+  if (!h) return;
+  hostBreaker.set(h, trippedEntry(hostBreaker.get(h), kind, now));
+  const mins = Math.round(HOST_BREAKER_COOLDOWN_MS / 60000);
+  console.log(`[jat11] host breaker TRIPPED: ${h} (bot-challenge: ${kind || 'unknown'}) — pausing dispatch ~${mins} min`);
+}
+
+// Best-effort expiry log so a cooled-down host is observable. Called lazily from the gate.
+function noteHostBreakerCooldownIfElapsed(host, now = Date.now()) {
+  const h = String(host || '').toLowerCase();
+  const entry = hostBreaker.get(h);
+  if (entry && now >= (Number(entry.until) || 0)) {
+    hostBreaker.delete(h);
+    console.log(`[jat11] host breaker cooled down: ${h} — resuming dispatch`);
+  }
+}
+
 // Keep every auto-apply / discovery tab in ONE labelled Chrome tab group so the
 // user can see + manage them together (and they're not scattered everywhere).
 const AA_GROUP_TITLE = 'JAT Auto-apply';
@@ -675,12 +720,39 @@ async function waitForExternalTarget(sourceTabId, token, timeoutMs = 20000) {
   return null;
 }
 
+// The manifest declares content/loader.js as the resident content script in every
+// frame; this is the SAME entry, so programmatic injection mirrors the normal load
+// path (the loader then lazy-imports the engine). Idempotent: the loader self-guards
+// with window.__jat11_loaded, so re-injecting an already-loaded frame is a no-op.
+const CONTENT_ENTRY = 'content/loader.js';
+
+// Heavy SPA / redirect / login / late document_idle on the external ATS child tab
+// frequently means the manifest content script hasn't attached yet, so the very first
+// sendMessage gets "Could not establish connection. Receiving end does not exist." That
+// is recoverable: force-inject the content entry, then retry. Only after injection +
+// retry still fails do we let the caller fall back.
+async function injectContentEntry(tabId) {
+  if (!chrome.scripting?.executeScript) return false;   // Firefox MV3 fallback / older runtimes
+  try {
+    await chrome.scripting.executeScript({ target: { tabId, allFrames: false }, files: [CONTENT_ENTRY] });
+    return true;
+  } catch { return false; }
+}
+
 async function sendTaskWhenReady(tabId, message, timeoutMs = 20000) {
   const started = Date.now();
   let lastError = null;
+  let injected = false;
   while (Date.now() - started < timeoutMs) {
     try { return await chrome.tabs.sendMessage(tabId, message, { frameId: 0 }); }
-    catch (e) { lastError = e; await new Promise((resolve) => setTimeout(resolve, 500)); }
+    catch (e) {
+      lastError = e;
+      // "Receiving end does not exist" → the content script isn't loaded in this tab.
+      // Inject it once (mirroring the manifest load), then keep retrying so the loader
+      // has time to register its onMessage listener before we give up.
+      if (!injected) { injected = await injectContentEntry(tabId); }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
   }
   throw lastError || new Error('external target content script did not become ready');
 }
@@ -697,6 +769,11 @@ async function runExternalHandoff(sourceTabId, token, task, context) {
     await waitTabComplete(childTabId, 30000);
     await new Promise((resolve) => setTimeout(resolve, 1200));
     child = await chrome.tabs.get(childTabId);
+    // Proactively ensure the content entry is attached on the external ATS tab before we
+    // dispatch. The manifest content script may not have run yet (redirect chains, login
+    // walls, throttled document_idle), and sendTaskWhenReady also injects-on-miss as a
+    // belt-and-braces retry. Idempotent via the loader's window.__jat11_loaded guard.
+    await injectContentEntry(childTabId);
     const childContext = {
       ...(context || {}),
       externalHandoff: true,
@@ -1292,6 +1369,7 @@ async function pump(force = false) {
   let dispatched = 0;
   let reason = 'idle';
   let gapEligibleAt = null;
+  let parkedThisPump = 0;            // breaker parks per pump — bounds the no-dispatch loop
   try {
     while (activeCount < currentConcurrency) {
       const r = await api.call('GET', '/queue/next' + (force ? '?force=1' : ''), null, 8000);
@@ -1303,6 +1381,26 @@ async function pump(force = false) {
         reason = r?.reason || 'nothing queued';
         if (r?.nextEligibleAt) gapEligibleAt = r.nextEligibleAt;
         break;
+      }
+      // HOST CIRCUIT BREAKER: if this job's host is cooling down after a bot-challenge,
+      // don't burn it on the same wall. Park it honestly and pull the NEXT job instead
+      // (no slot consumed). The breaker is in-memory/per-run and self-expires.
+      const jobHost = hostOfUrl(r.context?.job?.jobUrl || r.task?.jobUrl);
+      noteHostBreakerCooldownIfElapsed(jobHost);
+      const gate = shouldDispatchHost(jobHost, Date.now(), hostBreaker);
+      if (!gate.dispatch && r.task?.id != null) {
+        console.log(`[jat11] parking ${jobHost} job ${r.task.id} — host under bot-challenge cooldown`);
+        await api.call('PATCH', '/queue/' + encodeURIComponent(r.task.id), {
+          state: 'skipped',
+          lastError: 'host under bot-challenge cooldown — site is serving a verification wall; will not retry this run',
+          parkReason: 'bot_challenge',
+          transcriptAppend: { kind: 'recovery', note: `host ${jobHost} under bot-challenge cooldown — parked without dispatch` },
+        }).catch(() => {});
+        reason = 'host-cooldown';
+        // Bound the park loop so a server that keeps re-returning the same row can't spin
+        // this pump forever; the next alarm/re-pump will drain the rest.
+        if (++parkedThisPump >= 25) break;
+        continue;             // pull the next queued job; don't open a tab for this one
       }
       stopping = false;        // actively launching → not in teardown (clears a recent Stop)
       startStopWatchdog();     // catch a desktop-app Stop (no chrome there) while this runs

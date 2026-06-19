@@ -28,6 +28,17 @@ test('classifyQueueFailure maps failures to retry/user/inspect policy', () => {
   assert.equal(db.classifyQueueFailure({ state: 'skipped', last_error: 'site sign-in required before applying — skipped' }).action, 'user');
   assert.equal(db.classifyQueueFailure({ state: 'failed', last_error: 'Postuler sur le site de l’employeur; Easy-Apply form did not hydrate' }).action, 'inspect');
   assert.equal(db.classifyQueueFailure({ state: 'failed', _src: 'glassdoor', last_error: 'Easy-Apply form did not hydrate — will retry' }).action, 'inspect');
+  // Loosened termination (regression fix): a first-attempt hydration miss on a throttled/
+  // occluded tab and an un-attached external handoff are RETRIABLE transient failures, not
+  // terminal external skips. Their lastError is kept free of external/company-site words.
+  assert.equal(db.classifyQueueFailure({ state: 'failed', last_error: 'apply form did not hydrate on a throttled/occluded tab — will retry' }).action, 'retry');
+  assert.equal(db.classifyQueueFailure({ state: 'failed', last_error: 'apply handoff did not attach — page did not change; will retry' }).action, 'retry');
+  // Site bot-gate (Cloudflare / CAPTCHA / verify wall, or host-cooldown park) is its OWN
+  // category — distinct from a benign sign-in/captcha `site_gate` and from our-flow failures.
+  assert.equal(db.classifyQueueFailure({ state: 'skipped', last_error: 'bot challenge (cloudflare) — needs human verification', park_reason: 'bot_challenge' }).failureClass, 'bot_challenge');
+  assert.equal(db.classifyQueueFailure({ state: 'skipped', last_error: 'host under bot-challenge cooldown — site is serving a verification wall; will not retry this run' }).failureClass, 'bot_challenge');
+  // ...and is NOT swallowed by the generic site_gate "human" matcher.
+  assert.notEqual(db.classifyQueueFailure({ state: 'skipped', last_error: 'bot challenge (captcha) — needs human verification', park_reason: 'bot_challenge' }).failureClass, 'site_gate');
   const repeated = { state: 'failed', last_error: 'page stopped advancing', transcript: JSON.stringify([
     { kind: 'recovery', fingerprint: 'linkedin|step2|next|abc' },
     { kind: 'recovery', fingerprint: 'linkedin|step2|next|abc' },

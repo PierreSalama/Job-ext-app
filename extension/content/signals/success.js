@@ -17,6 +17,93 @@ export function urlLooksLikeSuccess(href = location.href) {
   return !NON_SUCCESS_URL_RX.test(href) && SUCCESS_URL_RX.test(href);
 }
 
+// ============================================================
+// SUCCESS-TRUTH: the pure, node-testable submit-evidence evaluator.
+// ============================================================
+// A submit is only VERIFIED when a post-click CHANGE proves it — never from
+// pre-existing static page text. The executor captures a baseline IMMEDIATELY
+// before the final-submit click (apply-dialog/body text, URL, form signature)
+// and again AFTER the click+settle, then feeds both snapshots here. This fn owns
+// the decision so it can be exercised against the known false positives
+// (Activision, Canada Job Bank) without a browser.
+//
+// Inputs (all plain data — no DOM):
+//   before        : { text, url, successText:boolean }  baseline pre-click
+//   after         : { text, url, successText:boolean }  post-click + settle
+//   formGrounded  : boolean   a REAL application form was opened+filled this run
+//   msElapsed     : number    ms from click to the verifying observation
+//   urlBefore     : string    (optional; falls back to before.url)
+//   urlAfter      : string    (optional; falls back to after.url)
+//   newNodes      : Array<{ text, confirmation }>  containers that APPEARED post-click
+//   networkPost   : boolean   (optional, best-effort) a correlated application POST/XHR
+//
+// Returns { verified:boolean, reason:string }.
+//
+// The minimum plausible time for a genuine server round-trip + confirmation
+// render. A "confirmation" that appears faster than this WITHOUT any network or
+// DOM-structure change is the Activision pattern (static text + a fast click) —
+// reject it.
+const MIN_CONFIRM_MS = 400;
+
+function hasNewSuccessNode(newNodes) {
+  if (!Array.isArray(newNodes)) return false;
+  return newNodes.some((n) => {
+    if (!n) return false;
+    if (n.confirmation === true) return true;
+    const t = String(n.text || '');
+    return t.length > 0 && t.length < 800 && SUCCESS_TEXT_RX.test(t);
+  });
+}
+
+export function evaluateSubmitEvidence({
+  before = {},
+  after = {},
+  formGrounded = false,
+  msElapsed = 0,
+  urlBefore,
+  urlAfter,
+  newNodes = [],
+  networkPost = false,
+} = {}) {
+  // (2) GROUNDED-FORM REQUIREMENT — a generic page-level Submit on a careers /
+  // search / newsletter / problem-report page can never be a verified submit.
+  // This alone rejects Canada Job Bank (no application form ever opened/filled).
+  if (!formGrounded) return { verified: false, reason: 'no-grounded-form' };
+
+  const uBefore = urlBefore != null ? urlBefore : before.url;
+  const uAfter = urlAfter != null ? urlAfter : after.url;
+
+  // (1) URL → confirmation page (not a login/search/error URL). A real
+  // navigation to a success URL is strong, independent proof.
+  if (uAfter && uAfter !== uBefore && !NON_SUCCESS_URL_RX.test(uAfter) && SUCCESS_URL_RX.test(uAfter)) {
+    return { verified: true, reason: 'url-confirmation' };
+  }
+
+  // A correlated application network POST/XHR observed around the submit is
+  // independent proof the form actually transmitted (best-effort; optional).
+  if (networkPost === true) return { verified: true, reason: 'network-post' };
+
+  // (1) NEW confirmation that was NOT present in the baseline (diff, not absolute
+  // match). Pre-existing static success-like text — i.e. the baseline ALREADY
+  // matched — must NOT count. This is the Activision rejection: identical
+  // before/after success text, no new node.
+  const newNode = hasNewSuccessNode(newNodes);
+  const textBecameSuccess = !before.successText && after.successText === true;
+  if (newNode || textBecameSuccess) {
+    // Implausibly fast with no network and no NEW structural node → not real.
+    if (msElapsed < MIN_CONFIRM_MS && !networkPost && !newNode) {
+      return { verified: false, reason: 'confirmation-too-fast' };
+    }
+    return { verified: true, reason: newNode ? 'new-confirmation-node' : 'text-became-success' };
+  }
+
+  // Baseline already looked like success (static recruitment/"thank you" copy)
+  // and nothing changed → the canonical false positive. Reject.
+  if (before.successText) return { verified: false, reason: 'static-success-text-unchanged' };
+
+  return { verified: false, reason: 'no-post-click-change' };
+}
+
 export function nodeLooksLikeSuccess(node) {
   if (!(node instanceof Element)) return false;
   if (node.id === 'post-apply-modal') return true;
@@ -30,4 +117,4 @@ export function nodeLooksLikeSuccess(node) {
   return t.length < 600 && SUCCESS_TEXT_RX.test(t);
 }
 
-export { SUCCESS_TEXT_RX, SUCCESS_URL_RX, NON_SUCCESS_URL_RX };
+export { SUCCESS_TEXT_RX, SUCCESS_URL_RX, NON_SUCCESS_URL_RX, MIN_CONFIRM_MS };

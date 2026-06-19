@@ -16,10 +16,12 @@
 import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput } from './autofill.js';
 import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
-import { pageTextLooksLikeSuccess, urlLooksLikeSuccess } from './signals/success.js';
+import { pageTextLooksLikeSuccess, urlLooksLikeSuccess, evaluateSubmitEvidence } from './signals/success.js';
 import { qsa, isProbablyVisible, compactText } from './lib/dom.js';
 import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence, resolveLocator, recoveryFingerprint } from './replay.js';
 import { classifyApplyControl, observeRoute, applyRouteForState } from './route.js';
+import { classifyInterstitial } from './lib/interstitial.js';
+import { detectBotChallenge, botChallengeLastError } from './lib/challenge.js';
 
 const MAX_STEPS = 40;
 const STEP_TIMEOUT = 9000;
@@ -273,6 +275,33 @@ function captchaOrLoginPresent() {
   return null;
 }
 
+// Bot-challenge / Cloudflare circuit-breaker probe. Builds a DOM-free description of the
+// live page and hands it to the pure detector in lib/challenge.js. Returns the detector
+// verdict; the executor uses `blocked` to bail TERMINALLY-but-honestly (a site gate, not an
+// occlusion miss and not a failure of our flow). Best-effort structural hints (a cf ray-id
+// marker, challenge widgets) are gathered cheaply and guarded so a hostile DOM can't throw.
+function detectBotChallengeOnPage() {
+  try {
+    const bodyText = (document.body?.innerText || '').slice(0, 20000);
+    let hasRayId = false;
+    try {
+      hasRayId = !!document.querySelector(
+        '[data-ray], .cf-ray, #cf-wrapper, #challenge-running, #challenge-form, '
+        + 'script[src*="/cdn-cgi/challenge"], script[src*="challenge-platform"], '
+        + 'iframe[src*="/cdn-cgi/"], .cf-turnstile, [class*="cf-turnstile"]'
+      );
+    } catch {}
+    return detectBotChallenge({
+      url: location.href,
+      title: document.title,
+      bodyText,
+      hasRayId,
+    });
+  } catch {
+    return { blocked: false, kind: null, reason: 'probe-error' };
+  }
+}
+
 // Detect LinkedIn's "You reached today's Easy Apply limit" modal. Narrow + guarded:
 // only fires on linkedin.com, and only on the explicit copy OR a generic "daily limit"
 // phrase that co-occurs with "Easy Apply" on the page. Returns true when the cap is hit.
@@ -330,6 +359,56 @@ async function waitForStickyLinkedInDialog(timeoutMs = 6500) {
     await sleep(150);
   }
   return null;
+}
+
+// LinkedIn shows intermediate modals between the Easy-Apply opener and the real
+// field-bearing form — a resume picker, a "Continue applying" confirmation, a review
+// interstitial — that carry no answerable fields. The generic form scan reports
+// haveForm=false on these, so without a handler the loop would re-click the underlying
+// opener and the duplicate-opener breaker would terminal-fail. This advances THROUGH the
+// interstitial (selecting the most-recent resume if asked, clicking continue/next/review)
+// so the flow reaches the real Easy-Apply form. Pure decision lives in lib/interstitial.js;
+// this only builds the live description and acts on it. Returns true iff it advanced.
+async function handleLinkedInInterstitial() {
+  if (!/(^|\.)linkedin\.com$/i.test(location.hostname)) return false;
+  const dialog = findApplyDialog();
+  if (!dialog) return false;
+  // A field-bearing apply form is owned by the normal fill path, not this handler.
+  const hasAnswerableFields = !!dialog.querySelector?.('input:not([type="radio"]):not([type="checkbox"]):not([type="hidden"]), textarea, select, [role="combobox"], [contenteditable="true"], input[type="file"]');
+  const controls = qsa('button, input[type="submit"], a[role="button"], [role="button"]', dialog)
+    .filter((el) => el && !el.disabled && isProbablyVisible(el));
+  const buttons = controls.map((el, index) => ({ el, index, label: btnText(el) }));
+  // Resume choices: LinkedIn renders them as radios or selectable cards. "recent" is a
+  // best-effort signal from the option text/badge.
+  const resumeEls = qsa('input[type="radio"], [role="radio"], [data-test-resume-card], .jobs-resume-picker__resume', dialog)
+    .filter((el) => el && isProbablyVisible(el));
+  const resumeChoices = resumeEls.map((el, index) => {
+    const around = compactText(`${el.getAttribute?.('aria-label') || ''} ${el.closest?.('label, li, .jobs-resume-picker__resume')?.innerText || el.parentElement?.innerText || ''}`);
+    return { el, index, label: around.slice(0, 80), recent: /most recent|recently|last used|updated/i.test(around) };
+  });
+  const dialogText = compactText(`${dialog.getAttribute?.('aria-label') || ''} ${dialog.innerText || dialog.textContent || ''}`).slice(0, 2500);
+
+  const decision = classifyInterstitial({
+    onLinkedIn: true,
+    present: true,
+    hasAnswerableFields,
+    dialogText,
+    buttons: buttons.map(({ label, index }) => ({ label, index })),
+    resumeChoices: resumeChoices.map(({ label, index, recent }) => ({ label, index, recent })),
+  });
+  if (!decision.isInterstitial) return false;
+
+  if (decision.pickResumeIndex != null) {
+    const choice = resumeChoices[decision.pickResumeIndex];
+    if (choice?.el) { logLine('ok', `interstitial: selecting resume "${choice.label.slice(0, 40)}"`); syntheticClick(choice.el); await sleep(250); }
+  }
+  const advance = buttons[decision.advanceIndex];
+  if (!advance?.el) return false;
+  logLine('ok', `interstitial: advancing past "${btnText(advance.el).slice(0, 30)}"`);
+  const prevHash = domHash();
+  syntheticClick(advance.el);
+  await waitForChange(prevHash);
+  return true;
 }
 
 // LinkedIn's "Easy Apply" button on the job-view page (before the modal opens).
@@ -408,6 +487,38 @@ async function confirmSubmitted(applyModal, timeoutMs = 15000) {
     await sleep(400);
   }
   return null;
+}
+
+// SUCCESS-TRUTH baseline snapshot. Captured IMMEDIATELY before the final-submit
+// click, then again after the settle. `scope` is the verified apply dialog when
+// we have one (so we diff the application surface, not unrelated page chrome),
+// else document.body. We record normalized text, the URL, a boolean of whether
+// the text ALREADY looks like success (pre-existing static copy must not count),
+// and a structural signature so a fresh confirmation container is detectable.
+function submitSnapshot(scope) {
+  const el = (scope && document.contains(scope)) ? scope : document.body;
+  const text = compactText(el?.innerText || el?.textContent || '').slice(0, 8000);
+  return {
+    text,
+    url: location.href,
+    successText: pageTextLooksLikeSuccess(8000),
+    nodeSig: new Set(qsa('[role="alert"], [role="status"], [class*="confirm" i], [class*="success" i], [class*="thank" i], [id*="post-apply" i]')
+      .filter(isProbablyVisible).map((n) => `${n.tagName}.${n.className}#${n.id}`)),
+  };
+}
+
+// Confirmation containers that are present AFTER the click but were NOT in the
+// baseline signature — the "diff, not absolute match" requirement.
+function newConfirmationNodes(before) {
+  const seen = before?.nodeSig || new Set();
+  const out = [];
+  for (const n of qsa('[role="alert"], [role="status"], [class*="confirm" i], [class*="success" i], [class*="thank" i], [id*="post-apply" i]')) {
+    if (!isProbablyVisible(n)) continue;
+    const key = `${n.tagName}.${n.className}#${n.id}`;
+    if (seen.has(key)) continue;
+    out.push({ text: compactText(n.innerText || n.textContent || '').slice(0, 800), confirmation: false });
+  }
+  return out;
 }
 
 function syntheticClick(el) {
@@ -553,9 +664,11 @@ export async function run(task, context, helpers) {
   let finished = false;
   let finalState = null;
   let everHadForm = false;     // has the apply form/modal ever appeared this run?
+  let formGrounded = false;    // SUCCESS-TRUTH: a REAL apply form was opened+interacted-with
   let submitAttempted = false; // did we click a final submit (auto mode) at least once?
   let noChange = 0;            // consecutive advance clicks that didn't change the page (stall)
   let lastPageAction = '';     // blocks repeated clicks on the same page-level opener
+  let interstitialAdvances = 0; // LinkedIn resume/continue interstitials advanced this run (bounded)
 
   // ============================================================
   // Front-until-hydrated [occlusion fix] — ADDITIVE, fully guarded.
@@ -1001,6 +1114,31 @@ export async function run(task, context, helpers) {
     if (S.cancelled) break;
 
     // ---- hard stops ----
+    // (0) BOT-CHALLENGE / CLOUDFLARE WALL — checked FIRST so an anti-automation interstitial
+    // is never mislabeled as OCCLUSION (the old failure: a hidden/throttled tab on a CF wall
+    // looked like a non-hydrating form, so we kept fronting the window and burning attempts
+    // and the diagnostic blamed "occlusion"). On a STRONG challenge signal we STOP: no
+    // front-until-hydrate loop, no opener retry, no synthetic submit (cooperates with R1 —
+    // never mints success). We PARK it (skipped) with an honest, distinct lastError and flag
+    // the host so background.js trips a per-run circuit breaker (one wall must not nuke every
+    // same-host job). This is a SITE gate, not a failure of our flow — classified distinctly.
+    const challenge = detectBotChallengeOnPage();
+    if (challenge.blocked) {
+      const why = botChallengeLastError(challenge.kind);
+      logLine('warn', `${why} (${challenge.reason}) — stopping; not our flow's failure`);
+      setStatus('Site bot-challenge — needs you to verify');
+      signalHydrated();   // release any held front-until-hydrated; we are NOT waiting on hydration
+      report({
+        state: 'skipped',
+        lastError: why,
+        parkReason: 'bot_challenge',
+        botChallenge: { kind: challenge.kind, host: location.hostname.replace(/^www\./, ''), reason: challenge.reason },
+        transcriptAppend: { kind: 'recovery', note: `${why} [${challenge.reason}] — site anti-automation gate, parked (host breaker armed)` },
+      });
+      finalState = 'skipped';
+      break;
+    }
+
     const blocker = captchaOrLoginPresent();
     if (blocker) {
       logLine('warn', `${blocker} detected — handing back to you`);
@@ -1079,6 +1217,11 @@ export async function run(task, context, helpers) {
 
     // ---- resume upload ----
     const att = haveForm ? await tryAttachResume(root, resume) : { attempted: false, attached: 0 };
+    // SUCCESS-TRUTH grounding: we opened a real, field-bearing application surface
+    // (a verified dialog, or a probed form we filled/attached into) for THIS job.
+    // A generic page-level Submit on a careers/search/newsletter/problem-report
+    // page never reaches here with a form root, so it can never be grounded.
+    if (haveForm && (dialog || filled > 0 || att?.attached > 0)) formGrounded = true;
     if (resume?.id && att.attempted && att.attached === 0) {
       logLine('err', 'resume could not be attached — stopping for you to upload it');
       report({ state: 'failed', lastError: 'resume attachment failed (will retry)' });
@@ -1219,9 +1362,32 @@ export async function run(task, context, helpers) {
         }
         const ext = opening && externalApplyPresent();
         if (ext) {
+          // "Looks external + the form never opened." This is reliable ONLY once the tab
+          // has been visible/settled and we've already given it a real retry — LinkedIn
+          // frequently renders an offsite-looking "Apply" first and swaps in the real
+          // Easy-Apply button seconds later, and a hidden/throttled tab amplifies that.
+          // Committing to a TERMINAL external verdict on the first pass terminal-skipped
+          // jobs that would have been drivable (the over-aggressive 07bb35e gate). So:
+          // on the first attempt of a tab that was hidden/throttled, fail RETRIABLY
+          // (transient phrasing → classifier routes to transient_page/retry); only commit
+          // to the honest terminal external state once it persists across attempts.
+          const attemptN = Number(task?.attempts) || 0;
+          const confidentExternal = attemptN >= 1 || !wasHidden;
+          if (!confidentExternal) {
+            // NOTE: keep this lastError free of "external"/"company site" so the server's
+            // failure classifier routes it to transient_page (retry), not external_site
+            // (inspect/terminal). It IS a transient hydration miss on a throttled tab.
+            logLine('warn', 'apply form never hydrated on this hidden/throttled tab — will retry before judging the posting non-drivable');
+            report({
+              state: 'failed',
+              lastError: 'apply form did not hydrate on a throttled/occluded tab — will retry',
+              transcriptAppend: { note: 'deferred non-drivable verdict: first attempt, tab was hidden/throttled' },
+            });
+            finalState = 'failed'; break;
+          }
           // A genuinely EXTERNAL posting (apply on the company site) — JAT can't drive it.
           // SKIP it (terminal): retrying wastes the pool + drags the success rate, and the
-          // tab is now an active/visible window so this detection is reliable.
+          // tab is now an active/visible (or already-retried) window so this is reliable.
           const st = allowExternal ? 'failed' : 'skipped';
           report({ state: st, lastError: allowExternal ? 'external apply button was present but could not be opened — inspect' : 'external — apply on the company site (not auto-applicable)', applyRoute: 'external' });
           finalState = st; break;
@@ -1277,6 +1443,18 @@ export async function run(task, context, helpers) {
       ? recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label, stage: externalClick ? 'external-opener' : 'apply-opener' })
       : '';
     if (pageAction && pageAction === lastPageAction) {
+      // Before declaring the opener dead: on LinkedIn this repeat usually means an
+      // INTERMEDIATE resume/continue/review modal is up (no answerable fields, so
+      // haveForm was false), and we're about to re-click the underlying opener. Advance
+      // THROUGH the interstitial instead — without re-clicking the opener (sticky modal
+      // scope preserved). If it advances, restart the loop to reach the real form.
+      if (interstitialAdvances < 4 && await handleLinkedInInterstitial()) {
+        interstitialAdvances++;
+        logLine('ok', 'advanced past a LinkedIn interstitial — re-scanning for the apply form');
+        report({ transcriptAppend: { kind: 'recovery', note: 'advanced LinkedIn resume/continue interstitial', fingerprint: pageAction } });
+        lastPageAction = null;   // the interstitial advance is real progress; allow the next opener/advance
+        continue;
+      }
       logLine('warn', `same page-level action repeated — stopping before another "${label}" click`);
       report({ state: 'failed', lastError: `repeated page-level action did not transfer: ${label}`, transcriptAppend: { kind: 'recovery', note: 'duplicate opener blocked', fingerprint: pageAction } });
       finalState = 'failed';
@@ -1313,6 +1491,13 @@ export async function run(task, context, helpers) {
     setStatus(`Step ${S.step}: "${label}"…`);
     const beforeClickUrl = location.href;
     const prevHash = domHash();
+    // SUCCESS-TRUTH: snapshot the application surface IMMEDIATELY before a final
+    // submit, so the post-click evaluator diffs against this exact baseline and
+    // can never mint a "done" from pre-existing static success-like page text.
+    const submitBaseline = (isFinal && mode !== 'review')
+      ? submitSnapshot(submitDialog || findApplyDialog())
+      : null;
+    const submitClickAt = Date.now();
     syntheticClick(clickBtn);
     if (externalClick && handoffToken) {
       setStatus('Transferring control to the company application…');
@@ -1343,10 +1528,31 @@ export async function run(task, context, helpers) {
       const observed = observeRoute({ beforeUrl: beforeClickUrl, afterUrl: location.href, dialogOpen: !!findApplyDialog() });
       S.routeState = observed.state;
     }
-    if (externalClick && !changed) {
+    // We only reach here for an external click whose handoff did NOT adopt an owned child
+    // executor (a captured child already broke out above). Don't hard-fail: an external
+    // opener we can't drive via the SW handoff is recoverable, not terminal.
+    if (externalClick) {
+      if (changed) {
+        // The click DID transition this tab — typically a same-tab off-origin navigation
+        // to the company ATS. Fall back to the PRIOR in-tab behavior: keep driving the
+        // page in-tab (the loop re-detects the apply form / advance button next pass).
+        // Clear externalRoute so the loop treats it as a normal same-tab application.
+        logLine('ok', 'external target navigated in-tab — continuing to drive it here');
+        S.externalRoute = false;
+        if (S.routeState === 'external_same_tab' || S.routeState === 'external_new_tab') {
+          S.routeState = 'same_tab_application';
+        }
+        continue;
+      }
+      // No transition and no captured child → a transient miss (child tab not yet owned,
+      // late opener, redirect chain still settling). Report RETRIABLY — phrased so the
+      // server's failure classifier reads it as transient_page (retry), not external_site
+      // (inspect/terminal). The in-run duplicate-opener breaker already prevents a second
+      // click this pass, and the queue's attempts cap bounds cross-run retries, so this
+      // can't loop forever.
       const fingerprint = recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label, stage: 'external-handoff-missing' });
-      logLine('warn', 'external target did not become an owned executor — stopping after one click');
-      report({ state: 'failed', lastError: 'external target opened without a controllable handoff — inspect', applyRoute: 'external', transcriptAppend: { kind: 'recovery', note: 'external handoff target was not captured', fingerprint } });
+      logLine('warn', 'apply handoff did not attach this pass — will retry');
+      report({ state: 'failed', lastError: 'apply handoff did not attach — page did not change; will retry', applyRoute: applyRouteForState(S.routeState), transcriptAppend: { kind: 'recovery', note: 'external handoff target was not captured this pass', fingerprint } });
       finalState = 'failed';
       break;
     }
@@ -1416,38 +1622,52 @@ export async function run(task, context, helpers) {
       }
     } else if (changed) { noChange = 0; }
 
-    // ---- confirm a real submit (auto mode) ----
-    // After clicking the final submit, WAIT for the confirmation (banner or the
-    // Easy-Apply modal closing) instead of checking once — the banner renders a
-    // beat later, which used to make real submissions look like awaiting_input.
+    // ---- confirm a real submit (auto mode) — SUCCESS-TRUTH ----
+    // A "done" must be TRUSTWORTHY, never a false positive. After the final-submit
+    // click we WAIT for the confirmation to settle (the banner / modal-close renders
+    // a beat later) and then prove the submit with a POST-CLICK CHANGE diffed against
+    // the pre-click baseline: a NEW confirmation container, the surface text BECOMING
+    // success (not already-static), a navigation to a real confirmation URL, OR a
+    // correlated network POST. Pre-existing static "thank you"/recruitment text — the
+    // Activision / Canada Job Bank false positives — can never count. A submit that
+    // can't be proven is reported submitted-but-unverified (awaiting_review), never done.
     if (isFinal && mode !== 'review') {
       submitAttempted = true;
       setStatus('Submitting — waiting for confirmation…');
-      const how = await confirmSubmitted(submitDialog);
-      if (how) {
-        logLine('ok', `✓ application submitted (${how})`);
+      const how = await confirmSubmitted(submitDialog);   // settle wait (also early-true on modal close)
+      const after = submitSnapshot(submitDialog || findApplyDialog());
+      const verdict = evaluateSubmitEvidence({
+        before: submitBaseline || { url: beforeClickUrl, successText: false, text: '' },
+        after,
+        formGrounded,
+        msElapsed: Date.now() - submitClickAt,
+        urlBefore: beforeClickUrl,
+        urlAfter: location.href,
+        newNodes: newConfirmationNodes(submitBaseline),
+      });
+      // confirmSubmitted's "apply form closed" is corroborating, but only counts when
+      // the form was grounded — a closed unrelated modal is not proof.
+      const formClosed = how === 'apply form closed' && formGrounded;
+      if (verdict.verified || formClosed) {
+        const reason = verdict.verified ? verdict.reason : 'apply-form-closed';
+        logLine('ok', `✓ application submitted (${reason})`);
         setStatus('✓ Application submitted');
         // Mark the JOB submitted too, so it's counted even if the passive capture
         // detector misses the banner (queuePatch only updates the task).
         if (job?.id) await send({ type: 'api-call', method: 'PATCH', path: '/jobs/' + encodeURIComponent(job.id), body: { status: 'submitted' } });
-        report({ state: 'done', submissionEvidence: { type: 'confirmed', detail: how, url: location.href, at: new Date().toISOString() }, transcriptAppend: { note: `submitted — ${how}` } });
+        report({ state: 'done', submissionEvidence: { type: 'verified', reason, detail: how || reason, url: location.href, at: new Date().toISOString() }, transcriptAppend: { note: `submitted — verified (${reason})` } });
         finalState = 'done';
         finished = true;
         continue;
       }
-      logLine('warn', 'submit not confirmed yet — continuing');
-    }
-
-    // ---- success? (generic net for one-click / non-modal apply flows) ----
-    // Never infer success merely because an Apply CTA opened another page. A task is
-    // complete only after THIS executor attempted a real final submit.
-    if (submitAttempted && (pageTextLooksLikeSuccess(6000) || urlLooksLikeSuccess())) {
-      logLine('ok', '✓ application submitted');
-      setStatus('✓ Application submitted');
-      if (job?.id) await send({ type: 'api-call', method: 'PATCH', path: '/jobs/' + encodeURIComponent(job.id), body: { status: 'submitted' } });
-      report({ state: 'done', submissionEvidence: { type: 'success-signal', detail: pageTextLooksLikeSuccess(6000) ? 'confirmation text' : 'confirmation URL', url: location.href, at: new Date().toISOString() }, transcriptAppend: { note: 'success detected' } });
-      finalState = 'done';
+      // Submit was clicked but NOT proven. Do not fabricate a done. Report
+      // submitted-but-unverified so the user confirms it, rather than trusting it.
+      logLine('warn', `submit not verified (${verdict.reason}) — flagged for your review`);
+      setStatus('Submitted — awaiting your confirmation');
+      report({ state: 'awaiting_review', lastError: `submit was clicked but could not be verified (${verdict.reason}) — please confirm`, transcriptAppend: { note: `submit unverified — ${verdict.reason}` } });
+      finalState = 'awaiting_review';
       finished = true;
+      continue;
     }
     if (changed) lastPageAction = '';
     await sleep(600);

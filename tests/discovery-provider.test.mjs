@@ -49,6 +49,43 @@ test('discovery batches and browser fallback requests are durable', () => {
   assert.equal(db.discoveryBatchList({ limit: 1 })[0].status, 'blocked');
 });
 
+test('defaultRunner falls through a non-viable launcher (py -3 lacks jobspy) to the next candidate', async () => {
+  // Simulate the multi-candidate launcher list by stubbing the per-candidate process.
+  // The first launcher (py -3) runs but the interpreter has no jobspy module — it exits
+  // non-zero with an ImportError (NOT enoent), which previously THREW and produced zero
+  // jobs. The runner must keep going and let `python` succeed.
+  const calls = [];
+  const fakeRunProcess = async (candidate) => {
+    calls.push(candidate.command + ' ' + candidate.args.join(' '));
+    if (/\bpy\b/.test(candidate.command) && candidate.args[0] === '-3') {
+      throw new Error("ModuleNotFoundError: No module named 'jobspy'");
+    }
+    return { ok: true, jobs: [{ site: 'linkedin', title: 'Dev', company: 'Acme', job_url: 'https://www.linkedin.com/jobs/view/9' }] };
+  };
+  const result = await discovery.runWithCandidates(
+    [{ command: 'py', args: ['-3', 'jobspy_worker.py'] }, { command: 'python', args: ['jobspy_worker.py'] }],
+    fakeRunProcess,
+    {},
+  );
+  assert.equal(result.ok, true);
+  assert.equal(result.jobs.length, 1);
+  assert.deepEqual(calls, ['py -3 jobspy_worker.py', 'python jobspy_worker.py']);
+});
+
+test('defaultRunner surfaces a genuine provider failure (rate limit) instead of masking it', async () => {
+  // A real provider error must NOT be swallowed as a launcher fall-through — it has to
+  // reach the typed classifier so the browser fallback can be queued.
+  const fakeRunProcess = async () => { throw new Error('HTTP 429 too many requests'); };
+  await assert.rejects(
+    discovery.runWithCandidates(
+      [{ command: 'py', args: ['-3', 'w.py'] }, { command: 'python', args: ['w.py'] }],
+      fakeRunProcess,
+      {},
+    ),
+    /429/,
+  );
+});
+
 test('primary success does not enqueue a browser fallback', async () => {
   const seen = [];
   const service = discovery.createDiscoveryService({

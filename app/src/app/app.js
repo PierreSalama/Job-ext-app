@@ -2251,6 +2251,33 @@ route('/queue', async () => {
     const dh = hp.discovery || {};
     const healthLine = `<div class="muted" style="font-size:12px;margin-bottom:10px">Watchdog: ${hp.staleTasks || hp.invalidWaits ? `<b style="color:var(--danger)">${esc((hp.staleTasks || 0) + (hp.invalidWaits || 0))} issue(s) detected</b>` : '<b>healthy</b>'} · discovery ${dh.lastSuccess ? `last healthy ${esc(fmtRel(dh.lastSuccess))}` : 'awaiting first healthy batch'}${dh.pendingFallbacks ? ` · ${esc(dh.pendingFallbacks)} fallback pending` : ''}</div>`;
     const stat = (n, lbl, cls) => `<div class="mini"><div class="mini-label">${lbl}</div><div class="mini-value ${cls || ''}">${n}</div></div>`;
+    // R3 — HONEST run-scoped breakdown. The headline is the RAW verified rate (verified
+    // submits ÷ everything dispatched this run); the supported rate (over jobs we could
+    // actually drive — excludes site/bot gates + out-of-scope skips) sits beside it as
+    // context. awaiting_review is shown as the honest "maybe" and is NEVER counted as
+    // verified. Site/bot gates are broken out so they don't read as our failures.
+    const honest = (() => {
+      const rs = d.runSummary; if (!rs || !rs.counts) return '';
+      const c = rs.counts;
+      const pct = (x) => `${Math.round((x || 0) * 100)}%`;
+      const row = (n, lbl, cls, title) => `<div class="aa-honest-row${cls ? ' ' + cls : ''}"${title ? ` title="${esc(title)}"` : ''}><span class="aa-honest-n">${n || 0}</span><span class="aa-honest-l">${lbl}</span></div>`;
+      return `<div class="aa-honest" style="margin:4px 0 14px;padding:12px 14px;border:1px solid var(--border);border-radius:10px">
+        <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:10px">
+          <div><div class="section-eyebrow">Honest rate (this run)</div><div style="font-size:24px;font-weight:700">${pct(rs.rawRate)} <span class="muted" style="font-size:12px;font-weight:500">raw verified</span></div></div>
+          <div class="muted" style="font-size:13px">${pct(rs.supportedRate)} <span style="font-size:11px">supported (of ${rs.drivable || 0} drivable)</span></div>
+          <div class="muted" style="font-size:11px;margin-left:auto">${c.dispatched || 0} dispatched · raw = verified ÷ dispatched</div>
+        </div>
+        <div class="aa-honest-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:7px">
+          ${row(c.verified_done, 'Verified submits', 'ok', 'R1-trustworthy submits only')}
+          ${row(c.awaiting_review, 'Submitted, needs confirm', 'warn', 'Submit reported but not verified — needs human confirmation')}
+          ${row((c.site_gate || 0) + (c.bot_challenge || 0), 'Blocked by site (Cloudflare/CAPTCHA)', '', 'Site/bot gate — NOT our failure')}
+          ${row(c.flow_failed, 'Flow failed', 'bad', 'Our flow genuinely failed (no-advance, missing form, executor error)')}
+          ${row(c.skipped, 'Skipped (out of scope)', '', 'Filters, dupes, non-applicable / external-site')}
+          ${c.needs_you ? row(c.needs_you, 'Needs your answer', 'warn', 'A real unanswered question is blocking it') : ''}
+        </div>
+        ${c.awaiting_review ? `<div class="muted" style="font-size:11px;margin-top:9px">Note: “Submitted, needs confirm” items are NOT counted as verified — they need human confirmation.</div>` : ''}
+      </div>`;
+    })();
     return `<section class="section" style="margin-bottom:14px">
       <header class="section-header" style="align-items:center">
         <div><div class="section-eyebrow">Live</div><h2 class="section-title">Running now</h2></div>
@@ -2266,6 +2293,7 @@ route('/queue', async () => {
           ${stat(d.queuedDepth || 0, 'in queue', '')}
         </div>
         <div class="muted" style="font-size:12px;margin-bottom:12px">≈ <b style="color:${slow ? 'var(--danger)' : 'inherit'}">${p.effectivePerHour || 0}</b> applications/hour at current settings${p.bindingCap ? ` (capped by ${p.bindingCap === 'hourly-cap' ? 'your hourly limit' : 'the gap between applications'})` : ''}${slow ? ` — your saved pacing predates the speed update. <button class="btn small" data-aa-maxspeed style="padding:2px 9px">⚡ Max speed</button>` : ''}</div>
+        ${honest}
         ${siteSpread}
         ${healthLine}
         ${workers}

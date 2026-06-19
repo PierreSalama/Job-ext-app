@@ -597,7 +597,45 @@ const MIGRATIONS = [
       ALTER TABLE auto_apply_tasks ADD COLUMN handoff_token TEXT;
     `);
   },
+
+  // SUCCESS-TRUTH quarantine. Historical `done` rows were minted with evidence that
+  // is not TRUSTWORTHY: either no submission_evidence at all, or the old static
+  // `success-signal` type whose detail was "confirmation text"/"confirmation URL"
+  // (regex-matched against pre-existing page text with no before/after baseline —
+  // the Activision / Canada Job Bank false positives). Downgrade those to
+  // awaiting_review so they are RE-VERIFIED by a human, not silently trusted. Rows
+  // with trustworthy evidence (the new `verified` type, or the genuine `confirmed`
+  // modal-close) are left untouched. Idempotent and append-only.
+  () => { quarantineUntrustworthyDone(); },
 ];
+
+// SUCCESS-TRUTH quarantine (shared by the migration above and exported for tests).
+// Returns the number of rows downgraded. Idempotent: trustworthy rows are skipped,
+// already-quarantined rows are no longer `done` so they won't match again.
+function quarantineUntrustworthyDone() {
+  const before = get(
+    `SELECT COUNT(*) AS n FROM auto_apply_tasks
+      WHERE state = 'done'
+        AND ( submission_evidence IS NULL
+           OR TRIM(submission_evidence) = ''
+           OR submission_evidence LIKE '%"type":"success-signal"%'
+           OR submission_evidence LIKE '%"type": "success-signal"%'
+           OR submission_evidence LIKE '%confirmation text%' )`).n;
+  exec(`
+    UPDATE auto_apply_tasks
+       SET state = 'awaiting_review',
+           last_error = 'submit evidence was not trustworthy (legacy/static success signal) — please re-verify'
+     WHERE state = 'done'
+       AND (
+            submission_evidence IS NULL
+         OR TRIM(submission_evidence) = ''
+         OR submission_evidence LIKE '%"type":"success-signal"%'
+         OR submission_evidence LIKE '%"type": "success-signal"%'
+         OR submission_evidence LIKE '%confirmation text%'
+       );
+  `);
+  return before;
+}
 
 function userVersion() {
   const r = get('PRAGMA user_version');
@@ -2405,6 +2443,15 @@ function classifyQueueFailure(input = {}) {
     return mk('missing_info', 'user', 'Needs your answer, then retries');
   }
   if (/easyapply-limit|easy apply.*limit|daily.*limit/.test(text)) return mk('easyapply_cooldown', 'wait', 'Easy Apply cooldown');
+  // SITE BOT-GATE (Cloudflare / CAPTCHA / verify wall, or a host under the dispatch
+  // breaker's cooldown). This is the SITE blocking automation — NOT a failure of our
+  // flow, and distinct from a benign "sign in / captcha" gate the user can clear inline.
+  // Must precede `site_gate` (its regex also matches "human"). Honest metrics (R3) read
+  // this as the "site bot-gate" bucket, separate from our-flow failures and real submits.
+  if (input.parkReason === 'bot_challenge' || input.park_reason === 'bot_challenge'
+      || /bot.?challenge|bot-challenge cooldown|verification wall|needs human verification/.test(text)) {
+    return mk('bot_challenge', 'inspect', 'Site bot-challenge (Cloudflare/CAPTCHA)');
+  }
   if (/captcha|human|unusual activity|login required|sign into|sign-in required|sign in required|sign.?in required|site sign.?in|required before applying|connectez-vous/.test(text)) return mk('site_gate', 'user', 'Site gate needs you');
   if (/external|company site|employer site|not auto-applicable|apply on the company site|postuler sur le site/.test(text)) return mk('external_site', 'inspect', 'External site skipped');
   if (source === 'glassdoor' && /hydrate|no advance|did not open|application not open/.test(text)) return mk('external_site', 'inspect', 'Glassdoor posting was not auto-applicable');
@@ -2538,6 +2585,79 @@ function queueBreakdown({ days = 30 } = {}) {
     .sort((a, b) => b[1] - a[1]).slice(0, 8)
     .map(([reason, count]) => ({ reason, count }));
   return { total: rows.length, days, byOutcome, byBoard, byRoute, byFailureClass, byFailureAction, topReasons };
+}
+
+// ============================================================
+// R3 — HONEST run-scoped metrics.
+// ============================================================
+// A "done" now means a VERIFIED submit (R1 success-truth + terminal-integrity guard),
+// bot-gates/site-gates are a DISTINCT category (R2), not our failures, and unverified
+// submits sit in their own honest "maybe" bucket. summarizeRun is a PURE function over
+// raw auto_apply_tasks rows (the same shape classifyQueueFailure already reads) so it is
+// importable + testable under node with no DB. It buckets every row through the single
+// source of truth (classifyQueueFailure → failureClass) and computes two clearly-labelled
+// rates so the headline can never be inflated by false positives or by site gates.
+//
+// Buckets (mutually exclusive, every dispatched row lands in exactly one):
+//   verified_done   — failureClass 'submitted' (R1-trustworthy submit ONLY)
+//   awaiting_review — 'review_gate' (submitted-but-unverified; the honest "maybe")
+//   bot_challenge   — 'bot_challenge' (R2: Cloudflare/CAPTCHA/verify-wall — SITE blocked us)
+//   site_gate       — 'site_gate' (benign sign-in/captcha wall — site blocked us)
+//   flow_failed     — our flow genuinely failed (no-advance, missing form, executor error,
+//                     repeated failure, unknown failure)
+//   needs_you       — 'missing_info' (a real unanswered question — neither a submit nor a
+//                     flow failure; pending on the human)
+//   skipped         — out-of-scope: filters/dupes/non-applicable (external site, relevance)
+//   in_flight       — queued/scheduled/running (counted in dispatched but not yet resolved)
+//
+// RATES (both labelled; awaiting_review NEVER counts as verified):
+//   rawRate       = verified_done / dispatched                        (brutally honest)
+//   supportedRate = verified_done / (dispatched − bot_challenge − site_gate − skipped − in_flight)
+//                   (rate over jobs we could actually drive to a submit decision)
+const RUN_BUCKET = {
+  submitted: 'verified_done',
+  review_gate: 'awaiting_review',
+  bot_challenge: 'bot_challenge',
+  site_gate: 'site_gate',
+  external_site: 'skipped',
+  relevance_skip: 'skipped',
+  missing_info: 'needs_you',
+  in_flight: 'in_flight',
+  easyapply_cooldown: 'in_flight',
+};
+function summarizeRun(rows = []) {
+  const counts = {
+    dispatched: 0, verified_done: 0, awaiting_review: 0,
+    site_gate: 0, bot_challenge: 0, flow_failed: 0,
+    needs_you: 0, skipped: 0, in_flight: 0,
+  };
+  for (const r of rows || []) {
+    counts.dispatched++;
+    const fc = classifyQueueFailure(r).failureClass;
+    const bucket = RUN_BUCKET[fc] || 'flow_failed';   // transient/repeated/unknown/other → our failure
+    counts[bucket]++;
+  }
+  const rate = (num, den) => (den > 0 ? num / den : 0);
+  const drivable = counts.dispatched - counts.bot_challenge - counts.site_gate - counts.skipped - counts.in_flight;
+  return {
+    counts,
+    rawRate: rate(counts.verified_done, counts.dispatched),
+    supportedRate: rate(counts.verified_done, drivable),
+    drivable: Math.max(0, drivable),
+  };
+}
+
+// Run-scoped honest breakdown for the dashboard. The "current run" is the auto-apply
+// session that began when the master switch was last turned ON (settings.autoApply.startedAt,
+// stamped in server.js). Falls back to the last 24h when no run marker exists. Loads the raw
+// rows touched since the run started and feeds them to the pure summarizeRun.
+function queueRunSummary({ startedAt } = {}) {
+  const since = startedAt || new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const rows = all(
+    `SELECT t.state, t.last_error, t.park_reason, t.pending_questions, t.transcript, j.source AS source
+       FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
+      WHERE t.updated_at >= ?`, [since]);
+  return { since, ...summarizeRun(rows) };
 }
 
 // Live snapshot for the Auto-apply "Running now" panel: the in-flight workers
@@ -3801,7 +3921,7 @@ module.exports = {
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
   discoveryBatchStart, discoveryBatchGet, discoveryBatchComplete, discoveryBatchList, discoveryRecordJob,
   discoveryFallbackQueue, discoveryFallbackNext, discoveryFallbackComplete, discoveryHealth, reconcileDiscovery, pipelineHealth,
-  queueList, queueHistory, queueBreakdown, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, saveIntakeAnswer,
+  queueList, queueHistory, queueBreakdown, summarizeRun, queueRunSummary, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, quarantineUntrustworthyDone, saveIntakeAnswer,
   classifyQueueFailure, taskSiteKey, queueActiveSiteKeys,
   setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
   aiLog, aiLogList, aiUsage,
