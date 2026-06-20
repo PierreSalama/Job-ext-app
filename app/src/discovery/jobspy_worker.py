@@ -31,16 +31,26 @@ def main():
 
     source = str(request.get("source") or "indeed").lower()
     wanted = max(1, min(100, int(request.get("limit") or 25)))
+    country = str(request.get("country") or "Canada")
+    # `location` is ALWAYS a geography. LinkedIn has no country param, so the geography
+    # must carry it — when the planner sends an empty location, fall back to the country
+    # so a search is never borderless. Work-mode ("remote") is a SEPARATE boolean below,
+    # never folded into the location string.
+    location = str(request.get("location") or "").strip() or country
     kwargs = {
         "site_name": [source],
         "search_term": str(request.get("keyword") or ""),
-        "location": str(request.get("location") or ""),
+        "location": location,
         "results_wanted": wanted,
         "hours_old": max(1, min(720, int(request.get("hours_old") or 72))),
         "verbose": 0,
     }
     if source in ("indeed", "glassdoor"):
-        kwargs["country_indeed"] = str(request.get("country") or "Canada")
+        kwargs["country_indeed"] = country
+    # Work-mode filter: jobspy exposes is_remote across its supported boards. Only set it
+    # when the request explicitly asks for remote — otherwise leave results unfiltered.
+    if request.get("remote"):
+        kwargs["is_remote"] = True
     if request.get("proxies"):
         kwargs["proxies"] = request["proxies"]
 

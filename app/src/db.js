@@ -74,6 +74,46 @@ function deepMerge(base, over) {
   return out;
 }
 
+// Work-mode words a user may have (wrongly) typed into `locations`. A location is
+// ALWAYS a geography; remote/hybrid/onsite is a SEPARATE filter. Folding these out of
+// `locations` fixes the borderless-"remote" bug (dad set "remote" → applied worldwide).
+const WORK_MODE_BY_WORD = {
+  'remote': 'remote', 'work from home': 'remote', 'wfh': 'remote', 'anywhere': 'remote',
+  'hybrid': 'hybrid',
+  'onsite': 'onsite', 'on-site': 'onsite', 'on site': 'onsite', 'in office': 'onsite', 'in-office': 'onsite',
+};
+
+// Pure, idempotent repair of an autoApply settings object: a location is always a
+// geography; work-mode words are stripped from `locations` and folded into `workModes`;
+// if `locations` ends up empty it defaults to [country] so EVERY search is geo-scoped
+// (a search can never be borderless again). Runs on every load → auto-repairs bad
+// stored configs (e.g. dad's "remote" location) without a one-shot migration. Safe to
+// run twice: a clean config is returned unchanged.
+function normalizeAutoApply(aa) {
+  if (!aa || typeof aa !== 'object') return aa;
+  const country = (typeof aa.country === 'string' && aa.country.trim()) ? aa.country.trim() : 'Canada';
+  const rawLocations = Array.isArray(aa.locations) ? aa.locations : [];
+  const rawModes = Array.isArray(aa.workModes) ? aa.workModes : [];
+  const modes = new Set(rawModes.map((m) => String(m).trim().toLowerCase()).filter((m) => ['remote', 'hybrid', 'onsite'].includes(m)));
+  const cleanLocations = [];
+  const seen = new Set();
+  for (const raw of rawLocations) {
+    const loc = String(raw == null ? '' : raw).trim();
+    if (!loc) continue;
+    const mode = WORK_MODE_BY_WORD[loc.toLowerCase()];
+    if (mode) { modes.add(mode); continue; }   // it was a work-mode masquerading as a location → fold out
+    const key = loc.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    cleanLocations.push(loc);
+  }
+  // A search must ALWAYS be geo-scoped — never borderless.
+  if (!cleanLocations.length) cleanLocations.push(country);
+  const order = ['remote', 'hybrid', 'onsite'];
+  const workModes = order.filter((m) => modes.has(m));
+  return { ...aa, country, locations: cleanLocations, workModes };
+}
+
 let db = null;
 let userDir = null;
 
@@ -800,6 +840,10 @@ function getSettings() {
   for (const r of rows) stored[r.section] = safeParse(r.value, {});
   const merged = {};
   for (const k of Object.keys(DEFAULTS)) merged[k] = deepMerge(DEFAULTS[k], stored[k]);
+  // Auto-repair the work-mode/location split on every read (idempotent). This makes a
+  // bad stored config — e.g. "remote" typed as a location — heal itself the next time
+  // any code path reads settings, with no separate migration step.
+  if (merged.autoApply) merged.autoApply = normalizeAutoApply(merged.autoApply);
   // Decrypt secret fields for in-memory use (callers like the AI/email layers need the
   // real value). The API layer re-redacts before sending anything to a client.
   for (const [section, dotted] of SECRET_SETTINGS) {
@@ -3904,7 +3948,7 @@ function getTeachScreenshotPath(id) {
 
 module.exports = {
   open, close, backupNow, dailyBackup, maintenance, transaction,
-  getSettings, patchSettings, kvGet, kvSet,
+  getSettings, patchSettings, normalizeAutoApply, kvGet, kvSet,
   listJobs, getJob, upsertJob, patchJob, deleteJob, stats, activityTrend,
   listEvents, listRecentEvents, recordEvent,
   qaRecord, qaLookup, qaList, qaDelete, normalizeQuestion, guessLocale,

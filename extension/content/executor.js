@@ -18,9 +18,10 @@ import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
 import { pageTextLooksLikeSuccess, urlLooksLikeSuccess, evaluateSubmitEvidence } from './signals/success.js';
 import { qsa, isProbablyVisible, compactText } from './lib/dom.js';
-import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence, resolveLocator, recoveryFingerprint } from './replay.js';
+import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence, resolveLocator, recoveryFingerprint, shouldResetPageActionBreaker } from './replay.js';
 import { classifyApplyControl, observeRoute, applyRouteForState } from './route.js';
 import { classifyInterstitial } from './lib/interstitial.js';
+import { shouldFrontOnOpenerStall } from './lib/opener-stall.js';
 import { detectBotChallenge, botChallengeLastError } from './lib/challenge.js';
 import { ADVANCE_KEYWORDS, isAdvanceLabel } from './lib/advance.js';
 import { sitePack } from './sites/index.js';
@@ -188,6 +189,15 @@ function logLine(level, text) {
 function reportSeen(root, phase) {
   try {
     const scope = root || document;
+    // LAG FIX (#2.3): reportSeen ran two full querySelectorAll sweeps + an innerText read on
+    // EVERY step. The transcript "seen" breadcrumb only needs to refresh when the surface
+    // actually changes. Gate the expensive sweeps behind a CHEAP pre-signal (phase + URL +
+    // interactive-element count + dialog presence); if it hasn't moved since the last
+    // reportSeen, bail before doing any sweep. This keeps the breadcrumbs on phase/form changes
+    // while eliminating per-step full-document scans.
+    const cheapSig = `${phase}|${location.href}|${scope.querySelectorAll ? scope.querySelectorAll('input,select,textarea,button,[role="button"]').length : 0}|${!!document.querySelector(APPLY_DIALOG_SEL)}`;
+    if (S.lastSeenCheapSig === cheapSig) return;
+    S.lastSeenCheapSig = cheapSig;
     const fields = qsa('input, textarea, select, [role="combobox"], [contenteditable="true"]', scope)
       .filter(isProbablyVisible)
       .map((el) => compactText(fieldLabel(el) || el.getAttribute?.('aria-label') || el.getAttribute?.('placeholder') || el.name || el.id || el.tagName || 'field'))
@@ -246,7 +256,13 @@ const ROUTE_STATES = new Set(['done', 'awaiting_review', 'awaiting_input', 'park
 // Helpers
 // ============================================================
 function domHash() {
-  return `${(document.body?.innerText || '').length}|${location.href}|${qsa('input,select,textarea,button').length}`;
+  // LAG FIX (#2.2): the old hash read document.body.innerText.length, which forces a full
+  // layout + text serialization of the WHOLE DOM every poll (~every 250ms). On heavy SPAs
+  // (LinkedIn) that was a measurable per-tick cost. A cheap, equally-discriminating signal:
+  // URL + interactive-element count + whether the apply dialog is present. waitForChange only
+  // needs to detect that the page MOVED (navigation, new fields, modal open/close) — all three
+  // of those flip this signal — without walking/serializing text nodes.
+  return `${location.href}|${document.querySelectorAll('input,select,textarea,button').length}|${!!document.querySelector(APPLY_DIALOG_SEL)}`;
 }
 
 async function untilUnpaused() {
@@ -258,7 +274,7 @@ async function waitForChange(initialHash, timeoutMs = STEP_TIMEOUT) {
   while (Date.now() - start < timeoutMs) {
     if (S.cancelled) return false;
     if (domHash() !== initialHash) return true;
-    await sleep(180);
+    await sleep(250);   // LAG FIX (#2.2): 180→250ms; the hash is now cheap, poll a touch less often
   }
   return false;
 }
@@ -649,12 +665,25 @@ export async function run(task, context, helpers) {
   // old generic 40× loop. `account:'none'` packs (Lever/Greenhouse/Ashby/BambooHR) →
   // drive the adapter flow to completion (BambooHR fills then parks for the CAPTCHA).
   const onLinkedInHost = /(^|\.)linkedin\.com$/i.test(location.hostname);
-  const atsPack = (() => { try { return onLinkedInHost ? null : sitePack(location.hostname); } catch { return null; } })();
-  // Only drive a pack that declares the full account-less contract (formSelector +
-  // account:'none'); a bare legacy hint pack (no `account`) falls through to today's
-  // generic flow unchanged.
-  const driveablePack = atsPack && atsPack.account === 'none' && atsPack.formSelector ? atsPack : null;
-  const walledPack = atsPack && atsPack.account === 'required' ? atsPack : null;
+  // Re-derivable per host: when an external "Apply (opens in new tab)" navigates IN-TAB to a
+  // RECOGNISED company ATS, the live hostname changes from the one this run started on. The
+  // packs are computed for the CURRENT host and re-derived in the loop if the host changes,
+  // so the normal ATS-driving path can take over on the company site (Fix 3). `let` (not
+  // `const`) for exactly that re-derivation; the initial value is unchanged.
+  let atsPackHost = location.hostname;
+  const derivePacks = (host) => {
+    const onLI = /(^|\.)linkedin\.com$/i.test(host);
+    const pack = (() => { try { return onLI ? null : sitePack(host); } catch { return null; } })();
+    // Only drive a pack that declares the full account-less contract (formSelector +
+    // account:'none'); a bare legacy hint pack (no `account`) falls through to today's
+    // generic flow unchanged.
+    return {
+      atsPack: pack,
+      driveablePack: pack && pack.account === 'none' && pack.formSelector ? pack : null,
+      walledPack: pack && pack.account === 'required' ? pack : null,
+    };
+  };
+  let { atsPack, driveablePack, walledPack } = derivePacks(location.hostname);
   showOverlay(`${mode === 'review' ? 'Filling for your review' : 'Applying'} — ${job?.title || ''}`);
 
   // A structured profile is OPTIONAL — we also fill from harvested/learned
@@ -723,6 +752,11 @@ export async function run(task, context, helpers) {
   let submitAttempted = false; // did we click a final submit (auto mode) at least once?
   let noChange = 0;            // consecutive advance clicks that didn't change the page (stall)
   let lastPageAction = '';     // blocks repeated clicks on the same page-level opener
+  let lastPageActionUrl = '';  // the page URL at which lastPageAction was armed — when the live
+                               // URL differs a REAL navigation happened (e.g. an external opener
+                               // navigated in-tab to the company ATS), so the breaker must reset
+                               // before the first click on the NEW page is judged a repeat.
+  let openerStallFronted = false; // F2: did we already do a fronted retry for an opener that clicked but never mounted?
   let interstitialAdvances = 0; // LinkedIn resume/continue interstitials advanced this run (bounded)
   // BUG-3: external/company-ATS repeat breaker. The page-level opener breaker resets on
   // any DOM change, so an external site that re-renders on every "Apply" click (BMO: 40×
@@ -1205,6 +1239,19 @@ export async function run(task, context, helpers) {
     await untilUnpaused();
     if (S.cancelled) break;
 
+    // ---- Fix 3: re-derive the ATS pack when the host changed (external in-tab handoff) ----
+    // An external opener can navigate IN-TAB to the company ATS (handled below: externalRoute
+    // cleared, "continuing to drive it here"). The packs were computed for the LinkedIn/origin
+    // host, so on the company site they'd be stale. Re-derive once per host change so a now-
+    // RECOGNISED account-less ATS gets driven by the normal adapter path (and a now-walled ATS
+    // is recognised too). UNRECOGNISED hosts derive null packs → today's generic flow / honest
+    // no-progress cap, exactly as before. Guarded: only re-runs when the hostname actually moved.
+    if (location.hostname !== atsPackHost) {
+      atsPackHost = location.hostname;
+      ({ atsPack, driveablePack, walledPack } = derivePacks(location.hostname));
+      if (driveablePack) logLine('ok', `now on a recognised ATS (${driveablePack.id}) after in-tab navigation — driving it`);
+    }
+
     // ---- hard stops ----
     // (0) BOT-CHALLENGE / CLOUDFLARE WALL — checked FIRST so an anti-automation interstitial
     // is never mislabeled as OCCLUSION (the old failure: a hidden/throttled tab on a CF wall
@@ -1633,6 +1680,18 @@ export async function run(task, context, helpers) {
     const pageAction = !haveForm
       ? recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label, stage: externalClick ? 'external-opener' : 'apply-opener' })
       : '';
+    // ---- BREAKER RESET ON REAL NAVIGATION (external in-tab handoff fix) ----
+    // The duplicate-page-action breaker (lastPageAction) protects against re-clicking the
+    // SAME opener on the SAME page (the "opener doesn't transfer" loop). But when an external
+    // "Apply (opens in new tab)" navigates IN-TAB to the company ATS, the company landing page
+    // commonly has its OWN "Apply"/"Apply on company site" button — and that first, legitimate,
+    // DIFFERENT-page click must not be mistaken for a repeat. If the live page URL differs from
+    // the one at which lastPageAction was armed, a real navigation happened → clear the breaker.
+    // Same page (same host+path) → no reset, so the genuine in-page opener loop is still caught.
+    if (shouldResetPageActionBreaker({ lastActionUrl: lastPageActionUrl, currentUrl: location.href, hasPending: !!lastPageAction })) {
+      logLine('ok', 'page navigated since the last page-level action — resetting the duplicate-action breaker for the new page');
+      lastPageAction = ''; lastPageActionUrl = '';
+    }
     if (pageAction && pageAction === lastPageAction) {
       // Before declaring the opener dead: on LinkedIn this repeat usually means an
       // INTERMEDIATE resume/continue/review modal is up (no answerable fields, so
@@ -1643,7 +1702,7 @@ export async function run(task, context, helpers) {
         interstitialAdvances++;
         logLine('ok', 'advanced past a LinkedIn interstitial — re-scanning for the apply form');
         report({ transcriptAppend: { kind: 'recovery', note: 'advanced LinkedIn resume/continue interstitial', fingerprint: pageAction } });
-        lastPageAction = null;   // the interstitial advance is real progress; allow the next opener/advance
+        lastPageAction = null; lastPageActionUrl = '';   // the interstitial advance is real progress; allow the next opener/advance
         continue;
       }
       logLine('warn', `same page-level action repeated — stopping before another "${label}" click`);
@@ -1651,7 +1710,7 @@ export async function run(task, context, helpers) {
       finalState = 'failed';
       break;
     }
-    if (pageAction) lastPageAction = pageAction;
+    if (pageAction) { lastPageAction = pageAction; lastPageActionUrl = location.href; }
     // ---- BUG-3: external/company-ATS no-progress cap ----
     // When driving an EXTERNAL/company site (allowExternal + an external or same-tab
     // application route, NOT a LinkedIn Easy Apply modal), an ATS that re-renders the page
@@ -1732,9 +1791,19 @@ export async function run(task, context, helpers) {
         const childState = ['done', 'awaiting_review', 'awaiting_input', 'parked', 'failed', 'skipped'].includes(childResult?.state)
           ? childResult.state : 'failed';
         const childError = childResult?.error || childResult?.lastError || handoff?.error || null;
+        // No terminal external state without an honest diagnostic. The db terminal-integrity
+        // guard synthesizes "…without a diagnostic" when lastError is missing on failed/skipped;
+        // set a concrete reason at the SOURCE for every external-child terminal so the user
+        // always learns WHY the company-site handoff didn't complete.
+        const childTerminalError = childError || (
+          childState === 'skipped'
+            ? 'company site application could not be completed (handoff returned skipped) — needs you'
+            : childState === 'failed'
+              ? 'company site Apply did not open a drivable form (external handoff failed) — needs you'
+              : null);
         report({
           state: childState,
-          lastError: childState === 'failed' ? (childError || 'external executor failed without a diagnostic') : childError,
+          lastError: childTerminalError,
           parkReason: childResult?.parkReason,
           pendingQuestions: childResult?.pendingQuestions,
           applyRoute: 'external', routeState: controlRoute.state,
@@ -1788,6 +1857,49 @@ export async function run(task, context, helpers) {
     const isFinalAuto = isFinal && mode !== 'review';
     if (!changed && !isFinalAuto) {
       logLine('warn', 'page did not change after click');
+      // ---- F2 KEYSTONE: opener clicked but the modal never mounted → FRONT + RETRY ----
+      // We clicked the Easy-Apply OPENER (no form open yet) and nothing changed AND no apply
+      // modal mounted. The dominant cause on the regressed build: the apply window is occluded
+      // → Chrome throttled its JS → the modal can't mount. Before this counts toward the
+      // duplicate-opener breaker / stall (which would FAIL the task without ever fronting the
+      // window), ask the SW to front+un-throttle the apply window and WAIT for the modal to
+      // hydrate. Only ONE fronted retry; if it STILL doesn't mount, fall through to the normal
+      // stall/breaker path so a genuinely dead opener still fails. LinkedIn interstitials and
+      // external routes are explicitly excluded by the pure helper.
+      const modalMounted = !!findApplyDialog();
+      const stallDecision = shouldFrontOnOpenerStall({
+        haveForm,
+        isExternalClick: externalClick,
+        changed,
+        modalMounted,
+        alreadyFronted: openerStallFronted,
+      });
+      if (stallDecision.front) {
+        openerStallFronted = true;
+        logLine('warn', 'apply opener clicked but the modal did not mount — fronting the apply window and waiting for it to hydrate');
+        report({ transcriptAppend: { kind: 'recovery', note: 'opener clicked, no mount — front-until-hydrated retry', fingerprint: pageAction } });
+        requestFrontUntilHydrated();
+        // Give the now-foreground (un-throttled) tab real wall-clock time to mount the modal.
+        // ~14s of 500ms ticks — comfortably past the SW's front hard-cap. Nudge the lazy
+        // renderer with a scroll like the opener-hydration path does.
+        let mounted = false;
+        for (let i = 0; i < 28 && !S.cancelled; i++) {
+          if (i % 4 === 0) { try { window.scrollTo(0, 600); window.scrollTo(0, 0); } catch {} }
+          await sleep(500);
+          if (findApplyDialog() || findPackAdvance(root) || (findEasyApplyButton() && everHadForm)) { mounted = true; break; }
+        }
+        if (mounted) {
+          signalHydrated();
+          logLine('ok', 'apply modal mounted after fronting the window — continuing');
+          // Real progress: clear the stall/breaker counters so the next pass drives the form.
+          noChange = 0; lastPageAction = null; lastPageActionUrl = '';
+          continue;
+        }
+        // Fronted retry still produced no modal — release the front and fall through to the
+        // honest stall/breaker handling below (it will fail RETRIABLY, classified as transient).
+        signalHydrated();
+        logLine('warn', 'apply modal still did not mount after fronting — treating as a genuine stall');
+      }
       if (++noChange >= S.sessionSettings.stallLimit) {
         if (sup) {
           const fingerprint = recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label, stage: 'unchanged-screen' });
@@ -1903,7 +2015,7 @@ export async function run(task, context, helpers) {
       finished = true;
       continue;
     }
-    if (changed) lastPageAction = '';
+    if (changed) { lastPageAction = ''; lastPageActionUrl = ''; }
     await sleep(600);
   }
 

@@ -234,3 +234,34 @@ export function recoveryFingerprint({ hostname, pathname, label, stage } = {}) {
   const phase = String(stage || '').toLowerCase().replace(/\s+/g, '-').trim();
   return [host, path, action, phase].join('|');
 }
+
+// Page identity for the duplicate-page-action breaker. We compare host+pathname (query
+// strings are render noise) so the breaker keys to "the same page", not the same full
+// URL. Used by shouldResetPageActionBreaker below.
+export function pageActionUrlKey(url) {
+  try {
+    const u = new URL(String(url || ''));
+    const host = u.hostname.toLowerCase().replace(/^www\./, '');
+    const path = (u.pathname || '/').toLowerCase().replace(/\/+$/, '') || '/';
+    return `${host}${path}`;
+  } catch {
+    // Non-absolute / opaque input: fall back to a normalized raw string so two identical
+    // inputs still compare equal (within-page protection preserved) and any difference
+    // still trips the reset.
+    return String(url || '').toLowerCase().replace(/[?#].*$/, '').replace(/\/+$/, '');
+  }
+}
+
+// Should the duplicate-page-action breaker be reset because the page NAVIGATED?
+// The breaker (executor.js lastPageAction) keys on host+path+label+stage. When an
+// external "Apply (opens in new tab)" actually navigates IN-TAB to the company ATS, the
+// company landing page often has its OWN "Apply"-labelled button; without resetting the
+// breaker across the navigation, that first (legitimate, different-page) click is mistaken
+// for a repeat and the run is killed. Reset iff a lastPageAction is armed AND the current
+// page identity differs from where it was armed. Same page (same host+path) → NO reset, so
+// the genuine "opener doesn't transfer" loop is still caught WITHIN a single page.
+export function shouldResetPageActionBreaker({ lastActionUrl, currentUrl, hasPending } = {}) {
+  if (!hasPending) return false;            // nothing armed → nothing to reset
+  if (lastActionUrl == null) return false;  // armed without a recorded URL → don't reset blind
+  return pageActionUrlKey(lastActionUrl) !== pageActionUrlKey(currentUrl);
+}

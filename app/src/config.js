@@ -115,7 +115,11 @@ const DEFAULTS = {
     aiAnswerConfidenceMin: 0.7,   // AI answers a screening question when reasonably confident (lower = fewer parks, more autonomy)
     easyApplyOnly: false,         // OFF = include normal/external postings and let the runner hand off to company/ATS forms when possible
     keywords: [],                 // e.g. ['software engineer', 'data analyst']
-    locations: [],                // e.g. ['Toronto', 'Remote']
+    locations: [],                // GEOGRAPHY ONLY — e.g. ['Toronto, ON', 'Canada']. NEVER a work-mode
+                                  // ('remote'/'hybrid'/'onsite' belong in workModes); empty = country-wide.
+    workModes: [],                // ['remote'|'hybrid'|'onsite']; empty = any. SEPARATE from locations so
+                                  // "remote" no longer leaks in as a borderless location (it applied worldwide).
+    country: 'Canada',            // hard geo-clamp for every search (JobSpy country_indeed + URL geography)
     boards: ['linkedin', 'indeed'],
     // ---- relevance / fit filters (skip jobs that don't match your level) ----
     experienceYears: 0,           // your years of experience; >0 = skip jobs that demand many more

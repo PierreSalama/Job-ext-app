@@ -21,6 +21,8 @@ import * as api from './lib/api.js';
 import { isJobPageUrl } from './lib/jobpage.js';
 import { HOST_BREAKER_COOLDOWN_MS, hostOfUrl, shouldDispatchHost, trippedEntry } from './lib/host-breaker.js';
 import { pickApplyWindowBounds } from './lib/window-place.js';
+import { buildSearchUrl } from './lib/search-url.js';
+import { NARROWEST_TIER, nextFreshnessTier } from './lib/freshness.js';
 
 // ---------- browser capability probe (cross-browser parity, Apprenticeship Engine P8) ----------
 // Firefox lacks some Chrome MV3 surfaces (tabGroups, storage.session). The existing apply-pool
@@ -614,6 +616,49 @@ let aaWindowPool = [];                       // DEDICATED apply window ids (crea
 const aaBusyWindows = new Set();             // window ids currently hosting a RUNNING apply tab
 let aaRuntimeHydrated = false;
 
+// ---- STABLE apply-window focus model (F2 regression fix) -----------------------------
+// Chrome THROTTLES non-visible/occluded tabs: a background apply window's JS timers are
+// suspended → LinkedIn's Easy-Apply modal never mounts and external pages never hydrate.
+// v11.24.0 worked because the apply window was fronted (focused) so it stayed un-throttled;
+// v11.24.1/v11.25.0 created it focused:false → near-total non-hydration. The fix is a STABLE
+// model (no 700ms focus-thrash): we capture the user's focused window ONCE at run start,
+// keep the active apply window FRONTED for the whole run, and restore the user's focus only
+// when the run goes idle / stops. With concurrency 1 there is exactly ONE apply window, so
+// it can be the single foreground window for the duration.
+let userFocusedWindowId = null;             // the user's window at run start (restore target)
+let userFocusCaptured = false;              // capture only once per run
+
+// Record the user's currently-focused window so we can hand focus back when the run ends.
+// Idempotent within a run; never records one of OUR apply windows as the restore target.
+async function captureUserFocusOnce() {
+  if (userFocusCaptured) return;
+  userFocusCaptured = true;
+  try {
+    const w = await chrome.windows.getLastFocused();
+    const id = w?.id;
+    if (id != null && !isOurApplyWindow(id)) userFocusedWindowId = id;
+  } catch {}
+}
+
+// Bring an apply window to the foreground and KEEP it there (no yank). Un-throttles the tab
+// so the SPA hydrates. Captures the user's focus first so we can restore it later.
+async function focusApplyWindow(winId) {
+  if (winId == null || !chrome.windows?.update) return;
+  await captureUserFocusOnce();
+  try { await chrome.windows.update(winId, { focused: true, state: 'normal' }); } catch {}
+}
+
+// Restore focus to the user's previously-focused window — called when the run goes idle /
+// stops. Resets capture so the next run records a fresh restore target.
+async function restoreUserFocus() {
+  const id = userFocusedWindowId;
+  userFocusedWindowId = null;
+  userFocusCaptured = false;
+  if (id == null || !chrome.windows?.update) return;
+  if (isOurApplyWindow(id)) return;          // never restore "back" to one of our windows
+  try { await chrome.windows.update(id, { focused: true }); } catch {}
+}
+
 // source tab id -> { token, childTabId, createdAt }. This intentionally stays in memory:
 // the arm→click→claim transaction lasts seconds and the open message port keeps MV3 alive.
 // Stale entries are swept defensively so an intercepted click cannot leak state.
@@ -975,60 +1020,54 @@ async function autoApplyTargetWindow() {
     try { await chrome.windows.get(aaWindowId); return aaWindowId; }
     catch { aaWindowId = null; }
   }
-  // Create it once, behind your work. We OWN it (safe to close on Stop) — we never
-  // borrow or close one of your own windows.
+  // Create it once. We OWN it (safe to close on Stop) — we never borrow or close one of
+  // your own windows.
   try {
-    const wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
-    const focusedId = wins.find((w) => w.focused)?.id;
+    // F2 FIX: capture the user's focused window BEFORE we create+front ours, so we can hand
+    // focus back when the run ends.
+    await captureUserFocusOnce();
     let win = null;
-    // BUG-2: place the window so it never covers the user's main-display work. On a
-    // multi-display setup it goes FULLY onto a non-primary display (visible there ⇒ not
-    // occluded ⇒ un-throttled, and off the user's screen); on a single display it goes
-    // out of the way (bottom-right). Always focused:false — we never steal foreground on
-    // create. (chrome.system.display guarded; falls back to top-left if unavailable.)
-    const placement = await resolveApplyWindowCreate({ focused: false, state: 'normal' });
+    // BUG-2 placement: on a multi-display setup the window goes FULLY onto a non-primary
+    // display (off the user's main screen); on a single display it goes out of the way
+    // (bottom-right). F2 REGRESSION FIX: create it FOCUSED. Chrome throttles a non-visible/
+    // occluded window → LinkedIn's Easy-Apply modal never mounts and external pages never
+    // hydrate (this is why focused:false near-zeroed submissions). The window must be the
+    // foreground window so its tab is un-throttled. We keep it fronted for the run and
+    // restore the user's focus only when the queue goes idle / Stop (restoreUserFocus).
+    const placement = await resolveApplyWindowCreate({ focused: true, state: 'normal' });
     try { win = await chrome.windows.create(placement.create); } catch {}
     aaWindowId = win ? win.id : null;
     persistAaWindowId();
-    if (win && focusedId != null) { try { await chrome.windows.update(focusedId, { focused: true }); } catch {} }
-    return aaWindowId != null ? aaWindowId : (wins.find((w) => !w.focused)?.id);
+    // Belt-and-suspenders: ensure it's actually focused even if create() didn't honor it.
+    if (aaWindowId != null) { try { await chrome.windows.update(aaWindowId, { focused: true, state: 'normal' }); } catch {} }
+    return aaWindowId != null ? aaWindowId : undefined;
   } catch { return undefined; }
 }
 
-// Briefly raise the dedicated apply window(s) so Chrome un-throttles an occluded apply
-// tab and its SPA hydrates, then restore the user's focus. Debounced so a burst of
-// stalled tabs only flashes once. Non-destructive: only ever touches windows WE own.
-let lastNudge = 0;
+// F2 FIX: keep the active apply window FOREGROUND so Chrome doesn't throttle it (occluded/
+// background tabs get their JS suspended → LinkedIn never hydrates). This REPLACES the old
+// "focus for 700ms then yank focus back" strobe, which re-occluded the window before a heavy
+// SPA could mount. We now front it STABLY and leave it; the user's focus is restored once at
+// run idle/stop (restoreUserFocus). Only ever touches windows WE own. Idempotent + guarded.
 async function nudgeApplyWindows() {
   await hydrateAaRuntime();
-  const now = Date.now();
-  if (now - lastNudge < 8000) return;   // at most once / 8s — don't strobe the user
-  lastNudge = now;
   if (!chrome.windows?.update) return;
-  let userFocused = null;
-  try { userFocused = (await chrome.windows.getLastFocused())?.id; } catch {}
-  const ids = new Set([aaWindowId, ...aaWindowPool].filter((x) => x != null));
+  await captureUserFocusOnce();
+  const ids = [aaWindowId, ...aaWindowPool].filter((x) => x != null);
   for (const id of ids) {
     try { await chrome.windows.update(id, { focused: true, state: 'normal' }); } catch {}
   }
-  await new Promise((r) => setTimeout(r, 700));   // let Chrome mark it visible + render a frame
-  // Hand focus straight back to where the user was (never leave them on our window).
-  if (userFocused != null && !ids.has(userFocused)) {
-    try { await chrome.windows.update(userFocused, { focused: true }); } catch {}
-  }
 }
 
-// ---- FRONT-UNTIL-HYDRATED (occlusion fix) -------------------------------------------
-// WINDOWS OCCLUSION LIMIT: a window is only un-throttled by Chrome while it is visible /
-// on-top, which (for chrome.windows) means FOCUSED. A non-focused apply window behind the
-// user's MAXIMIZED window is fully occluded → its timers throttle → a heavy SPA never
-// hydrates. The single 700ms nudge above re-occludes instantly. So when an apply tab
-// reports itself occluded-and-not-yet-hydrated we FRONT its window and KEEP it front until
-// the page is usable (apply-hydrated) or a hard cap elapses — giving the few seconds of
-// sustained visible time the page needs — then hand the user's focus straight back.
-// Only ever touches the apply tab's OWN window (verified against the windows we created).
-const frontHeld = new Map();   // applyWindowId → { userFocused, timer }
-const FRONT_HARD_CAP_MS = 12000;
+// ---- FRONT-UNTIL-HYDRATED (occlusion safety net) ------------------------------------
+// With the STABLE focus model above, the active apply window is already fronted for the run,
+// so an occluded apply tab should be rare. This stays as a reactive SAFETY NET: if an apply
+// tab still reports itself occluded-and-not-yet-hydrated (e.g. the user clicked back onto
+// their own window mid-run), re-front its window for a SHORT window so the SPA gets visible
+// time. The run-level restoreUserFocus() owns handing focus back, so release here only clears
+// the safety timer (no per-release focus yank → no thrash). Only ever touches OUR windows.
+const frontHeld = new Map();   // applyWindowId → { timer }
+const FRONT_HARD_CAP_MS = 4000;   // safety-net only; the apply window is normally already front
 
 function isOurApplyWindow(winId) {
   if (winId == null) return false;
@@ -1040,28 +1079,21 @@ async function frontUntilHydrated(applyWinId) {
   if (applyWinId == null || !chrome.windows?.update) return;
   if (!isOurApplyWindow(applyWinId)) return;   // never front a window we don't own
   if (frontHeld.has(applyWinId)) return;       // already holding this one
-  let userFocused = null;
-  try { userFocused = (await chrome.windows.getLastFocused())?.id; } catch {}
-  // Don't record our own apply window as the "user" window to restore to.
-  if (userFocused != null && isOurApplyWindow(userFocused)) userFocused = null;
-  // Bring the apply window to the front and keep it there (do NOT restore after 700ms).
+  await captureUserFocusOnce();
+  // Bring the apply window to the front and keep it there (stable; no 700ms yank).
   try { await chrome.windows.update(applyWinId, { focused: true, state: 'normal' }); } catch {}
-  // Hard cap so we never hold the user's focus hostage if the page is genuinely dead.
+  // Short safety cap — just clears the hold marker; focus restore is run-level.
   const timer = setTimeout(() => { try { releaseFrontUntilHydrated(applyWinId); } catch {} }, FRONT_HARD_CAP_MS);
-  frontHeld.set(applyWinId, { userFocused, timer });
+  frontHeld.set(applyWinId, { timer });
 }
 
 async function releaseFrontUntilHydrated(applyWinId) {
-  await hydrateAaRuntime();
   if (applyWinId == null) return;
   const held = frontHeld.get(applyWinId);
   if (!held) return;
   frontHeld.delete(applyWinId);
   try { clearTimeout(held.timer); } catch {}
-  // Hand focus back to where the user was (never leave them parked on our apply window).
-  if (held.userFocused != null && held.userFocused !== applyWinId) {
-    try { await chrome.windows.update(held.userFocused, { focused: true }); } catch {}
-  }
+  // No focus yank here — restoreUserFocus() (run idle/stop) owns handing the user back.
 }
 
 // ---------- dedicated-window POOL for the OPT-IN reliability / PARALLEL modes ----------
@@ -1080,19 +1112,21 @@ async function acquireApplyWindow(focus = false) {
     if (aaWindowPool.length >= cap && aaWindowPool.length) win = aaWindowPool[0];
   }
   if (win == null && aaWindowPool.length < cap) {
-    // …or create one, restoring focus to your window unless we're intentionally fronting.
+    // …or create one. F2 FIX: capture the user's focus first, then create the apply window
+    // FOCUSED so its tab is un-throttled and the SPA hydrates. (NOTE: parallel pools open
+    // multiple apply windows but only ONE can be foreground at a time — the others are still
+    // throttled; this is why concurrency defaults to 1. The >1 confirm warns about this.)
     try {
-      const wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
-      const focusedId = wins.find((w) => w.focused)?.id;
+      await captureUserFocusOnce();
       // BUG-2: same display-aware placement as autoApplyTargetWindow — a non-primary
       // display when available (off the user's screen + un-throttled), else out of the way.
-      const placement = await resolveApplyWindowCreate({ focused: !!focus, state: 'normal' });
+      const placement = await resolveApplyWindowCreate({ focused: true, state: 'normal' });
       const w = await chrome.windows.create(placement.create);
       if (w) {
         win = w.id;
         aaWindowPool = normalizeWindowIds([...aaWindowPool, win]);
         persistAaWindowPool();
-        if (!focus && focusedId != null) { try { await chrome.windows.update(focusedId, { focused: true }); } catch {} }
+        try { await chrome.windows.update(win, { focused: true, state: 'normal' }); } catch {}
       }
     } catch {}
   }
@@ -1120,17 +1154,16 @@ async function createAaTab(url, { active = true, focusWindow = false, winId: for
   const winId = forceWin != null ? forceWin : await autoApplyTargetWindow();
   const tab = await chrome.tabs.create({ url, active, ...(winId ? { windowId: winId } : {}) });
   trackAaTab(tab.id);   // register for cleanup/reaping (works without tabGroups, e.g. Firefox)
-  // Opt-in: bring the apply window to the FRONT so an occluded page (e.g. behind a
-  // fullscreen game) isn't throttled by Chrome and the Easy-Apply button hydrates.
-  if (focusWindow && winId != null && chrome.windows?.update) {
-    try { await chrome.windows.update(winId, { focused: true }); } catch {}
-  }
   await groupTab(tab.id);
-  // One-time, debounced load-nudge for APPLY tabs only (not discovery/sync): a freshly
-  // created apply page in a non-focused background window can be occlusion-throttled and
-  // never hydrate. nudgeApplyWindows() is debounced (≤1/8s) and restores the user's focus
-  // after ~700ms, so an occluded page still gets a render pass. Fully guarded.
-  if (isApply) { try { nudgeApplyWindows(); } catch {} }   // fire-and-forget; never throws
+  // F2 FIX: APPLY tabs MUST load in a FOREGROUND window or Chrome throttles them and the
+  // page (LinkedIn Easy-Apply / external ATS) never hydrates. Front the apply window STABLY
+  // (no 700ms yank) for the load + opener click. focusWindow is the legacy opt-in flag, but
+  // we now front for every apply tab — hydration reliability is the whole point. The user's
+  // focus is captured once and restored when the run goes idle (restoreUserFocus). Discovery/
+  // sync tabs (isApply=false) never front. Fully guarded; never throws.
+  if (isApply && winId != null && chrome.windows?.update) {
+    try { await focusApplyWindow(winId); } catch {}
+  }
   return tab;
 }
 
@@ -1204,6 +1237,8 @@ async function closeAutoApplyTabs() {
     }
     aaWindowPool = []; aaBusyWindows.clear();
   } catch {}
+  // F2 FIX: the run is over — hand the user's focus back to where it was at run start.
+  try { await restoreUserFocus(); } catch {}
   // Stop the self-driving timers too, so a queued re-pump can't pop a new tab open
   // moments after the user hit Stop.
   if (gapTimer) { clearTimeout(gapTimer); gapTimer = null; }
@@ -1222,17 +1257,20 @@ async function closeAutoApplyTabs() {
 // enabled=false; without this watchdog the tabs would linger until the next 1-min
 // alarm and the interrupted task would fail → toast. Poll the enabled flag cheaply
 // and tear the run down the moment it goes off.
+// LAG FIX (#2.4): ONE instance per RUN (the guard makes startStopWatchdog idempotent across
+// every job-launch), cleared the moment activeCount hits 0, and polled at 8s (was 4s) — a
+// desktop-app Stop tolerates an ~8s detection latency and this halves the background poll.
 let stopWatchdog = null;
 function startStopWatchdog() {
   if (stopWatchdog) return;
   stopWatchdog = setInterval(async () => {
     try {
-      if (activeCount <= 0) { clearInterval(stopWatchdog); stopWatchdog = null; return; }
+      if (activeCount <= 0) { clearInterval(stopWatchdog); stopWatchdog = null; try { await restoreUserFocus(); } catch {} return; }
       const s = await api.call('GET', '/settings', null, 4000);
       const enabled = s?.ok ? !!s.settings?.autoApply?.enabled : true;
       if (!enabled) await closeAutoApplyTabs();   // clears the watchdog itself
     } catch {}
-  }, 4000);
+  }, 8000);
 }
 
 // Run ONE queued task end-to-end in its own tab. Pure per-task: opens the tab,
@@ -1444,6 +1482,13 @@ async function pump(force = false) {
     const delay = Math.max(300, new Date(gapEligibleAt).getTime() - Date.now());
     if (delay < 70000) { clearTimeout(gapTimer); gapTimer = setTimeout(() => { gapTimer = null; pump().catch(() => {}); }, delay); }
   }
+  // F2 FIX — run idle → restore the user's focus. When no apply tab is running AND nothing is
+  // queued (NOT merely waiting on the pacing gap, where the next job is imminent and the apply
+  // window should stay fronted), the run has gone quiet: hand the user's focus back to where it
+  // was at run start. The next dispatch re-captures + re-fronts. Idempotent + guarded.
+  if (activeCount <= 0 && dispatched === 0 && reason !== 'gap') {
+    try { await restoreUserFocus(); } catch {}
+  }
   return { dispatched: dispatched > 0, count: dispatched, active: activeCount, reason };
 }
 
@@ -1555,30 +1600,12 @@ function withinWindow(aa) {
   return mins >= sh * 60 + (sm || 0) && mins <= eh * 60 + (em || 0);
 }
 
-function buildSearchUrl(board, keyword, location, { easyApplyOnly = true } = {}) {
-  const kw = encodeURIComponent(keyword);
-  const loc = location ? encodeURIComponent(location) : '';
-  if (board === 'indeed') {
-    // Indeed's "Easily apply" filter (attr DSQF7) — the LinkedIn-only f_AL had no
-    // Indeed equivalent, so Indeed was flooding the queue with external "apply on
-    // company site" jobs the engine can't auto-drive (the bulk of "did not open").
-    const ea = easyApplyOnly ? '&sc=0kf%3Aattr(DSQF7)%3B' : '';
-    return `https://www.indeed.com/jobs?q=${kw}&sort=date&fromage=7${ea}` + (loc ? `&l=${loc}` : '');
-  }
-  if (board === 'glassdoor') {
-    // Glassdoor has no public "easy apply"-only URL filter, so easyApplyOnly can't be
-    // expressed in the URL here — the discover scrape enqueues all cards and the
-    // executor/handoff path sorts drivability (Glassdoor Easy-Apply stays in-page;
-    // "apply on company site" hands off to an external ATS). fromAge=7 = last week.
-    return `https://www.glassdoor.com/Job/jobs.htm?sc.keyword=${kw}&fromAge=7` + (loc ? `&locKeyword=${loc}` : '');
-  }
-  // linkedin (default) — f_AL=true is the Easy-Apply filter; DD = sort by date.
-  // When easyApplyOnly is OFF the user also wants normal/external postings, so we
-  // drop the filter (the executor drives any in-page apply form and flags true
-  // external redirects as "needs you / external" in the breakdown).
-  const al = easyApplyOnly ? 'f_AL=true&' : '';
-  return `https://www.linkedin.com/jobs/search/?${al}keywords=${kw}&sortBy=DD` + (loc ? `&location=${loc}` : '');
-}
+// buildSearchUrl now lives in ./lib/search-url.js (pure + node-testable): geography is
+// mandatory (empty location → country), work-mode → LinkedIn f_WT / Indeed remote attr,
+// and freshnessSeconds → LinkedIn f_TPR / Indeed fromage. The freshness tier per combo is
+// tracked in DISCOVER_TIERS below (newest-first ramp; widens only when a scan finds 0 new).
+const DISCOVER_TIERS = new Map();          // `${board}|${keyword}|${location}` → tier seconds
+const comboKey = (board, keyword, location) => `${board}|${keyword}|${location}`;
 
 async function processDiscoveryFallback() {
   if (scanning || pumping) return { ok: false, note: 'busy' };
@@ -1591,7 +1618,11 @@ async function processDiscoveryFallback() {
   try {
     const sres = await api.call('GET', '/settings', null, 6000);
     const aa = sres?.settings?.autoApply || {};
-    const url = buildSearchUrl(req.source, req.keyword || '', req.location || '', { easyApplyOnly: aa.easyApplyOnly !== false });
+    const url = buildSearchUrl(req.source, req.keyword || '', req.location || '', {
+      easyApplyOnly: aa.easyApplyOnly !== false,
+      workModes: aa.workModes || [],
+      country: aa.country || 'Canada',
+    });
     tab = await createAaTab(url, { active: false });
     await waitTabComplete(tab.id, 35000);
     await new Promise((resolve) => setTimeout(resolve, 2200));
@@ -1667,7 +1698,18 @@ async function discoverTick(force = false) {
   const combo = combos[dIdx % combos.length];
   try { await chrome.storage.local.set({ [DISCOVER_IDX_KEY]: (dIdx + 1) % 1000000 }); } catch {}
   const board = combo.b, keyword = combo.k, location = combo.l;
-  const url = buildSearchUrl(board, keyword, location, { easyApplyOnly: aa.easyApplyOnly !== false });
+  // Newest-first freshness ramp, per combo: start at the NARROWEST tier (last 1h) and keep
+  // hammering it while it yields NEW jobs; widen one tier each time a scan enqueues 0 new,
+  // capping at 7d so the queue always stays fed. LinkedIn gets the fine f_TPR ramp; Indeed
+  // clamps sub-day tiers to fromage=1 inside buildSearchUrl.
+  const cKey = comboKey(board, keyword, location);
+  const tierSeconds = DISCOVER_TIERS.has(cKey) ? DISCOVER_TIERS.get(cKey) : NARROWEST_TIER;
+  const url = buildSearchUrl(board, keyword, location, {
+    easyApplyOnly: aa.easyApplyOnly !== false,
+    workModes: aa.workModes || [],
+    country: aa.country || 'Canada',
+    freshnessSeconds: tierSeconds,
+  });
   let resp = null, enqueued = 0;
   try {
     tab = await createAaTab(url, { active: false });   // background: don't steal "active" from a running apply tab
@@ -1705,10 +1747,17 @@ async function discoverTick(force = false) {
           ? `all ${found} jobs here were already tried — rotating to the next search`
           : 'no fresh jobs in this search — rotating to the next search');
   }
+  // Advance this combo's freshness tier: enqueuing NEW jobs keeps the narrow window (keep
+  // hammering fresh); 0 new widens to the next tier (capped at 7d). A scan that couldn't
+  // even reach the page (resp.ok === false) is not treated as "exhausted" — keep the tier.
+  const foundNew = enqueued > 0;
+  const reachable = resp?.ok !== false;
+  const nextTier = reachable ? nextFreshnessTier(tierSeconds, foundNew) : tierSeconds;
+  DISCOVER_TIERS.set(cKey, nextTier);
   if (enqueued > 0 || requeued > 0) schedulePump();
-  const status = { board, keyword, url, found, enqueued, note, ok: resp?.ok !== false };
+  const status = { board, keyword, url, found, enqueued, note, ok: resp?.ok !== false, freshnessSeconds: tierSeconds, nextFreshnessSeconds: nextTier };
   await api.call('POST', '/auto-apply/discovery-status', status, 6000).catch(() => {});
-  console.log('[JAT] discovery', board, '"' + keyword + '"@"' + location + '" found', found, 'enqueued', enqueued, note);
+  console.log('[JAT] discovery', board, '"' + keyword + '"@"' + location + '" tier r' + tierSeconds + '→r' + nextTier, 'found', found, 'enqueued', enqueued, note);
   return status;
 }
 

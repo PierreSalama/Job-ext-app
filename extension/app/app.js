@@ -1963,7 +1963,9 @@ route('/queue', async () => {
       <header class="section-header"><div><div class="section-eyebrow">Target</div><h2 class="section-title">What to apply to</h2></div></header>
       <div class="queue-controls section-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px">
         ${qc('Keywords', '<div id="aa-keywords-slot"></div>')}
-        ${qc('Locations', '<div id="aa-locations-slot"></div>')}
+        ${qc('Locations', '<div id="aa-locations-slot"></div><div class="form-hint">Geography only — e.g. Toronto, ON · Canada. For remote/hybrid use Work mode, not a location.</div>')}
+        ${qc('Work mode', `<label class="aa-chk"><input type="checkbox" id="aa-wm-remote" ${(aa.workModes || []).includes('remote') ? 'checked' : ''}/> Remote</label> <label class="aa-chk"><input type="checkbox" id="aa-wm-hybrid" ${(aa.workModes || []).includes('hybrid') ? 'checked' : ''}/> Hybrid</label> <label class="aa-chk"><input type="checkbox" id="aa-wm-onsite" ${(aa.workModes || []).includes('onsite') ? 'checked' : ''}/> On-site</label><div class="form-hint">Filter by how you work. None checked = any. Separate from Locations so "remote" never means worldwide.</div>`)}
+        ${qc('Country', `<input class="input" id="aa-country" value="${esc(aa.country || 'Canada')}" placeholder="Canada" /><div class="form-hint">Hard limit — every search stays inside this country.</div>`)}
         ${qc('Mode', `<select class="select" id="aa-mode">
           <option value="auto" ${aa.mode === 'auto' ? 'selected' : ''}>Auto — submit for me</option>
           <option value="review" ${aa.mode === 'review' ? 'selected' : ''}>Review — stop before submit</option>
@@ -2032,7 +2034,7 @@ route('/queue', async () => {
 
   const kw = chipsInput(aa.keywords || [], 'software engineer, data analyst…');
   v.querySelector('#aa-keywords-slot').appendChild(kw.node);
-  const locs = chipsInput(aa.locations || [], 'Toronto, Remote…');
+  const locs = chipsInput(aa.locations || [], 'Toronto, ON · Canada…');
   v.querySelector('#aa-locations-slot').appendChild(locs.node);
   const exTitles = chipsInput(aa.excludeKeywords || [], 'game, manager, sales…');
   v.querySelector('#aa-exclude-slot').appendChild(exTitles.node);
@@ -2056,7 +2058,7 @@ route('/queue', async () => {
       // footprint. Warn (once) only when the user is RAISING it past safe serial.
       if (conc > 1 && conc > (Math.max(1, Number(aa.concurrency) || 1))) {
         const ok = await confirmModal(
-          `This opens ${conc} apply tabs at the same time, so it applies much faster — but LinkedIn and Indeed watch for automated behaviour, and the more you run in parallel the more likely a temporary block or account flag becomes. "1" (one at a time) is the safe default. Continue?`,
+          `This opens ${conc} apply windows at the same time. IMPORTANT: only ONE window can be in the foreground at a time, and Chrome THROTTLES every background/occluded window — it suspends that window's JavaScript, so LinkedIn's Easy-Apply form never loads in the throttled windows and those applications silently fail to go through. Parallel also looks more like a bot to LinkedIn/Indeed (higher risk of a temporary block or account flag). "1" (one at a time) is the safe default and the only setting where every application reliably hydrates. Continue?`,
           { title: `Run ${conc} applications in parallel?`, danger: true, okLabel: 'Yes, go parallel', cancelLabel: 'Keep it safe' });
         if (!ok) return;
       }
@@ -2067,6 +2069,8 @@ route('/queue', async () => {
           mode: v.querySelector('#aa-mode').value,
           keywords: kw.get(),
           locations: locs.get(),
+          workModes: ['remote', 'hybrid', 'onsite'].filter((m) => v.querySelector('#aa-wm-' + m)?.checked),
+          country: (v.querySelector('#aa-country').value || '').trim() || 'Canada',
           boards: boardsSel,
           easyApplyOnly: v.querySelector('#aa-easy').checked,
           concurrency: conc,

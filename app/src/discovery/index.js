@@ -134,11 +134,15 @@ async function defaultRunner(request, timeoutMs = 90000) {
 function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = defaultRunner } = {}) {
   let timer = null, warmup = null, running = false, stopped = false;
 
-  async function searchBoard({ source, keyword, location, limit, hoursOld = 72, force = false }) {
-    const batch = db.discoveryBatchStart({ provider: 'jobspy', source, keyword, location });
+  async function searchBoard({ source, keyword, location, limit, hoursOld = 72, force = false, country = 'Canada', remote = false }) {
+    // location is ALWAYS a geography. Never let it be empty — fall back to the country so
+    // a LinkedIn scrape (which has no country param) is still geo-clamped. Work-mode is a
+    // separate boolean (`remote`), never smuggled in as the location string.
+    const geo = text(location) || text(country) || 'Canada';
+    const batch = db.discoveryBatchStart({ provider: 'jobspy', source, keyword, location: geo });
     broadcast('discovery.updated', { batch });
     try {
-      const result = await runner({ source, keyword, location, limit, hours_old: hoursOld, country: 'Canada' }, 90000);
+      const result = await runner({ source, keyword, location: geo, limit, hours_old: hoursOld, country: text(country) || 'Canada', remote: !!remote }, 90000);
       if (stopped) return batch;
       const jobs = (result.jobs || []).map((j) => normalizeJobSpyRecord(j, source)).filter(Boolean);
       const intake = await ingestJobs(source, jobs, { provider: 'jobspy', batchId: batch.id, force });
@@ -177,10 +181,13 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     const selectedBoards = [];
     for (let i = 0; i < Math.min(3, boards.length); i++) selectedBoards.push(boards[(boardIndex + i) % boards.length]);
     db.kvSet('discoveryBoardIndex', (boardIndex + selectedBoards.length) % boards.length);
+    // Country-clamp every source; pass work-mode through as a boolean (never as location).
+    const country = text(aa.country) || 'Canada';
+    const remote = Array.isArray(aa.workModes) && aa.workModes.includes('remote');
     running = true;
     try {
       const results = await Promise.all(selectedBoards.map((source) => searchBoard({
-        source, keyword: query.keyword, location: query.location,
+        source, keyword: query.keyword, location: query.location, country, remote,
         limit: Math.max(10, Math.min(50, Number(aa.discovery?.perRunLimit) || 25)), force,
       })));
       db.kvSet('discoveryStatus', { provider: 'jobspy', query, results, at: new Date().toISOString() });
