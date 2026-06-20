@@ -24,7 +24,7 @@ import { classifyInterstitial } from './lib/interstitial.js';
 import { shouldFrontOnOpenerStall } from './lib/opener-stall.js';
 import { detectBotChallenge, botChallengeLastError } from './lib/challenge.js';
 import { ADVANCE_KEYWORDS, isAdvanceLabel } from './lib/advance.js';
-import { isLinkedInEasyApplyApplyUrl, isLinkedInApplyAdvanceLabel, deriveApplyRootFromAdvanceButton, shouldUseGenericOpenFallback } from './lib/linkedin-apply.js';
+import { isLinkedInEasyApplyApplyUrl, isLinkedInApplyAdvanceLabel, deriveApplyRootFromAdvanceButton, shouldUseGenericOpenFallback, decideResumePage, isUploadResumeAffordanceLabel, pageRequiresResume } from './lib/linkedin-apply.js';
 import { sitePack } from './sites/index.js';
 import { confirmSignalsMatched } from './lib/ats-drive.js';
 
@@ -677,6 +677,145 @@ async function tryAttachResume(root, resume) {
     }
   }
   return { attempted: true, attached };
+}
+
+// ---- RESUME PAGE (new full-page Easy Apply) ----
+// Saved-resume SELECTION controls: LinkedIn renders previously-uploaded resumes as radio
+// cards. Returns the visible, selectable elements (the clickable radio/card), plus whether
+// any is already selected. Best-effort + guarded — an empty list means "no saved resumes".
+function findSavedResumeControls(root) {
+  const scope = root || document;
+  let els = [];
+  try {
+    els = qsa('input[type="radio"], [role="radio"], [data-test-resume-card], .jobs-resume-picker__resume, [class*="resume-card" i]', scope)
+      .filter((el) => el && isProbablyVisible(el));
+  } catch { els = []; }
+  const anySelected = els.some((el) => {
+    try {
+      if (el.checked) return true;
+      const aria = el.getAttribute?.('aria-checked');
+      if (aria === 'true') return true;
+      const sel = el.getAttribute?.('aria-selected');
+      if (sel === 'true') return true;
+      if (el.closest?.('[aria-checked="true"], [aria-selected="true"], [class*="selected" i], [class*="--is-selected" i]')) return true;
+    } catch {}
+    return false;
+  });
+  return { els, anySelected };
+}
+
+// Is there an "Upload resume" / "Attach resume" affordance (a button/element) present? The new
+// full-page flow has NO `<input type=file>` until this is clicked — clicking it CREATES the
+// input. Returns the affordance element (to click) or null. Guarded.
+function findUploadResumeAffordance(root) {
+  const scope = root || document;
+  try {
+    for (const el of qsa('button, [role="button"], label, a[role="button"]', scope)) {
+      if (!el || el.disabled || !isProbablyVisible(el)) continue;
+      const t = compactText(el.getAttribute?.('aria-label') || el.textContent || el.value || '');
+      if (t && isUploadResumeAffordanceLabel(t)) return el;
+    }
+  } catch {}
+  return null;
+}
+
+// Does this step show a résumé REQUIREMENT ("A resume is required", "Resume*")? Scans the
+// scope text (and any inline error). Guarded.
+function resumeRequiredOnPage(root) {
+  try {
+    const scope = root || document;
+    const txt = compactText(scope.innerText || scope.textContent || '').slice(0, 4000);
+    return pageRequiresResume(txt);
+  } catch { return false; }
+}
+
+// Poll up to ~2s for a resume file input to appear after clicking the "Upload resume"
+// affordance (the input is created lazily by LinkedIn). Returns true once one is present.
+async function waitForResumeFileInput(root, timeoutMs = 2000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs && !S.cancelled) {
+    if (findResumeFileInputs(root).length) return true;
+    await sleep(150);
+  }
+  return findResumeFileInputs(root).length > 0;
+}
+
+// Drive the RESUME step on the new full-page (or any) apply form. Builds DOM-free signals,
+// asks the PURE decideResumePage() what to do, then ACTS:
+//   • select  → click the first/most-recent saved-resume card (no upload needed)
+//   • attach  → a file input is already present → run the existing attach path
+//   • upload-then-attach → CLICK "Upload resume" to create the input, wait for it, then attach
+//   • park    → a résumé is genuinely required but unattachable → honest park (caller stops)
+//   • none    → nothing to do; proceed
+// Returns { acted, attached, satisfied, park }:
+//   acted     — true if we took any resume-page action (the caller should NOT also run the
+//               legacy tryAttachResume()).
+//   attached  — how many file inputs we filled (the SUCCESS-TRUTH grounding signal).
+//   satisfied — true when the resume requirement is met WITHOUT an attach (a saved card was
+//               selected, or one was already selected) — so the caller must NOT treat
+//               attached===0 as an attach failure.
+//   park      — a reason string when the run should PARK (resume required but unattachable).
+async function handleResumePage(root, resume) {
+  const { els: savedEls, anySelected } = findSavedResumeControls(root);
+  const fileInputPresent = findResumeFileInputs(root).length > 0;
+  const uploadAffordance = findUploadResumeAffordance(root);
+  const resumeRequired = resumeRequiredOnPage(root);
+  const haveResumeBytes = !!resume?.id;
+
+  // Nothing resume-shaped on this page at all → let the normal attach path (run by the caller
+  // for the old layout) own it; we have no opinion. This keeps handleResumePage cheap and
+  // side-effect-free on non-resume steps.
+  if (!savedEls.length && !uploadAffordance && !resumeRequired && !fileInputPresent) {
+    return { acted: false, attached: 0, satisfied: false, park: null };
+  }
+
+  const decision = decideResumePage({
+    savedResumeCount: savedEls.length,
+    anySavedSelected: anySelected,
+    fileInputPresent,
+    uploadAffordancePresent: !!uploadAffordance,
+    resumeRequired,
+    haveResumeBytes,
+  });
+
+  if (decision.action === 'select') {
+    const choice = savedEls[decision.index] || savedEls[0];
+    if (choice) {
+      logLine('ok', 'resume page: selecting your saved resume');
+      syntheticClick(choice);
+      try { if (choice.tagName === 'INPUT' && !choice.checked) { choice.checked = true; choice.dispatchEvent(new Event('input', { bubbles: true })); choice.dispatchEvent(new Event('change', { bubbles: true })); } } catch {}
+      await sleep(250);
+      return { acted: true, attached: 0, satisfied: true, park: null };
+    }
+    return { acted: false, attached: 0, satisfied: false, park: null };
+  }
+
+  if (decision.action === 'attach') {
+    const att = await tryAttachResume(root, resume);
+    return { acted: true, attached: att.attached, satisfied: att.attached > 0, park: null };
+  }
+
+  if (decision.action === 'upload-then-attach') {
+    if (uploadAffordance) {
+      logLine('ok', 'resume page: clicking "Upload resume" to create the file input');
+      syntheticClick(uploadAffordance);
+      await waitForResumeFileInput(root);
+    }
+    const att = await tryAttachResume(root, resume);
+    if (att.attached > 0) return { acted: true, attached: att.attached, satisfied: true, park: null };
+    // Re-scan: if a resume requirement is still showing and we couldn't attach, park honestly.
+    if (resumeRequiredOnPage(root) || resumeRequired) {
+      return { acted: true, attached: 0, satisfied: false, park: 'resume required — add a résumé to your profile / LinkedIn (JAT could not upload one here)' };
+    }
+    return { acted: true, attached: 0, satisfied: false, park: null };
+  }
+
+  if (decision.action === 'park') {
+    return { acted: true, attached: 0, satisfied: false, park: decision.reason };
+  }
+
+  // 'none' → already selected / no requirement → satisfied, nothing to do.
+  return { acted: false, attached: 0, satisfied: decision.reason === 'saved-resume-already-selected', park: null };
 }
 
 // ============================================================
@@ -1499,14 +1638,48 @@ export async function run(task, context, helpers) {
     const filled = await engine.fill(suggestions);
     if (filled) logLine('ok', `filled ${filled} field(s) from profile/history`);
 
-    // ---- resume upload ----
-    const att = haveForm ? await tryAttachResume(root, resume) : { attempted: false, attached: 0 };
+    // ---- resume upload / selection (handles BOTH layouts) ----
+    // NEW full-page Easy Apply: the resume step may have (a) saved-resume RADIO CARDS to
+    // SELECT, or (b) a plain "Upload resume" <button> with NO `<input type=file>` in the DOM
+    // until it is CLICKED (clicking CREATES the input). handleResumePage() recognises these,
+    // selects the most-recent saved resume, or clicks-then-attaches, and PARKS honestly when a
+    // resume is genuinely required but unattachable — instead of looping "stuck". The OLD modal
+    // layout (file input already present) flows through the same handler's 'attach' branch, so
+    // the existing path is preserved. When the page has no resume-shaped UI at all, the handler
+    // is a no-op and we fall through to the legacy tryAttachResume() (unchanged behavior).
+    let att = { attempted: false, attached: 0 };
+    let resumeSatisfiedBySelect = false;   // saved card selected (no attach) → not an attach failure
+    if (haveForm) {
+      const resumePage = await handleResumePage(root, resume);
+      if (resumePage.park) {
+        logLine('warn', `resume — ${resumePage.park}`);
+        setStatus(`Needs you — ${resumePage.park}`);
+        report({
+          state: 'parked',
+          parkReason: 'resume_required',
+          lastError: resumePage.park,
+          pendingQuestions: [{ question: resumePage.park, fieldType: 'resume', reason: 'resume_required' }],
+          transcriptAppend: { kind: 'recovery', note: `resume required but unattachable — parked honestly (${resumePage.park})` },
+        });
+        finalState = 'parked';
+        break;
+      }
+      if (resumePage.acted) {
+        att = { attempted: true, attached: resumePage.attached };
+        // A saved-resume card selected satisfies the requirement WITHOUT an attach — so the
+        // attached===0 attach-failure guard below must not fire on it.
+        resumeSatisfiedBySelect = resumePage.satisfied && resumePage.attached === 0;
+      } else {
+        // No resume-shaped UI handled → legacy attach path (file input already present, etc.).
+        att = await tryAttachResume(root, resume);
+      }
+    }
     // SUCCESS-TRUTH grounding: we opened a real, field-bearing application surface
     // (a verified dialog, or a probed form we filled/attached into) for THIS job.
     // A generic page-level Submit on a careers/search/newsletter/problem-report
     // page never reaches here with a form root, so it can never be grounded.
-    if (haveForm && (dialog || filled > 0 || att?.attached > 0)) formGrounded = true;
-    if (resume?.id && att.attempted && att.attached === 0) {
+    if (haveForm && (dialog || filled > 0 || att?.attached > 0 || resumeSatisfiedBySelect)) formGrounded = true;
+    if (resume?.id && att.attempted && att.attached === 0 && !resumeSatisfiedBySelect) {
       logLine('err', 'resume could not be attached — stopping for you to upload it');
       report({ state: 'failed', lastError: 'resume attachment failed (will retry)' });
       finalState = 'failed';

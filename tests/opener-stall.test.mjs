@@ -75,13 +75,14 @@ test('missing args are treated as the no-front default (never front blindly)', (
   assert.equal(shouldFrontOnOpenerStall({}).front, false);
 });
 
-// FIX 4: concurrency now defaults to 3. Forms hydrate unfocused (the occlusion theory was
-// disproven by direct live observation), so parallel apply windows are safe; a /apply/ page
-// that loads slowly while backgrounded is fronted-on-load (Fix 3) or retried. The value stays
-// within the 1..8 range (the server clamps the effective pool to 3) and >1 keeps the ban-risk
-// confirm warning in the dashboard.
-test('autoApply.concurrency default is 3 (parallel — forms work unfocused)', () => {
-  assert.equal(DEFAULTS.autoApply.concurrency, 3);
+// concurrency defaults back to 1 (SERIAL) for RELIABILITY over throughput. The NEW full-page
+// Easy Apply NAVIGATES to a /apply/ page that must LOAD; a backgrounded/occluded parallel
+// window gets Chrome-throttled and times out ("did not hydrate on a throttled/occluded tab").
+// Serial keeps the single apply window foreground so /apply/ reliably loads. The value stays
+// within the 1..8 range (the server clamps the effective pool to 3) and >1 keeps the
+// throttle/ban-risk confirm warning in the dashboard.
+test('autoApply.concurrency default is 1 (serial — reliable full-page /apply/ load)', () => {
+  assert.equal(DEFAULTS.autoApply.concurrency, 1);
   // still inside the supported range
   assert.ok(DEFAULTS.autoApply.concurrency >= 1 && DEFAULTS.autoApply.concurrency <= 8);
 });

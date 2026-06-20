@@ -104,7 +104,7 @@ const DEFAULTS = {
     maxPerHour: 30,
     minGapMinutes: 1,             // ~1–3 min between starts (human-like; avoids the throttle)
     maxGapMinutes: 3,
-    concurrency: 3,               // default: 3 parallel apply windows (forms work unfocused — direct live observation disproved the occlusion theory). Range 1..8 (server clamps to 3); each worker gets its own owned Chrome window. Raise/lower in Advanced; >1 shows the ban-risk confirm.
+    concurrency: 1,               // default: SERIAL — one apply window at a time (reliability over throttle). The NEW full-page Easy Apply NAVIGATES to a /apply/ page that must LOAD; a backgrounded/occluded parallel window gets Chrome-throttled and times out ("did not hydrate on a throttled/occluded tab"). Serial keeps the single apply window foreground so /apply/ reliably loads. Range 1..8 (server clamps to 3); each worker gets its own owned Chrome window. Raise in Advanced; >1 shows the throttle/ban-risk confirm.
     keepAwake: true,              // while auto-apply is ON, prevent system sleep (session-scoped; never edits Windows power plans)
     keepDisplayAwake: false,      // optional stronger mode for sites that throttle occluded/off displays
     bringToFrontToHydrate: false, // OFF by default. ON = the apply window is brought to the FRONT while applying, guaranteeing the page isn't throttled (Chrome throttles a fully-occluded window — e.g. behind a fullscreen game — so the Easy-Apply button never loads). Trade-off: it takes focus while each application runs. Turn ON when reliability matters more than not being interrupted (e.g. running while away).
