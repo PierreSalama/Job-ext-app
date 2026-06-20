@@ -254,6 +254,14 @@ async function queueNext(force = false) {
     const stats = db.queueRunStats();
     if (stats.doneDay >= s.maxPerDay) return { task: null, reason: 'daily-cap', concurrency };
     if (stats.doneHour >= s.maxPerHour) return { task: null, reason: 'hourly-cap', concurrency };
+    // SOFT DAILY CAP (anti-ban whole-session shaping): once we've DISPATCHED dailyCap
+    // applies (submits + attempts) in the rolling 24h, pause until the window rolls — so an
+    // aggressive maxPerHour can't drive a marathon session that throttles/bans the account.
+    // Configurable; dailyCap<=0 disables it.
+    const dailyCap = Number(s.dailyCap) || 0;
+    if (dailyCap > 0 && stats.dispatchedDay >= dailyCap) {
+      return { task: null, reason: 'daily-soft-cap', dailyCap, dispatchedDay: stats.dispatchedDay, concurrency };
+    }
     // Pace launches from when the PREVIOUS application STARTED (not finished) —
     // otherwise a self-driving loop re-arms the gap on every completion and
     // collapses back to one-per-alarm-tick. The job's own runtime usually
@@ -1176,10 +1184,13 @@ async function handle(req, res, parsed) {
     const gapPerHour = Math.round((60 / avgGap) * concurrency);   // gap divides by concurrency now
     const effectivePerHour = maxPerHour ? Math.min(maxPerHour, gapPerHour) : gapPerHour;
     const bindingCap = maxPerHour && maxPerHour <= gapPerHour ? 'hourly-cap' : 'gap';
+    const dailyCap = Number(s.dailyCap) || 0;
+    const softCapReached = dailyCap > 0 && stats.dispatchedDay >= dailyCap;
     let status;
     if (!s.enabled) status = 'off';
     else if (live.active > 0) status = 'running';
     else if (live.queuedDepth === 0 && live.scheduled === 0) status = 'queue-empty';
+    else if (softCapReached) status = 'daily-soft-cap';
     else if (maxPerHour && stats.doneHour >= maxPerHour) status = 'hourly-cap';
     else status = 'pacing';
     return sendJson(res, 200, {
@@ -1191,6 +1202,7 @@ async function handle(req, res, parsed) {
         maxPerHour, maxPerDay: Number(s.maxPerDay) || 0,
         minGapMinutes: Number(s.minGapMinutes) || 0, maxGapMinutes: Number(s.maxGapMinutes) || 0,
         concurrency, effectivePerHour, bindingCap, doneHour: stats.doneHour, doneDay: stats.doneDay,
+        dailyCap, dispatchedDay: stats.dispatchedDay, softCapReached,
       },
     });
   }
@@ -1605,4 +1617,4 @@ function stopServer() {
   if (server) { try { server.close(); } catch {} server = null; }
 }
 
-module.exports = { startServer, stopServer, broadcast, getToken, rescanAllFolders, startFolderWatchers, ingestDiscoveredJobs, jobFit, easyApplyIngestEligible };
+module.exports = { startServer, stopServer, broadcast, getToken, rescanAllFolders, startFolderWatchers, ingestDiscoveredJobs, jobFit, easyApplyIngestEligible, queueNext };

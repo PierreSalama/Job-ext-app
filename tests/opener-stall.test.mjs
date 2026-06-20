@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { shouldFrontOnOpenerStall } from '../extension/content/lib/opener-stall.js';
+import { shouldFrontOnOpenerStall, classifyNoChangeRoute } from '../extension/content/lib/opener-stall.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -85,4 +85,38 @@ test('autoApply.concurrency default is 1 (serial — reliable full-page /apply/ 
   assert.equal(DEFAULTS.autoApply.concurrency, 1);
   // still inside the supported range
   assert.ok(DEFAULTS.autoApply.concurrency >= 1 && DEFAULTS.autoApply.concurrency <= 8);
+});
+
+// ---- FIX 2: opening-vs-mid-flow routing for the "page did not change" path ----------
+// LIVE BUG (Open Systems): a mid-flow "Review" that didn't advance (a form was already open
+// this run) wrongly took the OPENER-STALL front path, consumed the one fronted retry, then
+// failed "duplicate opener blocked" BEFORE the advance-blocked answer-rescan could run.
+// classifyNoChangeRoute routes the no-change click so opener-stall fires ONLY in the opening
+// case, and a mid-flow advance goes straight to the answer-rescan.
+test('mid-flow advance (form already open) → answer-rescan, NOT opener-stall', () => {
+  const d = classifyNoChangeRoute({ haveForm: true, everHadForm: true, isExternalClick: false });
+  assert.equal(d.route, 'answer-rescan');
+});
+
+test('mid-flow with a momentary dialog drop (haveForm false but everHadForm true) → still answer-rescan', () => {
+  // The React transition after a Review click can briefly drop the dialog. everHadForm keeps
+  // it routed as mid-flow so the click is never mis-handled as a fresh opener.
+  const d = classifyNoChangeRoute({ haveForm: false, everHadForm: true, isExternalClick: false });
+  assert.equal(d.route, 'answer-rescan');
+  assert.equal(d.reason, 'mid-flow-advance');
+});
+
+test('opening click (no form ever opened this run) → opener-stall', () => {
+  const d = classifyNoChangeRoute({ haveForm: false, everHadForm: false, isExternalClick: false });
+  assert.equal(d.route, 'opener-stall');
+});
+
+test('external click → external route (its own handoff + no-progress cap own it)', () => {
+  const d = classifyNoChangeRoute({ haveForm: false, everHadForm: false, isExternalClick: true });
+  assert.equal(d.route, 'external');
+});
+
+test('classifyNoChangeRoute: missing args default to the opening case (never a blind rescan)', () => {
+  assert.equal(classifyNoChangeRoute().route, 'opener-stall');
+  assert.equal(classifyNoChangeRoute({}).route, 'opener-stall');
 });

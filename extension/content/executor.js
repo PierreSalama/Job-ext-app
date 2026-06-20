@@ -21,7 +21,7 @@ import { qsa, isProbablyVisible, compactText } from './lib/dom.js';
 import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence, resolveLocator, recoveryFingerprint, shouldResetPageActionBreaker } from './replay.js';
 import { classifyApplyControl, observeRoute, applyRouteForState } from './route.js';
 import { classifyInterstitial } from './lib/interstitial.js';
-import { shouldFrontOnOpenerStall } from './lib/opener-stall.js';
+import { shouldFrontOnOpenerStall, classifyNoChangeRoute } from './lib/opener-stall.js';
 import { detectBotChallenge, botChallengeLastError } from './lib/challenge.js';
 import { ADVANCE_KEYWORDS, isAdvanceLabel } from './lib/advance.js';
 import { isLinkedInEasyApplyApplyUrl, isLinkedInApplyAdvanceLabel, deriveApplyRootFromAdvanceButton, shouldUseGenericOpenFallback, decideResumePage, isUploadResumeAffordanceLabel, pageRequiresResume, groundedEligibilityAnswer, isEligibilityScreeningQuestion, decideAnswerOrPark } from './lib/linkedin-apply.js';
@@ -2250,48 +2250,60 @@ export async function run(task, context, helpers) {
     const isFinalAuto = isFinal && mode !== 'review';
     if (!changed && !isFinalAuto) {
       logLine('warn', 'page did not change after click');
-      // ---- F2 KEYSTONE: opener clicked but the modal never mounted → FRONT + RETRY ----
+      // ---- OPENING vs MID-FLOW routing (live-bug fix) ----
+      // Decide ONCE which no-change handler owns this click:
+      //   • OPENING  (no form has opened this run) → the opener-stall front+retry path.
+      //   • MID-FLOW (a form has opened this run — Next/Review/Submit) → the advance-blocked
+      //     answer-rescan. The opener-stall front/duplicate-opener logic must NOT run here
+      //     (it was pre-empting the rescan and burning the retry on a "duplicate opener
+      //     blocked" failure — the Open Systems mid-flow Review bug). everHadForm keys the
+      //     mid-flow case so a brief React drop of the dialog after Review can't mis-route it.
+      //   • EXTERNAL click → neither (its own handoff + no-progress cap handled above).
+      const noChangeRoute = classifyNoChangeRoute({ haveForm, everHadForm, isExternalClick: externalClick });
+      // ---- F2 KEYSTONE (OPENING ONLY): opener clicked but the modal never mounted → FRONT + RETRY ----
       // We clicked the Easy-Apply OPENER (no form open yet) and nothing changed AND no apply
       // modal mounted. The dominant cause on the regressed build: the apply window is occluded
       // → Chrome throttled its JS → the modal can't mount. Before this counts toward the
       // duplicate-opener breaker / stall (which would FAIL the task without ever fronting the
       // window), ask the SW to front+un-throttle the apply window and WAIT for the modal to
       // hydrate. Only ONE fronted retry; if it STILL doesn't mount, fall through to the normal
-      // stall/breaker path so a genuinely dead opener still fails. LinkedIn interstitials and
-      // external routes are explicitly excluded by the pure helper.
-      const modalMounted = !!findApplyDialog();
-      const stallDecision = shouldFrontOnOpenerStall({
-        haveForm,
-        isExternalClick: externalClick,
-        changed,
-        modalMounted,
-        alreadyFronted: openerStallFronted,
-      });
-      if (stallDecision.front) {
-        openerStallFronted = true;
-        logLine('warn', 'apply opener clicked but the modal did not mount — fronting the apply window and waiting for it to hydrate');
-        report({ transcriptAppend: { kind: 'recovery', note: 'opener clicked, no mount — front-until-hydrated retry', fingerprint: pageAction } });
-        requestFrontUntilHydrated();
-        // Give the now-foreground (un-throttled) tab real wall-clock time to mount the modal.
-        // ~14s of 500ms ticks — comfortably past the SW's front hard-cap. Nudge the lazy
-        // renderer with a scroll like the opener-hydration path does.
-        let mounted = false;
-        for (let i = 0; i < 28 && !S.cancelled; i++) {
-          if (i % 4 === 0) { try { window.scrollTo(0, 600); window.scrollTo(0, 0); } catch {} }
-          await sleep(500);
-          if (findApplyDialog() || findPackAdvance(root) || (findEasyApplyButton() && everHadForm)) { mounted = true; break; }
-        }
-        if (mounted) {
+      // stall/breaker path so a genuinely dead opener still fails. Gated to the OPENING route so
+      // a mid-flow advance click goes straight to the answer-rescan below.
+      if (noChangeRoute.route === 'opener-stall') {
+        const modalMounted = !!findApplyDialog();
+        const stallDecision = shouldFrontOnOpenerStall({
+          haveForm,
+          isExternalClick: externalClick,
+          changed,
+          modalMounted,
+          alreadyFronted: openerStallFronted,
+        });
+        if (stallDecision.front) {
+          openerStallFronted = true;
+          logLine('warn', 'apply opener clicked but the modal did not mount — fronting the apply window and waiting for it to hydrate');
+          report({ transcriptAppend: { kind: 'recovery', note: 'opener clicked, no mount — front-until-hydrated retry', fingerprint: pageAction } });
+          requestFrontUntilHydrated();
+          // Give the now-foreground (un-throttled) tab real wall-clock time to mount the modal.
+          // ~14s of 500ms ticks — comfortably past the SW's front hard-cap. Nudge the lazy
+          // renderer with a scroll like the opener-hydration path does.
+          let mounted = false;
+          for (let i = 0; i < 28 && !S.cancelled; i++) {
+            if (i % 4 === 0) { try { window.scrollTo(0, 600); window.scrollTo(0, 0); } catch {} }
+            await sleep(500);
+            if (findApplyDialog() || findPackAdvance(root) || (findEasyApplyButton() && everHadForm)) { mounted = true; break; }
+          }
+          if (mounted) {
+            signalHydrated();
+            logLine('ok', 'apply modal mounted after fronting the window — continuing');
+            // Real progress: clear the stall/breaker counters so the next pass drives the form.
+            noChange = 0; lastPageAction = null; lastPageActionUrl = '';
+            continue;
+          }
+          // Fronted retry still produced no modal — release the front and fall through to the
+          // honest stall/breaker handling below (it will fail RETRIABLY, classified as transient).
           signalHydrated();
-          logLine('ok', 'apply modal mounted after fronting the window — continuing');
-          // Real progress: clear the stall/breaker counters so the next pass drives the form.
-          noChange = 0; lastPageAction = null; lastPageActionUrl = '';
-          continue;
+          logLine('warn', 'apply modal still did not mount after fronting — treating as a genuine stall');
         }
-        // Fronted retry still produced no modal — release the front and fall through to the
-        // honest stall/breaker handling below (it will fail RETRIABLY, classified as transient).
-        signalHydrated();
-        logLine('warn', 'apply modal still did not mount after fronting — treating as a genuine stall');
       }
       // ---- FIX 1 KEYSTONE: advance BLOCKED on a form → re-scan, ANSWER, RETRY (before give-up) ----
       // The dominant remaining cap: a REQUIRED screening field (Yes/No radio, dropdown, text) was

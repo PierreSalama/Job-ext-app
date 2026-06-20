@@ -23,6 +23,7 @@ import { HOST_BREAKER_COOLDOWN_MS, hostOfUrl, shouldDispatchHost, trippedEntry }
 import { pickApplyWindowBounds } from './lib/window-place.js';
 import { buildSearchUrl } from './lib/search-url.js';
 import { NARROWEST_TIER, nextFreshnessTier } from './lib/freshness.js';
+import { applyHardCapMs, APPLY_HIDDEN_STALL_CAP_MS } from './lib/apply-cap.js';
 
 // ---------- browser capability probe (cross-browser parity, Apprenticeship Engine P8) ----------
 // Firefox lacks some Chrome MV3 surfaces (tabGroups, storage.session). The existing apply-pool
@@ -211,11 +212,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // front and KEEP it there (sustained visible time so a heavy SPA can hydrate), then
       // hand focus back on jat11.apply-hydrated or after a hard cap. Only ever fronts a
       // window WE own (the apply tab's window). Fire-and-forget; never throws.
+      // FIX 1: record that THIS apply tab is hidden-and-not-yet-hydrated so the dispatch
+      // race fails it fast+retriably (short cap) instead of burning the full 5.5-min cap.
+      try { if (sender?.tab?.id != null) aaFrontRequested.set(sender.tab.id, { at: Date.now(), hydrated: false }); } catch {}
       respond(frontUntilHydrated(sender?.tab?.windowId).then(() => ({ ok: true })).catch(() => ({ ok: true })));
       return true;
     case 'jat11.apply-hydrated':
       // The apply form hydrated (or the run ended) — release the held front and restore the
       // user's previously-focused window. Idempotent + guarded.
+      // FIX 1: the tab DID hydrate → clear the hidden-stall fast-fail so it gets full time.
+      try { const r = sender?.tab?.id != null && aaFrontRequested.get(sender.tab.id); if (r) r.hydrated = true; } catch {}
       respond(releaseFrontUntilHydrated(sender?.tab?.windowId).then(() => ({ ok: true })).catch(() => ({ ok: true })));
       return true;
     case 'jat11.external-handoff-arm':
@@ -1065,6 +1071,15 @@ async function nudgeApplyWindows() {
 const frontHeld = new Map();   // applyWindowId → { timer }
 const FRONT_HARD_CAP_MS = 4000;   // safety-net only; the apply window is normally already front
 
+// ---- HIDDEN-NON-HYDRATING fast-fail (FIX 1) ----------------------------------------
+// THROUGHPUT BUG (live): a hidden apply tab that won't hydrate used to burn the FULL
+// APPLY_HARD_CAP_MS (5.5 min) before failing — at concurrency=1 that single stall freezes
+// the whole queue. The cap selection lives in the pure lib/apply-cap.js helper (node-
+// testable). A tab that front-requested but NOT yet hydrated is the "hidden, non-hydrating"
+// case → fail it FAST + RETRIABLY (~90s) so retry-stale re-attempts it later (when it may be
+// foreground). aaFrontRequested tracks per-tab { at, hydrated } from the two messages below.
+const aaFrontRequested = new Map();        // apply tabId → { at, hydrated } (hidden-non-hydrating tracker)
+
 function isOurApplyWindow(winId) {
   if (winId == null) return false;
   return winId === aaWindowId || aaWindowPool.includes(winId);
@@ -1319,13 +1334,40 @@ async function launchOne(task, context) {
       // + Fix-this picker) and bring the window to front so Pierre can watch + correct. No
       // hard cap — a supervised run is paced by the human, not the pool. [T4]
       const runType = context && context.supervised ? 'jat11.supervised-run' : 'jat11.run-task';
+      // FIX 1: reset this tab's hidden-non-hydrating tracker for a fresh run.
+      try { aaFrontRequested.delete(tab.id); } catch {}
       const dispatch = chrome.tabs.sendMessage(tab.id, { type: runType, task, context }, { frameId: 0 });
-      result = context && context.supervised
-        ? await dispatch
-        : await Promise.race([
-            dispatch,
-            new Promise((_, rej) => setTimeout(() => rej(new Error('apply timed out after 5.5 min')), 330000)),
-          ]);
+      if (context && context.supervised) {
+        result = await dispatch;
+      } else {
+        // ADAPTIVE HARD CAP (FIX 1): poll the per-tab hidden-non-hydrating signal and shorten
+        // the cap to ~90s for a tab that asked to be fronted and still hasn't hydrated (the
+        // throughput-killing stall), while keeping the full 5.5-min cap for a visible-but-slow
+        // tab (which never sends front-until-hydrated). The reject is phrased RETRIABLY
+        // (transient) so the server classifier reschedules it via retry-stale.
+        const runStart = Date.now();
+        let capTimer = null;
+        const timeout = new Promise((_, rej) => {
+          const tick = () => {
+            const tr = aaFrontRequested.get(tab.id) || {};
+            const cap = applyHardCapMs({ frontRequested: !!tr.at, hydrated: !!tr.hydrated });
+            if (Date.now() - runStart >= cap) {
+              rej(new Error(cap === APPLY_HIDDEN_STALL_CAP_MS
+                ? 'apply form did not hydrate on a throttled/occluded tab — will retry'
+                : 'apply timed out after 5.5 min — will retry'));
+              return;
+            }
+            capTimer = setTimeout(tick, 2000);
+          };
+          capTimer = setTimeout(tick, 2000);
+        });
+        try {
+          result = await Promise.race([dispatch, timeout]);
+        } finally {
+          if (capTimer) { try { clearTimeout(capTimer); } catch {} }
+          try { aaFrontRequested.delete(tab.id); } catch {}
+        }
+      }
     } catch (e) {
       // Run being torn down (user pressed Stop) → the tab was removed out from under
       // us. That's NOT a real failure: leave the task as the dashboard set it (skipped)

@@ -102,6 +102,12 @@ const DEFAULTS = {
     // actually going through. The Advanced area lets you push it (at higher flag risk).
     maxPerDay: 150,
     maxPerHour: 30,
+    // SOFT DAILY CAP (anti-ban whole-session shaping). Independent of maxPerDay/maxPerHour:
+    // counts EVERY apply DISPATCH (submits + attempts, not just successes) in the rolling 24h.
+    // When it's reached, queueNext pauses dispatch with reason 'daily-soft-cap' until the
+    // window rolls — so an over-aggressive maxPerHour (e.g. 999) can't drive a marathon
+    // session that gets the account throttled/banned. 0 = off; configurable in Settings.
+    dailyCap: 120,
     minGapMinutes: 1,             // ~1–3 min between starts (human-like; avoids the throttle)
     maxGapMinutes: 3,
     concurrency: 1,               // default: SERIAL — one apply window at a time (reliability over throttle). The NEW full-page Easy Apply NAVIGATES to a /apply/ page that must LOAD; a backgrounded/occluded parallel window gets Chrome-throttled and times out ("did not hydrate on a throttled/occluded tab"). Serial keeps the single apply window foreground so /apply/ reliably loads. Range 1..8 (server clamps to 3); each worker gets its own owned Chrome window. Raise in Advanced; >1 shows the throttle/ban-risk confirm.

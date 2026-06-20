@@ -3042,6 +3042,15 @@ function queueRunStats() {
   const doneHour = get(
     `SELECT COUNT(*) AS n FROM auto_apply_tasks WHERE state IN ('done','awaiting_review') AND updated_at >= ?`,
     [hourAgo]).n;
+  // SOFT DAILY CAP (anti-ban): EVERY apply DISPATCH in the rolling 24h — submits
+  // (done/awaiting_review) PLUS attempts that reached a terminal outcome (failed/skipped/
+  // parked/awaiting_input). Whole-session shaping: a marathon of failed attempts is just as
+  // much a throttle/ban signal as successes, so both count toward the cap.
+  const dispatchedDay = get(
+    `SELECT COUNT(*) AS n FROM auto_apply_tasks
+     WHERE state IN ('done','awaiting_review','failed','skipped','parked','awaiting_input')
+       AND updated_at >= ?`,
+    [dayAgo]).n;
   const lastRun = get(
     `SELECT MAX(updated_at) AS t FROM auto_apply_tasks WHERE state IN ('done','awaiting_review','failed')`).t;
   // Last START (scheduled_at) — the gap between applications is paced from when
@@ -3049,7 +3058,7 @@ function queueRunStats() {
   // parallel pool both space their launches correctly without stalling.
   const lastStart = get(
     `SELECT MAX(scheduled_at) AS t FROM auto_apply_tasks WHERE scheduled_at IS NOT NULL`).t;
-  return { doneDay, doneHour, lastRun, lastStart };
+  return { doneDay, doneHour, dispatchedDay, lastRun, lastStart };
 }
 
 // ============================================================

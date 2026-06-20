@@ -47,4 +47,43 @@ function shouldFrontOnOpenerStall({
   return { front: true, reason: 'opener-clicked-no-mount-front-and-retry' };
 }
 
-export { shouldFrontOnOpenerStall };
+// ============================================================
+// OPENING vs MID-FLOW routing for the "page did not change after click" path.
+// ============================================================
+// LIVE BUG (Open Systems): on a mid-flow "Review" click that didn't advance (a form was
+// already open this run, haveForm/everHadForm true), the OPENER-STALL front path
+// (shouldFrontOnOpenerStall → requestFrontUntilHydrated) was evaluated FIRST and consumed
+// the one fronted retry, then the duplicate-opener breaker failed the task ("duplicate
+// opener blocked") — BEFORE the advance-blocked answer-rescan (re-scan current page for
+// unanswered required fields → answer → retry → park) could run. The two behaviors are
+// both correct, they were just mis-ordered.
+//
+// classifyNoChangeRoute is the PURE decision: given the live opening-vs-mid-flow signals,
+// return which handler the no-change path should take. The executor routes on it so:
+//   • OPENING (the Easy-Apply opener was clicked, no form has opened yet) → 'opener-stall'
+//     (front-until-hydrate the un-mounted modal, then the duplicate-opener breaker).
+//   • MID-FLOW (a form has already opened this run — a Next/Review/Submit advance click) →
+//     'answer-rescan' (re-scan THIS page for unanswered required fields, answer, retry,
+//     park). NEVER the opener-stall/duplicate-opener path.
+//   • EXTERNAL click → 'external' (its own handoff + no-progress cap own that path).
+//
+// "Mid-flow" is keyed on everHadForm (the form has appeared at least once this run), not
+// only the instantaneous haveForm — so a brief React transition that momentarily drops the
+// dialog after a Review click can't mis-route the click as a fresh opener.
+//
+// Returns { route: 'opener-stall' | 'answer-rescan' | 'external', reason }.
+function classifyNoChangeRoute({
+  haveForm,
+  everHadForm,
+  isExternalClick,
+} = {}) {
+  if (isExternalClick) return { route: 'external', reason: 'external-click-has-own-cap' };
+  // Mid-flow: a form is open now OR has opened at least once this run → this was an in-form
+  // advance (Next/Review/Submit) that didn't move. Re-scan + answer required fields; never
+  // treat it as an opener stall.
+  if (haveForm || everHadForm) return { route: 'answer-rescan', reason: 'mid-flow-advance' };
+  // Opening: no form has ever opened this run → the click was the Easy-Apply opener.
+  return { route: 'opener-stall', reason: 'opening-click' };
+}
+
+export { shouldFrontOnOpenerStall, classifyNoChangeRoute };

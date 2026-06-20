@@ -35,6 +35,10 @@ for (const f of ['popup/popup.css', 'popup/popup.js', 'app/app.html', 'app/app.c
 
 grp('web_accessible_resources cover dynamic imports');
 const war = (mf.web_accessible_resources?.[0]?.resources || []).join(' ');
+// ANTI-DETECTION (BrowserGate): WAR resources must be served under a rotating per-session
+// UUID (use_dynamic_url:true) so a static chrome-extension://<id>/<resource> probe 404s and
+// can't fingerprint the install. Manifest-only; no new permission. Cross-browser-safe.
+ok(mf.web_accessible_resources?.[0]?.use_dynamic_url === true, 'web_accessible_resources use a rotating dynamic URL (use_dynamic_url)');
 // loader dynamically imports detector; detector imports executor + signals + sites + panel + lib
 for (const need of ['content/detector.js', 'content/panel.js', 'content/executor.js', 'content/autofill.js', 'content/signals/*.js', 'content/sites/*.js', 'content/lib/*.js'])
   ok(war.includes(need), 'WAR lists: ' + need);

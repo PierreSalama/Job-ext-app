@@ -180,6 +180,87 @@ export function isResumeFileInput(input, ctxText = '') {
   } catch { return false; }
 }
 
+// Normalized Levenshtein similarity in [0,1] (1 = identical) — tiny, self-contained,
+// NO dependency. Used as the FINAL fuzzy tier in matchOption/pickRadioInGroup so a
+// paraphrased AI/learned answer snaps to a real option ("Bachelors" → "Bachelor's
+// Degree", "5-7 yrs" → "5 to 7 years", "Yes" → "Yes, I am authorized to work").
+// Whitespace-/case-/punctuation-folded so trivial formatting differences don't cost
+// distance. Conservative by design — the caller gates on FUZZY_SNAP_MIN so garbage
+// still parks; this never mis-selects on its own.
+export const FUZZY_SNAP_MIN = 0.72;
+function normForFuzzy(s) {
+  return String(s == null ? '' : s)
+    .toLowerCase()
+    // Canonicalize a few high-frequency answer abbreviations so a paraphrase scores against
+    // the same surface form as the option ("5-7 yrs" ≈ "5 to 7 years"). Conservative + tiny;
+    // it only normalizes spelling, it does not invent meaning.
+    .replace(/\byrs?\b/g, 'years')
+    .replace(/(\d)\s*[-–—]\s*(\d)/g, '$1 to $2')   // "5-7" → "5 to 7" (range dash → "to")
+    .replace(/\bgrad\b/g, 'graduate')
+    .replace(/[^a-z0-9]+/g, ' ')   // fold remaining punctuation/apostrophes to spaces
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  let cur = new Array(b.length + 1);
+  for (let i = 1; i <= a.length; i++) {
+    cur[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+    }
+    [prev, cur] = [cur, prev];
+  }
+  return prev[b.length];
+}
+function levSim(x, y) {
+  if (!x || !y) return 0;
+  if (x === y) return 1;
+  const maxLen = Math.max(x.length, y.length);
+  return maxLen ? 1 - levenshtein(x, y) / maxLen : 0;
+}
+// Similarity in [0,1]. Combines whole-string normalized Levenshtein with a TOKEN-aware
+// measure so a SHORT answer that is the meaningful subset of a longer option still scores
+// high ("Bachelors" ⊂ "Bachelor's Degree", "Yes" ⊂ "Yes, I am authorized to work") — the
+// whole-string metric alone over-penalizes that length gap. Token measure: for each token of
+// the shorter side, take its BEST per-token Levenshtein similarity against the longer side's
+// tokens, then average — so unrelated answers (no token aligns) still score low and PARK.
+export function fuzzySimilarity(a, b) {
+  const x = normForFuzzy(a);
+  const y = normForFuzzy(b);
+  if (!x || !y) return 0;
+  if (x === y) return 1;
+  const whole = levSim(x, y);
+  const xt = x.split(' ').filter(Boolean);
+  const yt = y.split(' ').filter(Boolean);
+  const [short, long] = xt.length <= yt.length ? [xt, yt] : [yt, xt];
+  let tokenScore = 0;
+  if (short.length) {
+    let sum = 0;
+    for (const t of short) {
+      let best = 0;
+      for (const u of long) { const s = levSim(t, u); if (s > best) best = s; }
+      sum += best;
+    }
+    tokenScore = sum / short.length;
+  }
+  return Math.max(whole, tokenScore);
+}
+// Score `value` against every candidate label and return the index of the best ONLY
+// when its similarity clears `min` (default FUZZY_SNAP_MIN); else null → caller parks.
+export function bestFuzzyIndex(labels, value, min = FUZZY_SNAP_MIN) {
+  let best = -1, bestScore = 0;
+  labels.forEach((lbl, i) => {
+    const score = fuzzySimilarity(value, lbl);
+    if (score > bestScore) { bestScore = score; best = i; }
+  });
+  return bestScore >= min ? best : null;
+}
+
 // Pick the best <option> for a value, preferring exactness over substring so
 // '5' selects '5+ years' / '5-10 years' (longest containing match), never the
 // first DOM-order option that merely contains the digit ('3-5 years').
@@ -193,10 +274,18 @@ export function matchOption(select, v) {
   // contains it, so '6' selects '5-10 years' not '16+ years' by accidental substring.
   const ni = numericMatch(opts.map((o) => o.text), v);
   if (ni != null) return opts[ni];
-  return opts
+  const sub = opts
     .filter((o) => o.text.toLowerCase().includes(vl) || o.value.toLowerCase().includes(vl))
-    .sort((a, b) => b.text.length - a.text.length)[0]
-    || null;
+    .sort((a, b) => b.text.length - a.text.length)[0];
+  if (sub) return sub;
+  // FINAL fuzzy tier: snap a paraphrased answer to the closest real option label, but
+  // ONLY when similarity is high enough (conservative) — otherwise return null (park).
+  // Never mis-selects garbage: a low-similarity answer falls through to null. Skip the
+  // synthetic "Select…/Choose…/--" placeholder so we never snap onto the empty default.
+  const labels = opts.map((o) => (o.text || '').trim());
+  const fi = bestFuzzyIndex(labels, v);
+  if (fi != null && !/^select|^choose|^--|^$/i.test(labels[fi])) return opts[fi];
+  return null;
 }
 
 // If `value` is a bare number (optionally $/years/k), return the INDEX of the label
@@ -242,7 +331,13 @@ export function pickRadioInGroup(input, v) {
   const hit = labelled.find((x) => x.lbl === vl)
     || labelled.filter((x) => x.lbl.includes(vl) || vl.includes(x.lbl)).sort((a, b) => b.lbl.length - a.lbl.length)[0]
     || null;
-  return hit ? hit.r : null;
+  if (hit) return hit.r;
+  // FINAL fuzzy tier (matches matchOption): snap a paraphrased answer to the closest
+  // radio label, but ONLY above the conservative FUZZY_SNAP_MIN — else null (park). So
+  // "Yes" → "Yes, I am authorized to work", "Bachelors" → "Bachelor's Degree"; garbage
+  // (no label clears the bar) still returns null and is parked, never mis-selected.
+  const fi = bestFuzzyIndex(labelled.map((x) => x.lbl), v);
+  return fi != null ? labelled[fi].r : null;
 }
 
 // React-proof value injection.
