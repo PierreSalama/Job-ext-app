@@ -445,6 +445,14 @@ async function pipelineWatchdogTick() {
   let repaired = 0;
   try { repaired += db.reconcileStaleRunning({ olderThanMinutes: 8 }); } catch {}
   try { repaired += db.reclaimDeadParks(); } catch {}
+  // Self-heal the failed pile: recycle retriable failures back to 'queued' so a drained-but-
+  // failed queue refills itself. Previously retryStaleQueue only ran opportunistically inside
+  // queueNext (gated on enabled && empty live-queue, limit 10), so hundreds of action=retry
+  // failures sat as 'failed' and the queue dispatched nothing. The pump still gates on
+  // enabled/window/cap/gap, so this never causes an apply burst — it only keeps the queue
+  // ready to drain whenever auto-apply is running. Environmental failures retry without
+  // charging an attempt (see retryStaleQueue); a 24h ceiling retires truly-dead tasks.
+  try { repaired += db.retryStaleQueue({ olderThanMinutes: 20, maxAttempts: 4, limit: 50 }); } catch {}
   const health = db.pipelineHealth();
   if (repaired) {
     log.warn(`pipeline watchdog repaired ${repaired} stranded task(s)`);

@@ -1414,7 +1414,19 @@ async function launchOne(task, context) {
       return 'failed';
     }
     if (finalState !== 'running') {
-      await api.call('PATCH', '/queue/' + task.id, { state: finalState });   // idempotent reconcile
+      // Idempotent reconcile — but it MUST carry the executor's terminal evidence, not just the
+      // state. The executor's own evidence-bearing report() is fire-and-forget and can be dropped
+      // when we tear the apply tab down right after a verified submit; if this reconcile sent
+      // {state:'done'} alone, the server's terminal-integrity guard would downgrade a genuinely
+      // VERIFIED submission to awaiting_review ("reported without confirmation evidence"). Carry
+      // the full terminal result so this deterministic last write preserves the proof.
+      const reconcile = { state: finalState };
+      if (result.submissionEvidence != null) reconcile.submissionEvidence = result.submissionEvidence;
+      if (result.lastError != null) reconcile.lastError = result.lastError;
+      if (result.parkReason != null) reconcile.parkReason = result.parkReason;
+      if (Array.isArray(result.pendingQuestions) && result.pendingQuestions.length) reconcile.pendingQuestions = result.pendingQuestions;
+      if (result.routeState != null) reconcile.routeState = result.routeState;
+      await api.call('PATCH', '/queue/' + task.id, reconcile);
     }
     if (result?.nextRequested) setTimeout(() => { watchAndTeachOne().catch(() => {}); }, 900);
     // Close the apply tab on terminal outcomes AND on awaiting_input — the user now

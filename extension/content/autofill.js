@@ -147,16 +147,53 @@ function profileFieldFor(label, profile) {
 // or harvested — regardless of settings (legal/ethical). Mirrors executor.js.
 export const NEVER_AUTOFILL_RX = /(ethnic|race|gender|disabilit|veteran|criminal|background.?check|felony|conviction|pronoun|sexual.?orientation|\blgbtq?)/i;
 
+// A radio/checkbox is "visible enough" to be a real screening control when the native input
+// OR an associated <label> / styled wrapper is visible. LinkedIn (and many ATS) render the
+// native <input type=radio> as a 0x0 / clipped / opacity:0 box behind a styled label, so a
+// strict isProbablyVisible(input) check made the entire "Authorized to work? Yes/No" screening
+// question INVISIBLE to the scanner — the form then silently refused to advance ("stuck on a
+// step", the single largest failure bucket). Confirmed by live transcripts where the Oui/Non
+// group was in the page text but absent from the scanned field set.
+function isControlOrLabelVisible(input) {
+  if (isProbablyVisible(input)) return true;
+  try {
+    const doc = input.ownerDocument || document;
+    const lab = input.closest('label')
+      || (input.id && doc.querySelector(`label[for="${cssEscape(input.id)}"]`))
+      || input.closest('[role="radio"],[role="checkbox"],[data-test-text-selectable-option],[class*="radio"],[class*="checkbox"],[class*="selectable-option"]');
+    return !!(lab && isProbablyVisible(lab));
+  } catch { return false; }
+}
+
 export function isFillable(input) {
   if (!input) return false;
   if (input.disabled || input.readOnly) return false;
   if (input.type && ['hidden', 'file', 'submit', 'button', 'image', 'reset'].includes(input.type)) return false;
-  if (!isProbablyVisible(input)) return false;
+  // Radios/checkboxes: judge visibility via the input OR its label/wrapper (the native input is
+  // often visually hidden for styling). Everything else: the input itself must be visible.
+  if (input.type === 'radio' || input.type === 'checkbox') {
+    if (!isControlOrLabelVisible(input)) return false;
+  } else if (!isProbablyVisible(input)) {
+    return false;
+  }
   const id = (input.id || '') + ' ' + (input.name || '') + ' ' + (input.placeholder || '');
   if (/captcha|recaptcha|cardnumber|cvv|cvc|password/i.test(id)) return false;
   if (NEVER_AUTOFILL_RX.test(id)) return false;
   if (input.type === 'password') return false;
   return true;
+}
+
+// LinkedIn prefills some REQUIRED numeric screening inputs ("How many years … with X?") with a
+// junk placeholder "1" (the "1 of 20 characters" counter). The non-empty guards below would treat
+// that as "already answered" and silently submit "1 year" without ever asking — a trust-eroding
+// false answer. A lone digit in a REQUIRED field is therefore treated as UNanswered so it surfaces
+// to the answer layer (grounded estimate or honest park) instead of auto-submitting the default.
+function looksPrefilledPlaceholder(input) {
+  try {
+    if (!input || input.tagName === 'SELECT') return false;
+    const required = input.required || input.getAttribute('aria-required') === 'true';
+    return required && /^\d$/.test(String(input.value || '').trim());
+  } catch { return false; }
 }
 
 // ---- résumé upload detection (B4: Glassdoor / external company-site uploads) ----
@@ -429,7 +466,7 @@ export class AutofillEngine {
     for (const input of this.fields(rootEl)) {
       if (!isFillable(input)) continue;
       if (isSiteChromeInput(input)) continue;   // never touch the global search bar / header chrome
-      if (input.tagName !== 'SELECT' && input.value && String(input.value).trim()) continue;
+      if (input.tagName !== 'SELECT' && input.value && String(input.value).trim() && !looksPrefilledPlaceholder(input)) continue;
       if (input.tagName === 'SELECT' && input.selectedIndex > 0) continue;
       if ((input.type === 'checkbox' || input.type === 'radio') && input.checked) continue;
       const label = fieldLabel(input);
@@ -463,7 +500,7 @@ export class AutofillEngine {
         continue;   // never auto-decide bare checkboxes (consents etc.)
       } else if (input.tagName === 'SELECT') {
         if (input.selectedIndex > 0 && input.value) continue;
-      } else if (input.value && String(input.value).trim()) {
+      } else if (input.value && String(input.value).trim() && !looksPrefilledPlaceholder(input)) {
         continue;
       }
       // For radios, the per-option <label> is just "Yes"/"No" — use the group's
@@ -474,7 +511,13 @@ export class AutofillEngine {
       // (Generic site-search / global-search typeahead inputs are already skipped above
       // via isSiteChromeInput — they're never a real application question and would
       // falsely park the whole job at submit.)
-      if (profileFieldFor(label, profile || {})) continue;
+      // Non-radio fields defer to the profile (a string we can type). RADIOS, however, need an
+      // OPTION SELECTED, not a string typed — the profile stores text (e.g. the workAuthorization
+      // sentence) that can't be typed into a Yes/No radio. So route radios to the answer path
+      // (groundedEligibilityAnswer / AI → pickRadioInGroup) even when the profile "matches" the
+      // group question, instead of skipping them here and silently leaving the group unanswered
+      // (which blocked "Review"/"Next" → the "stuck on a step" failure).
+      if (input.type !== 'radio' && profileFieldFor(label, profile || {})) continue;
       if (await this.lookupAnswer(label)) continue;
       const required = input.required || input.getAttribute('aria-required') === 'true';
       let options = null;

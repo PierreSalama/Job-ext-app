@@ -647,6 +647,13 @@ const MIGRATIONS = [
   // with trustworthy evidence (the new `verified` type, or the genuine `confirmed`
   // modal-close) are left untouched. Idempotent and append-only.
   () => { quarantineUntrustworthyDone(); },
+
+  // Recover race-lost VERIFIED submissions that were downgraded to awaiting_review because the
+  // executor's evidence-bearing PATCH was dropped on tab-teardown (only the state-only reconcile
+  // landed). Promotes back to `done` ONLY rows whose transcript proves R1 post-click verification
+  // (NOT the legacy static "(confirmation)" markers). Append-only + idempotent. See
+  // recoverRaceLostSubmissions / recoverVerifiedEvidenceFromTranscript.
+  () => { recoverRaceLostSubmissions(); },
 ];
 
 // SUCCESS-TRUTH quarantine (shared by the migration above and exported for tests).
@@ -693,6 +700,73 @@ function isTrustworthyEvidence(evidence) {
   const detail = String(e.detail || '').toLowerCase();
   if (/confirmation text/.test(detail)) return false;
   return true;
+}
+
+// Recover R1-trustworthy submission evidence from a task TRANSCRIPT when the evidence object
+// itself was lost in transit. The executor's evidence-bearing task-progress PATCH is fire-and-
+// forget (executor.js report → .catch(()=>{})); when the apply tab is torn down right after a
+// verified submit, that PATCH can be dropped and only background's STATE-ONLY reconcile lands —
+// so queuePatch saw `done` with no evidence and downgraded a genuinely VERIFIED submission to
+// awaiting_review. But the executor logs its R1 verdict into the transcript BEFORE that final
+// report, and it ONLY logs these markers AFTER R1's strict POST-CLICK verification passed:
+//   • "trace:submit → DONE evidence=verified:<reason>"      (vlog)
+//   • "submitted — verified (<reason>)"                      (done report transcriptAppend)
+//   • "✓ application submitted (<reason>)"                   (logLine)
+// where <reason> ∈ {text-became-success, new-confirmation-node, confirm-signal:*}. Those are
+// POST-CLICK NEW-evidence DIFF signals — the strongest, unambiguous proof a submit landed.
+// We DELIBERATELY do NOT auto-recover on two weaker/legacy markers:
+//   • "application submitted (confirmation)" / "success-signal" — the legacy pre-R1 STATIC
+//     signal (Activision / Canada Job Bank false positives) R1+quarantine exist to reject.
+//   • "apply-form-closed" — a corroborating (form-dismissed-after-submit) signal the executor
+//     accepts live, but an adversarial audit flagged it as borderline when the evidence object
+//     is GONE; rather than risk telling the user they applied when they may not have, those
+//     stay in awaiting_review for human confirmation. (Trustworthiness > recall here.)
+const R1_TRUSTWORTHY_TRANSCRIPT_RX =
+  /evidence=verified:(text-became-success|new-confirmation-node|confirm-signal[^\s|]*)|(?:application submitted|submitted — verified) \((text-became-success|new-confirmation-node|confirm-signal[^)]*)\)/i;
+function recoverVerifiedEvidenceFromTranscript(transcript) {
+  let steps = transcript;
+  if (typeof steps === 'string') steps = safeParse(steps, []);
+  if (!Array.isArray(steps)) return null;
+  for (let i = steps.length - 1; i >= 0; i--) {   // scan newest→oldest; the verdict is near the end
+    const s = steps[i];
+    const text = String((s && (s.text || s.note)) || '');
+    const m = text.match(R1_TRUSTWORTHY_TRANSCRIPT_RX);
+    if (m) {
+      const reason = String(m[1] || m[2] || '').toLowerCase();
+      if (!reason || reason === 'confirmation' || reason === 'success-signal') continue;   // never the legacy static signal
+      return { type: 'verified', reason, detail: 'recovered-from-transcript', at: now() };
+    }
+  }
+  return null;
+}
+
+// RECOVER race-lost verified submissions already sitting in awaiting_review. Promote BACK to
+// `done` the rows whose TRANSCRIPT carries an R1-trustworthy post-click marker (so the lost
+// evidence object is reconstructed from the proven verdict), stamping recovered evidence and
+// clearing the stale downgrade error. Skips the legacy "(confirmation)"/success-signal rows
+// (no trustworthy marker → recoverVerifiedEvidenceFromTranscript returns null). Idempotent:
+// once promoted to `done` a row no longer matches the awaiting_review filter. Returns the count.
+function recoverRaceLostSubmissions() {
+  const rows = all(
+    `SELECT id, transcript FROM auto_apply_tasks
+      WHERE state = 'awaiting_review'
+        AND ( transcript LIKE '%evidence=verified:%'
+           OR transcript LIKE '%submitted — verified (%'
+           OR transcript LIKE '%application submitted (text-became-success%'
+           OR transcript LIKE '%application submitted (new-confirmation-node%'
+           OR transcript LIKE '%application submitted (apply-form-closed%'
+           OR transcript LIKE '%application submitted (confirm-signal%' )`);
+  let n = 0;
+  for (const r of rows) {
+    const ev = recoverVerifiedEvidenceFromTranscript(r.transcript);
+    if (!ev) continue;
+    run(`UPDATE auto_apply_tasks
+            SET state = 'done', submission_evidence = ?, last_error = NULL,
+                park_reason = NULL, pending_questions = '[]', updated_at = ?
+          WHERE id = ?`, [JSON.stringify(ev), now(), r.id]);
+    n++;
+  }
+  return n;
 }
 
 function userVersion() {
@@ -2792,19 +2866,34 @@ function queueLive({ startedAt } = {}) {
 // which the current engine no longer hits) whose job isn't already submitted, capped
 // by attempts so a permanently-dead job can't churn forever. Excludes skipped
 // (relevance won't change) and awaiting_input/parked (those genuinely need the user).
-function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25 } = {}) {
+// Environmental failures — Chrome backgrounded/occluded/THROTTLED the apply tab, or LinkedIn's
+// SPA simply hadn't hydrated yet. These are NOT the job's fault: the same posting usually applies
+// fine once its window is uncovered. We retry them WITHOUT charging an attempt, so a few unlucky
+// backgrounded passes can't exile an otherwise-applyable Easy-Apply job to the permanent dead
+// pool (the live DB had 163 transient LinkedIn failures stuck at the attempt cap from exactly
+// this). Genuine flow failures (stuck/max-steps/no-advance) still consume an attempt so a truly
+// broken job retires at maxAttempts. The maxAgeHours ceiling retires anything (even environmental)
+// that has been failing for a full day, so nothing retries forever.
+const ENVIRONMENTAL_FAILURE_RX = /occlud|throttl|hydrat|page stopped advancing|backgrounded|never hydrated/i;
+function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25, maxAgeHours = 24 } = {}) {
   const cutoff = new Date(Date.now() - Math.max(1, olderThanMinutes) * 60000).toISOString();
+  const ageFloor = new Date(Date.now() - Math.max(1, maxAgeHours) * 3600000).toISOString();
   const rows = all(
     `SELECT t.*, j.source AS _src, j.job_url AS _url FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
-     WHERE t.state = 'failed' AND t.updated_at < ?
+     WHERE t.state = 'failed' AND t.updated_at < ? AND t.updated_at >= ?
        AND COALESCE(t.attempts, 0) < ?
        AND j.status != 'submitted'
-     ORDER BY t.updated_at ASC LIMIT ?`, [cutoff, maxAttempts, limit]);
+     ORDER BY t.updated_at ASC LIMIT ?`, [cutoff, ageFloor, maxAttempts, limit]);
   let n = 0;
   for (const r of rows) {
     const failure = classifyQueueFailure(r);
     if (failure.action !== 'retry') continue;
-    if (queuePatch(r.id, { state: 'queued', lastError: null, handoffToken: null, attemptsDelta: 1, transcriptAppend: { note: `self-heal retry after ${failure.failureClass}` } })) n++;
+    const environmental = ENVIRONMENTAL_FAILURE_RX.test(String(r.last_error || ''));
+    if (queuePatch(r.id, {
+      state: 'queued', lastError: null, handoffToken: null,
+      attemptsDelta: environmental ? 0 : 1,
+      transcriptAppend: { note: `self-heal retry after ${failure.failureClass}${environmental ? ' (environmental — no attempt charged)' : ''}` },
+    })) n++;
   }
   return n;
 }
@@ -2893,7 +2982,7 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
   let nextError = lastError !== undefined ? lastError : cur.last_error;
   let nextParkReason = parkReason !== undefined ? parkReason : cur.park_reason;
   let nextPending = pendingQuestions !== undefined ? (pendingQuestions || []).slice(0, 40) : safeParse(cur.pending_questions, []);
-  const nextEvidence = submissionEvidence !== undefined ? submissionEvidence : safeParse(cur.submission_evidence, null);
+  let nextEvidence = submissionEvidence !== undefined ? submissionEvidence : safeParse(cur.submission_evidence, null);
 
   // Terminal-state integrity is enforced at the storage boundary. Executors can be
   // interrupted or old extension versions can omit fields, but the ledger must never
@@ -2907,8 +2996,20 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
     nextPending = [];
   }
   if (nextState === 'done' && !nextEvidence) {
-    nextState = 'awaiting_review';
-    nextError = 'submit was reported without confirmation evidence — please verify';
+    // The evidence object can be lost in transit: the executor's evidence-bearing task-progress
+    // PATCH is fire-and-forget and gets dropped when the apply tab is torn down right after a
+    // verified submit, leaving only background's STATE-ONLY reconcile — which would downgrade a
+    // genuinely VERIFIED submission. Before downgrading, try to RECOVER the evidence from the
+    // transcript (already persisted by earlier task-progress writes): the executor logs its R1
+    // post-click verdict there and ONLY for trustworthy reasons. If found, the submit was proven
+    // → keep it `done`. Otherwise (no trustworthy marker) downgrade for honest human re-verify.
+    const recovered = recoverVerifiedEvidenceFromTranscript(cur.transcript);
+    if (recovered) {
+      nextEvidence = recovered;
+    } else {
+      nextState = 'awaiting_review';
+      nextError = 'submit was reported without confirmation evidence — please verify';
+    }
   }
   // FIX 2: a VERIFIED done must carry NO contradictory failure text. An earlier retry attempt
   // on this row commonly left a stale last_error ("submit was reported without confirmation —
@@ -4004,7 +4105,7 @@ module.exports = {
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
   discoveryBatchStart, discoveryBatchGet, discoveryBatchComplete, discoveryBatchList, discoveryRecordJob,
   discoveryFallbackQueue, discoveryFallbackNext, discoveryFallbackComplete, discoveryHealth, reconcileDiscovery, pipelineHealth,
-  queueList, queueHistory, queueBreakdown, summarizeRun, queueRunSummary, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, quarantineUntrustworthyDone, saveIntakeAnswer,
+  queueList, queueHistory, queueBreakdown, summarizeRun, queueRunSummary, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, quarantineUntrustworthyDone, recoverRaceLostSubmissions, recoverVerifiedEvidenceFromTranscript, isTrustworthyEvidence, saveIntakeAnswer,
   classifyQueueFailure, taskSiteKey, queueActiveSiteKeys,
   setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
   aiLog, aiLogList, aiUsage,
