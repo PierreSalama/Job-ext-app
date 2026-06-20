@@ -132,8 +132,14 @@ chrome.alarms.onAlarm.addListener(async (a) => {
     // Auto-apply was turned OFF (from either dashboard host) → tidy up the run's
     // tabs/group. Cheap no-op once aaGroupId is cleared.
     if (r.reason === 'disabled' && aaGroupId != null) await closeAutoApplyTabs().catch(() => {});
-    // App-owned JobSpy is the primary discovery engine. Chrome only consumes an
-    // explicit fallback request after JobSpy reports a typed provider failure.
+    // EA-DENSE TOP-UP (primary supply). When the queue runs low, grow it with an Easy-Apply-ONLY
+    // LinkedIn search (f_AL=true) so the pool is REAL Easy-Apply jobs, not the JobSpy external
+    // flood the executor has to skip (the dominant "nothing submitted" cause). discoverTick
+    // self-gates: no-op unless auto-apply + discovery.enabled, inside the window, and queued
+    // depth < refillBelow — so this never over-enqueues or scrapes aggressively.
+    await discoverTick().catch(() => {});
+    // App-owned JobSpy is the FALLBACK discovery engine (runs only when the queue is empty).
+    // Chrome only consumes an explicit fallback request after JobSpy reports a typed failure.
     await processDiscoveryFallback().catch(() => {});
   }
   if (a.name === 'jat11-extupdate') {

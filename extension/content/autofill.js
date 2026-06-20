@@ -186,11 +186,15 @@ export function isFillable(input) {
 // LinkedIn prefills some REQUIRED numeric screening inputs ("How many years … with X?") with a
 // junk placeholder "1" (the "1 of 20 characters" counter). The non-empty guards below would treat
 // that as "already answered" and silently submit "1 year" without ever asking — a trust-eroding
-// false answer. A lone digit in a REQUIRED field is therefore treated as UNanswered so it surfaces
-// to the answer layer (grounded estimate or honest park) instead of auto-submitting the default.
+// false answer. A lone digit in a REQUIRED field that WE have NOT filled is therefore treated as
+// UNanswered so it surfaces to the answer layer (grounded estimate or honest park). Once we fill it
+// (any value) it is "ours" (marked in setNativeValue) and never re-surfaced — so a legit single-digit
+// answer ("0"/"6" years) can't loop: fill → re-detected as placeholder → re-fill → …
+const _jatFilledFields = new WeakSet();
 function looksPrefilledPlaceholder(input) {
   try {
     if (!input || input.tagName === 'SELECT') return false;
+    if (_jatFilledFields.has(input)) return false;   // we already answered it — not a placeholder
     const required = input.required || input.getAttribute('aria-required') === 'true';
     return required && /^\d$/.test(String(input.value || '').trim());
   } catch { return false; }
@@ -386,6 +390,7 @@ export function setNativeValue(el, value) {
     if (setter) setter.call(el, value);
     else el.value = value;
   } catch { el.value = value; }
+  try { _jatFilledFields.add(el); } catch {}   // mark as answered-by-us (see looksPrefilledPlaceholder)
   el.dispatchEvent(new Event('input', { bubbles: true }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
 }
