@@ -677,6 +677,24 @@ function quarantineUntrustworthyDone() {
   return before;
 }
 
+// Is a submission_evidence object TRUSTWORTHY (the inverse of the quarantine criteria above)?
+// Trustworthy = present, NOT the legacy static `success-signal` type, and NOT a "confirmation
+// text/url" detail that was regex-matched against pre-existing page copy with no before/after
+// baseline. The R1 `verified` type and the genuine `confirmation`/`confirmed` modal-close are
+// trustworthy. Used by queuePatch (FIX 2) to clear stale failure text off a verified done.
+// Accepts the parsed object OR a JSON string; any malformed input → false (treat as untrusted).
+function isTrustworthyEvidence(evidence) {
+  if (!evidence) return false;
+  let e = evidence;
+  if (typeof e === 'string') { e = safeParse(e, null); if (!e) return false; }
+  if (typeof e !== 'object') return false;
+  const type = String(e.type || '').toLowerCase();
+  if (!type || type === 'success-signal') return false;
+  const detail = String(e.detail || '').toLowerCase();
+  if (/confirmation text/.test(detail)) return false;
+  return true;
+}
+
 function userVersion() {
   const r = get('PRAGMA user_version');
   return r ? (r.user_version ?? Object.values(r)[0] ?? 0) : 0;
@@ -2891,6 +2909,18 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
   if (nextState === 'done' && !nextEvidence) {
     nextState = 'awaiting_review';
     nextError = 'submit was reported without confirmation evidence — please verify';
+  }
+  // FIX 2: a VERIFIED done must carry NO contradictory failure text. An earlier retry attempt
+  // on this row commonly left a stale last_error ("submit was reported without confirmation —
+  // please confirm") / park_reason / pending_questions, so a genuinely verified submission
+  // LOOKED unconfirmed/false. When a done lands with TRUSTWORTHY evidence (the R1 `verified`
+  // type or the genuine `confirmation`/`confirmed` modal-close — NOT the legacy static
+  // `success-signal`), null out the stale failure fields. This NEVER weakens the guard above
+  // (an evidence-LESS done is still downgraded to awaiting_review first); it only cleans a
+  // contradictory error off a done that IS trustworthy. Defensive mirror of the executor's
+  // own done report (which now sets lastError:null at the source).
+  if (nextState === 'done' && isTrustworthyEvidence(nextEvidence)) {
+    nextError = null; nextParkReason = null; nextPending = [];
   }
   const transcript = safeParse(cur.transcript, []);
   if (transcriptAppend) {

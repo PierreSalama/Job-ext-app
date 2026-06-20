@@ -185,4 +185,87 @@ export function pageRequiresResume(text) {
   return RESUME_REQUIRED_RX.test(String(text || ''));
 }
 
-export { APPLY_ADVANCE_LABEL_RX, UPLOAD_RESUME_LABEL_RX, RESUME_REQUIRED_RX };
+// ============================================================
+// FIX 1 — advance-blocked screening questions (the #1 remaining cap).
+// ============================================================
+// ROOT CAUSE (confirmed live, Webisoft new full-page Easy Apply): on the "Additional
+// Questions" page the executor filled the contact fields but left a REQUIRED screening
+// radio/select unanswered, clicked Review → LinkedIn blocked the advance (a required Q
+// is unanswered) → the page didn't change → the stall guard just re-clicked Review and
+// gave up "stuck — page stopped advancing". The fix re-scans the CURRENT page for
+// unanswered REQUIRED fields, ANSWERS them (profile → qa → AI → grounded eligibility
+// default), retries the advance, and PARKS honestly only what truly can't be answered.
+//
+// These pieces are PURE so the answer-or-park decision + the grounded eligibility
+// defaults are node-testable without a DOM. The executor builds the live signals and
+// acts on the decision.
+
+// The well-known WORK-ELIGIBILITY screening questions. Yes/No (or a dropdown) questions
+// whose truthful answer is fully determined by the user's stated work authorization — so
+// when the profile/qa store DIDN'T already answer them we may apply a GROUNDED default
+// (never a fabrication). Anything outside this set is left to profile/qa/AI or parked.
+const ELIGIBILITY_AUTHORIZED_RX = /(legally\s+)?authori[sz]ed\s+to\s+work|eligible\s+to\s+work|right\s+to\s+work|work\s+(?:permit|authori[sz]ation)\b|are\s+you\s+(?:legally\s+)?(?:authori[sz]ed|eligible|permitted)\s+to\s+work/i;
+const ELIGIBILITY_SPONSOR_RX = /(require|need|seek).{0,30}(sponsor|visa)|sponsor(ship)?\b.{0,30}(require|need|now or in the future)|(now or in the future).{0,30}sponsor/i;
+
+// Decide a GROUNDED answer for a well-known work-eligibility screening question, given
+// what the profile already tells us. Returns a string answer (e.g. 'Yes'/'No') or null
+// when the question is NOT a determinable eligibility one (→ caller leaves it to AI/park).
+// NEVER fabricates: it only answers the two eligibility questions whose truthful value
+// follows from `authorizedToWork`, and ONLY when we actually know `authorizedToWork`.
+//   label             — the question text.
+//   authorizedToWork  — is the user authorized to work (in the job's country)? boolean|null.
+//                       null/undefined = unknown → return null (don't guess).
+//   yesText/noText    — the literal option strings to emit (defaults 'Yes'/'No') so a
+//                       select/radio whose options read e.g. "Yes, I am" can be matched.
+export function groundedEligibilityAnswer(label, { authorizedToWork = null, yesText = 'Yes', noText = 'No' } = {}) {
+  const t = String(label || '');
+  if (!t.trim()) return null;
+  if (authorizedToWork == null) return null;        // unknown authorization → never guess
+  // "Are you authorized / eligible / permitted to work…?" → Yes iff authorized.
+  if (ELIGIBILITY_AUTHORIZED_RX.test(t)) return authorizedToWork ? yesText : noText;
+  // "Will you now or in the future require sponsorship / a visa?" → No iff already authorized.
+  // We only ground the NEGATIVE (authorized → no sponsorship needed). If NOT authorized we
+  // do NOT assume sponsorship IS required (could be relocating, etc.) → leave to AI/park.
+  if (ELIGIBILITY_SPONSOR_RX.test(t)) return authorizedToWork ? noText : null;
+  return null;
+}
+
+// Is this label one of the determinable work-eligibility screening questions (so the
+// caller may apply a grounded default)? Pure helper, used to keep the executor's branch
+// readable and node-testable.
+export function isEligibilityScreeningQuestion(label) {
+  const t = String(label || '');
+  return ELIGIBILITY_AUTHORIZED_RX.test(t) || ELIGIBILITY_SPONSOR_RX.test(t);
+}
+
+// Partition the unanswered REQUIRED fields blocking an advance into the ones we can
+// answer this pass vs the ones we must PARK. PURE: the caller resolves `answerable`
+// (did profile/qa/AI/grounded-default produce a confident value?) and `parkable`
+// (is it a real question we can hand to the user?) for each field, and this decides
+// what to do. Keeps the answer-vs-park policy in one node-testable place.
+//   fields — [{ label, answer (string|null), parkable (bool), fieldType, options, reason }]
+// Returns { toAnswer:[{label,answer,...}], toPark:[{label,reason,...}], allHandled:bool }.
+//   toAnswer   — fields with a non-empty grounded answer → fill them, then retry advance.
+//   toPark     — required fields with no answer that ARE parkable → honest park.
+//   allHandled — every blocking field was either answered or parked (nothing left in a
+//                limbo "blocked but invisible" state).
+export function decideAnswerOrPark(fields = []) {
+  const toAnswer = [];
+  const toPark = [];
+  for (const f of Array.isArray(fields) ? fields : []) {
+    if (!f) continue;
+    const ans = (f.answer != null && String(f.answer).trim()) ? String(f.answer) : null;
+    if (ans) { toAnswer.push({ ...f, answer: ans }); continue; }
+    if (f.parkable) { toPark.push({ ...f, reason: f.reason || 'needs your answer' }); }
+  }
+  const allHandled = (toAnswer.length + toPark.length) >= (Array.isArray(fields) ? fields.filter(Boolean).length : 0);
+  return { toAnswer, toPark, allHandled };
+}
+
+export {
+  APPLY_ADVANCE_LABEL_RX,
+  UPLOAD_RESUME_LABEL_RX,
+  RESUME_REQUIRED_RX,
+  ELIGIBILITY_AUTHORIZED_RX,
+  ELIGIBILITY_SPONSOR_RX,
+};

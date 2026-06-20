@@ -24,7 +24,7 @@ import { classifyInterstitial } from './lib/interstitial.js';
 import { shouldFrontOnOpenerStall } from './lib/opener-stall.js';
 import { detectBotChallenge, botChallengeLastError } from './lib/challenge.js';
 import { ADVANCE_KEYWORDS, isAdvanceLabel } from './lib/advance.js';
-import { isLinkedInEasyApplyApplyUrl, isLinkedInApplyAdvanceLabel, deriveApplyRootFromAdvanceButton, shouldUseGenericOpenFallback, decideResumePage, isUploadResumeAffordanceLabel, pageRequiresResume } from './lib/linkedin-apply.js';
+import { isLinkedInEasyApplyApplyUrl, isLinkedInApplyAdvanceLabel, deriveApplyRootFromAdvanceButton, shouldUseGenericOpenFallback, decideResumePage, isUploadResumeAffordanceLabel, pageRequiresResume, groundedEligibilityAnswer, isEligibilityScreeningQuestion, decideAnswerOrPark } from './lib/linkedin-apply.js';
 import { sitePack } from './sites/index.js';
 import { confirmSignalsMatched } from './lib/ats-drive.js';
 
@@ -866,6 +866,25 @@ export async function run(task, context, helpers) {
   // structured profile with any harvested fields that map to known profile keys
   // so the autofill engine has the most to work with even with no saved profile.
   const profileData = { ...(profile?.data || {}) };
+  // FIX 1: derive whether the user is authorized to work, for GROUNDED eligibility-screening
+  // defaults (authorized → "authorized to work?" = Yes, "require sponsorship?" = No) applied
+  // ONLY when the profile/qa store didn't already answer the question. Truthful, never invented:
+  // we only treat the user as authorized when the profile explicitly says so (a yes/authorized/
+  // citizen/permanent-resident value), or there's an explicit work-auth region list. Unknown →
+  // null (the grounded default then declines to guess and the question falls to AI/park).
+  const authorizedToWork = (() => {
+    try {
+      const wa = String(profileData.workAuthorization || '').toLowerCase();
+      const cit = String(profileData.citizenship || '').toLowerCase();
+      const regions = profileData.workAuthRegions;
+      const hasRegions = Array.isArray(regions) ? regions.length > 0 : !!String(regions || '').trim();
+      const positive = /\b(yes|authori[sz]ed|eligible|citizen|permanent resident|pr\b|work permit|right to work|no sponsorship)\b/;
+      const negative = /\b(no\b|not authori[sz]ed|require sponsorship|need sponsorship|require a visa)\b/;
+      if (positive.test(wa) || positive.test(cit) || hasRegions) return true;
+      if (negative.test(wa)) return false;
+      return null;   // unknown → never guess an eligibility answer
+    } catch { return null; }
+  })();
   const learnedCount = Array.isArray(harvested) ? harvested.length : 0;
   logLine('ok', `start mode=${mode} · profile=${profile ? 'loaded' : 'none'} · learned=${learnedCount} · resume=${resume?.name || 'none'}`);
   reportSeen(document, 'job page');
@@ -933,6 +952,7 @@ export async function run(task, context, helpers) {
                                // before the first click on the NEW page is judged a repeat.
   let openerStallFronted = false; // F2: did we already do a fronted retry for an opener that clicked but never mounted?
   let interstitialAdvances = 0; // LinkedIn resume/continue interstitials advanced this run (bounded)
+  let blockedRescueTries = 0;   // FIX 1: advance-blocked → re-scan + answer required field(s) recoveries (bounded)
   // BUG-3: external/company-ATS repeat breaker. The page-level opener breaker resets on
   // any DOM change, so an external site that re-renders on every "Apply" click (BMO: 40×
   // "clicking Apply" → max steps) is never caught. Track the last external advance label +
@@ -1103,6 +1123,92 @@ export async function run(task, context, helpers) {
     report({ state: 'parked', parkReason: `needs ${parked.length} answer(s)`, pendingQuestions: parked, transcriptAppend: { note: `parked at ${where}: ` + parked.map((p) => p.question.slice(0, 40)).join('; ') } });
     finalState = 'parked';
   };
+
+  // ============================================================
+  // FIX 1 — advance-blocked → re-scan → answer the unanswered REQUIRED field(s).
+  // ============================================================
+  // When an advance click (Next/Review/Submit) does NOT change the page, LinkedIn is almost
+  // always blocking on an UNANSWERED REQUIRED field (a Yes/No screening radio, a dropdown, a
+  // text field) — the dominant remaining cap on the success rate (Webisoft: a required
+  // "comfortable commuting?" radio left blank → Review refused → "stuck"). Before the stall
+  // guard gives up, we re-scan the CURRENT page root for unanswered required fields and ANSWER
+  // them through the EXISTING ladder (profile/qa via scanFillable+fill → AI via
+  // /ai/answer-question → grounded eligibility default for the well-known work-auth/sponsorship
+  // Qs), then the caller retries the advance. Returns:
+  //   { filled, parkedCount, sawRequired } — `filled` answered this pass, `parkedCount` honestly
+  //   parked (unanswerable required), `sawRequired` whether any required field was even seen.
+  // Reuses engine.scanFillable / engine.fill / engine.scanUnknown + the same AI route the main
+  // loop uses; does NOT duplicate the ladder. Fully guarded — any throw → {filled:0,...}.
+  async function answerBlockingRequiredFields(scopeRoot) {
+    const out = { filled: 0, parkedCount: 0, sawRequired: false };
+    const root = scopeRoot || findApplyDialog() || detectApplyForm()?.form || null;
+    if (!root) return out;
+    // 1) profile + learned-qa first: scanFillable matches profile patterns (incl. the
+    //    work-authorization / sponsorship profile fields) and the qa store. This already
+    //    handles radios (pickRadioInGroup) + selects (matchOption). Required-only? No —
+    //    filling any empty profile-known field that's blocking is strictly safe and cheap.
+    try {
+      const sugg = (await engine.scanFillable(root)).filter((s) => !NEVER_AUTOFILL_RX.test(s.label || ''));
+      const n = await engine.fill(sugg);
+      if (n) { out.filled += n; logLine('ok', `recovered: filled ${n} field(s) from profile/history to unblock advance`); }
+    } catch {}
+    // 2) Re-scan for the REQUIRED fields still unanswered (radios/selects/text) and resolve
+    //    each via AI → grounded eligibility default, parking honestly what we can't answer.
+    let unknown = [];
+    try { unknown = (await engine.scanUnknown(root)).filter((u) => u && u.required); } catch { unknown = []; }
+    if (!unknown.length) return out;
+    out.sawRequired = true;
+    // Build the per-field answer-or-park inputs (PURE decision delegated to decideAnswerOrPark).
+    const decided = [];
+    for (const u of unknown.slice(0, 6)) {
+      if (S.cancelled) break;
+      // EEO / criminal-history fields are NEVER auto-answered — they must be parked for the user.
+      if (NEVER_AUTOFILL_RX.test(u.label)) { decided.push({ ...u, answer: null, parkable: true, reason: 'sensitive — needs your answer' }); continue; }
+      let answer = null;
+      // a) AI ladder (skips legal/eligibility — those are grounded from profile below, never AI'd).
+      if (!LEGAL_RX.test(u.label)) {
+        try {
+          const r = await send({
+            type: 'api-call', method: 'POST', path: '/ai/answer-question', timeoutMs: 150000,
+            body: { question: u.label, fieldType: u.fieldType, options: u.options, jobId: job?.id, profileId },
+          });
+          const a = (r?.ok && r.result && typeof r.result.answer === 'string' && typeof r.result.confidence === 'number') ? r.result : null;
+          if (a && !a.refuse && a.confidence >= S.sessionSettings.confidence && a.answer.trim()) answer = a.answer;
+        } catch {}
+      }
+      // b) GROUNDED eligibility default for the well-known work-auth/sponsorship screening Qs —
+      //    truthful, derived from the profile (authorizedToWork), applied ONLY when AI didn't
+      //    (and profile/qa in step 1 didn't) already answer. Matches Yes/No option text when
+      //    the field offers options (so a select/radio with "Yes, I am" still resolves).
+      if (answer == null && isEligibilityScreeningQuestion(u.label)) {
+        const opts = Array.isArray(u.options) ? u.options : [];
+        const yesText = opts.find((o) => /^\s*yes\b/i.test(o)) || 'Yes';
+        const noText = opts.find((o) => /^\s*no\b/i.test(o)) || 'No';
+        answer = groundedEligibilityAnswer(u.label, { authorizedToWork, yesText, noText });
+        if (answer != null) logLine('ok', `recovered: grounded eligibility answer for "${u.label.slice(0, 40)}" → ${answer}`);
+      }
+      // Parkable: a real question (has label) we couldn't answer → hand to the user.
+      decided.push({ ...u, answer, parkable: !!u.label, reason: answer == null ? `needs your answer: ${u.label.slice(0, 80)}` : null });
+    }
+    const plan = decideAnswerOrPark(decided);
+    for (const f of plan.toAnswer) {
+      if (S.cancelled) break;
+      try {
+        const ok = await engine.fill([{ input: f.input, value: f.answer }]);
+        if (ok) {
+          out.filled++;
+          logLine('ok', `recovered: answered required "${f.label.slice(0, 40)}"`);
+          try { await engine.recordAnswer({ question: f.label, answer: f.answer, fieldType: f.fieldType, source: isEligibilityScreeningQuestion(f.label) ? 'profile' : 'ai', jobId: job?.id }); } catch {}
+        } else {
+          // Fill failed (un-pickable widget) → park it rather than lose the blocker silently.
+          park(f.label, f.fieldType, f.options, 'blocked the application — could not fill the answer');
+          out.parkedCount++;
+        }
+      } catch {}
+    }
+    for (const f of plan.toPark) { park(f.label, f.fieldType, f.options, f.reason); out.parkedCount++; }
+    return out;
+  }
 
   // ============================================================
   // Apprenticeship Engine [P5] — gated, additive recipe replay.
@@ -2187,6 +2293,53 @@ export async function run(task, context, helpers) {
         signalHydrated();
         logLine('warn', 'apply modal still did not mount after fronting — treating as a genuine stall');
       }
+      // ---- FIX 1 KEYSTONE: advance BLOCKED on a form → re-scan, ANSWER, RETRY (before give-up) ----
+      // The dominant remaining cap: a REQUIRED screening field (Yes/No radio, dropdown, text) was
+      // left unanswered on this page (the "Additional Questions" page in the new full-page flow),
+      // so LinkedIn refuses to advance and the page doesn't change. The OLD behavior just re-clicked
+      // the same advance button and gave up "stuck". Instead, when we HAVE a form root and haven't
+      // exhausted the bounded recovery budget, re-scan THIS page for unanswered required fields and
+      // ANSWER them (profile/qa → AI → grounded eligibility default), then RETRY the advance with
+      // the normal change-detection wait. Unanswerable required fields are PARKED honestly. Only if
+      // nothing could be answered AND nothing is parkable do we fall through to the genuine stall.
+      // Excludes the no-form / external / final-auto-submit cases (handled elsewhere); bounded so a
+      // genuinely dead button still fails.
+      if (haveForm && !externalClick && blockedRescueTries < 3) {
+        blockedRescueTries++;
+        logLine('warn', `advance blocked — re-scanning this page for an unanswered required field (try ${blockedRescueTries})`);
+        await sleep(600);   // let LinkedIn render its inline "required" markers / validation state
+        const rescue = await answerBlockingRequiredFields(root);
+        if (rescue.parkedCount && parked.length) {
+          // A required field we genuinely can't answer is blocking → park honestly (replaces the
+          // old "stuck — page stopped advancing" loop for the unanswerable case). NEVER submit
+          // past an unanswered required question (R1 preserved).
+          logLine('warn', `blocked by an unanswerable required question — parking for your input`);
+          reportParked('advance-blocked');
+          break;
+        }
+        if (rescue.filled) {
+          // We answered the blocking field(s). Retry the advance and re-judge with a fresh wait.
+          report({ transcriptAppend: { kind: 'recovery', note: `answered ${rescue.filled} blocking required field(s); retrying advance`, fingerprint: pageAction } });
+          const retryBtn = (clickBtn && document.contains(clickBtn) && !clickBtn.disabled && isProbablyVisible(clickBtn))
+            ? clickBtn
+            : (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }));
+          if (retryBtn) {
+            const retryHash = domHash();
+            logLine('ok', `retrying "${btnText(retryBtn).slice(0, 30)}" after answering the required field(s)`);
+            syntheticClick(retryBtn);
+            const retried = await waitForChange(retryHash);
+            if (retried) {
+              // Real progress — clear stall/breaker counters and drive the next page.
+              noChange = 0; lastPageAction = ''; lastPageActionUrl = '';
+              continue;
+            }
+          }
+          // Filled but STILL didn't advance: don't count this rescue toward give-up yet — loop
+          // around so the next pass re-scans (a multi-required page answers one field at a time).
+          continue;
+        }
+        // Nothing answerable here this pass → fall through to the normal stall handling below.
+      }
       if (++noChange >= S.sessionSettings.stallLimit) {
         if (sup) {
           const fingerprint = recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label, stage: 'unchanged-screen' });
@@ -2288,7 +2441,12 @@ export async function run(task, context, helpers) {
         // Mark the JOB submitted too, so it's counted even if the passive capture
         // detector misses the banner (queuePatch only updates the task).
         if (job?.id) await send({ type: 'api-call', method: 'PATCH', path: '/jobs/' + encodeURIComponent(job.id), body: { status: 'submitted' } });
-        report({ state: 'done', submissionEvidence: { type: 'verified', reason, detail: how || reason, url: location.href, at: new Date().toISOString() }, transcriptAppend: { note: `submitted — verified (${reason})` } });
+        // FIX 2: a VERIFIED done must carry NO contradictory failure text. Earlier retry
+        // attempts on this row may have left a stale last_error ("submit was reported without
+        // confirmation — please confirm") / park_reason / pendingQuestions — clear them at the
+        // SOURCE so a real, verified submission never LOOKS unconfirmed. (db.js queuePatch also
+        // nulls these defensively when a done carries trustworthy evidence.)
+        report({ state: 'done', lastError: null, parkReason: null, pendingQuestions: [], submissionEvidence: { type: 'verified', reason, detail: how || reason, url: location.href, at: new Date().toISOString() }, transcriptAppend: { note: `submitted — verified (${reason})` } });
         finalState = 'done';
         finished = true;
         continue;

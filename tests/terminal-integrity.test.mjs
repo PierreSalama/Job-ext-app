@@ -38,3 +38,56 @@ test('done requires confirmation evidence', () => {
   assert.equal(proven.state, 'done');
   assert.equal(proven.submissionEvidence.type, 'confirmation');
 });
+
+// ---- FIX 2: a VERIFIED done must clear a stale last_error (the "looks like a false positive") ----
+test('verified done CLEARS a stale last_error / park_reason / pending_questions', () => {
+  const t = task(6);
+  // Simulate an earlier retry attempt that left a stale "submit not confirmed" error + park.
+  db.queuePatch(t.id, {
+    state: 'awaiting_review',
+    lastError: 'submit was reported without confirmation — please confirm',
+    parkReason: 'unverified',
+    pendingQuestions: [{ question: 'confirm submit', reason: 'unverified' }],
+  });
+  // Now the real, verified submission lands with trustworthy R1 evidence.
+  const done = db.queuePatch(t.id, {
+    state: 'done',
+    submissionEvidence: { type: 'verified', reason: 'text-became-success', url: 'https://x/applied' },
+  });
+  assert.equal(done.state, 'done');
+  assert.equal(done.lastError, null, 'stale last_error must be cleared on a verified done');
+  assert.equal(done.parkReason, null, 'stale park_reason must be cleared on a verified done');
+  assert.deepEqual(done.pendingQuestions, [], 'stale pending_questions must be cleared on a verified done');
+  assert.equal(done.submissionEvidence.type, 'verified');
+});
+
+test('verified done clears the error even when this same patch carries the stale lastError', () => {
+  // An old extension version could PATCH done + the stale error together — the guard must
+  // still null it because the evidence IS trustworthy.
+  const done = db.queuePatch(task(7).id, {
+    state: 'done',
+    lastError: 'submit was reported without confirmation — please confirm',
+    submissionEvidence: { type: 'verified', reason: 'new-confirmation-node', url: 'https://x/ok' },
+  });
+  assert.equal(done.state, 'done');
+  assert.equal(done.lastError, null);
+});
+
+test('evidence-LESS done is STILL downgraded to awaiting_review (R1 guard not weakened)', () => {
+  const r = db.queuePatch(task(8).id, { state: 'done', lastError: null });
+  assert.equal(r.state, 'awaiting_review');
+  assert.match(r.lastError, /without confirmation evidence/);
+});
+
+test('done with LEGACY/untrustworthy success-signal evidence does NOT get its error cleared', () => {
+  // A legacy static success-signal is NOT trustworthy → the clear must not fire. The row stays
+  // done with the evidence as-is (the historical quarantine migration is what downgrades these),
+  // but a same-patch lastError is preserved rather than nulled by the FIX-2 trustworthy clear.
+  const r = db.queuePatch(task(9).id, {
+    state: 'done',
+    lastError: 'heads up — static success text only',
+    submissionEvidence: { type: 'success-signal', detail: 'confirmation text', url: 'https://x/maybe' },
+  });
+  assert.equal(r.state, 'done');                       // evidence is present (non-null), so not downgraded here
+  assert.equal(r.lastError, 'heads up — static success text only');  // untrusted → error NOT cleared
+});
