@@ -24,6 +24,7 @@ import { classifyInterstitial } from './lib/interstitial.js';
 import { shouldFrontOnOpenerStall } from './lib/opener-stall.js';
 import { detectBotChallenge, botChallengeLastError } from './lib/challenge.js';
 import { ADVANCE_KEYWORDS, isAdvanceLabel } from './lib/advance.js';
+import { isLinkedInEasyApplyApplyUrl, isLinkedInApplyAdvanceLabel, deriveApplyRootFromAdvanceButton } from './lib/linkedin-apply.js';
 import { sitePack } from './sites/index.js';
 import { confirmSignalsMatched } from './lib/ats-drive.js';
 
@@ -388,6 +389,41 @@ async function waitForStickyLinkedInDialog(timeoutMs = 6500) {
     await sleep(150);
   }
   return null;
+}
+
+// ---- NEW FULL-PAGE Easy Apply recognition (KEYSTONE) ----
+// LinkedIn migrated Easy Apply from a pop-up modal to a FULL-PAGE flow on the
+// /jobs/view/<id>/apply/ route: NO `<form>`, NO `[role=dialog]`, obfuscated class names, a
+// "N/M pages" indicator and a Next/Review/Submit button. findApplyDialog() (old-modal
+// selectors only) misses it entirely, so we recognise it structurally here. LIVE-VALIDATED:
+// from the visible advance button (Next/Review/Submit/Continue), walk UP to the first ancestor
+// that bears >=1 visible field and does NOT swallow the global nav/search — that ancestor is
+// the apply form root. Returns the root element or null. The /apply/ URL is a fast guard so
+// this never fires on the plain job page (where the old-modal path / opener still win), but we
+// do NOT require it absolutely: a field-bearing advance root is itself sufficient evidence.
+const APPLY_FIELD_SEL = 'input:not([type="hidden"]), select, textarea, [role="combobox"], [contenteditable="true"]';
+const APPLY_NAV_SEL = 'header, nav, [role="banner"], [role="navigation"], [class*="global-nav"], [id*="global-nav"], .search-global-typeahead, [data-test-global-nav]';
+function findLinkedInApplyAdvanceButton() {
+  for (const el of qsa('button, input[type="submit"], [role="button"]')) {
+    if (!el || el.disabled || !isProbablyVisible(el)) continue;
+    if (isEasyApplyOpener(el)) continue;   // never the page-level opener
+    if (isLinkedInApplyAdvanceLabel(btnText(el))) return el;
+  }
+  return null;
+}
+function findLinkedInApplyPageRoot() {
+  if (!/(^|\.)linkedin\.com$/i.test(location.hostname)) return null;
+  // Only the /apply/ route is the full-page flow; the plain job page is the opener's domain.
+  if (!isLinkedInEasyApplyApplyUrl(location.pathname)) return null;
+  const btn = findLinkedInApplyAdvanceButton();
+  if (!btn) return null;
+  return deriveApplyRootFromAdvanceButton(btn, {
+    parentOf: (el) => el.parentElement,
+    countFields: (el) => {
+      try { return qsa(APPLY_FIELD_SEL, el).filter(isProbablyVisible).length; } catch { return 0; }
+    },
+    hasNav: (el) => { try { return !!el.querySelector?.(APPLY_NAV_SEL); } catch { return false; } },
+  });
 }
 
 // LinkedIn shows intermediate modals between the Easy-Apply opener and the real
@@ -1346,6 +1382,22 @@ export async function run(task, context, helpers) {
     }
     const probedRoot = formProbe?.form || null;
     const onLinkedIn = /(^|\.)linkedin\.com$/i.test(location.hostname);
+    // KEYSTONE: the new FULL-PAGE Easy Apply flow has no modal dialog. When findApplyDialog()
+    // misses, recognise the /jobs/view/<id>/apply/ full-page form structurally (the visible
+    // Next/Review/Submit button's field-bearing, nav-free ancestor). This is the root the
+    // existing fill + F1 advance logic then drives. The old-modal `dialog` still WINS when a
+    // real modal is present (search/collections split-view) so BOTH layouts work.
+    const applyPageRoot = (onLinkedIn && !dialog) ? findLinkedInApplyPageRoot() : null;
+    // OPENER → NAVIGATION recognition: the full-page opener NAVIGATES to .../apply/ instead
+    // of opening an in-place modal. The moment the live URL is the /apply/ route, the form is
+    // "opened" — latch everHadForm so the opener is NEVER re-clicked (this excludes the opener
+    // path below) even during the brief window before the advance button/fields hydrate. The
+    // duplicate-opener breaker therefore can't fire once we're on /apply/.
+    if (onLinkedIn && !everHadForm && isLinkedInEasyApplyApplyUrl(location.pathname)) {
+      everHadForm = true; S.everHadForm = true;
+      if (S.routeState === 'unknown') S.routeState = 'linkedin_easy_apply_modal';
+      logLine('ok', 'Easy Apply navigated to the full-page application (/apply/) — driving it here');
+    }
     const broadLinkedInRoot = onLinkedIn
       && (probedRoot === document || probedRoot === document.body || probedRoot === document.documentElement);
     // detectApplyForm may use document.body for SPA-style ATS pages. That is useful on
@@ -1379,17 +1431,25 @@ export async function run(task, context, helpers) {
         }
       } catch {}
     }
+    // On LinkedIn, once a form has opened the ONLY safe roots are the tight dialog OR the
+    // full-page apply root (both exclude the page-level opener + global nav). The full-page
+    // flow has no modal, so after Next/Review the next root is again the full-page apply root.
     const root = onLinkedIn && everHadForm
-      ? dialog
-      : (dialog || packRoot || (broadLinkedInRoot ? null : probedRoot));
+      ? (dialog || applyPageRoot)
+      : (dialog || applyPageRoot || packRoot || (broadLinkedInRoot ? null : probedRoot));
     const haveForm = !!root;
     if (haveForm) {
       everHadForm = true; S.everHadForm = true;
-      if (dialog && onLinkedIn) S.routeState = 'linkedin_easy_apply_modal';
+      // The full-page flow IS the Easy Apply application — treat it as the easy-apply route.
+      if ((dialog || applyPageRoot) && onLinkedIn) S.routeState = 'linkedin_easy_apply_modal';
       else if (!S.externalRoute && S.routeState === 'unknown') S.routeState = 'same_tab_application';
       signalHydrated(); reportSeen(root, 'apply form');
     }
-    if (!haveForm && everHadForm && onLinkedIn) {
+    // "Form disappeared after advancing" only fails when we're NOT on the full-page /apply/
+    // route. On /apply/ the form IS present (just mid-hydration / between pages after Next) —
+    // failing here would abort a live full-page application; the no-button hydration wait below
+    // handles that case correctly without ever re-clicking the opener.
+    if (!haveForm && everHadForm && onLinkedIn && !isLinkedInEasyApplyApplyUrl(location.pathname)) {
       const fingerprint = recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label: 'easy apply form', stage: 'lost-after-advance' });
       logLine('warn', 'Easy Apply form disappeared after advancing — stopping instead of re-clicking the opener');
       report({ state: 'failed', lastError: 'Easy Apply form disappeared after advancing — will retry', applyRoute: 'easy-apply', transcriptAppend: { kind: 'recovery', note: 'sticky Easy Apply scope was lost after advance', fingerprint } });
@@ -1503,11 +1563,18 @@ export async function run(task, context, helpers) {
 
     // ---- advance ----
     setStatus(`Step ${S.step}: looking for next/submit…`);
-    // In-form: prefer buttons inside the modal. Not open yet: also try LinkedIn's
-    // Easy-Apply button to OPEN the form (covers postings the generic scan misses).
+    // On the NEW full-page /apply/ route the opener is already gone (we navigated here), so we
+    // must NEVER use the open-path button finders (they could re-click a stray opener). Use the
+    // ADVANCE-ONLY scan (Next/Review/Submit) scoped to the form root or the document. This also
+    // covers the brief window where haveForm is false because the advance button hasn't hydrated.
+    const onApplyPage = onLinkedIn && isLinkedInEasyApplyApplyUrl(location.pathname);
+    // In-form: prefer buttons inside the modal. Not open yet (and NOT on /apply/): also try
+    // LinkedIn's Easy-Apply button to OPEN the form (covers postings the generic scan misses).
     let btn = haveForm
       ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }))
-      : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(root, { allowOpen: true }));
+      : (onApplyPage
+          ? (findAdvanceButton(root || document, { allowOpen: false }))
+          : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(root, { allowOpen: true })));
     if (!btn) {
       const opening = !everHadForm;   // the apply form has never appeared yet
       // Background/occluded apply tabs get their JS timers throttled by Chrome, so
@@ -1520,38 +1587,48 @@ export async function run(task, context, helpers) {
       // throttled tab's SPA (LinkedIn) often never hydrates the Easy-Apply button. Detect
       // it so we (a) wait MUCH longer in real wall-clock and (b) report the true cause.
       const wasHidden = (typeof document !== 'undefined' && document.visibilityState === 'hidden');
-      if (wasHidden && opening) {
-        if (frontToHydrate) {
-          // FRONT-UNTIL-HYDRATED: keep our own apply window front until the form loads (the
-          // SW hands focus back the moment we signal apply-hydrated, or after its own ~12s
-          // hard cap). A single 700ms nudge re-occludes before a heavy SPA can hydrate, so we
-          // need SUSTAINED visible time. Reactive: only fires because we are actually hidden.
-          requestFrontUntilHydrated();
-        } else {
-          // Setting off → keep today's one-shot nudge (briefly raise, restore focus ~700ms).
-          try { chrome.runtime?.sendMessage?.({ type: 'jat11.nudge-apply-window' }); } catch {}
-        }
-      }
+      // NON-FOCUS-STEALING: do NOT front the window preemptively. DIRECT live observation
+      // proved the Easy Apply form mounts + works on a HIDDEN, UNFOCUSED tab, so on the normal
+      // path we simply WAIT for it to hydrate (a hidden on-display tab is un-throttled enough).
+      // Fronting is now a RARE last-resort safety net: only after an initial wait fails do we
+      // escalate to front-until-hydrated (below). This avoids stealing the foreground on every
+      // apply (the v11.26.0 disruption) while still rescuing a genuinely occluded+stuck tab.
       logLine('warn', opening
-        ? (wasHidden
-            ? (frontToHydrate ? 'apply tab is hidden/occluded — Chrome throttled it; fronting its window until it hydrates' : 'apply tab is hidden/occluded — Chrome throttled it; nudging its window to hydrate')
-            : 'application not open yet — waiting for it to hydrate')
+        ? (wasHidden ? 'apply tab is hidden — waiting for the application to hydrate' : 'application not open yet — waiting for it to hydrate')
         : 'no advance button — waiting for the page (or you)');
       let found = null;
-      // A hidden/throttled tab gets ~1 timer tick/sec, so it needs far more real time —
-      // give it up to ~3 min (the pool's hard timeout still caps a truly dead tab). BUT once
-      // we've FRONTED the window (front-until-hydrated), the tab is no longer throttled, so a
-      // page that STILL won't hydrate within the SW's front cap (~12s) is genuinely stuck —
-      // don't burn the full 3 min; fail fast/retriably (retryStaleQueue re-attempts later).
-      const frontedCap = 28;   // ~14s of 500ms ticks — comfortably past the SW front hard-cap
-      const tries = opening ? ((wasHidden && frontToHydrate) ? frontedCap : (wasHidden ? 180 : 40)) : 60;
-      for (let i = 0; i < tries && !S.cancelled; i++) {
+      const findBtn = () => haveForm
+        ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }))
+        : (onApplyPage
+            ? findAdvanceButton(root || document, { allowOpen: false })
+            : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(document, { allowOpen: true })));
+      // 1) Initial hydration wait WITHOUT fronting. Hidden tabs get fewer timer ticks, so give
+      //    them more real wall-clock; a visible tab settles fast.
+      const initialTries = opening ? (wasHidden ? 40 : 40) : 60;   // ~20s hidden / ~20s visible
+      for (let i = 0; i < initialTries && !S.cancelled; i++) {
         if (opening && i % 4 === 0) { try { window.scrollTo(0, 600); window.scrollTo(0, 0); } catch {} }
         await sleep(500);
-        found = haveForm
-          ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }))
-          : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(document, { allowOpen: true }));
+        found = findBtn();
         if (found) { signalHydrated(); break; }
+      }
+      // 2) LAST-RESORT safety net: still nothing AND the tab is genuinely hidden+stuck on the
+      //    OPEN path. Now (and only now) front the window so a truly occluded tab gets visible
+      //    time, then wait the fronted cap. Rare by construction — never fires on the normal,
+      //    successfully-hydrating path. Gated by frontToHydrate (default ON); off → one-shot nudge.
+      if (!found && opening && wasHidden) {
+        if (frontToHydrate) {
+          logLine('warn', 'apply tab still not hydrated after waiting — fronting its window as a last resort');
+          requestFrontUntilHydrated();
+        } else {
+          try { chrome.runtime?.sendMessage?.({ type: 'jat11.nudge-apply-window' }); } catch {}
+        }
+        const frontedCap = 28;   // ~14s of 500ms ticks — comfortably past the SW front hard-cap
+        for (let i = 0; i < frontedCap && !S.cancelled; i++) {
+          if (i % 4 === 0) { try { window.scrollTo(0, 600); window.scrollTo(0, 0); } catch {} }
+          await sleep(500);
+          found = findBtn();
+          if (found) { signalHydrated(); break; }
+        }
       }
       if (!found) {
         // If we're stuck because of unanswered questions, park (self-heal) so the
@@ -1658,11 +1735,14 @@ export async function run(task, context, helpers) {
       }
       logLine('ok', 'final submit (auto mode)');
     }
-    // Snapshot the VERIFIED apply modal (the field-bearing `dialog`, never a loose
+    // Snapshot the VERIFIED apply surface (the field-bearing `dialog`, never a loose
     // fallback) before clicking submit, so detecting it close can't be tricked by
     // an unrelated modal (cookie/consent) closing. For a recognised account-less
-    // pack the snapshot scope is the adapter form root (no LinkedIn dialog).
-    const submitDialog = isFinal ? (dialog || (driveablePack ? root : null)) : null;
+    // pack the snapshot scope is the adapter form root (no LinkedIn dialog). For the
+    // NEW full-page Easy Apply flow there is no modal — the verified apply-page root is
+    // the tight scope (its disappearance / the page text becoming "application sent"
+    // after the click is the confirmation), so use it as the submit scope too.
+    const submitDialog = isFinal ? (dialog || applyPageRoot || (driveablePack ? root : null)) : null;
 
     // Re-verify the button is still clickable right before acting — the DOM may
     // have changed since findAdvanceButton() above (validation re-render, etc.).
@@ -1670,7 +1750,9 @@ export async function run(task, context, helpers) {
     if (clickBtn.disabled || !isProbablyVisible(clickBtn) || !document.contains(clickBtn)) {
       clickBtn = haveForm
         ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }))
-        : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(document, { allowOpen: true }));
+        : (onApplyPage
+            ? findAdvanceButton(root || document, { allowOpen: false })
+            : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(document, { allowOpen: true })));
       if (!clickBtn) { logLine('warn', 'advance button became invalid before click — re-scanning'); continue; }
     }
     const label = btnText(clickBtn).slice(0, 30);

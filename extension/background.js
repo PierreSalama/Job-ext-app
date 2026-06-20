@@ -1023,31 +1023,27 @@ async function autoApplyTargetWindow() {
   // Create it once. We OWN it (safe to close on Stop) — we never borrow or close one of
   // your own windows.
   try {
-    // F2 FIX: capture the user's focused window BEFORE we create+front ours, so we can hand
-    // focus back when the run ends.
-    await captureUserFocusOnce();
     let win = null;
-    // BUG-2 placement: on a multi-display setup the window goes FULLY onto a non-primary
-    // display (off the user's main screen); on a single display it goes out of the way
-    // (bottom-right). F2 REGRESSION FIX: create it FOCUSED. Chrome throttles a non-visible/
-    // occluded window → LinkedIn's Easy-Apply modal never mounts and external pages never
-    // hydrate (this is why focused:false near-zeroed submissions). The window must be the
-    // foreground window so its tab is un-throttled. We keep it fronted for the run and
-    // restore the user's focus only when the queue goes idle / Stop (restoreUserFocus).
-    const placement = await resolveApplyWindowCreate({ focused: true, state: 'normal' });
+    // NON-FOCUS-STEALING (reverts the v11.26.0 focus thrash). DIRECT live observation proved
+    // the Easy Apply form mounts + works on a HIDDEN, UNFOCUSED tab (document.hasFocus()===false,
+    // visibilityState==='hidden'). So we do NOT steal the foreground: create the apply window
+    // `focused:false`. BUG-2 placement is KEPT — on a multi-display setup the window goes FULLY
+    // onto a non-primary display (off the user's main screen, so it's visible+un-throttled there
+    // WITHOUT covering the user's work); on a single display it goes out of the way (bottom-right).
+    // The opener-stall→front + front-until-hydrate paths remain as a RARE last-resort safety net.
+    const placement = await resolveApplyWindowCreate({ focused: false, state: 'normal' });
     try { win = await chrome.windows.create(placement.create); } catch {}
     aaWindowId = win ? win.id : null;
     persistAaWindowId();
-    // Belt-and-suspenders: ensure it's actually focused even if create() didn't honor it.
-    if (aaWindowId != null) { try { await chrome.windows.update(aaWindowId, { focused: true, state: 'normal' }); } catch {} }
     return aaWindowId != null ? aaWindowId : undefined;
   } catch { return undefined; }
 }
 
-// F2 FIX: keep the active apply window FOREGROUND so Chrome doesn't throttle it (occluded/
-// background tabs get their JS suspended → LinkedIn never hydrates). This REPLACES the old
-// "focus for 700ms then yank focus back" strobe, which re-occluded the window before a heavy
-// SPA could mount. We now front it STABLY and leave it; the user's focus is restored once at
+// SAFETY-NET ONLY (reverted from the v11.26.0 always-on focus model). The normal path no
+// longer fronts the apply window — live observation proved the form mounts on a hidden/
+// unfocused tab, so fronting only disrupts the user. This fires solely from the legacy
+// jat11.nudge-apply-window message (when frontToHydrate is OFF) as a rare last-resort raise
+// for a tab that reported itself occluded AND not hydrating. The user's focus is restored at
 // run idle/stop (restoreUserFocus). Only ever touches windows WE own. Idempotent + guarded.
 async function nudgeApplyWindows() {
   await hydrateAaRuntime();
@@ -1112,21 +1108,19 @@ async function acquireApplyWindow(focus = false) {
     if (aaWindowPool.length >= cap && aaWindowPool.length) win = aaWindowPool[0];
   }
   if (win == null && aaWindowPool.length < cap) {
-    // …or create one. F2 FIX: capture the user's focus first, then create the apply window
-    // FOCUSED so its tab is un-throttled and the SPA hydrates. (NOTE: parallel pools open
-    // multiple apply windows but only ONE can be foreground at a time — the others are still
-    // throttled; this is why concurrency defaults to 1. The >1 confirm warns about this.)
+    // …or create one. NON-FOCUS-STEALING: create it `focused:false` by default (the form
+    // mounts fine on an unfocused on-display tab). Only the opt-in "bring window to front"
+    // path (focus===true) actually fronts. BUG-2 placement is kept: a non-primary display
+    // when available (off the user's screen + un-throttled), else out of the way.
     try {
-      await captureUserFocusOnce();
-      // BUG-2: same display-aware placement as autoApplyTargetWindow — a non-primary
-      // display when available (off the user's screen + un-throttled), else out of the way.
-      const placement = await resolveApplyWindowCreate({ focused: true, state: 'normal' });
+      if (focus) await captureUserFocusOnce();
+      const placement = await resolveApplyWindowCreate({ focused: !!focus, state: 'normal' });
       const w = await chrome.windows.create(placement.create);
       if (w) {
         win = w.id;
         aaWindowPool = normalizeWindowIds([...aaWindowPool, win]);
         persistAaWindowPool();
-        try { await chrome.windows.update(win, { focused: true, state: 'normal' }); } catch {}
+        if (focus) { try { await chrome.windows.update(win, { focused: true, state: 'normal' }); } catch {} }
       }
     } catch {}
   }
@@ -1155,13 +1149,12 @@ async function createAaTab(url, { active = true, focusWindow = false, winId: for
   const tab = await chrome.tabs.create({ url, active, ...(winId ? { windowId: winId } : {}) });
   trackAaTab(tab.id);   // register for cleanup/reaping (works without tabGroups, e.g. Firefox)
   await groupTab(tab.id);
-  // F2 FIX: APPLY tabs MUST load in a FOREGROUND window or Chrome throttles them and the
-  // page (LinkedIn Easy-Apply / external ATS) never hydrates. Front the apply window STABLY
-  // (no 700ms yank) for the load + opener click. focusWindow is the legacy opt-in flag, but
-  // we now front for every apply tab — hydration reliability is the whole point. The user's
-  // focus is captured once and restored when the run goes idle (restoreUserFocus). Discovery/
-  // sync tabs (isApply=false) never front. Fully guarded; never throws.
-  if (isApply && winId != null && chrome.windows?.update) {
+  // NON-FOCUS-STEALING: the normal path does NOT front the apply window (live observation
+  // proved the form mounts on a hidden/unfocused tab, so fronting only disrupts the user).
+  // The apply tab is the ACTIVE tab in its own (on-display) dedicated window; the opener-stall
+  // → front and front-until-hydrate paths remain as a rare reactive safety net for the unusual
+  // case where the tab really is occluded AND won't hydrate. `focusWindow` opt-in still fronts.
+  if (isApply && focusWindow && winId != null && chrome.windows?.update) {
     try { await focusApplyWindow(winId); } catch {}
   }
   return tab;

@@ -1,6 +1,15 @@
 const EASY_RX = /\beasy apply\b|candidature simplifi[ée]e?/i;
 const EXTERNAL_RX = /apply on (?:the )?(?:company|employer)|company (?:site|website)|employer (?:site|website)|apply externally|postuler sur le site|site de l['’](?:employeur|entreprise)/i;
 const APPLY_INTENT_RX = /\bapply\b|postuler|candidature/i;
+// FIX 3: the LinkedIn SEARCH page renders an "Easy Apply filter." pill (aria-label
+// "Easy Apply filter.") that matches EASY_RX but is a search FILTER, not an apply opener.
+// Clicking it never opens an application. Exclude any control whose label says "filter" or
+// that lives inside the search filter bar so the opener picker can never select it.
+const FILTER_LABEL_RX = /\bfilters?\b|\bfiltre/i;
+// Narrow to LinkedIn's actual search-filter containers — NOT a broad [class*="filter"] that
+// could swallow a legitimate top-card apply opener. The label check ("Easy Apply filter.")
+// is the precise primary signal; this is the structural backstop for unlabelled toggles.
+const FILTER_BAR_SEL = '.search-reusables__filter-binary-toggle, .search-reusables__filters-bar, .search-reusables__secondary-filters, [class*="search-filters-bar"], [id*="searchFilter" i], [class*="jobs-search-box"]';
 
 function value(el, name) {
   try { return el?.getAttribute?.(name) || ''; } catch { return ''; }
@@ -21,6 +30,14 @@ export function classifyApplyControl(el, { currentUrl = location.href } = {}) {
   const currentHost = hostOf(currentUrl);
   const targetHost = href ? hostOf(new URL(href, currentUrl).href) : '';
   const offOrigin = !!targetHost && targetHost !== currentHost;
+  // FIX 3: never classify a search FILTER pill as an Easy-Apply opener. A label containing
+  // "filter" (e.g. "Easy Apply filter.") or a control inside the search filter bar is a
+  // filter toggle, not an apply button — clicking it opens nothing.
+  let inFilterBar = false;
+  try { inFilterBar = !!el.closest?.(FILTER_BAR_SEL); } catch { inFilterBar = false; }
+  if (FILTER_LABEL_RX.test(label) || inFilterBar) {
+    return { state: 'unknown', evidence: 'filter-control-excluded', label, href: href || null };
+  }
   if (EASY_RX.test(label)) return { state: 'linkedin_easy_apply_modal', evidence: 'easy-apply-label', label, href: href || null };
   if ((offOrigin && APPLY_INTENT_RX.test(label)) || EXTERNAL_RX.test(label)) {
     return {
