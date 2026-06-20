@@ -18,6 +18,7 @@ import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
 import { pageTextLooksLikeSuccess, urlLooksLikeSuccess, evaluateSubmitEvidence } from './signals/success.js';
 import { qsa, isProbablyVisible, compactText } from './lib/dom.js';
+import { redactValue, redactLabel } from './lib/redact.js';
 import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence, resolveLocator, recoveryFingerprint, shouldResetPageActionBreaker } from './replay.js';
 import { classifyApplyControl, observeRoute, applyRouteForState } from './route.js';
 import { classifyInterstitial } from './lib/interstitial.js';
@@ -186,6 +187,39 @@ function logLine(level, text) {
     log.scrollTop = log.scrollHeight;
   }
   report({ transcriptAppend: { step: S.step, level, text: String(text).slice(0, 300) } });
+}
+
+// ============================================================
+// FORENSIC TRACE (VERBOSE) — additive, behavior-neutral.
+// ============================================================
+// VERBOSE turns the transcript into a COMPLETE, firsthand trace of every
+// executor decision (page state, field scans + fill outcomes, button choice +
+// why others were rejected, advance results, AI ladder, resume page, hydration,
+// screening/park, submit/success-truth, terminal). Default ON for forensic
+// debugging; flip to false to silence the verbose stream (the existing concise
+// logLine/report breadcrumbs stay on regardless — this only ADDS detail).
+//
+// vlog() is a thin wrapper over logLine: it no-ops when VERBOSE is off, never
+// throws (a logging bug must never break an apply), and tags every line with a
+// `trace:` prefix + a category so the lines are filterable in the transcript.
+// Each emitted string is hard-capped (logLine already slices to 300; we also cap
+// per-field at ~200 here) and NEVER carries raw DOM/innerText — only short,
+// redacted, structured descriptions.
+const VERBOSE = true;
+const TRACE_MAX = 200;   // hard cap per verbose log string (transcript-bloat guard)
+function vlog(category, text) {
+  if (!VERBOSE) return;
+  try { logLine('info', `trace:${category} ${String(text).slice(0, TRACE_MAX)}`); } catch {}
+}
+
+// Sensitive-value redaction for the trace (redactValue / redactLabel) is imported
+// from ./lib/redact.js — pure, DOM-free, and unit-tested directly. Passwords / SIN
+// / full SSN / card numbers are dropped ("[redacted]"); emails/phones are masked to
+// the last 4; everything is truncated short so the transcript never bloats or leaks.
+// pagePathOf() — the URL path (no query/hash) for compact page-state lines; the
+// full href is already carried by reportSeen, so the trace keeps it short.
+function pagePathOf() {
+  try { return (location.pathname || '/') + (location.search ? '?…' : ''); } catch { return '?'; }
 }
 function reportSeen(root, phase) {
   try {
@@ -596,6 +630,51 @@ function syntheticClick(el) {
   }
 }
 
+// ---- forensic trace helpers (read-only; never mutate the page) ----
+// The LinkedIn full-page flow + many ATS show a "Step N of M" / "N/M" progress
+// indicator. Best-effort scrape of the most explicit one for the page-state line.
+// PURE-ish (DOM read only) + guarded → '' when absent. Capped short.
+function pageProgressIndicator() {
+  try {
+    // 1) Accessible progress widgets carry the value in aria-* — prefer those.
+    const pb = document.querySelector('[role="progressbar"][aria-valuenow], progress[value]');
+    if (pb) {
+      const now = pb.getAttribute?.('aria-valuenow') ?? pb.getAttribute?.('value');
+      const max = pb.getAttribute?.('aria-valuemax') ?? pb.getAttribute?.('max');
+      if (now != null) return max != null ? `${now}/${max}` : String(now);
+    }
+    // 2) Visible "Step N of M" / "N of M pages" / "N / M" copy.
+    const txt = compactText(document.body?.innerText || '').slice(0, 4000);
+    const m = txt.match(/\b(?:step\s*)?(\d{1,2})\s*(?:of|\/)\s*(\d{1,2})\b(?:\s*(?:pages?|steps?))?/i);
+    if (m) return `${m[1]}/${m[2]}`;
+  } catch {}
+  return '';
+}
+// Short structural descriptor of which root matched (for the page-state line):
+// modal dialog vs the new /apply/ full-page root vs a recognised-ATS packRoot vs
+// a generic probed form vs none. PURE; no side effects.
+function describeRoot({ dialog, applyPageRoot, packRoot, probedRoot, root }) {
+  if (!root) return 'none';
+  if (root === dialog) return 'modal-dialog';
+  if (root === applyPageRoot) return 'apply-page-root(/apply/)';
+  if (root === packRoot) return 'ats-pack-root';
+  if (root === probedRoot) return 'probed-form';
+  return 'form';
+}
+// fieldType label for the trace (text/select/radio/checkbox/file/combobox/textarea).
+function traceFieldType(input) {
+  try {
+    if (!input) return 'field';
+    const tag = (input.tagName || '').toLowerCase();
+    if (tag === 'select') return 'select';
+    if (tag === 'textarea') return 'textarea';
+    const role = input.getAttribute?.('role');
+    if (role === 'combobox') return 'combobox';
+    if (input.closest?.('[class*="select__control"],[class*="react-select"],[class*="-control"],[class*="basic-typeahead"]')) return 'combobox';
+    return input.type || tag || 'field';
+  } catch { return 'field'; }
+}
+
 // Best-effort context around a (possibly hidden, custom-widget) file input: its own
 // attrs + accept, plus nearby button / label / dropzone text. Glassdoor and many ATS
 // hide the real <input type=file> behind a styled "Upload resume" button, so the input
@@ -777,6 +856,8 @@ async function handleResumePage(root, resume) {
     resumeRequired,
     haveResumeBytes,
   });
+  // [TRACE 6] RESUME PAGE — the live signals + the pure decision the executor will act on.
+  vlog('resume', `saved=${savedEls.length} selected=${anySelected} fileInput=${fileInputPresent} uploadBtn=${!!uploadAffordance} required=${resumeRequired} haveBytes=${haveResumeBytes} → action=${decision.action}${decision.reason ? ' (' + decision.reason + ')' : ''}`);
 
   if (decision.action === 'select') {
     const choice = savedEls[decision.index] || savedEls[0];
@@ -792,6 +873,7 @@ async function handleResumePage(root, resume) {
 
   if (decision.action === 'attach') {
     const att = await tryAttachResume(root, resume);
+    vlog('resume', `attach-existing → attached=${att.attached} ${att.attached > 0 ? 'OK' : 'FAIL'}`);
     return { acted: true, attached: att.attached, satisfied: att.attached > 0, park: null };
   }
 
@@ -799,9 +881,11 @@ async function handleResumePage(root, resume) {
     if (uploadAffordance) {
       logLine('ok', 'resume page: clicking "Upload resume" to create the file input');
       syntheticClick(uploadAffordance);
-      await waitForResumeFileInput(root);
+      const appeared = await waitForResumeFileInput(root);
+      vlog('resume', `clicked Upload-resume → file input ${appeared ? 'appeared' : 'did NOT appear'}`);
     }
     const att = await tryAttachResume(root, resume);
+    vlog('resume', `upload-then-attach → attached=${att.attached} ${att.attached > 0 ? 'OK' : 'FAIL'}`);
     if (att.attached > 0) return { acted: true, attached: att.attached, satisfied: true, park: null };
     // Re-scan: if a resume requirement is still showing and we couldn't attach, park honestly.
     if (resumeRequiredOnPage(root) || resumeRequired) {
@@ -1185,7 +1269,11 @@ export async function run(task, context, helpers) {
         const yesText = opts.find((o) => /^\s*yes\b/i.test(o)) || 'Yes';
         const noText = opts.find((o) => /^\s*no\b/i.test(o)) || 'No';
         answer = groundedEligibilityAnswer(u.label, { authorizedToWork, yesText, noText });
-        if (answer != null) logLine('ok', `recovered: grounded eligibility answer for "${u.label.slice(0, 40)}" → ${answer}`);
+        // [TRACE 8] grounded-eligibility default applied from the profile (never invented).
+        if (answer != null) {
+          vlog('screen', `grounded-eligibility "${redactLabel(u.label)}" = ${redactValue(answer, u.label)} (from profile, authorizedToWork=${authorizedToWork})`);
+          logLine('ok', `recovered: grounded eligibility answer for "${u.label.slice(0, 40)}" → ${answer}`);
+        }
       }
       // Parkable: a real question (has label) we couldn't answer → hand to the user.
       decided.push({ ...u, answer, parkable: !!u.label, reason: answer == null ? `needs your answer: ${u.label.slice(0, 80)}` : null });
@@ -1524,15 +1612,18 @@ export async function run(task, context, helpers) {
   // blocks that fallback in exactly that case; genuine non-LinkedIn ATS pages still use it.
   function findOpenBranchButton(fallbackScope) {
     const easyOpener = findEasyApplyButton();
-    if (easyOpener) return easyOpener;
+    if (easyOpener) { vlog('button', 'open-branch → easy-apply-opener'); return easyOpener; }
     const externalOpener = allowExternal ? findExternalApplyButton() : null;
-    if (externalOpener) return externalOpener;
+    if (externalOpener) { vlog('button', 'open-branch → external-opener'); return externalOpener; }
     const onLI = /(^|\.)linkedin\.com$/i.test(location.hostname);
     const onApply = onLI && isLinkedInEasyApplyApplyUrl(location.pathname);
     if (!shouldUseGenericOpenFallback({ onLinkedIn: onLI, onApplyRoute: onApply, hasEasyApplyOpener: false, haveForm: false })) {
+      vlog('button', 'open-branch → generic fallback EXCLUDED (LinkedIn job-view, no Easy Apply — would click a stray advance)');
       return null;   // LinkedIn job-view page, no Easy Apply → never click a stray advance button
     }
-    return findAdvanceButton(fallbackScope, { allowOpen: true });
+    const gen = findAdvanceButton(fallbackScope, { allowOpen: true });
+    vlog('button', gen ? `open-branch → generic fallback "${redactLabel(btnText(gen))}"` : 'open-branch → no generic advance found');
+    return gen;
   }
 
   while (S.step < MAX_STEPS && !S.cancelled && !finished) {
@@ -1703,6 +1794,22 @@ export async function run(task, context, helpers) {
       ? (dialog || applyPageRoot)
       : (dialog || applyPageRoot || packRoot || (broadLinkedInRoot ? null : probedRoot));
     const haveForm = !!root;
+    // [TRACE 1] PAGE STATE — one structured line per loop iteration capturing
+    // exactly what the executor sees before it acts: step#, URL path, tab
+    // visibility/focus (the throttling signals), the N/M page indicator, the
+    // current route state, haveForm, and WHICH root matched (modal vs /apply/
+    // root vs ats-pack vs probed form) + a short why for the no-form case.
+    try {
+      const progress = pageProgressIndicator();
+      const rootDesc = describeRoot({ dialog, applyPageRoot, packRoot, probedRoot, root });
+      let vis = '?'; let focus = '?';
+      try { vis = document.visibilityState; } catch {}
+      try { focus = document.hasFocus() ? 'focused' : 'blurred'; } catch {}
+      vlog('page', `step=${S.step} path=${pagePathOf()} vis=${vis} ${focus}`
+        + (progress ? ` pages=${progress}` : '')
+        + ` route=${S.routeState || 'unknown'} haveForm=${haveForm} root=${rootDesc}`
+        + (haveForm ? '' : ` (everHadForm=${everHadForm}${onLinkedIn ? ' onLinkedIn' : ''}${atsPack ? ' ats=' + atsPack.id : ''})`));
+    } catch {}
     if (haveForm) {
       everHadForm = true; S.everHadForm = true;
       // The full-page flow IS the Easy Apply application — treat it as the easy-apply route.
@@ -1741,7 +1848,27 @@ export async function run(task, context, helpers) {
       }
       return true;
     }) : [];
-    const filled = await engine.fill(suggestions);
+    // [TRACE 2a] FIELD SCAN — what scanFillable resolved as fillable (label/type/
+    // source), value redacted. The per-field FILL OUTCOME is traced via the
+    // onOutcome side-channel passed to engine.fill() below (behavior-neutral).
+    if (haveForm) {
+      vlog('scan', `fillable=${suggestions.length}`);
+      for (const s of suggestions.slice(0, 12)) {
+        vlog('field', `"${redactLabel(s.label)}" type=${traceFieldType(s.input)} src=${s.source || '?'} → ${redactValue(s.value, s.label)}`);
+      }
+    }
+    const filled = await engine.fill(suggestions, ({ suggestion, outcome, detail }) => {
+      // [TRACE 2b] FILL OUTCOME per field.
+      const lbl = redactLabel(suggestion.label);
+      const src = suggestion.source === 'qa' ? 'filled-from-qa' : 'filled-from-profile';
+      if (outcome === 'filled') vlog('fill', `"${lbl}" → ${src}`);
+      else if (outcome === 'fuzzy-snapped') vlog('fill', `"${lbl}" → fuzzy-snapped-to "${redactLabel(detail)}"`);
+      else if (outcome === 'skipped-no-option') vlog('fill', `"${lbl}" → left-empty (no matching option)`);
+      else if (outcome === 'skipped-combobox-miss') vlog('fill', `"${lbl}" → left-empty (typeahead no match)`);
+      else if (outcome === 'skipped-not-yes') vlog('fill', `"${lbl}" → skipped-optional (checkbox, answer not affirmative)`);
+      else if (outcome === 'skipped-site-chrome') vlog('fill', `"${lbl}" → skipped (site chrome)`);
+      else if (outcome === 'error') vlog('fill', `"${lbl}" → error (${String(detail || '').slice(0, 40)})`);
+    });
     if (filled) logLine('ok', `filled ${filled} field(s) from profile/history`);
 
     // ---- resume upload / selection (handles BOTH layouts) ----
@@ -1805,9 +1932,16 @@ export async function run(task, context, helpers) {
       }
       return true;
     }).slice(0, 5);
+    // [TRACE 2c] UNANSWERED fields the ladder must resolve (with required flag).
+    if (haveForm) {
+      vlog('scan', `unknown=${unknownAll.length} toResolve=${unknown.length}`);
+      for (const u of unknown) vlog('field', `unanswered "${redactLabel(u.label)}" type=${u.fieldType}${u.required ? ' REQUIRED' : ' optional'}${u.options ? ' opts=' + u.options.length : ''}`);
+    }
     for (const u of unknown) {
       if (S.cancelled) break;
       if (LEGAL_RX.test(u.label)) {
+        // [TRACE 8] SCREENING — legal/eligibility never goes to AI; parked for the user.
+        vlog('screen', `legal/eligibility "${redactLabel(u.label)}" → not AI'd${(u.required || onJobBoard) ? ' → PARK' : ' → left (optional)'}`);
         logLine('warn', `legal/eligibility question not in profile: "${u.label.slice(0, 60)}" — leaving for you`);
         if (u.required || onJobBoard) park(u.label, u.fieldType, u.options, 'legal/eligibility — needs your answer');
         continue;
@@ -1815,10 +1949,13 @@ export async function run(task, context, helpers) {
       // Optional photo/headshot fields: leave blank + move on — don't park the job on a
       // field that's almost always optional and can't be truthfully auto-answered.
       if (OPTIONAL_SKIP_RX.test(u.label)) {
+        vlog('field', `"${redactLabel(u.label)}" → left-empty (optional photo/headshot — not auto-answerable)`);
         logLine('warn', `left optional field blank: "${u.label.slice(0, 40)}" (photo/headshot — not auto-answerable)`);
         continue;
       }
       setStatus(`Step ${S.step}: thinking about "${u.label.slice(0, 40)}…"`);
+      // [TRACE 5] AI LADDER — the question going to /ai/answer-question.
+      vlog('ai', `ask "${redactLabel(u.label)}" type=${u.fieldType}`);
       const r = await send({
         type: 'api-call', method: 'POST', path: '/ai/answer-question',
         timeoutMs: 150000,
@@ -1829,16 +1966,23 @@ export async function run(task, context, helpers) {
       const a = (r?.ok && r.result && typeof r.result.answer === 'string'
                  && typeof r.result.confidence === 'number') ? r.result : null;
       if (!a || a.refuse || a.confidence < S.sessionSettings.confidence || !a.answer.trim()) {
+        // [TRACE 5] AI result rejected — refusal / low-confidence / malformed.
+        const why = !a ? 'malformed/failed' : a.refuse ? 'refused' : !a.answer.trim() ? 'empty' : `conf ${a.confidence.toFixed(2)}<min ${S.sessionSettings.confidence}`;
+        vlog('ai', `reply "${redactLabel(u.label)}" → ${a ? 'ans="' + redactValue(a.answer, u.label) + '" ' : ''}${why} → ${(u.required || onJobBoard) ? 'PARK' : 'left'}`);
         logLine('warn', `no grounded answer for "${u.label.slice(0, 50)}" (${a ? 'conf ' + a.confidence : 'ai failed/malformed'})`);
         // Not highly confident → park it (don't guess). Required fields and any
         // job-board screening question must be answered before we submit.
         if (u.required || onJobBoard) park(u.label, u.fieldType, u.options, a && a.reason ? a.reason : 'no confident answer');
         continue;
       }
+      // [TRACE 5] AI accepted (above confidence floor).
+      vlog('ai', `reply "${redactLabel(u.label)}" → ans="${redactValue(a.answer, u.label)}" conf=${a.confidence.toFixed(2)} → accepted`);
       const ok = await engine.fill([{ input: u.input, value: a.answer }]);
       if (ok) {
         logLine('ok', `AI answered "${u.label.slice(0, 40)}" (conf ${a.confidence.toFixed(2)})`);
         await engine.recordAnswer({ question: u.label, answer: a.answer, fieldType: u.fieldType, source: 'ai', jobId: job?.id });
+      } else {
+        vlog('ai', `"${redactLabel(u.label)}" → AI answer could NOT be filled (un-pickable widget)`);
       }
     }
 
@@ -1874,6 +2018,15 @@ export async function run(task, context, helpers) {
       : (onApplyPage
           ? (findAdvanceButton(root || document, { allowOpen: false }))
           : findOpenBranchButton(root));
+    // [TRACE 3] BUTTON CHOICE — which control was selected and which TIER (in-form
+    // advance vs /apply/ advance vs easy-apply/external/generic opener) + the branch.
+    try {
+      const tier = haveForm ? 'in-form-advance'
+        : onApplyPage ? '/apply/-advance'
+        : 'open-branch(opener)';
+      if (btn) vlog('button', `chose "${redactLabel(btnText(btn))}" tier=${tier}${isEasyApplyOpener(btn) ? ' [easy-apply-opener]' : ''}`);
+      else vlog('button', `no control found (tier=${tier}) — opener excluded? haveForm=${haveForm} onApplyPage=${onApplyPage}`);
+    } catch {}
     if (!btn) {
       const opening = !everHadForm;   // the apply form has never appeared yet
       // Fix 3: the NEW Easy Apply NAVIGATES to a full /apply/ page that must LOAD. On a
@@ -1911,12 +2064,17 @@ export async function run(task, context, helpers) {
       // 1) Initial hydration wait WITHOUT fronting. Hidden tabs get fewer timer ticks, so give
       //    them more real wall-clock; a visible tab settles fast.
       const initialTries = opening ? (wasHidden ? 40 : 40) : 60;   // ~20s hidden / ~20s visible
+      // [TRACE 7] HYDRATION — entering the wait, with the occlusion/visibility cause + cap.
+      const hydrateStart = Date.now();
+      vlog('hydrate', `wait begin opening=${opening} applyPageLoading=${applyPageLoading} hidden=${wasHidden} cap=${initialTries * 500}ms`);
       for (let i = 0; i < initialTries && !S.cancelled; i++) {
         if ((opening || applyPageLoading) && i % 4 === 0) { try { window.scrollTo(0, 600); window.scrollTo(0, 0); } catch {} }
         await sleep(500);
         found = findBtn();
         if (found) { signalHydrated(); break; }
       }
+      if (found) vlog('hydrate', `hydrated after ${Date.now() - hydrateStart}ms (initial wait)`);
+      else vlog('hydrate', `initial wait EXHAUSTED (${Date.now() - hydrateStart}ms) — no control yet${(opening || applyPageLoading) && wasHidden ? ' → escalating to front-until-hydrate' : ''}`);
       // 2) LAST-RESORT safety net: still nothing AND the tab is genuinely hidden+stuck either on
       //    the OPEN path (form never opened) OR on the /apply/ page-LOAD path (Fix 3: navigated to
       //    the full-page /apply/ form but it hasn't hydrated on this throttled tab). Now (and only
@@ -1934,12 +2092,15 @@ export async function run(task, context, helpers) {
           try { chrome.runtime?.sendMessage?.({ type: 'jat11.nudge-apply-window' }); } catch {}
         }
         const frontedCap = 28;   // ~14s of 500ms ticks — comfortably past the SW front hard-cap
+        const frontStart = Date.now();
+        vlog('hydrate', `front-until-hydrate requested (frontToHydrate=${frontToHydrate}) cap=${frontedCap * 500}ms`);
         for (let i = 0; i < frontedCap && !S.cancelled; i++) {
           if (i % 4 === 0) { try { window.scrollTo(0, 600); window.scrollTo(0, 0); } catch {} }
           await sleep(500);
           found = findBtn();
           if (found) { signalHydrated(); break; }
         }
+        vlog('hydrate', found ? `hydrated after fronting (${Date.now() - frontStart}ms)` : `FAST-FAIL CAP HIT — still not hydrated after fronting (${Date.now() - frontStart}ms)`);
       }
       if (!found) {
         // If we're stuck because of unanswered questions, park (self-heal) so the
@@ -2018,6 +2179,8 @@ export async function run(task, context, helpers) {
       try { packSubmit = !!driveablePack.isSubmitHint(btnText(btn), btn); } catch {}
     }
     const isFinal = packSubmit || isFinalSubmit(btn);
+    // [TRACE 3] isFinalSubmit decision — is this the terminal submit, and via which recognizer.
+    vlog('button', `isFinalSubmit("${redactLabel(btnText(btn))}")=${isFinal}${isFinal ? (packSubmit ? ' [ats-pack hint]' : ' [generic recognizer]') : ''} mode=${mode}`);
     if (isFinal) {
       // SAFETY NET: never submit a job that still has unanswered questions.
       if (parked.length) { reportParked('final-submit'); break; }
@@ -2174,6 +2337,9 @@ export async function run(task, context, helpers) {
     const submitBaseline = (isFinal && mode !== 'review')
       ? submitSnapshot(submitDialog || findApplyDialog())
       : null;
+    // [TRACE 9] SUBMIT — the pre-click success-truth baseline (text already looks like
+    // success? + confirmation-node signature count) so the post-click diff is auditable.
+    if (submitBaseline) vlog('submit', `baseline url=${pagePathOf()} successTextAlready=${submitBaseline.successText} nodeSig=${submitBaseline.nodeSig?.size ?? 0} formGrounded=${formGrounded}`);
     const submitClickAt = Date.now();
     syntheticClick(clickBtn);
     if (externalClick && handoffToken) {
@@ -2211,6 +2377,16 @@ export async function run(task, context, helpers) {
       }
     }
     const changed = await waitForChange(prevHash);
+    // [TRACE 4] ADVANCE RESULT — did the page change after the click? (domHash diff +
+    // url move + the next page indicator). The no-change branch below traces the rescan.
+    try {
+      const afterPath = pagePathOf();
+      const prog = pageProgressIndicator();
+      vlog('advance', `clicked "${redactLabel(label)}" → changed=${changed}`
+        + (beforeClickUrl !== location.href ? ` url:${'navigated'}` : ' url:same')
+        + (afterPath ? ` path=${afterPath}` : '')
+        + (prog ? ` pages=${prog}` : ''));
+    } catch {}
     if (changed && S.routeState === 'unknown') {
       const observed = observeRoute({ beforeUrl: beforeClickUrl, afterUrl: location.href, dialogOpen: !!findApplyDialog() });
       S.routeState = observed.state;
@@ -2260,6 +2436,8 @@ export async function run(task, context, helpers) {
       //     mid-flow case so a brief React drop of the dialog after Review can't mis-route it.
       //   • EXTERNAL click → neither (its own handoff + no-progress cap handled above).
       const noChangeRoute = classifyNoChangeRoute({ haveForm, everHadForm, isExternalClick: externalClick });
+      // [TRACE 4] no-change route decision: opening (opener stall) vs mid-flow (advance-blocked rescan).
+      vlog('advance', `blocked — re-scanning; route=${noChangeRoute.route} (haveForm=${haveForm} everHadForm=${everHadForm} ext=${externalClick})`);
       // ---- F2 KEYSTONE (OPENING ONLY): opener clicked but the modal never mounted → FRONT + RETRY ----
       // We clicked the Easy-Apply OPENER (no form open yet) and nothing changed AND no apply
       // modal mounted. The dominant cause on the regressed build: the apply window is occluded
@@ -2321,6 +2499,8 @@ export async function run(task, context, helpers) {
         logLine('warn', `advance blocked — re-scanning this page for an unanswered required field (try ${blockedRescueTries})`);
         await sleep(600);   // let LinkedIn render its inline "required" markers / validation state
         const rescue = await answerBlockingRequiredFields(root);
+        // [TRACE 4] what the advance-blocked rescan found/answered.
+        vlog('advance', `rescan: sawRequired=${rescue.sawRequired} filled=${rescue.filled} parked=${rescue.parkedCount}`);
         if (rescue.parkedCount && parked.length) {
           // A required field we genuinely can't answer is blocking → park honestly (replaces the
           // old "stuck — page stopped advancing" loop for the unanswerable case). NEVER submit
@@ -2446,8 +2626,19 @@ export async function run(task, context, helpers) {
         const src = confirmSignalsMatched(driveablePack.confirmSignals, (submitBaseline?.text || ''), (after?.text || ''));
         if (src) packSignalReason = `confirm-signal:${src}`;
       }
+      // [TRACE 9] SUBMIT result — the settle outcome + evidence the evaluator weighed +
+      // the after-snapshot diff (url move? new confirmation nodes? text became success?).
+      try {
+        const newNodeCount = newConfirmationNodes(submitBaseline).length;
+        vlog('submit', `settle=${how || 'none'} verified=${verdict.verified} reason=${verdict.reason}`
+          + ` urlMoved=${beforeClickUrl !== location.href} successTextNow=${after?.successText} newNodes=${newNodeCount}`
+          + ` formClosed=${formClosed}${packSignalReason ? ' ' + packSignalReason : ''} elapsed=${Date.now() - submitClickAt}ms`);
+      } catch {}
       if (verdict.verified || formClosed || packSignalReason) {
         const reason = verdict.verified ? verdict.reason : (packSignalReason || 'apply-form-closed');
+        // [TRACE 9] DONE — the evidence TYPE chosen for the verified submission.
+        const evType = verdict.verified ? `verified:${verdict.reason}` : packSignalReason ? packSignalReason : 'apply-form-closed';
+        vlog('submit', `→ DONE evidence=${evType}`);
         logLine('ok', `✓ application submitted (${reason})`);
         setStatus('✓ Application submitted');
         // Mark the JOB submitted too, so it's counted even if the passive capture
@@ -2465,6 +2656,8 @@ export async function run(task, context, helpers) {
       }
       // Submit was clicked but NOT proven. Do not fabricate a done. Report
       // submitted-but-unverified so the user confirms it, rather than trusting it.
+      // [TRACE 9] submit clicked but unproven → awaiting_review (never minted done).
+      vlog('submit', `→ AWAITING_REVIEW (unverified: ${verdict.reason})`);
       logLine('warn', `submit not verified (${verdict.reason}) — flagged for your review`);
       setStatus('Submitted — awaiting your confirmation');
       report({ state: 'awaiting_review', lastError: `submit was clicked but could not be verified (${verdict.reason}) — please confirm`, transcriptAppend: { note: `submit unverified — ${verdict.reason}` } });
@@ -2484,6 +2677,15 @@ export async function run(task, context, helpers) {
       finalState = 'failed';
     }
   }
+
+  // [TRACE 10] TERMINAL — the final state, lastError, route, steps + a one-line WHY.
+  try {
+    const term = finalState || (S.cancelled ? 'skipped' : 'unknown');
+    const why = S.lastReport?.lastError
+      || (parked.length ? `parked: ${parked.length} unanswered (${parked.map((p) => redactLabel(p.question)).slice(0, 3).join('; ')})` : null)
+      || (S.cancelled ? 'cancelled by user/escape' : 'no terminal diagnostic');
+    vlog('terminal', `state=${term} route=${S.routeState || 'unknown'} steps=${S.step} everHadForm=${everHadForm} formGrounded=${formGrounded} why=${String(why).slice(0, 120)}`);
+  } catch {}
 
   S.running = false;
   // Always release any held front-until-hydrated so focus is handed back even if the run

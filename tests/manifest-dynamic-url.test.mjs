@@ -1,9 +1,10 @@
-// FIX 4 (anti-detection): web_accessible_resources must use a rotating per-session UUID.
-// LinkedIn's 2026 "BrowserGate" fingerprinting probes chrome-extension://<static-id>/<resource>
-// to DETECT installed extensions. Setting use_dynamic_url:true serves WAR resources under a
-// rotating UUID, so the static-ID probe 404s. Manifest-only change (no new permission). The
-// content loader chain must reference every resource via a RUNTIME chrome.runtime.getURL(...)
-// (the UUID rotates per session) — never a hardcoded chrome-extension://<id>/… literal.
+// use_dynamic_url MUST NOT be set on web_accessible_resources.
+// We tried it (v11.31.0) as anti-detection vs LinkedIn's "BrowserGate" extension-ID
+// probing — but it BROKE the engine: the content-script loader's dynamic
+// `import(chrome.runtime.getURL('content/detector.js'))` fails to FETCH a
+// use_dynamic_url resource ("Failed to fetch dynamically imported module"), so the
+// engine never loads and auto-apply is fully dead. Reverted in v11.31.x. Keep it off.
+// (The no-hardcoded-static-ID guarantee below is still good hygiene regardless.)
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -11,10 +12,11 @@ import fs from 'node:fs';
 
 const mf = JSON.parse(fs.readFileSync(new URL('../extension/manifest.json', import.meta.url), 'utf8'));
 
-test('web_accessible_resources sets use_dynamic_url:true', () => {
+test('web_accessible_resources does NOT set use_dynamic_url (it breaks content-script dynamic import)', () => {
   const war = mf.web_accessible_resources?.[0];
   assert.ok(war, 'a web_accessible_resources entry exists');
-  assert.equal(war.use_dynamic_url, true);
+  assert.ok(!('use_dynamic_url' in war) || war.use_dynamic_url === false,
+    'use_dynamic_url must be absent/false — it breaks import(getURL(...)) of content modules');
 });
 
 test('the WAR resource list is unchanged in shape (still covers the content chain)', () => {

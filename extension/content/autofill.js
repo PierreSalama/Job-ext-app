@@ -489,42 +489,61 @@ export class AutofillEngine {
     return out;
   }
 
-  async fill(suggestions) {
+  // fill(suggestions, onOutcome?) — fills each suggested field. `onOutcome` is an
+  // OPTIONAL, behavior-neutral side-channel for forensic logging: it is invoked with
+  // ({ suggestion, outcome, detail }) for every field (filled OR skipped) and its
+  // return value is ignored. It NEVER changes what gets filled or the returned count —
+  // it only observes (so the executor can write a per-field FILL-OUTCOME trace line).
+  // outcome ∈ filled | fuzzy-snapped | skipped-no-option | skipped-not-yes |
+  //          skipped-site-chrome | skipped-combobox-miss | error.
+  async fill(suggestions, onOutcome) {
+    const emit = typeof onOutcome === 'function'
+      ? (suggestion, outcome, detail) => { try { onOutcome({ suggestion, outcome, detail }); } catch {} }
+      : () => {};
     let n = 0;
     for (const s of suggestions) {
       try {
-        if (isSiteChromeInput(s.input)) continue;   // belt-and-suspenders: never fill site chrome
+        if (isSiteChromeInput(s.input)) { emit(s, 'skipped-site-chrome'); continue; }   // belt-and-suspenders: never fill site chrome
         const v = String(s.value);
         const isCombo = s.input.getAttribute && (s.input.getAttribute('role') === 'combobox'
           || (s.input.closest && s.input.closest('[class*="select__control"],[class*="react-select"],[class*="-control"],[class*="basic-typeahead"]')));
         if (s.input.tagName === 'SELECT') {
           const opt = matchOption(s.input, v);
-          if (!opt) continue;
+          if (!opt) { emit(s, 'skipped-no-option'); continue; }
           setNativeValue(s.input, opt.value);
+          // Detect a fuzzy snap: the chosen option text isn't an exact/substring of the value.
+          const snapped = !(opt.value === v || opt.text === v
+            || String(opt.value).toLowerCase() === v.toLowerCase()
+            || String(opt.text).toLowerCase().trim() === v.toLowerCase().trim());
+          emit(s, snapped ? 'fuzzy-snapped' : 'filled', snapped ? (opt.text || opt.value) : undefined);
         } else if (isCombo) {
           // custom dropdown / typeahead (Workday/Greenhouse/Lever/LinkedIn location) — async
-          if (!(await fillCombobox(s.input, v))) continue;
+          if (!(await fillCombobox(s.input, v))) { emit(s, 'skipped-combobox-miss'); continue; }
+          emit(s, 'filled');
         } else if (s.input.type === 'radio') {
           // Radio GROUPS (years-of-experience, work-authorization, salary band) are
           // not yes/no — pick the option in the group whose label best matches the
           // answer. Falls back to the old yes-token behaviour for boolean radios.
           const picked = pickRadioInGroup(s.input, v);
           const target = picked || (/^(yes|true|y|oui|sí|si|ja|1)$/i.test(v) ? s.input : null);
-          if (!target) continue;
+          if (!target) { emit(s, 'skipped-no-option'); continue; }
           target.checked = true;
           target.dispatchEvent(new Event('input', { bubbles: true }));
           target.dispatchEvent(new Event('change', { bubbles: true }));
+          emit(s, 'filled');
         } else if (s.input.type === 'checkbox') {
           const yes = /^(yes|true|y|oui|sí|si|ja|1)$/i.test(v);
-          if (!yes) continue;
+          if (!yes) { emit(s, 'skipped-not-yes'); continue; }
           s.input.checked = true;
           s.input.dispatchEvent(new Event('input', { bubbles: true }));
           s.input.dispatchEvent(new Event('change', { bubbles: true }));
+          emit(s, 'filled');
         } else {
           setNativeValue(s.input, v);
+          emit(s, 'filled');
         }
         n++;
-      } catch {}
+      } catch (e) { emit(s, 'error', e?.message); }
     }
     return n;
   }
