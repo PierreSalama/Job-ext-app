@@ -31,6 +31,35 @@ export function confirmSignalsMatched(signals, beforeText, afterText) {
   return null;
 }
 
+// findPackSubmitBroadened — BROADENED final-submit pick for a recognised account-less
+// ATS whose final "Submit Application" button sits OUTSIDE the field container (e.g.
+// BambooHR renders it in a page-level footer, not inside the form root). The normal
+// in-form advance/submit scan is root-scoped and misses it. When that scan finds nothing,
+// the executor re-scans a BROADER scope (document) and asks THIS helper which candidate is
+// the pack's final submit, using ONLY the adapter's specific `isSubmitHint` — never an
+// arbitrary button. This keeps the broadening conservative: a button must match the pack's
+// own submit recognizer (e.g. bamboohr → "submit application") AND be visible + enabled.
+//
+// The DOM walk stays in the executor (it builds the candidates array with live text +
+// visibility + the element handle); THIS function is the pure, node-testable decision:
+// "of these candidates, which is the pack's final submit?".
+//
+// @param candidates  array of { text, el, visible, disabled } — buttons in the broad scope.
+// @param isSubmitHint  the adapter's submit recognizer: (text, el) => boolean.
+// @returns the index of the first visible, enabled candidate the adapter recognises as its
+//          final submit; or -1 when none qualify (so the executor does NOT broaden blindly).
+export function findPackSubmitBroadened(candidates, isSubmitHint) {
+  if (!Array.isArray(candidates) || typeof isSubmitHint !== 'function') return -1;
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    if (!c || !c.visible || c.disabled) continue;
+    let hit = false;
+    try { hit = !!isSubmitHint(c.text, c.el); } catch { hit = false; }
+    if (hit) return i;
+  }
+  return -1;
+}
+
 // Normalize a confirmSignal entry (RegExp or string) into a case-insensitive RegExp.
 // Strings are treated as literal substrings (escaped). Returns null on bad input.
 function toRegExp(sig) {

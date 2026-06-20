@@ -19,7 +19,7 @@ import greenhouse from '../extension/content/sites/greenhouse.js';
 import ashby from '../extension/content/sites/ashby.js';
 import bamboohr from '../extension/content/sites/bamboohr.js';
 import { wallAdapters } from '../extension/content/sites/walls.js';
-import { confirmSignalsMatched } from '../extension/content/lib/ats-drive.js';
+import { confirmSignalsMatched, findPackSubmitBroadened } from '../extension/content/lib/ats-drive.js';
 
 const byId = (id) => wallAdapters.find((a) => a.id === id);
 const workday = byId('workday');
@@ -138,6 +138,55 @@ test('isSubmitHint: recognises the FINAL submit, rejects non-submit controls', (
   assert.equal(workday.isSubmitHint('Submit', el({})), true);
   assert.equal(workday.isSubmitHint('Soumettre', el({})), true);
   assert.equal(workday.isSubmitHint('Next', el({})), false);
+});
+
+test('findPackSubmitBroadened picks the pack final-submit OUTSIDE the form root (BambooHR footer)', () => {
+  // BambooHR renders "Submit Application" in a page-level footer outside the field
+  // container; the root-scoped scan misses it. When the executor re-scans a broader scope
+  // it hands the candidates here and only a button the pack's OWN isSubmitHint recognises
+  // (visible + enabled) qualifies — never an arbitrary button.
+  const submit = el({ name: 'submit', text: 'Submit Application' });
+  const cands = [
+    { el: el({ text: 'Apply for This Job' }), text: 'Apply for This Job', visible: true, disabled: false },
+    { el: submit, text: 'Submit Application', visible: true, disabled: false },
+  ];
+  const idx = findPackSubmitBroadened(cands, bamboohr.isSubmitHint);
+  assert.equal(idx, 1, 'should select the "Submit Application" footer button');
+  assert.equal(cands[idx].el, submit);
+
+  // Conservative: a NON-submit button (e.g. a generic "Continue") never qualifies, even
+  // when it is the only visible control — broadening must not click an arbitrary button.
+  assert.equal(
+    findPackSubmitBroadened(
+      [{ el: el({ text: 'Continue' }), text: 'Continue', visible: true, disabled: false }],
+      bamboohr.isSubmitHint,
+    ),
+    -1,
+  );
+
+  // Invisible or disabled submit buttons are skipped.
+  assert.equal(
+    findPackSubmitBroadened([{ el: submit, text: 'Submit Application', visible: false, disabled: false }], bamboohr.isSubmitHint),
+    -1,
+  );
+  assert.equal(
+    findPackSubmitBroadened([{ el: submit, text: 'Submit Application', visible: true, disabled: true }], bamboohr.isSubmitHint),
+    -1,
+  );
+
+  // The FIRST visible+enabled recognised submit wins (stable order).
+  const two = [
+    { el: el({ text: 'Submit Application' }), text: 'Submit Application', visible: true, disabled: false },
+    { el: el({ text: 'Submit Application' }), text: 'Submit Application', visible: true, disabled: false },
+  ];
+  assert.equal(findPackSubmitBroadened(two, bamboohr.isSubmitHint), 0);
+
+  // Bad inputs → -1 (never throws, never broadens).
+  assert.equal(findPackSubmitBroadened(null, bamboohr.isSubmitHint), -1);
+  assert.equal(findPackSubmitBroadened(cands, null), -1);
+  assert.equal(findPackSubmitBroadened([], bamboohr.isSubmitHint), -1);
+  // A throwing isSubmitHint is swallowed (a hostile adapter must not break the loop).
+  assert.equal(findPackSubmitBroadened(cands, () => { throw new Error('boom'); }), -1);
 });
 
 test('confirmSignalsMatched only counts NEW post-submit confirmation (never weakens R1)', () => {

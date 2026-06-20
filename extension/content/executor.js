@@ -27,7 +27,7 @@ import { detectBotChallenge, botChallengeLastError } from './lib/challenge.js';
 import { ADVANCE_KEYWORDS, isAdvanceLabel } from './lib/advance.js';
 import { isLinkedInEasyApplyApplyUrl, isLinkedInApplyAdvanceLabel, deriveApplyRootFromAdvanceButton, shouldUseGenericOpenFallback, decideResumePage, isUploadResumeAffordanceLabel, pageRequiresResume, groundedEligibilityAnswer, isEligibilityScreeningQuestion, decideAnswerOrPark } from './lib/linkedin-apply.js';
 import { sitePack } from './sites/index.js';
-import { confirmSignalsMatched } from './lib/ats-drive.js';
+import { confirmSignalsMatched, findPackSubmitBroadened } from './lib/ats-drive.js';
 
 const MAX_STEPS = 40;
 const STEP_TIMEOUT = 9000;
@@ -1603,6 +1603,35 @@ export async function run(task, context, helpers) {
     return null;
   }
 
+  // ---- BROADENED final-submit finder for a recognised pack (BUG: BambooHR submit in footer) ----
+  // A recognised account-less ATS can render its FINAL "Submit Application" button OUTSIDE the
+  // field container — BambooHR puts it in a page-level footer, so the root-scoped findPackAdvance
+  // above misses it entirely and the loop would falsely "no advance button — will retry". When the
+  // in-root scan finds nothing, look for the pack's final submit in a BROADER scope (document),
+  // but CONSERVATIVELY: only a button the adapter's OWN isSubmitHint recognises (specific, e.g.
+  // bamboohr → "submit application") qualifies — never an arbitrary button. We always prefer the
+  // in-root control (findPackAdvance) when present; this is strictly the fallback. The pure pick
+  // lives in lib/ats-drive.js (findPackSubmitBroadened) so it's node-testable. Returns the element
+  // or null. Safe for LinkedIn/modal flows: those have no driveablePack (onLinkedIn → pack=null),
+  // and in-root submits are found first, so this never fires for them.
+  function findPackSubmitBroad(root) {
+    if (!driveablePack || typeof driveablePack.isSubmitHint !== 'function') return null;
+    try {
+      const rootEl = root || null;
+      const cands = qsa('button, input[type="submit"], a[role="button"], [role="button"]', document)
+        // Exclude controls already inside the form root — findPackAdvance owns those, and we
+        // only broaden for a submit that lives OUTSIDE the scanned root.
+        .filter((el) => !(rootEl && rootEl.contains?.(el)))
+        .map((el) => ({ el, text: btnText(el), visible: isProbablyVisible(el), disabled: !!el.disabled }));
+      const idx = findPackSubmitBroadened(cands, driveablePack.isSubmitHint);
+      if (idx >= 0) {
+        vlog('button', `pack-submit found OUTSIDE root via broadened scan: "${redactLabel(cands[idx].text)}" (${driveablePack.id})`);
+        return cands[idx].el;
+      }
+    } catch {}
+    return null;
+  }
+
   // ---- Fix 1: open-branch button finder (no form open yet, NOT on the /apply/ route) ----
   // Order: a real LinkedIn Easy-Apply opener → a real external opener (when allowed) → the
   // GENERIC advance/open fallback. The generic fallback is the one that, on a LinkedIn
@@ -2014,7 +2043,7 @@ export async function run(task, context, helpers) {
     // In-form: prefer buttons inside the modal. Not open yet (and NOT on /apply/): also try
     // LinkedIn's Easy-Apply button to OPEN the form (covers postings the generic scan misses).
     let btn = haveForm
-      ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }))
+      ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }) || findPackSubmitBroad(root))
       : (onApplyPage
           ? (findAdvanceButton(root || document, { allowOpen: false }))
           : findOpenBranchButton(root));
@@ -2057,7 +2086,7 @@ export async function run(task, context, helpers) {
         : 'no advance button — waiting for the page (or you)');
       let found = null;
       const findBtn = () => haveForm
-        ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }))
+        ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }) || findPackSubmitBroad(root))
         : (onApplyPage
             ? findAdvanceButton(root || document, { allowOpen: false })
             : findOpenBranchButton(document));
@@ -2223,7 +2252,7 @@ export async function run(task, context, helpers) {
     let clickBtn = btn;
     if (clickBtn.disabled || !isProbablyVisible(clickBtn) || !document.contains(clickBtn)) {
       clickBtn = haveForm
-        ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }))
+        ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }) || findPackSubmitBroad(root))
         : (onApplyPage
             ? findAdvanceButton(root || document, { allowOpen: false })
             : findOpenBranchButton(document));
