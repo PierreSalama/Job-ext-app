@@ -60,12 +60,31 @@ test('FIX 5(b): easyApplyIngestEligible drops non-LinkedIn postings only when ea
   for (const src of ['linkedin', 'indeed', 'glassdoor', 'ziprecruiter', 'google', 'workday', '']) {
     assert.equal(server.easyApplyIngestEligible(src, false), true, `OFF should keep ${src || '(empty)'}`);
   }
-  // easyApplyOnly ON → only LinkedIn postings are eligible (the rest are "obviously external").
-  assert.equal(server.easyApplyIngestEligible('linkedin', true), true);
-  assert.equal(server.easyApplyIngestEligible('LinkedIn', true), true);   // case-insensitive
+  // easyApplyOnly ON → non-LinkedIn boards are always dropped (no real Easy-Apply concept).
   for (const src of ['indeed', 'glassdoor', 'ziprecruiter', 'google', 'workday', '', null, undefined]) {
     assert.equal(server.easyApplyIngestEligible(src, true), false, `ON should drop ${src || '(empty)'}`);
   }
+});
+
+test('ANTI-STARVATION: easyApplyOnly KEEPS all LinkedIn ingest (no capability gate); executor fast-skips externals', () => {
+  // Discovery is JobSpy-only: every LinkedIn job is stamped applyCapability:'unknown'
+  // (discovery/index.js) and the f_AL extension path that would stamp 'easy-apply' is NOT
+  // running, and there is no apply_capability column to persist it. A capability gate here
+  // would therefore drop EVERY LinkedIn job → empty queue → strictly worse than the flood.
+  // So EA-only KEEPS LinkedIn regardless of capability; the EXECUTOR fast-skips a posting
+  // that turns out external (detectLinkedInExternalPosting, ~35ms, terminal-skip).
+  assert.equal(server.easyApplyIngestEligible('linkedin', true), true, 'bare LinkedIn must be kept (queue stays fed)');
+  assert.equal(server.easyApplyIngestEligible('linkedin', true, { source: 'linkedin', applyCapability: 'unknown' }), true);
+  assert.equal(server.easyApplyIngestEligible('linkedin', true, { source: 'linkedin', applyCapability: 'external' }), true);
+  assert.equal(server.easyApplyIngestEligible('linkedin', true, { source: 'linkedin', applyCapability: 'easy-apply' }), true);
+  assert.equal(server.easyApplyIngestEligible('LinkedIn', true), true, 'case-insensitive source');
+  // Source can come from the record alone (browser-fallback / ingest-endpoint path).
+  assert.equal(server.easyApplyIngestEligible(null, true, { source: 'linkedin' }), true);
+  // Non-LinkedIn boards stay dropped under EA-only (no Easy-Apply concept there).
+  assert.equal(server.easyApplyIngestEligible('indeed', true, { applyCapability: 'easy-apply' }), false, 'non-LinkedIn dropped even if mislabeled');
+  // easyApplyOnly OFF → everything kept.
+  assert.equal(server.easyApplyIngestEligible('linkedin', false, { source: 'linkedin', applyCapability: 'unknown' }), true);
+  assert.equal(server.easyApplyIngestEligible('indeed', false), true);
 });
 
 test('queueActiveSiteKeys reports scheduled/running site keys for worker spreading', () => {

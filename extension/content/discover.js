@@ -44,7 +44,7 @@ function cleanTitle(s) {
   return t.trim();
 }
 
-function scrapeLinkedIn(max) {
+function scrapeLinkedIn(max, easyApplyOnly = true) {
   const out = [];
   const seen = new Set();
   for (const card of qsa(LI_CARD_SEL)) {
@@ -62,7 +62,14 @@ function scrapeLinkedIn(max) {
     const jobUrl = id ? `https://www.linkedin.com/jobs/view/${id}/` : abs(link?.getAttribute('href'));
     if (!jobUrl || !title) continue;
     if (id) seen.add(id);
-    out.push({ externalId: id ? String(id) : null, title, company, location: loc, jobUrl, source: 'linkedin' });
+    // FIX 2(a): this scrape runs on the EA-filtered search page (buildSearchUrl pins
+    // f_AL=true when easyApplyOnly), so every card here IS an Easy-Apply posting. Stamp
+    // applyCapability:'easy-apply' so the ingest gate keeps them (vs JobSpy's unfiltered
+    // LinkedIn results, which carry 'unknown' and are dropped in Easy-Apply-only mode).
+    out.push({
+      externalId: id ? String(id) : null, title, company, location: loc, jobUrl, source: 'linkedin',
+      ...(easyApplyOnly ? { applyCapability: 'easy-apply' } : {}),
+    });
   }
   return out;
 }
@@ -151,7 +158,7 @@ export async function run({ source, max = 8, easyApplyOnly = true } = {}) {
           : 'no Glassdoor job cards rendered on the page',
       };
     }
-    const jobs = (isLinkedIn ? scrapeLinkedIn(max) : (isGlassdoor ? scrapeGlassdoor(max) : scrapeIndeed(max, easyApplyOnly))).slice(0, max);
+    const jobs = (isLinkedIn ? scrapeLinkedIn(max, easyApplyOnly) : (isGlassdoor ? scrapeGlassdoor(max) : scrapeIndeed(max, easyApplyOnly))).slice(0, max);
     const note = jobs.length ? '' : (pageNote() || (found ? `saw ${found} card(s) but couldn't read any (selectors may need tuning)` : 'no job cards rendered on the page'));
     return { ok: true, source: source || host, jobs, found, note };
   } catch (e) {

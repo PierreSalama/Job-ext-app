@@ -110,6 +110,56 @@ export function shouldUseGenericOpenFallback({
   return false;
 }
 
+// CONFIRMED ROOT CAUSE (firsthand, eBay job 4412182454): JobSpy ingests EVERY LinkedIn
+// search result (it can't read the Easy-Apply flag → applyCapability:'unknown'), so the
+// queue fills with NON-Easy-Apply LinkedIn postings ("Apply ↗" to the company site,
+// "Responses managed off LinkedIn"). With easyApplyOnly ON, the executor opens each one,
+// finds no Easy-Apply opener, then BURNS the full ~20s hydration cap waiting for a form
+// that will never appear before finally skipping. Dozens of 20s-wasting skips per run.
+//
+// This pure predicate lets the executor decide, in ~0s, that a LinkedIn JOB-VIEW page is a
+// POSITIVELY-external posting (no Easy Apply will ever open) so it can FAST-skip honestly
+// instead of waiting out the hydration cap. It is intentionally CONSERVATIVE: it ONLY fires
+// on a POSITIVE external signal, and NEVER on the mere absence of an Easy-Apply opener (a
+// real Easy Apply can be mid-hydration on a throttled tab — that path keeps the full wait).
+//
+// PURE — the live DOM is reduced to plain booleans by the caller, so this is node-testable:
+//   onLinkedIn          — is the live host linkedin.com (or a subdomain)?
+//   onApplyRoute        — is the live path the /apply/ full-page route? (true → never fast-skip;
+//                         we are already inside the Easy-Apply flow)
+//   hasEasyApplyOpener  — did findEasyApplyButton() find a REAL Easy-Apply opener? (true →
+//                         never fast-skip; it's drivable Easy Apply)
+//   haveForm            — has an apply form/dialog already been recognised this run?
+//   offsiteApplyAnchor  — is there a VISIBLE "Apply"-intent control that is an <a> pointing
+//                         OFF LinkedIn (the "Apply ↗" external link)?
+//   externalApplyLabel  — is there a VISIBLE Apply control whose label is explicitly external
+//                         ("Apply on company website", "Apply externally", FR equivalents)?
+//   managedOffLinkedIn  — does the page show "Responses managed off LinkedIn" (LinkedIn's own
+//                         marker that the posting routes applicants to the employer's ATS)?
+//
+// Returns { external: boolean, signal: string|null }. external=true ⇒ FAST-skip is safe.
+export function detectLinkedInExternalPosting({
+  onLinkedIn = false,
+  onApplyRoute = false,
+  hasEasyApplyOpener = false,
+  haveForm = false,
+  offsiteApplyAnchor = false,
+  externalApplyLabel = false,
+  managedOffLinkedIn = false,
+} = {}) {
+  // Only ever fast-skip on a LinkedIn JOB-VIEW page where no Easy Apply is in play.
+  if (!onLinkedIn || onApplyRoute || hasEasyApplyOpener || haveForm) {
+    return { external: false, signal: null };
+  }
+  // POSITIVE external evidence (any one is sufficient). Prefer the most specific signal name.
+  if (externalApplyLabel) return { external: true, signal: 'external-apply-label' };
+  if (offsiteApplyAnchor) return { external: true, signal: 'offsite-apply-anchor' };
+  if (managedOffLinkedIn) return { external: true, signal: 'responses-managed-off-linkedin' };
+  // No positive signal → NOT confidently external. The caller keeps the normal hydration
+  // wait so a genuinely-slow Easy Apply is never mis-skipped.
+  return { external: false, signal: null };
+}
+
 // Fix (resume page): decide what to do on the RESUME step of the new full-page Easy Apply
 // flow (or any apply form with a resume requirement). ROOT CAUSE (confirmed live on
 // linkedin.com): the user has NO saved resume in LinkedIn, and the upload is a plain

@@ -12,6 +12,7 @@ import {
   isLinkedInApplyAdvanceLabel,
   deriveApplyRootFromAdvanceButton,
   shouldUseGenericOpenFallback,
+  detectLinkedInExternalPosting,
 } from '../extension/content/lib/linkedin-apply.js';
 
 // ---- isLinkedInEasyApplyApplyUrl: the /apply/ route guard (LIVE-VALIDATED) ----
@@ -128,6 +129,62 @@ test('shouldUseGenericOpenFallback: defensive defaults (no args) → blocked is 
   // No args = onLinkedIn:false → fallback allowed (safe generic default).
   assert.equal(shouldUseGenericOpenFallback(), true);
   assert.equal(shouldUseGenericOpenFallback({}), true);
+});
+
+// ---- FIX 1: detectLinkedInExternalPosting — the FAST-SKIP decision (CONFIRMED ROOT CAUSE) ----
+// With easyApplyOnly ON, JobSpy floods the queue with NON-Easy-Apply LinkedIn postings and the
+// executor used to burn the ~20s hydration cap skipping each. This pure predicate lets it bail
+// in ~0s ONLY on a POSITIVE external signal — and NEVER on the mere absence of an Easy-Apply
+// opener (so a slow-hydrating REAL Easy Apply is never mis-skipped).
+test('detectLinkedInExternalPosting: EXTERNAL on an off-site "Apply ↗" anchor (the eBay case)', () => {
+  const v = detectLinkedInExternalPosting({ onLinkedIn: true, onApplyRoute: false, hasEasyApplyOpener: false, haveForm: false, offsiteApplyAnchor: true });
+  assert.equal(v.external, true);
+  assert.equal(v.signal, 'offsite-apply-anchor');
+});
+
+test('detectLinkedInExternalPosting: EXTERNAL on an explicit "Apply on company website" label', () => {
+  const v = detectLinkedInExternalPosting({ onLinkedIn: true, externalApplyLabel: true });
+  assert.equal(v.external, true);
+  assert.equal(v.signal, 'external-apply-label');
+});
+
+test('detectLinkedInExternalPosting: EXTERNAL on the "Responses managed off LinkedIn" marker', () => {
+  const v = detectLinkedInExternalPosting({ onLinkedIn: true, managedOffLinkedIn: true });
+  assert.equal(v.external, true);
+  assert.equal(v.signal, 'responses-managed-off-linkedin');
+});
+
+test('detectLinkedInExternalPosting: NEVER external with NO positive signal (slow-hydrating Easy Apply is safe)', () => {
+  // The mere absence of an Easy-Apply opener is NOT external — a real Easy Apply may be
+  // mid-hydration on a throttled tab. This is the exact mis-skip we must avoid.
+  const v = detectLinkedInExternalPosting({ onLinkedIn: true, onApplyRoute: false, hasEasyApplyOpener: false, haveForm: false });
+  assert.equal(v.external, false);
+  assert.equal(v.signal, null);
+});
+
+test('detectLinkedInExternalPosting: NEVER external when a real Easy-Apply opener exists (even with stray external signals)', () => {
+  const v = detectLinkedInExternalPosting({ onLinkedIn: true, hasEasyApplyOpener: true, offsiteApplyAnchor: true, managedOffLinkedIn: true });
+  assert.equal(v.external, false);
+});
+
+test('detectLinkedInExternalPosting: NEVER external on the /apply/ route (already inside the Easy-Apply flow)', () => {
+  const v = detectLinkedInExternalPosting({ onLinkedIn: true, onApplyRoute: true, offsiteApplyAnchor: true });
+  assert.equal(v.external, false);
+});
+
+test('detectLinkedInExternalPosting: NEVER external once a form is already recognised', () => {
+  const v = detectLinkedInExternalPosting({ onLinkedIn: true, haveForm: true, offsiteApplyAnchor: true });
+  assert.equal(v.external, false);
+});
+
+test('detectLinkedInExternalPosting: NEVER external off LinkedIn (real ATS pages own their own flow)', () => {
+  const v = detectLinkedInExternalPosting({ onLinkedIn: false, offsiteApplyAnchor: true, managedOffLinkedIn: true });
+  assert.equal(v.external, false);
+});
+
+test('detectLinkedInExternalPosting: defensive — no args never throws and is not external', () => {
+  assert.deepEqual(detectLinkedInExternalPosting(), { external: false, signal: null });
+  assert.deepEqual(detectLinkedInExternalPosting({}), { external: false, signal: null });
 });
 
 // ---- FIX 3: the "Easy Apply filter." search pill must NOT be classified as an opener ----

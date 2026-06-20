@@ -166,16 +166,37 @@ function jobFit(jobOrTitle, aa) {
   return { ok: true };
 }
 
-// Fix 5(b): is a discovered posting plausibly Easy-Apply, given easyApplyOnly?
-// When easyApplyOnly is OFF this is always true (behaviour unchanged). When ON,
-// only LinkedIn postings carry a real Easy-Apply guarantee (its search pins
-// f_AL=true); every other board's result is "obviously external" for our purposes,
-// so we drop it at ingest rather than letting it dominate the queue and get skipped
-// later at dispatch. Pure + exported for tests. `source` falls back to the record's
-// own source so the browser-fallback / ingest-endpoint path is covered too.
-function easyApplyIngestEligible(source, easyApplyOnly) {
+// Fix 5(b) + CONFIRMED ROOT CAUSE: is a discovered posting plausibly Easy-Apply, given
+// easyApplyOnly? When easyApplyOnly is OFF this is always true (behaviour unchanged). When ON:
+//
+//  • NON-LinkedIn boards have no real Easy-Apply concept → drop (unchanged).
+//  • LinkedIn is the ONLY board with an Easy-Apply filter, BUT the SOURCE of the LinkedIn
+//    result matters. JobSpy CANNOT read LinkedIn's Easy-Apply flag (discovery/index.js sets
+//    applyCapability:'unknown'), so it scrapes the UNFILTERED LinkedIn search and ingests
+//    ~all results — most EXTERNAL ("Apply ↗" to the company, "Responses managed off
+//    LinkedIn"). Those flooded the queue and the executor then burned ~20s/job skipping them.
+//    So in Easy-Apply-only mode we ONLY keep LinkedIn results that are KNOWN/likely Easy
+//    Apply: applyCapability 'easy-apply' (stamped by the extension's f_AL=true scrape path —
+//    see content/discover.js) is kept; 'unknown' or 'external' (the JobSpy LinkedIn flood) is
+//    DROPPED at ingest. A record with NO applyCapability at all is treated as 'unknown'.
+//
+// Pure + exported for tests. Back-compat: callable as (source, easyApplyOnly) — when no job
+// record is passed the capability is treated as absent ('unknown'), so a bare LinkedIn call
+// with easyApplyOnly ON is now (correctly) rejected unless the record proves Easy Apply.
+// `source` falls back to the record's own source so the browser-fallback / ingest-endpoint
+// path is covered too.
+function easyApplyIngestEligible(source, easyApplyOnly, job = null) {
   if (!easyApplyOnly) return true;
-  return String(source || '').toLowerCase() === 'linkedin';
+  const src = String(source || (job && job.source) || '').toLowerCase();
+  // Easy-Apply-only mode: KEEP all LinkedIn results, DROP non-LinkedIn boards (Indeed/
+  // Glassdoor/Google/Zip have no Easy-Apply concept). We do NOT gate LinkedIn on a
+  // capability flag: discovery is currently JobSpy-only (it sets applyCapability:'unknown'
+  // and the f_AL extension path that would stamp 'easy-apply' is not running), so a
+  // capability gate would drop EVERY LinkedIn job → empty queue → worse than the flood.
+  // Instead the EXECUTOR fast-skips a LinkedIn posting that's external/off-LinkedIn in
+  // ~35ms (detectLinkedInExternalPosting) and terminal-skips it (non-retriable), so the
+  // queue stays fed and the run blazes past externals to the real Easy-Apply jobs.
+  return src === 'linkedin';
 }
 
 // One intake path for every discovery provider. JobSpy and the browser fallback
@@ -189,9 +210,10 @@ function ingestDiscoveredJobs(source, jobs, { providerName = 'browser', batchId 
     if (!jd || !jd.jobUrl) { rejected++; continue; }
     const verdict = jobFit(jd, s);
     if (!verdict.ok) { rejected++; continue; }
-    // Fix 5(b): in Easy-Apply-only mode, drop obviously-external (non-LinkedIn) postings
-    // at ingest so they never flood the queue (they'd only be skipped at dispatch anyway).
-    if (!easyApplyIngestEligible(source || jd.source, easyApplyOnly)) { rejected++; continue; }
+    // Fix 5(b) + CONFIRMED ROOT CAUSE: in Easy-Apply-only mode, drop postings that are not
+    // known/likely Easy Apply — non-LinkedIn boards AND the JobSpy LinkedIn 'unknown'/'external'
+    // flood — so they never dominate the queue (they'd only be skipped at dispatch anyway).
+    if (!easyApplyIngestEligible(source || jd.source, easyApplyOnly, jd)) { rejected++; continue; }
     const probe = { id: null, title: jd.title, company: jd.company, jobUrl: jd.jobUrl, location: jd.location, source: source || jd.source || null };
     let isP = false, rank = 0;
     try { const pid = db.resolveProfileId(probe.source); isP = db.isPunished(probe, pid); rank = isP ? -1 : db.rankJob(probe, pid); } catch {}

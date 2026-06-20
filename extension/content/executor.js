@@ -25,7 +25,7 @@ import { classifyInterstitial } from './lib/interstitial.js';
 import { shouldFrontOnOpenerStall, classifyNoChangeRoute } from './lib/opener-stall.js';
 import { detectBotChallenge, botChallengeLastError } from './lib/challenge.js';
 import { ADVANCE_KEYWORDS, isAdvanceLabel } from './lib/advance.js';
-import { isLinkedInEasyApplyApplyUrl, isLinkedInApplyAdvanceLabel, deriveApplyRootFromAdvanceButton, shouldUseGenericOpenFallback, decideResumePage, isUploadResumeAffordanceLabel, pageRequiresResume, groundedEligibilityAnswer, isEligibilityScreeningQuestion, decideAnswerOrPark } from './lib/linkedin-apply.js';
+import { isLinkedInEasyApplyApplyUrl, isLinkedInApplyAdvanceLabel, deriveApplyRootFromAdvanceButton, shouldUseGenericOpenFallback, detectLinkedInExternalPosting, decideResumePage, isUploadResumeAffordanceLabel, pageRequiresResume, groundedEligibilityAnswer, isEligibilityScreeningQuestion, decideAnswerOrPark } from './lib/linkedin-apply.js';
 import { sitePack } from './sites/index.js';
 import { confirmSignalsMatched, findPackSubmitBroadened } from './lib/ats-drive.js';
 
@@ -49,6 +49,12 @@ const EASYAPPLY_LIMIT_RX = /reached (today'?s )?easy apply limit/i;
 const DAILY_LIMIT_NEAR_EASYAPPLY_RX = /(daily|today'?s)[^.]{0,40}\blimit\b/i;
 const LOGIN_APPLY_RX = /(?:sign\s*in|log\s*in|connectez[- ]vous|se connecter|connexion)[^.!?\n]{0,80}(?:apply|postuler)|(?:apply|postuler)[^.!?\n]{0,80}(?:sign\s*in|log\s*in|connectez[- ]vous|se connecter|connexion)/i;
 const EXTERNAL_APPLY_RX = /apply on (?:the )?(?:company|employer)|apply externally|on company (?:site|website)|apply on .* website|postuler sur le site (?:de l['’]employeur|employeur|de l['’]entreprise|entreprise)|site (?:de l['’]employeur|employeur|de l['’]entreprise|entreprise)/i;
+// LinkedIn's OWN marker that a posting routes applicants to the employer's ATS rather than
+// Easy Apply: the job card / top card shows "Responses managed off LinkedIn" (FR: "Réponses
+// gérées en dehors de LinkedIn"). This is a POSITIVE external signal — when it's present
+// there is no Easy Apply to click, so the executor can FAST-skip instead of waiting out the
+// hydration cap. (Confirmed firsthand on eBay job 4412182454.)
+const MANAGED_OFF_LINKEDIN_RX = /responses managed off linkedin|r[ée]ponses g[ée]r[ée]es (?:en dehors|hors) de linkedin/i;
 // ADVANCE_KEYWORDS / OPEN_KEYWORDS / isAdvanceLabel are the pure advance-vs-opener
 // decision (BUG-1), in ./lib/advance.js so they're node-testable without a DOM.
 const FINAL_SUBMIT_RX = /^(submit( application)?|send( application)?|soumettre|envoyer( ma candidature)?|confirm and submit)$/i;
@@ -564,6 +570,51 @@ function findExternalApplyButton() {
     }
   } catch {}
   return null;
+}
+
+// ---- Fast-skip probes (CONFIRMED ROOT CAUSE): positive evidence a LinkedIn JOB-VIEW
+// posting is EXTERNAL (no Easy Apply will ever open). Each is a tight, guarded boolean the
+// pure `detectLinkedInExternalPosting` then weighs. Used to bail in ~0s instead of burning
+// the ~20s hydration cap on a form that will never appear. ----
+
+// A VISIBLE "Apply"-intent control that is an <a> whose href points OFF LinkedIn (the
+// "Apply ↗" external link). This is the strongest single signal of an off-LinkedIn posting.
+function linkedInOffsiteApplyAnchorPresent() {
+  try {
+    const here = location.hostname.replace(/^www\./, '').toLowerCase();
+    for (const a of qsa('a[href]')) {
+      if (!isProbablyVisible(a)) continue;
+      const t = btnText(a).toLowerCase();
+      if (!t || !/\bapply\b|postuler|candidature/.test(t)) continue;
+      // The page-level Easy-Apply opener is sometimes an <a>; never count it as external.
+      if (isEasyApplyOpener(a)) continue;
+      const href = a.getAttribute('href') || '';
+      if (!/^https?:\/\//i.test(href)) continue;   // in-page / relative apply → not offsite
+      let host = '';
+      try { host = new URL(href, location.href).hostname.replace(/^www\./, '').toLowerCase(); } catch {}
+      if (host && host !== here && !/(^|\.)linkedin\.com$/i.test(host)) return true;
+    }
+  } catch {}
+  return false;
+}
+
+// A VISIBLE Apply control whose LABEL is explicitly external ("Apply on company website",
+// "Apply externally", FR equivalents) — independent of the href.
+function externalApplyLabelPresent() {
+  try {
+    for (const el of qsa('a, button, [role="button"]')) {
+      if (!isProbablyVisible(el)) continue;
+      if (isEasyApplyOpener(el)) continue;
+      if (EXTERNAL_APPLY_RX.test(btnText(el).toLowerCase())) return true;
+    }
+  } catch {}
+  return false;
+}
+
+// LinkedIn's own "Responses managed off LinkedIn" marker on the posting.
+function responsesManagedOffLinkedInPresent() {
+  try { return MANAGED_OFF_LINKEDIN_RX.test((document.body?.innerText || '').slice(0, 12000)); }
+  catch { return false; }
 }
 
 // After clicking a final submit, the application is "sent" when the page shows a
@@ -2075,6 +2126,49 @@ export async function run(task, context, helpers) {
       // throttled tab's SPA (LinkedIn) often never hydrates the Easy-Apply button. Detect
       // it so we (a) wait MUCH longer in real wall-clock and (b) report the true cause.
       const wasHidden = (typeof document !== 'undefined' && document.visibilityState === 'hidden');
+      // ---- FAST-SKIP: positively-EXTERNAL LinkedIn JOB-VIEW posting (CONFIRMED ROOT CAUSE) ----
+      // With easyApplyOnly ON, JobSpy floods the queue with NON-Easy-Apply LinkedIn jobs
+      // (it can't read the EA flag). The executor used to OPEN each one, find no Easy-Apply
+      // opener, then BURN the full ~20s hydration cap before skipping "without a diagnostic"
+      // (route=null) — dozens of 20s-wasting skips per run, almost no real applies.
+      //
+      // When the form has never opened (`opening`), we're on a LinkedIn JOB-VIEW page (NOT the
+      // /apply/ route), AND a POSITIVE external signal is present (an off-LinkedIn "Apply ↗"
+      // anchor / an explicitly-external Apply label / "Responses managed off LinkedIn"), the
+      // posting is external — there is no Easy Apply to wait for. SKIP NOW (~0s) with an HONEST
+      // diagnostic + applyRoute 'external' so (a) the user learns WHY and (b) the terminal
+      // 'skipped' state is non-retriable (retryStaleQueue only re-pulls 'failed'), so it is
+      // never re-dispatched. CONSERVATIVE: it fires ONLY on a positive external signal — the
+      // mere ABSENCE of an Easy-Apply opener keeps the full hydration wait below, so a genuinely
+      // slow-hydrating REAL Easy Apply is NEVER mis-skipped.
+      const onLI_fs = /(^|\.)linkedin\.com$/i.test(location.hostname);
+      const extVerdict = (opening && onLI_fs)
+        ? detectLinkedInExternalPosting({
+            onLinkedIn: true,
+            onApplyRoute: onApplyPage,
+            hasEasyApplyOpener: !!findEasyApplyButton(),
+            haveForm,
+            offsiteApplyAnchor: linkedInOffsiteApplyAnchorPresent(),
+            externalApplyLabel: externalApplyLabelPresent(),
+            managedOffLinkedIn: responsesManagedOffLinkedInPresent(),
+          })
+        : { external: false, signal: null };
+      if (extVerdict.external) {
+        vlog('button', `fast-skip: external LinkedIn posting (${extVerdict.signal}) — no Easy Apply to open; skipping in ~0s instead of waiting the hydration cap`);
+        logLine('warn', `external posting (${extVerdict.signal}) — no Easy Apply on this job; skipping fast`);
+        S.routeState = 'external_same_tab';   // honest route on the terminal result/trace (not 'unknown')
+        signalHydrated();   // release any held front-until-hydrated; we are NOT waiting
+        setStatus('External posting — no Easy Apply; skipped');
+        report({
+          state: 'skipped',
+          lastError: 'external posting — no Easy Apply on this job (skipped, easy-apply-only)',
+          applyRoute: 'external',
+          routeState: 'external_same_tab',
+          transcriptAppend: { kind: 'recovery', note: `fast-skip external LinkedIn posting [${extVerdict.signal}] — no Easy Apply, not re-dispatched` },
+        });
+        finalState = 'skipped';
+        break;
+      }
       // NON-FOCUS-STEALING: do NOT front the window preemptively. DIRECT live observation
       // proved the Easy Apply form mounts + works on a HIDDEN, UNFOCUSED tab, so on the normal
       // path we simply WAIT for it to hydrate (a hidden on-display tab is un-throttled enough).
@@ -2092,7 +2186,16 @@ export async function run(task, context, helpers) {
             : findOpenBranchButton(document));
       // 1) Initial hydration wait WITHOUT fronting. Hidden tabs get fewer timer ticks, so give
       //    them more real wall-clock; a visible tab settles fast.
-      const initialTries = opening ? (wasHidden ? 40 : 40) : 60;   // ~20s hidden / ~20s visible
+      // LIVE-DATA TUNING (2026-06-20): on the OPEN branch (job-view, looking for the Easy-Apply
+      // OPENER) a VISIBLE+FOCUSED tab hydrates the opener in <2s when it exists — direct
+      // observation showed working jobs find "Easy Apply to this job" on the very first tick.
+      // So a 20s wait there is pure waste on the JobSpy EXTERNAL flood (most LinkedIn jobs have
+      // NO Easy Apply): hundreds of postings each burned ~20s before being re-dispatched. Cut the
+      // visible-tab OPENER wait to ~8s (16×500ms) — long enough to absorb a slow paint, short
+      // enough to blaze through externals. KEEP the long wait for: hidden/throttled tabs (timers
+      // throttled → opener hydrates late) and for the /apply/ page-LOAD + in-form-advance cases
+      // (a full page must navigate + render, which genuinely takes longer).
+      const initialTries = opening ? (wasHidden ? 40 : 16) : 60;   // ~20s hidden / ~8s visible-opener / ~30s /apply/-load
       // [TRACE 7] HYDRATION — entering the wait, with the occlusion/visibility cause + cap.
       const hydrateStart = Date.now();
       vlog('hydrate', `wait begin opening=${opening} applyPageLoading=${applyPageLoading} hidden=${wasHidden} cap=${initialTries * 500}ms`);
@@ -2185,8 +2288,44 @@ export async function run(task, context, helpers) {
           report({ state: st, lastError: allowExternal ? 'external apply button was present but could not be opened — inspect' : 'external — apply on the company site (not auto-applicable)', applyRoute: 'external' });
           finalState = st; break;
         }
+        // HONEST TERMINAL for the no-Easy-Apply flood (LIVE-DATA, 2026-06-20): the dominant
+        // current-build waste was LinkedIn JOB-VIEW postings where the form never opened on a
+        // VISIBLE+FOCUSED (un-throttled) tab and NO opener appeared after the settle wait, yet
+        // externalApplyPresent()/loginApplyPresent() did NOT fire (LinkedIn's external "Apply"
+        // button isn't always matched by those positive signals). Those fell here and were
+        // marked failed-RETRIABLE ("did not hydrate") → re-dispatched every run, each burning
+        // the full wait, NEVER succeeding, and surfacing as the mystery "skipped without a
+        // diagnostic". On a tab that was NEVER hidden/occluded, Chrome did NOT throttle it, so a
+        // working Easy Apply opener WOULD have hydrated within the wait (observed: <2s when it
+        // exists). Therefore "no opener + no form after the visible wait" is RELIABLE evidence of
+        // NO Easy Apply on this posting (external/company-site). TERMINAL-SKIP it with a concrete
+        // diagnostic + an honest external route so (a) the pool stops re-burning it, (b) the
+        // server classifier reads it as terminal (not transient_page), and (c) the user learns
+        // WHY. CONSERVATIVE: fires ONLY when opening && !wasHidden && the form NEVER opened — a
+        // hidden/throttled tab (where late hydration is real) still fails RETRIABLY below.
+        if (opening && !wasHidden && !everHadForm) {
+          vlog('button', 'no Easy-Apply opener after the visible settle wait (un-throttled tab) → terminal-skip: this posting has no Easy Apply');
+          logLine('warn', 'no Easy Apply on this posting — no apply control appeared on a visible tab; skipping (not retried)');
+          S.routeState = 'external_same_tab';
+          signalHydrated();
+          setStatus('No Easy Apply on this posting — skipped');
+          const st = allowExternal ? 'failed' : 'skipped';
+          report({
+            state: st,
+            lastError: allowExternal
+              ? 'no Easy Apply opener and no drivable form appeared (visible tab) — inspect'
+              : 'no Easy Apply on this posting — apply is on the company site (not auto-applicable)',
+            applyRoute: 'external',
+            routeState: 'external_same_tab',
+            transcriptAppend: { kind: 'recovery', note: 'no opener + no form after visible settle wait → terminal external/no-EA skip (not re-dispatched)' },
+          });
+          finalState = st;
+          break;
+        }
         // Otherwise it's a transient non-open (late/throttled hydration, verification
-        // gate) — fail RETRIABLY so retryStaleQueue re-attempts it later (capped).
+        // gate) — fail RETRIABLY so retryStaleQueue re-attempts it later (capped). This now
+        // covers: hidden/occluded tabs (opener may hydrate late once visible) and the
+        // /apply/-advance case (!opening: a form WAS open and we lost the advance button).
         report({
           state: 'failed',
           lastError: opening
