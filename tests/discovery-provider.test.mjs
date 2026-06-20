@@ -38,6 +38,19 @@ test('query planner rotates keyword and location profiles deterministically', ()
   assert.deepEqual(discovery.planner(settings, 3), { keyword: 'analyst', location: 'Remote', nextIndex: 0 });
 });
 
+test('FIX 5(a): selectBoards drops non-LinkedIn boards when easyApplyOnly is ON', () => {
+  const all = ['linkedin', 'indeed', 'glassdoor', 'zip_recruiter', 'google'];
+  // easyApplyOnly ON → only LinkedIn (the only board with a real Easy-Apply filter).
+  assert.deepEqual(discovery.selectBoards(all, true), ['linkedin']);
+  // easyApplyOnly OFF → behaviour unchanged (all boards kept, order preserved).
+  assert.deepEqual(discovery.selectBoards(all, false), all);
+  // ON but no LinkedIn configured → empty (caller treats this as "no easy-apply boards").
+  assert.deepEqual(discovery.selectBoards(['indeed', 'glassdoor'], true), []);
+  // Defensive: non-array / falsy input never throws.
+  assert.deepEqual(discovery.selectBoards(null, true), []);
+  assert.deepEqual(discovery.selectBoards(undefined, false), []);
+});
+
 test('discovery batches and browser fallback requests are durable', () => {
   const batch = db.discoveryBatchStart({ provider: 'jobspy', source: 'indeed', keyword: 'dev', location: 'Toronto' });
   db.discoveryBatchComplete(batch.id, { status: 'blocked', error: '403', found: 0 });

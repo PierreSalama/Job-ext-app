@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const db = require(path.join(here, '..', 'app', 'src', 'db.js'));
+const server = require(path.join(here, '..', 'app', 'src', 'server.js'));
 
 let dir;
 test.before(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jat-policy-')); db.open(dir); });
@@ -52,6 +53,19 @@ test('classification exposes the retry gate used by stale retry', () => {
   const external = addTask({ url: 'https://example.com/external', state: 'failed', lastError: 'external — apply on the company site (not auto-applicable)' }).task;
   assert.equal(db.classifyQueueFailure(db.queueList({}).find((t) => t.id === transient.id)).action, 'retry');
   assert.notEqual(db.classifyQueueFailure(db.queueList({}).find((t) => t.id === external.id)).action, 'retry');
+});
+
+test('FIX 5(b): easyApplyIngestEligible drops non-LinkedIn postings only when easyApplyOnly is ON', () => {
+  // easyApplyOnly OFF → everything is eligible (behaviour unchanged).
+  for (const src of ['linkedin', 'indeed', 'glassdoor', 'ziprecruiter', 'google', 'workday', '']) {
+    assert.equal(server.easyApplyIngestEligible(src, false), true, `OFF should keep ${src || '(empty)'}`);
+  }
+  // easyApplyOnly ON → only LinkedIn postings are eligible (the rest are "obviously external").
+  assert.equal(server.easyApplyIngestEligible('linkedin', true), true);
+  assert.equal(server.easyApplyIngestEligible('LinkedIn', true), true);   // case-insensitive
+  for (const src of ['indeed', 'glassdoor', 'ziprecruiter', 'google', 'workday', '', null, undefined]) {
+    assert.equal(server.easyApplyIngestEligible(src, true), false, `ON should drop ${src || '(empty)'}`);
+  }
 });
 
 test('queueActiveSiteKeys reports scheduled/running site keys for worker spreading', () => {

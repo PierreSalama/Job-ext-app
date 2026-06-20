@@ -80,4 +80,34 @@ export function deriveApplyRootFromAdvanceButton(button, {
   return null;
 }
 
+// Fix 1: on a linkedin.com JOB-VIEW page (not the /apply/ route) that has NO Easy-Apply
+// opener, the executor must NOT fall back to the generic advance/open button scan. That
+// fallback would grab a STRAY "Next" elsewhere on the page (a carousel, a "more jobs"
+// pager, the search pagination) and click it repeatedly — the "repeated page-level action
+// did not transfer: Next" loop observed on external/"Apply on company website" postings
+// (Bosch). Such a posting is external / no-easy-apply and must be handled honestly, never
+// driven by a phantom advance button.
+//
+// PURE: returns whether the generic open/advance fallback is allowed to run on THIS page.
+//   onLinkedIn          — is the live host linkedin.com (or a subdomain)?
+//   onApplyRoute        — is the live path the /apply/ full-page route?
+//   hasEasyApplyOpener  — did findEasyApplyButton() find a real Easy-Apply opener?
+//   haveForm            — has an apply form/dialog already been recognised this step?
+// On a non-LinkedIn host (genuine external ATS) the generic fallback is ALWAYS allowed —
+// that's its legitimate job. Only the LinkedIn job-view-without-Easy-Apply case is blocked.
+export function shouldUseGenericOpenFallback({
+  onLinkedIn = false,
+  onApplyRoute = false,
+  hasEasyApplyOpener = false,
+  haveForm = false,
+} = {}) {
+  if (!onLinkedIn) return true;            // non-LinkedIn ATS pages keep the generic fallback
+  if (onApplyRoute) return true;           // the /apply/ full-page flow drives via advance scan
+  if (haveForm) return true;               // a real LinkedIn form is open — advance within it
+  if (hasEasyApplyOpener) return true;     // a real Easy-Apply opener exists — open it
+  // LinkedIn job-view page, no /apply/ route, no form, no Easy-Apply opener → external /
+  // no-easy-apply. Block the generic fallback so a stray "Next" is never clicked.
+  return false;
+}
+
 export { APPLY_ADVANCE_LABEL_RX };

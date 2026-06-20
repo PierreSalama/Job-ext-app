@@ -166,16 +166,32 @@ function jobFit(jobOrTitle, aa) {
   return { ok: true };
 }
 
+// Fix 5(b): is a discovered posting plausibly Easy-Apply, given easyApplyOnly?
+// When easyApplyOnly is OFF this is always true (behaviour unchanged). When ON,
+// only LinkedIn postings carry a real Easy-Apply guarantee (its search pins
+// f_AL=true); every other board's result is "obviously external" for our purposes,
+// so we drop it at ingest rather than letting it dominate the queue and get skipped
+// later at dispatch. Pure + exported for tests. `source` falls back to the record's
+// own source so the browser-fallback / ingest-endpoint path is covered too.
+function easyApplyIngestEligible(source, easyApplyOnly) {
+  if (!easyApplyOnly) return true;
+  return String(source || '').toLowerCase() === 'linkedin';
+}
+
 // One intake path for every discovery provider. JobSpy and the browser fallback
 // therefore share relevance, punishment, ranking, dedup and provenance behavior.
 function ingestDiscoveredJobs(source, jobs, { providerName = 'browser', batchId = null } = {}) {
   const s = db.getSettings().autoApply;
+  const easyApplyOnly = s.easyApplyOnly !== false;
   let enqueued = 0, rejected = 0, punished = 0, duplicates = 0;
   const ranked = [];
   for (const jd of (Array.isArray(jobs) ? jobs : []).slice(0, 100)) {
     if (!jd || !jd.jobUrl) { rejected++; continue; }
     const verdict = jobFit(jd, s);
     if (!verdict.ok) { rejected++; continue; }
+    // Fix 5(b): in Easy-Apply-only mode, drop obviously-external (non-LinkedIn) postings
+    // at ingest so they never flood the queue (they'd only be skipped at dispatch anyway).
+    if (!easyApplyIngestEligible(source || jd.source, easyApplyOnly)) { rejected++; continue; }
     const probe = { id: null, title: jd.title, company: jd.company, jobUrl: jd.jobUrl, location: jd.location, source: source || jd.source || null };
     let isP = false, rank = 0;
     try { const pid = db.resolveProfileId(probe.source); isP = db.isPunished(probe, pid); rank = isP ? -1 : db.rankJob(probe, pid); } catch {}
@@ -1589,4 +1605,4 @@ function stopServer() {
   if (server) { try { server.close(); } catch {} server = null; }
 }
 
-module.exports = { startServer, stopServer, broadcast, getToken, rescanAllFolders, startFolderWatchers, ingestDiscoveredJobs };
+module.exports = { startServer, stopServer, broadcast, getToken, rescanAllFolders, startFolderWatchers, ingestDiscoveredJobs, jobFit, easyApplyIngestEligible };

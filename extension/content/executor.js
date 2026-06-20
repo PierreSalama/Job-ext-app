@@ -24,7 +24,7 @@ import { classifyInterstitial } from './lib/interstitial.js';
 import { shouldFrontOnOpenerStall } from './lib/opener-stall.js';
 import { detectBotChallenge, botChallengeLastError } from './lib/challenge.js';
 import { ADVANCE_KEYWORDS, isAdvanceLabel } from './lib/advance.js';
-import { isLinkedInEasyApplyApplyUrl, isLinkedInApplyAdvanceLabel, deriveApplyRootFromAdvanceButton } from './lib/linkedin-apply.js';
+import { isLinkedInEasyApplyApplyUrl, isLinkedInApplyAdvanceLabel, deriveApplyRootFromAdvanceButton, shouldUseGenericOpenFallback } from './lib/linkedin-apply.js';
 import { sitePack } from './sites/index.js';
 import { confirmSignalsMatched } from './lib/ats-drive.js';
 
@@ -1270,6 +1270,26 @@ export async function run(task, context, helpers) {
     return null;
   }
 
+  // ---- Fix 1: open-branch button finder (no form open yet, NOT on the /apply/ route) ----
+  // Order: a real LinkedIn Easy-Apply opener → a real external opener (when allowed) → the
+  // GENERIC advance/open fallback. The generic fallback is the one that, on a LinkedIn
+  // job-view page WITHOUT an Easy-Apply opener, used to grab a stray "Next" (carousel / more-
+  // jobs pager) and click it forever ("repeated page-level action did not transfer: Next" on
+  // external/"Apply on company website" postings, e.g. Bosch). shouldUseGenericOpenFallback
+  // blocks that fallback in exactly that case; genuine non-LinkedIn ATS pages still use it.
+  function findOpenBranchButton(fallbackScope) {
+    const easyOpener = findEasyApplyButton();
+    if (easyOpener) return easyOpener;
+    const externalOpener = allowExternal ? findExternalApplyButton() : null;
+    if (externalOpener) return externalOpener;
+    const onLI = /(^|\.)linkedin\.com$/i.test(location.hostname);
+    const onApply = onLI && isLinkedInEasyApplyApplyUrl(location.pathname);
+    if (!shouldUseGenericOpenFallback({ onLinkedIn: onLI, onApplyRoute: onApply, hasEasyApplyOpener: false, haveForm: false })) {
+      return null;   // LinkedIn job-view page, no Easy Apply → never click a stray advance button
+    }
+    return findAdvanceButton(fallbackScope, { allowOpen: true });
+  }
+
   while (S.step < MAX_STEPS && !S.cancelled && !finished) {
     S.step++;
     await untilUnpaused();
@@ -1574,9 +1594,16 @@ export async function run(task, context, helpers) {
       ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }))
       : (onApplyPage
           ? (findAdvanceButton(root || document, { allowOpen: false }))
-          : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(root, { allowOpen: true })));
+          : findOpenBranchButton(root));
     if (!btn) {
       const opening = !everHadForm;   // the apply form has never appeared yet
+      // Fix 3: the NEW Easy Apply NAVIGATES to a full /apply/ page that must LOAD. On a
+      // backgrounded/throttled tab that page loads slowly → the advance button / form root
+      // hasn't hydrated yet even though everHadForm was latched the moment the URL became
+      // /apply/ (so `opening` is false here). That case must ALSO trigger the front-until-
+      // hydrate nudge — not only the opener-stall path — so the page actually loads. The
+      // form works once loaded; only the initial navigation/load throttles.
+      const applyPageLoading = onApplyPage && !haveForm;
       // Background/occluded apply tabs get their JS timers throttled by Chrome, so
       // LinkedIn's Easy-Apply button can hydrate LATE — or render an offsite-looking
       // "Apply" first and swap in the real button seconds later. We therefore do NOT
@@ -1601,23 +1628,28 @@ export async function run(task, context, helpers) {
         ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }))
         : (onApplyPage
             ? findAdvanceButton(root || document, { allowOpen: false })
-            : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(document, { allowOpen: true })));
+            : findOpenBranchButton(document));
       // 1) Initial hydration wait WITHOUT fronting. Hidden tabs get fewer timer ticks, so give
       //    them more real wall-clock; a visible tab settles fast.
       const initialTries = opening ? (wasHidden ? 40 : 40) : 60;   // ~20s hidden / ~20s visible
       for (let i = 0; i < initialTries && !S.cancelled; i++) {
-        if (opening && i % 4 === 0) { try { window.scrollTo(0, 600); window.scrollTo(0, 0); } catch {} }
+        if ((opening || applyPageLoading) && i % 4 === 0) { try { window.scrollTo(0, 600); window.scrollTo(0, 0); } catch {} }
         await sleep(500);
         found = findBtn();
         if (found) { signalHydrated(); break; }
       }
-      // 2) LAST-RESORT safety net: still nothing AND the tab is genuinely hidden+stuck on the
-      //    OPEN path. Now (and only now) front the window so a truly occluded tab gets visible
-      //    time, then wait the fronted cap. Rare by construction — never fires on the normal,
-      //    successfully-hydrating path. Gated by frontToHydrate (default ON); off → one-shot nudge.
-      if (!found && opening && wasHidden) {
+      // 2) LAST-RESORT safety net: still nothing AND the tab is genuinely hidden+stuck either on
+      //    the OPEN path (form never opened) OR on the /apply/ page-LOAD path (Fix 3: navigated to
+      //    the full-page /apply/ form but it hasn't hydrated on this throttled tab). Now (and only
+      //    now) front the window so a truly occluded tab gets visible time, then wait the fronted
+      //    cap. Rare by construction — never fires on the normal, successfully-hydrating path.
+      //    Bounded: requestFrontUntilHydrated is a no-op once already requested, so /apply/-load
+      //    and opener-stall can't strobe the window. Gated by frontToHydrate (default ON).
+      if (!found && (opening || applyPageLoading) && wasHidden) {
         if (frontToHydrate) {
-          logLine('warn', 'apply tab still not hydrated after waiting — fronting its window as a last resort');
+          logLine('warn', applyPageLoading
+            ? 'apply /apply/ page not hydrated on this throttled tab — fronting its window to let it load'
+            : 'apply tab still not hydrated after waiting — fronting its window as a last resort');
           requestFrontUntilHydrated();
         } else {
           try { chrome.runtime?.sendMessage?.({ type: 'jat11.nudge-apply-window' }); } catch {}
@@ -1752,7 +1784,7 @@ export async function run(task, context, helpers) {
         ? (findPackAdvance(root) || findAdvanceButton(root, { allowOpen: false }))
         : (onApplyPage
             ? findAdvanceButton(root || document, { allowOpen: false })
-            : (findEasyApplyButton() || (allowExternal ? findExternalApplyButton() : null) || findAdvanceButton(document, { allowOpen: true })));
+            : findOpenBranchButton(document));
       if (!clickBtn) { logLine('warn', 'advance button became invalid before click — re-scanning'); continue; }
     }
     const label = btnText(clickBtn).slice(0, 30);

@@ -55,6 +55,19 @@ function classifyProviderError(error) {
   return 'failed';
 }
 
+// Pure board selection respecting easyApplyOnly (exported for tests). When
+// easyApplyOnly is ON, NON-LinkedIn boards (Indeed/Glassdoor/Google/ZipRecruiter)
+// have no real "Easy Apply" concept — feeding their results floods the queue with
+// external postings that the runner then skips. So drop every non-LinkedIn board.
+// When easyApplyOnly is OFF, behavior is unchanged (all configured boards kept).
+// (LinkedIn search already pins f_AL=true via buildSearchUrl/easyApplyOnly, so its
+// results are genuinely Easy-Apply.)
+function selectBoards(boards, easyApplyOnly) {
+  const list = (Array.isArray(boards) ? boards : []).filter(Boolean);
+  if (!easyApplyOnly) return list;
+  return list.filter((b) => b === 'linkedin');
+}
+
 function planner(settings, index = 0) {
   const aa = settings?.autoApply || settings || {};
   const keywords = (aa.keywords || []).map(text).filter(Boolean);
@@ -175,8 +188,16 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     const query = planner(settings, idx);
     if (!query) return { ok: false, reason: 'no-keywords' };
     db.kvSet('discoveryPlannerIndex', query.nextIndex);
-    const boards = (aa.boards || ['linkedin', 'indeed']).map((b) => text(b).toLowerCase().replace(/\s+/g, '_')).filter((b) => SUPPORTED.has(b));
+    let boards = (aa.boards || ['linkedin', 'indeed']).map((b) => text(b).toLowerCase().replace(/\s+/g, '_')).filter((b) => SUPPORTED.has(b));
     if (!boards.length) return { ok: false, reason: 'no-supported-boards' };
+    // Fix 5(a): in Easy-Apply-only mode, only LinkedIn can yield real Easy-Apply jobs
+    // (its search adds f_AL=true). Non-LinkedIn boards have no Easy-Apply concept, so
+    // discovering from them just floods the queue with external postings that get skipped.
+    if (aa.easyApplyOnly !== false) {
+      const easyBoards = selectBoards(boards, true);
+      if (easyBoards.length) boards = easyBoards;
+      else return { ok: false, reason: 'no-easy-apply-boards' };
+    }
     const boardIndex = Number(db.kvGet('discoveryBoardIndex')) || 0;
     const selectedBoards = [];
     for (let i = 0; i < Math.min(3, boards.length); i++) selectedBoards.push(boards[(boardIndex + i) % boards.length]);
@@ -211,4 +232,4 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
   return { runTick, searchBoard, start, stop, isRunning: () => running };
 }
 
-module.exports = { normalizeJobSpyRecord, classifyProviderError, planner, defaultRunner, runWithCandidates, workerCandidates, createDiscoveryService };
+module.exports = { normalizeJobSpyRecord, classifyProviderError, planner, selectBoards, defaultRunner, runWithCandidates, workerCandidates, createDiscoveryService };

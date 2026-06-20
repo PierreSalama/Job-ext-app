@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const mod = await import(pathToFileURL(path.join(here, '..', 'extension', 'content', 'signals', 'success.js')).href);
-const { evaluateSubmitEvidence } = mod;
+const { evaluateSubmitEvidence, SUCCESS_TEXT_RX } = mod;
 
 // ---- MUST REJECT ----
 
@@ -127,6 +127,86 @@ test('URL change to a LOGIN page is NOT a confirmation', () => {
     newNodes: [],
   });
   assert.equal(r.verified, false);
+});
+
+// ---- FIX 2: the NEW full-page Easy Apply post-submit confirmation must verify ----
+// The new layout (/jobs/view/<id>/apply/) shows a full-page/section confirmation AFTER the
+// Submit click: "Your application was sent" / "Application sent" / "Your application was
+// submitted" (EN) or "Votre candidature a bien été envoyée" / "Candidature envoyée" (FR).
+// These must (a) be recognised by SUCCESS_TEXT_RX, and (b) verify as a NEW-after-submit
+// change — while pre-existing static copy of the SAME text is still rejected (R1 not weakened).
+
+test('FIX 2: the new full-page confirmation phrases are recognised by SUCCESS_TEXT_RX (EN + FR)', () => {
+  for (const p of [
+    'Your application was sent',
+    'Application sent',
+    'Your application was sent to Acme Corp',
+    'Your application was submitted',
+    'Votre candidature a bien été envoyée',
+    'Candidature envoyée',
+  ]) {
+    assert.equal(SUCCESS_TEXT_RX.test(p), true, `expected success phrase: "${p}"`);
+  }
+  // A bare apply CTA / advance label must NOT look like success.
+  for (const p of ['Easy Apply', 'Apply now', 'Next', 'Review your application', 'Submit application']) {
+    assert.equal(SUCCESS_TEXT_RX.test(p), false, `must NOT be success: "${p}"`);
+  }
+});
+
+test('FIX 2: new full-page submit — /apply/ form closes to "Application sent" (text became success) → verified', () => {
+  // Before: on the /apply/ form (no success text). After: the form closed and the page now
+  // shows the confirmation (success text appeared AFTER the click, after a plausible delay).
+  const r = evaluateSubmitEvidence({
+    before: { text: 'Review your application. Submit application.', url: 'https://www.linkedin.com/jobs/view/42/apply/', successText: false },
+    after: { text: 'Application sent. Your application was sent to Acme Corp.', url: 'https://www.linkedin.com/jobs/view/42', successText: true },
+    formGrounded: true,
+    msElapsed: 1300,
+    urlBefore: 'https://www.linkedin.com/jobs/view/42/apply/',
+    urlAfter: 'https://www.linkedin.com/jobs/view/42',
+    newNodes: [],
+  });
+  assert.equal(r.verified, true);
+  // The /apply/ → job-view URL change isn't a SUCCESS_URL, so this verifies via text-became-success.
+  assert.equal(r.reason, 'text-became-success');
+});
+
+test('FIX 2: new full-page submit — a NEW "Your application was submitted" confirmation node → verified', () => {
+  const r = evaluateSubmitEvidence({
+    before: { text: 'Review your application. Submit application.', url: 'https://www.linkedin.com/jobs/view/42/apply/', successText: false },
+    after: { text: 'Your application was submitted.', url: 'https://www.linkedin.com/jobs/view/42/apply/', successText: true },
+    formGrounded: true,
+    msElapsed: 1500,
+    newNodes: [{ text: 'Your application was submitted.', confirmation: false }],
+  });
+  assert.equal(r.verified, true);
+  assert.equal(r.reason, 'new-confirmation-node');
+});
+
+test('FIX 2: R1 NOT weakened — pre-existing static "Application sent" copy (unchanged) → still rejected', () => {
+  // The exact new-layout phrase, but it was ALREADY on the page before the click and nothing
+  // changed. This is the false-positive guard: static success text must never mint a done.
+  const staticText = 'Application sent. Your application was sent. Browse more jobs.';
+  const r = evaluateSubmitEvidence({
+    before: { text: staticText, url: 'https://www.linkedin.com/jobs/view/42', successText: true },
+    after: { text: staticText, url: 'https://www.linkedin.com/jobs/view/42', successText: true },
+    formGrounded: true,
+    msElapsed: 1500,
+    newNodes: [],
+  });
+  assert.equal(r.verified, false);
+  assert.equal(r.reason, 'static-success-text-unchanged');
+});
+
+test('FIX 2: R1 NOT weakened — new-layout phrase but ungrounded form → still rejected', () => {
+  const r = evaluateSubmitEvidence({
+    before: { text: 'Apply on company website.', url: 'https://www.linkedin.com/jobs/view/42', successText: false },
+    after: { text: 'Your application was sent.', url: 'https://www.linkedin.com/jobs/view/42', successText: true },
+    formGrounded: false,            // never opened/filled a real apply form
+    msElapsed: 1500,
+    newNodes: [{ text: 'Your application was sent.', confirmation: false }],
+  });
+  assert.equal(r.verified, false);
+  assert.equal(r.reason, 'no-grounded-form');
 });
 
 test('correlated network POST proves the submit even without a visible banner, grounded → verified', () => {

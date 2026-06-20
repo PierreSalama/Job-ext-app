@@ -550,7 +550,7 @@ async function launchApp() {
 let activeCount = 0;
 let pumping = false;
 let scanning = false;
-let currentConcurrency = 1;       // learned from each /queue/next response
+let currentConcurrency = 3;       // default 3 parallel windows; re-learned from each /queue/next response (server clamps 1..3)
 let gapTimer = null;              // precise wake-up when only the pacing gap held us back
 let pumpDirty = false;            // a re-pump request arrived while pumping — re-run once we finish
 // Resume the right parallelism after an MV3 service-worker eviction — otherwise the

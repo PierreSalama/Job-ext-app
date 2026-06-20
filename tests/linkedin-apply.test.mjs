@@ -11,6 +11,7 @@ import {
   isLinkedInEasyApplyApplyUrl,
   isLinkedInApplyAdvanceLabel,
   deriveApplyRootFromAdvanceButton,
+  shouldUseGenericOpenFallback,
 } from '../extension/content/lib/linkedin-apply.js';
 
 // ---- isLinkedInEasyApplyApplyUrl: the /apply/ route guard (LIVE-VALIDATED) ----
@@ -86,6 +87,47 @@ test('deriveApplyRootFromAdvanceButton: missing args never throw (defensive null
   assert.equal(deriveApplyRootFromAdvanceButton(), null);
   assert.equal(deriveApplyRootFromAdvanceButton(null, {}), null);
   assert.equal(deriveApplyRootFromAdvanceButton({}, { parentOf: () => null }), null);   // no countFields
+});
+
+// ---- FIX 1: the generic open/advance fallback must NOT run on a LinkedIn job-view page
+//      that has no Easy-Apply opener (that's where the stray "Next" gets clicked) ----
+test('shouldUseGenericOpenFallback: BLOCKED on a LinkedIn job page with no Easy Apply (the stray-Next bug)', () => {
+  // Bosch case: linkedin.com/jobs/view/<id>, no /apply/ route, no form, no Easy-Apply opener.
+  assert.equal(shouldUseGenericOpenFallback({
+    onLinkedIn: true, onApplyRoute: false, hasEasyApplyOpener: false, haveForm: false,
+  }), false);
+});
+
+test('shouldUseGenericOpenFallback: ALLOWED on a genuine non-LinkedIn ATS page', () => {
+  // A real external ATS (greenhouse/lever/company site) still needs the generic open fallback.
+  assert.equal(shouldUseGenericOpenFallback({
+    onLinkedIn: false, onApplyRoute: false, hasEasyApplyOpener: false, haveForm: false,
+  }), true);
+});
+
+test('shouldUseGenericOpenFallback: ALLOWED on the LinkedIn /apply/ full-page route', () => {
+  // The full-page flow drives via the advance scan — must keep working (preserve v11.27.0).
+  assert.equal(shouldUseGenericOpenFallback({
+    onLinkedIn: true, onApplyRoute: true, hasEasyApplyOpener: false, haveForm: false,
+  }), true);
+});
+
+test('shouldUseGenericOpenFallback: ALLOWED on LinkedIn when a real Easy-Apply opener exists', () => {
+  assert.equal(shouldUseGenericOpenFallback({
+    onLinkedIn: true, onApplyRoute: false, hasEasyApplyOpener: true, haveForm: false,
+  }), true);
+});
+
+test('shouldUseGenericOpenFallback: ALLOWED on LinkedIn once a real apply form is already open', () => {
+  assert.equal(shouldUseGenericOpenFallback({
+    onLinkedIn: true, onApplyRoute: false, hasEasyApplyOpener: false, haveForm: true,
+  }), true);
+});
+
+test('shouldUseGenericOpenFallback: defensive defaults (no args) → blocked is impossible only off-LinkedIn', () => {
+  // No args = onLinkedIn:false → fallback allowed (safe generic default).
+  assert.equal(shouldUseGenericOpenFallback(), true);
+  assert.equal(shouldUseGenericOpenFallback({}), true);
 });
 
 // ---- FIX 3: the "Easy Apply filter." search pill must NOT be classified as an opener ----

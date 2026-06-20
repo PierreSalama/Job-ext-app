@@ -3,8 +3,10 @@
 //   1. shouldFrontOnOpenerStall — front+retry the apply window when the Easy-Apply opener
 //      was clicked but the modal never mounted, BEFORE letting the duplicate-opener breaker
 //      fail the task (the keystone of the 0-submission regression).
-//   2. the concurrency DEFAULT is 1 (serial) — only one apply window can be foreground/
-//      un-throttled at a time, so parallel windows are throttled and don't hydrate.
+//   2. the concurrency DEFAULT is 3 (parallel) — direct live observation disproved the
+//      occlusion theory: apply forms work on hidden/unfocused tabs, so parallel windows are
+//      safe; the only throttled case (a /apply/ page still LOADING in a backgrounded window)
+//      is mitigated by front-on-load (Fix 3). The 1..8 range stays valid (server clamps 1..3).
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -73,9 +75,13 @@ test('missing args are treated as the no-front default (never front blindly)', (
   assert.equal(shouldFrontOnOpenerStall({}).front, false);
 });
 
-// F2: concurrency MUST default to 1. Parallel apply windows are all throttled except the one
-// foreground window, so >1 near-zeroes hydration. The 1..8 range stays valid (advanced users
-// can opt in with the strengthened warning), but the out-of-the-box value is serial.
-test('autoApply.concurrency default is 1 (serial — the only fully-hydrating setting)', () => {
-  assert.equal(DEFAULTS.autoApply.concurrency, 1);
+// FIX 4: concurrency now defaults to 3. Forms hydrate unfocused (the occlusion theory was
+// disproven by direct live observation), so parallel apply windows are safe; a /apply/ page
+// that loads slowly while backgrounded is fronted-on-load (Fix 3) or retried. The value stays
+// within the 1..8 range (the server clamps the effective pool to 3) and >1 keeps the ban-risk
+// confirm warning in the dashboard.
+test('autoApply.concurrency default is 3 (parallel — forms work unfocused)', () => {
+  assert.equal(DEFAULTS.autoApply.concurrency, 3);
+  // still inside the supported range
+  assert.ok(DEFAULTS.autoApply.concurrency >= 1 && DEFAULTS.autoApply.concurrency <= 8);
 });
