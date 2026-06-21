@@ -2142,7 +2142,12 @@ export async function run(task, context, helpers) {
       // mere ABSENCE of an Easy-Apply opener keeps the full hydration wait below, so a genuinely
       // slow-hydrating REAL Easy Apply is NEVER mis-skipped.
       const onLI_fs = /(^|\.)linkedin\.com$/i.test(location.hostname);
-      const extVerdict = (opening && onLI_fs)
+      // The fast-skip is an EASY-APPLY-ONLY optimization: when the user only wants Easy Apply,
+      // a positively-external LinkedIn posting has nothing to drive, so skip it in ~0s. But in
+      // BOTH mode (allowExternal — easyApplyOnly OFF) we WANT to apply to externals: don't
+      // fast-skip; let findOpenBranchButton's external-opener path drive the offsite handoff
+      // (and if no clickable external control is found, fall through to the retriable path).
+      const extVerdict = (opening && onLI_fs && !allowExternal)
         ? detectLinkedInExternalPosting({
             onLinkedIn: true,
             onApplyRoute: onApplyPage,
