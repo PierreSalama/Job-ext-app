@@ -90,6 +90,40 @@ if (domFailure) {
   });
 }
 
+// ---- TRUE skip breakdown (last_error labels hide the real reason; peek transcripts) ----
+// Most "skips" are LEGITIMATE (external posting / too-senior fit-skip), NOT failures — so the
+// raw done/terminal rate understates real performance. Classify recent skips by transcript so we
+// see eligible-apply performance vs supply loss.
+const skipRows = q(`SELECT t.last_error le, t.transcript tr FROM ${T} t WHERE t.state='skipped' AND t.updated_at>='${cutoff}'`);
+const skipKinds = { external: 0, tooSenior: 0, alreadyApplied: 0, stopped: 0, other: 0 };
+for (const r of skipRows) {
+  const tr = String(r.tr || ''); const le = String(r.le || '');
+  if (/stopped from dashboard/.test(tr)) skipKinds.stopped++;
+  else if (/external|no Easy Apply|company site|managed off/i.test(le + tr)) skipKinds.external++;
+  else if (/needs ~?\d+ ?yrs|needs .*experience|seniority|over[- ]?qualified|too senior/i.test(tr)) skipKinds.tooSenior++;
+  else if (/already applied/i.test(le)) skipKinds.alreadyApplied++;
+  else skipKinds.other++;
+}
+// eligible-apply rate: of tasks that were actually APPLY-ABLE (exclude legitimate skips + stops),
+// how many succeeded? This is the executor's true quality, separate from the supply problem.
+const genuineFailWin = q(`SELECT COUNT(*) n FROM ${T} WHERE updated_at>='${cutoff}' AND state='failed'`)[0]?.n || 0;
+const eligibleDenom = doneWin + genuineFailWin + (q(`SELECT COUNT(*) n FROM ${T} WHERE updated_at>='${cutoff}' AND state='awaiting_review'`)[0]?.n || 0);
+const eligibleRate = eligibleDenom ? Math.round((doneWin / eligibleDenom) * 100) : 0;
+
+// ---- discovery source + saturation (jobspy flood vs the EA-dense discoverTick) ----
+let discoveryStatus = null, discoverTickLive = false, lastDiscoverySaturated = false;
+try {
+  const dsRow = q(`SELECT value FROM kv WHERE key='discoveryStatus'`)[0];
+  if (dsRow) {
+    discoveryStatus = typeof dsRow.value === 'string' ? JSON.parse(dsRow.value) : dsRow.value;
+    // discoverTick (extension) posts a single object with a linkedin f_AL url; app JobSpy posts provider:'jobspy' + results[]
+    const url = String(discoveryStatus?.url || '');
+    discoverTickLive = /f_AL=true/.test(url) || (discoveryStatus?.provider && discoveryStatus.provider !== 'jobspy' && !discoveryStatus.results);
+    const res = discoveryStatus?.results?.[0] || discoveryStatus;
+    lastDiscoverySaturated = (Number(res?.found) || 0) > 0 && (Number(res?.accepted ?? res?.enqueued) || 0) === 0;
+  }
+} catch {}
+
 const rate = terminalWin ? Math.round((doneWin / terminalWin) * 100) : 0;
 const report = {
   db: DB_PATH, generatedAt: new Date(nowMs).toISOString(), windowMinutes: MINUTES,
@@ -98,7 +132,11 @@ const report = {
   stateAllTime: stateAll, stateWindow: stateWin, errorBucketsWindow: errWin,
   schedulableQueue: schedulable,
   recoveryCandidates: recoverable, legacyAwaitingReview: legacyAR,
-  discovery: { provenanceByProvider: prov, byApplyCapability: cap, jobsBySource },
+  skipBreakdown: skipKinds,
+  eligibleApplyRate: { done: doneWin, eligible: eligibleDenom, ratePct: eligibleRate },
+  discovery: { provenanceByProvider: prov, byApplyCapability: cap, jobsBySource,
+    lastStatus: discoveryStatus ? { provider: discoveryStatus.provider, at: discoveryStatus.at, url: discoveryStatus.url } : null,
+    discoverTickLive, lastDiscoverySaturated },
   dominantFailure: domFailure || null, samples,
 };
 
@@ -114,7 +152,11 @@ L(`\n══════════ JAT AUTO-APPLY DOCTOR ═══════�
 L(`db: ${DB_PATH}`);
 L(`now: ${report.generatedAt}   latest activity: ${latest}   build(learned=): ${buildProxy || '?'}`);
 L(`\n── SUBMISSION RATE (last ${MINUTES} min) ──`);
-L(`  done ${doneWin} / terminal ${terminalWin}  =  ${rate}%   ${rate >= 60 ? '✓ at target' : '✗ below 60% target'}`);
+L(`  raw:      done ${doneWin} / terminal ${terminalWin}  =  ${rate}%   (includes legitimate skips below)`);
+L(`  ELIGIBLE: done ${doneWin} / apply-able ${eligibleDenom}  =  ${eligibleRate}%   ${eligibleRate >= 60 ? '✓ at target' : '✗ below 60%'}   ← executor quality (excludes external/too-senior skips)`);
+L(`\n── SKIP BREAKDOWN (last ${MINUTES} min — most skips are LEGITIMATE, not failures) ──`);
+L(`  external/no-Easy-Apply: ${skipKinds.external}   too-senior(fit): ${skipKinds.tooSenior}   already-applied: ${skipKinds.alreadyApplied}   stopped-by-you: ${skipKinds.stopped}   other: ${skipKinds.other}`);
+if (skipKinds.external > (doneWin + genuineFailWin)) L(`  ⚠ SUPPLY-LIMITED: external skips dominate → the queue is mostly non-Easy-Apply jobs. Fix = EA-dense discovery (discoverTick) + broaden/relax search.`);
 L(`\n── QUEUE (schedulable now) ──`);
 L(schedulable.length ? schedulable.map((r) => `  ${r.state}: ${r.n}`).join('\n') : '  (empty — nothing queued/scheduled/running)');
 L(`\n── STATE (all time) ──`);
@@ -126,6 +168,9 @@ L(`\n── RECOVERY / HYGIENE ──`);
 L(`  awaiting_review w/ R1 verified marker (should be ~0; >0 = downgrade bug live): ${recoverable}`);
 L(`  awaiting_review legacy/static (human re-verify, expected): ${legacyAR}`);
 L(`\n── DISCOVERY SUPPLY ──`);
+L(`  last discovery: ${discoveryStatus ? `provider=${discoveryStatus.provider || '?'} at ${discoveryStatus.at || '?'}` : '(none recorded)'}`);
+L(`  EA-dense discoverTick LIVE? ${discoverTickLive ? 'YES (extension reloaded, f_AL search running)' : 'NO — still app JobSpy only (reload the extension to activate the Easy-Apply-only discovery)'}`);
+if (lastDiscoverySaturated) L(`  ⚠ SATURATED: the last search found jobs but accepted 0 (all duplicates/rejected) → your search niche is exhausted; broaden keywords/locations or widen the freshness window.`);
 L(`  provenance by provider: ${prov.map((r) => `${r.provider || '?'}=${r.n}`).join(', ') || '(n/a)'}`);
 L(`  by applyCapability:    ${cap.map((r) => `${r.c || '?'}=${r.n}`).join(', ') || '(n/a)'}`);
 L(`  jobs by source (top):  ${jobsBySource.map((r) => `${r.source}=${r.n}`).join(', ')}`);

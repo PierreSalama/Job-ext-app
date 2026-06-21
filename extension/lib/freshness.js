@@ -4,14 +4,20 @@
 // stops surfacing new ones. LinkedIn's time-posted filter is `f_TPR=r<seconds>`
 // (r3600 = last 1h, … r604800 = last 7d). We start at the NARROWEST tier and hammer it
 // while it keeps producing NEW jobs; the moment a (board,keyword,location) scan ingests
-// 0 new jobs, we widen to the next tier. At the widest tier we stay put (the queue stays
-// fed with the freshest 7-day window) — never narrower-than-1h, never wider-than-7d.
+// 0 new jobs, we widen to the next tier. At the widest tier we stay put — never narrower
+// than 1h, never wider than 30d.
+//
+// DEPTH (2026-06-21): the ladder now extends to 30 days (was 7d). When a niche is SATURATED
+// — every fresh Easy-Apply posting already applied to — the 7d ceiling left the queue starved
+// (discovery found only duplicates → ~1 submission/hour). Widening through 3d/14d/30d surfaces
+// older, not-yet-seen Easy-Apply postings so the queue keeps refilling. Still newest-first:
+// a combo only reaches 30d after every narrower window comes up dry, so fresh jobs always win.
 //
 // Indeed only exposes day-granularity (`&fromage=<days>`), so the sub-day tiers there
 // clamp to fromage=1 — the fine ramp is LinkedIn-only, which is fine.
 
-// Narrowest → widest. Seconds.
-const FRESHNESS_TIERS = [3600, 7200, 14400, 28800, 86400, 604800];
+// Narrowest → widest. Seconds. [1h, 2h, 4h, 8h, 24h, 3d, 7d, 14d, 30d]
+const FRESHNESS_TIERS = [3600, 7200, 14400, 28800, 86400, 259200, 604800, 1209600, 2592000];
 
 // The tier a brand-new combo starts at (the narrowest — freshest).
 const NARROWEST_TIER = FRESHNESS_TIERS[0];
