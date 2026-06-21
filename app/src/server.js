@@ -1445,6 +1445,29 @@ async function handle(req, res, parsed) {
       return sendJson(res, 200, { ok: true, result: null, aiUnavailable: true, reason: String(e?.message || e) });
     }
   }
+
+  // AI RESCUE: the executor calls this when a step BREAKS (no advance control, stuck, a required
+  // field it couldn't detect/answer). We inject the candidate profile + resume + learned memory and
+  // ask the configured provider (Claude/OpenAI CLI subscription or key, or local) for the exact next
+  // UI actions. Graceful: AI down → { result:null, aiUnavailable } so the executor parks cleanly.
+  if (req.method === 'POST' && pathname === '/ai/apply-rescue') {
+    const body = await readJson(req);
+    const ps = body.pageState || {};
+    const job = body.jobId ? db.getJob(body.jobId) : (body.job || {});
+    const profile = db.profileForSource(job?.source);
+    const resume = db.defaultDocument('resume');
+    const qaHistory = db.qaList(body.profileId || db.resolveProfileId(job?.source), 12);
+    try {
+      const r = await provider.run(prompts.applyRescue({
+        url: ps.url, routeState: ps.routeState, failureReason: ps.failureReason,
+        fields: ps.fields, buttons: ps.buttons, pageText: ps.pageText,
+        job, profile, qaHistory, resumeText: resume?.textContent || '',
+      }));
+      return sendJson(res, 200, { ok: true, result: r.json, provider: r.provider });
+    } catch (e) {
+      return sendJson(res, 200, { ok: true, result: null, aiUnavailable: true, reason: String(e?.message || e) });
+    }
+  }
   if (req.method === 'POST' && pathname === '/ai/classify-email') {
     const body = await readJson(req);
     const r = await provider.run(prompts.classifyEmail(body));

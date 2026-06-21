@@ -11,10 +11,26 @@ const prompts = require('../app/src/ai/prompts.js');
 const JOB = { title: 'Engineer', company: 'Acme', description: 'Build things.' };
 const PROFILE = { data: { firstName: 'Pierre', skills: ['JS'] } };
 
+test('applyRescue: structured-actions schema + safety rules + no throw on sparse input', () => {
+  const p = prompts.applyRescue({
+    url: 'https://x/apply', routeState: 'linkedin_easy_apply_modal', failureReason: 'page stopped advancing',
+    fields: [{ label: 'I certify the info is accurate', type: 'checkbox', required: true, value: '' }],
+    buttons: ['Review', 'Submit application'], pageText: 'Before you submit',
+    job: JOB, profile: PROFILE, qaHistory: [], resumeText: '',
+  });
+  assert.equal(p.kind, 'apply-rescue');
+  assert.ok(p.schema && p.schema.properties.actions, 'has an actions array schema');
+  assert.deepEqual(p.schema.properties.actions.items.properties.type.enum, ['fill', 'select', 'check', 'click', 'park']);
+  assert.match(p.prompt, /NEVER/i, 'carries hard truthfulness/no-blind-submit rules');
+  assert.match(p.prompt, /I certify the info is accurate/, 'includes the detected fields');
+  assert.doesNotThrow(() => prompts.applyRescue({ profile: PROFILE }));
+});
+
 test('structured prompts carry a JSON schema', () => {
   for (const build of [
     () => prompts.fitScore({ job: JOB, profile: PROFILE, resumeText: '' }),
     () => prompts.answerQuestion({ question: 'Years of JS?', job: JOB, profile: PROFILE, qaHistory: [], resumeText: '' }),
+    () => prompts.applyRescue({ failureReason: 'stuck', fields: [], buttons: [], profile: PROFILE }),
     () => prompts.classifyEmail({ subject: 's', from: 'f', body: 'b' }),
     () => prompts.resumeParse({ resumeText: 'text' }),
     () => prompts.validateCapture({ job: JOB }),

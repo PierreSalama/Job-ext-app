@@ -333,8 +333,87 @@ ${JSON.stringify({
   };
 }
 
+// applyRescue — the AI "guide" the executor calls when a step BREAKS (no advance control found,
+// the page stopped advancing, a required field it couldn't detect/answer). Given the live page
+// state + the candidate's profile + learned memory, return the EXACT next UI actions to make the
+// application progress truthfully. This is the brain behind the per-step fallback.
+function applyRescue({ url, routeState, failureReason, fields, buttons, pageText, job, profile, qaHistory, resumeText }) {
+  const fieldBlock = (fields || []).slice(0, 40).map((f, i) =>
+    `[${i}] label="${clip(f.label || '', 160)}" type=${f.type || '?'}${f.required ? ' REQUIRED' : ''}${f.value ? ` value="${clip(String(f.value), 40)}"` : ''}${(f.options && f.options.length) ? ` options=${JSON.stringify(f.options.slice(0, 20))}` : ''}`).join('\n') || '(none detected)';
+  const buttonBlock = (buttons || []).slice(0, 25).map((b) => `"${clip(String(b), 60)}"`).join(', ') || '(none)';
+  const historyBlock = (qaHistory || []).slice(0, 12).map((q) => `Q: ${clip(q.question, 160)}\nA: ${clip(q.answer, 160)}`).join('\n');
+  return {
+    kind: 'apply-rescue',
+    system: SYSTEM_BASE,
+    prompt:
+`You are driving a job-application form on the candidate's behalf and the automation is STUCK. Decide the next UI actions to progress the application.
+
+HARD RULES (truthfulness + safety — non-negotiable):
+- Ground every value ONLY in the candidate profile, resume, and previously-given answers below. NEVER invent employers, dates, degrees, numbers, or claims not supported there.
+- Work authorization / visa / citizenship / demographics (EEO) / criminal history / salary: only act if the profile explicitly has it; otherwise return a "park" action for that field.
+- NEVER choose a final-submit button ("Submit application", "Submit", "Send application") unless EVERY required field on the page is already satisfied. When unsure, advance ("Next"/"Review"/"Continue") instead, or "park".
+- For a choice/radio/select field, the value MUST be exactly one of its listed options.
+- "how many years of X" → a NUMBER from the resume (never a URL); estimate conservatively; if no relevant experience, a small number or park.
+- If you cannot make safe progress (a required field you can't ground, a login wall, a CAPTCHA), return a single "park" action with a clear reason. Do NOT guess.
+
+ACTION TYPES you may return (in order to perform):
+- {type:"fill", target:"<field label>", value:"<text>"}            — type into a text/number/textarea field
+- {type:"select", target:"<field label>", value:"<exact option>"}   — choose a dropdown/radio option (verbatim)
+- {type:"check", target:"<field label>", value:"yes"|"no"}          — a single checkbox (consent etc.) — only if truthful + safe
+- {type:"click", target:"<button label>"}                           — click an advance/open control (NOT final submit unless complete)
+- {type:"park", target:"", value:"", reason:"..."}                  — stop + hand to the user (unknown/required/legal/captcha/login)
+
+== WHY WE'RE STUCK ==
+${clip(failureReason || 'no progress', 200)}   (route: ${routeState || 'unknown'}, url: ${clip(url || '', 120)})
+
+== DETECTED FIELDS ON THIS PAGE ==
+${fieldBlock}
+
+== BUTTONS ON THIS PAGE ==
+${buttonBlock}
+
+== VISIBLE PAGE TEXT (snippet) ==
+${clip(pageText || '', 1500)}
+
+== JOB CONTEXT ==
+${jobBlock(job || {})}
+
+== CANDIDATE PROFILE ==
+${profileBlock(profile)}
+
+== RESUME ==
+${clip(resumeText, 3500) || '(none)'}
+
+== PREVIOUSLY GIVEN ANSWERS (this candidate, other applications) ==
+${historyBlock || '(none)'}`,
+    schema: {
+      type: 'object',
+      required: ['actions', 'assessment', 'confident'],
+      additionalProperties: false,
+      properties: {
+        actions: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['type', 'target', 'reason'],
+            additionalProperties: false,
+            properties: {
+              type: { type: 'string', enum: ['fill', 'select', 'check', 'click', 'park'] },
+              target: { type: 'string', description: 'the field label or button text to act on ("" for park)' },
+              value: { type: 'string', description: 'text to fill / option to select / yes|no for check' },
+              reason: { type: 'string', description: 'one line: why, grounded in the profile/resume' },
+            },
+          },
+        },
+        assessment: { type: 'string', description: 'one line: what this page is + the plan' },
+        confident: { type: 'boolean', description: 'true only if the actions truthfully progress the application' },
+      },
+    },
+  };
+}
+
 module.exports = {
   SYSTEM_BASE,
-  fitScore, coverLetter, tailorResume, answerQuestion,
+  fitScore, coverLetter, tailorResume, answerQuestion, applyRescue,
   classifyEmail, summarizeJob, followUp, resumeParse, validateCapture,
 };

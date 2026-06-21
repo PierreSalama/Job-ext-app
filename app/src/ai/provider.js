@@ -10,6 +10,7 @@
 // orders ('cloud-first' etc.) and the old ai.cloud shape still work.
 
 const codex = require('./codex');
+const claudeCli = require('./claude');
 const ollama = require('./ollama');
 const anthropic = require('./anthropic');
 const openai = require('./openai');
@@ -66,6 +67,14 @@ function buildAttempts(s, { prose, modelOverride, providerOverride }) {
   for (const key of order) {
     if (key === 'claude') {
       const cfg = s.claude || {};
+      // SUBSCRIPTION via the official Claude CLI (subprocess) FIRST — identical secure pattern to
+      // chatgpt→codex: the CLI owns its own credentials + refresh in ~/.claude; we never read,
+      // store, or hardcode the token. Default ON; flip cfg.useSubscription=false to use only the key.
+      if (cfg.useSubscription !== false) {
+        const model = modelOverride || cfg.cliModel || null;   // null → CLI's own default model
+        attempts.push({ name: 'claude-cli', model: model || 'cli-default', run: (a) => claudeCli.generate({ ...a, model, timeoutMs: cfg.timeoutMs }) });
+      }
+      // API-key fallback (Anthropic direct) when a key is set.
       if (cfg.apiKey) {
         const model = modelOverride || cfg.model || 'claude-sonnet-4-6';
         attempts.push({ name: 'claude', model, run: (a) => anthropic.generate({ ...a, model, cfg }) });
@@ -95,18 +104,25 @@ async function statusAll(force = false) {
   const s = db.getSettings().ai;
   if (!force && lastStatus.valid && Date.now() - lastStatus.checkedAt < 30000) return lastStatus;
   const chatgptCfg = bridgeChatgpt(s);
-  const [cx, ol, claudeSt, openaiSt] = await Promise.all([
+  const claudeCfg = s.claude || {};
+  const [cx, claudeCliSt, ol, claudeApiSt, openaiSt] = await Promise.all([
     codex.status().catch((e) => ({ available: false, reason: e.message })),
+    claudeCli.status().catch((e) => ({ available: false, reason: e.message })),
     ollama.status(s.local || {}).catch((e) => ({ available: false, reason: e.message })),
-    anthropic.status(s.claude || {}).catch((e) => ({ available: false, reason: e.message })),
+    anthropic.status(claudeCfg).catch((e) => ({ available: false, reason: e.message })),
     openai.status(chatgptCfg).catch((e) => ({ available: false, reason: e.message })),
   ]);
   const chatgpt = {
     available: (chatgptCfg.useSubscription !== false && cx.available) || openaiSt.available,
     subscription: cx, apiKey: openaiSt, useSubscription: chatgptCfg.useSubscription !== false,
   };
+  // Claude now mirrors chatgpt: CLI subscription (claude.js) + API key (anthropic.js).
+  const claude = {
+    available: (claudeCfg.useSubscription !== false && claudeCliSt.available) || claudeApiSt.available,
+    subscription: claudeCliSt, apiKey: claudeApiSt, useSubscription: claudeCfg.useSubscription !== false,
+  };
   lastStatus = {
-    claude: claudeSt, chatgpt, local: ol,
+    claude, chatgpt, local: ol,
     codex: cx, ollama: ol,                 // legacy keys
     order: resolveOrder(s.order), checkedAt: Date.now(), valid: true,
   };

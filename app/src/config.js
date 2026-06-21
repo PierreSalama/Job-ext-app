@@ -30,10 +30,15 @@ const DEFAULTS = {
     // Reorder freely in Settings. Default: Claude → ChatGPT → local.
     order: ['claude', 'chatgpt', 'local'],
 
-    // Claude (Anthropic). API key ONLY — Anthropic blocks subscription tokens
-    // outside Claude Code (server-side, since Jan 2026).
+    // Claude (Anthropic). Two ways: your Claude subscription via the official Claude Code CLI
+    // (the `claude` binary, invoked as a SUBPROCESS — the CLI owns its own auth + refresh; the
+    // app never reads/stores the token). That's NOT the blocked case (raw subscription token in a
+    // third-party client) — it's the official client making the call, identical to ChatGPT→Codex.
+    // Or use an Anthropic API key. Subscription (CLI) is tried first when on.
     claude: {
-      apiKey: '',
+      useSubscription: true,        // use the logged-in Claude Code CLI (Claude subscription)
+      cliModel: '',                 // '' = the CLI's default model; or e.g. 'claude-sonnet-4-6'
+      apiKey: '',                   // Anthropic API key (alternative / fallback)
       model: 'claude-sonnet-4-6',
       timeoutMs: 120000,
     },

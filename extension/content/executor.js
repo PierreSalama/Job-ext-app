@@ -13,7 +13,7 @@
 // questions only ever come from the profile, never the AI (enforced by the
 // prompt server-side AND a local guard here).
 
-import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput } from './autofill.js';
+import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput, isFillable, radioGroupLabel, isSiteChromeInput, bestFuzzyIndex } from './autofill.js';
 import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
 import { pageTextLooksLikeSuccess, urlLooksLikeSuccess, evaluateSubmitEvidence } from './signals/success.js';
@@ -1347,6 +1347,107 @@ export async function run(task, context, helpers) {
     }
     for (const f of plan.toPark) { park(f.label, f.fieldType, f.options, f.reason); out.parkedCount++; }
     return out;
+  }
+
+  // ============================================================
+  // AI RESCUE — last-resort AI guidance when the deterministic logic is STUCK.
+  // ============================================================
+  // When the normal ladder (profile → qa → /ai/answer-question → grounded defaults) AND the
+  // deterministic advance have BOTH failed (no advance control, page won't move, a required field
+  // the scanner couldn't see/answer), we hand the WHOLE page to the configured AI provider
+  // (Claude/OpenAI subscription via the official CLI, API key, or local) and apply the structured
+  // actions it returns through the EXISTING safe fill/click primitives. Profile + learned memory are
+  // injected server-side (/ai/apply-rescue). HARD SAFETY: never AI-blind-submits — a final-submit
+  // is refused here and left to the R1 success-truth path; sensitive/legal fields are parked, not
+  // guessed. Bounded per task so a confused page can't loop or rack up cost.
+  let aiRescueCount = 0;
+  const MAX_AI_RESCUE = 2;
+  async function tryAiRescue(reason) {
+    if (aiRescueCount >= MAX_AI_RESCUE || S.cancelled) return false;
+    const root = findApplyDialog() || (typeof findLinkedInApplyPageRoot === 'function' ? findLinkedInApplyPageRoot() : null) || detectApplyForm()?.form || document.body;
+    if (!root) return false;
+    // Gather the RAW field list (incl. fields the deterministic scanner may have skipped), deduped.
+    const seen = new Set();
+    const fieldRefs = [];
+    for (const el of qsa('input, select, textarea', root)) {
+      try {
+        if (!isFillable(el) || isSiteChromeInput(el)) continue;
+        const isRadio = el.type === 'radio';
+        const key = isRadio ? `radio:${el.name || el.id || ''}` : (el.id || el.name || `f${fieldRefs.length}`);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const label = (isRadio ? radioGroupLabel(el) : '') || fieldLabel(el) || el.getAttribute('aria-label') || el.name || '';
+        if (!label) continue;
+        let options = null;
+        if (el.tagName === 'SELECT') options = Array.from(el.options).map((o) => (o.textContent || '').trim()).filter(Boolean).slice(0, 20);
+        else if (isRadio && el.name) options = qsa('input[type="radio"]', root).filter((r) => r.name === el.name).map((r) => fieldLabel(r)).filter(Boolean).slice(0, 12);
+        // A checkbox/radio's .value is its option value ("on"), NOT whether it's answered — report
+        // CHECKED state so the AI sees an unchecked-required control as still needing action.
+        const reportedValue = (el.type === 'checkbox' || el.type === 'radio')
+          ? (el.checked ? 'checked' : (isRadio ? (qsa('input[type="radio"]', root).some((r) => r.name === el.name && r.checked) ? 'checked' : '') : ''))
+          : String(el.value || '').slice(0, 40);
+        fieldRefs.push({ el, label: String(label).slice(0, 160), type: el.type || el.tagName.toLowerCase(), required: !!(el.required || el.getAttribute('aria-required') === 'true'), value: reportedValue, options });
+      } catch {}
+    }
+    const btnRefs = qsa('button, [role="button"], input[type="submit"], a[role="button"]', root)
+      .map((el) => ({ el, label: btnText(el) })).filter((b) => b.label).slice(0, 25);
+    const pageText = String(root.innerText || '').replace(/\s+/g, ' ').slice(0, 1500);
+
+    aiRescueCount++;
+    vlog('rescue', `asking AI [${reason}] — ${fieldRefs.length} field(s), ${btnRefs.length} button(s)`);
+    let resp = null;
+    try {
+      resp = await send({
+        type: 'api-call', method: 'POST', path: '/ai/apply-rescue', timeoutMs: 150000,
+        body: {
+          pageState: {
+            url: location.href, routeState: S.routeState, failureReason: reason,
+            fields: fieldRefs.map((f) => ({ label: f.label, type: f.type, required: f.required, value: f.value, options: f.options })),
+            buttons: btnRefs.map((b) => b.label), pageText,
+          },
+          jobId: job?.id, profileId,
+        },
+      });
+    } catch (e) { vlog('rescue', `call failed: ${String(e?.message || e).slice(0, 80)}`); return false; }
+
+    const result = (resp && resp.ok) ? resp.result : null;
+    if (!result || !Array.isArray(result.actions) || !result.actions.length) {
+      vlog('rescue', `no actions (${resp?.aiUnavailable ? 'AI unavailable' : 'empty/none'})`);
+      return false;
+    }
+    vlog('rescue', `AI plan: ${redactLabel(String(result.assessment || ''))} — ${result.actions.length} action(s) confident=${result.confident}`);
+    let progressed = false;
+    for (const act of result.actions) {
+      if (S.cancelled) break;
+      const target = String(act.target || '');
+      const t = target.toLowerCase();
+      if (act.type === 'park') { park(target || 'AI rescue', 'text', null, act.reason || 'AI could not safely proceed — needs you'); return 'parked'; }
+      if (act.type === 'click') {
+        const btn = btnRefs.find((b) => b.label.toLowerCase() === t) || btnRefs.find((b) => t && (b.label.toLowerCase().includes(t) || t.includes(b.label.toLowerCase())));
+        if (!btn) { vlog('rescue', `click target not found: "${redactLabel(target)}"`); continue; }
+        if (isFinalSubmit(btn.el)) { vlog('rescue', `REFUSED AI final-submit "${redactLabel(btn.label)}" — submit stays on the verified path`); continue; }
+        logLine('ok', `AI rescue: clicking "${btn.label.slice(0, 40)}"`);
+        syntheticClick(btn.el); progressed = true; await sleep(500);
+        continue;
+      }
+      if (act.type === 'fill' || act.type === 'select' || act.type === 'check') {
+        if (NEVER_AUTOFILL_RX.test(target) || LEGAL_RX.test(target)) { park(target, 'text', null, 'sensitive/legal — needs your answer'); continue; }
+        let idx = bestFuzzyIndex(fieldRefs.map((f) => f.label), target, 0.5);
+        let f = idx >= 0 ? fieldRefs[idx] : fieldRefs.find((x) => t && (x.label.toLowerCase().includes(t) || t.includes(x.label.toLowerCase())));
+        if (!f) { vlog('rescue', `fill target not matched: "${redactLabel(target)}"`); continue; }
+        const val = act.type === 'check' ? (/(^|\b)(yes|true|1|on|agree|accept)\b/i.test(String(act.value || '')) ? 'Yes' : 'No') : String(act.value || '');
+        if (!val) continue;
+        try {
+          const ok = await engine.fill([{ input: f.el, value: val, label: f.label }]);
+          if (ok) {
+            progressed = true;
+            logLine('ok', `AI rescue: answered "${f.label.slice(0, 40)}"`);
+            try { await engine.recordAnswer({ question: f.label, answer: val, fieldType: f.type, source: 'ai', jobId: job?.id }); } catch {}
+          }
+        } catch {}
+      }
+    }
+    return progressed ? 'progressed' : false;
   }
 
   // ============================================================
@@ -2721,6 +2822,16 @@ export async function run(task, context, helpers) {
           break;
         }
         if (parked.length) { reportParked('stalled'); break; }
+        // AI RESCUE (last resort) — BEFORE we detect blockers + park. The deterministic ladder
+        // couldn't advance this form; hand the WHOLE page to the configured AI provider, which sees
+        // fields/buttons the scanner skipped (e.g. a required consent checkbox, a custom widget) and
+        // returns the next safe actions (never a final-submit). Bounded per task; if it can't help
+        // we fall through to the normal blocker-detect + honest park below.
+        if (!S.cancelled) {
+          const rescued = await tryAiRescue('page stopped advancing — a required control the deterministic ladder could not satisfy');
+          if (rescued === 'progressed') { logLine('ok', 'AI rescue made progress — retrying advance'); noChange = 0; continue; }
+          if (rescued === 'parked') { reportParked('stalled'); break; }
+        }
         // Find WHY the page won't advance. LinkedIn flags the offending field with an
         // INLINE ERROR (role=alert / artdeco-inline-feedback--error) — that's the ground
         // truth for what's blocking, even when the field isn't "empty" in a way the field
