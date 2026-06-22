@@ -2821,17 +2821,18 @@ export async function run(task, context, helpers) {
           cancel('recovery-skip');
           break;
         }
-        if (parked.length) { reportParked('stalled'); break; }
-        // AI RESCUE (last resort) — BEFORE we detect blockers + park. The deterministic ladder
-        // couldn't advance this form; hand the WHOLE page to the configured AI provider, which sees
-        // fields/buttons the scanner skipped (e.g. a required consent checkbox, a custom widget) and
-        // returns the next safe actions (never a final-submit). Bounded per task; if it can't help
-        // we fall through to the normal blocker-detect + honest park below.
+        // AI RESCUE (full-page, profile+memory) — runs FIRST, before we give up or park, so the AI
+        // gets a shot at the exact required controls the per-field ladder couldn't resolve, INCLUDING
+        // ones it parked this pass. The whole page (fields the scanner skipped, buttons, text) goes to
+        // the configured provider; it returns the next safe actions (never a final-submit). On progress
+        // we clear the pending parks (the AI just answered them) and retry the advance; if still
+        // blocked, the next pass honestly re-detects + re-parks. Bounded per task.
         if (!S.cancelled) {
           const rescued = await tryAiRescue('page stopped advancing — a required control the deterministic ladder could not satisfy');
-          if (rescued === 'progressed') { logLine('ok', 'AI rescue made progress — retrying advance'); noChange = 0; continue; }
+          if (rescued === 'progressed') { logLine('ok', 'AI rescue made progress — retrying advance'); parked.length = 0; noChange = 0; continue; }
           if (rescued === 'parked') { reportParked('stalled'); break; }
         }
+        if (parked.length) { reportParked('stalled'); break; }
         // Find WHY the page won't advance. LinkedIn flags the offending field with an
         // INLINE ERROR (role=alert / artdeco-inline-feedback--error) — that's the ground
         // truth for what's blocking, even when the field isn't "empty" in a way the field
