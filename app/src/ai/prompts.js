@@ -360,7 +360,7 @@ ACTION TYPES you may return (in order to perform):
 - {type:"fill", target:"<field label>", value:"<text>"}            — type into a text/number/textarea field
 - {type:"select", target:"<field label>", value:"<exact option>"}   — choose a dropdown/radio option (verbatim)
 - {type:"check", target:"<field label>", value:"yes"|"no"}          — a single checkbox (consent etc.) — only if truthful + safe
-- {type:"click", target:"<button label>"}                           — click an advance/open control (NOT final submit unless complete)
+- {type:"click", target:"<button label>", value:""}                 — click an advance/open control (NOT final submit unless complete)
 - {type:"park", target:"", value:"", reason:"..."}                  — stop + hand to the user (unknown/required/legal/captcha/login)
 
 == WHY WE'RE STUCK ==
@@ -395,12 +395,15 @@ ${historyBlock || '(none)'}`,
           type: 'array',
           items: {
             type: 'object',
-            required: ['type', 'target', 'reason'],
+            // ALL properties required — OpenAI/codex structured output rejects a schema with
+            // additionalProperties:false AND an optional property (the cause of the "codex exited 1"
+            // rescue failures). `value` is always present; use "" for park/click actions.
+            required: ['type', 'target', 'value', 'reason'],
             additionalProperties: false,
             properties: {
               type: { type: 'string', enum: ['fill', 'select', 'check', 'click', 'park'] },
               target: { type: 'string', description: 'the field label or button text to act on ("" for park)' },
-              value: { type: 'string', description: 'text to fill / option to select / yes|no for check' },
+              value: { type: 'string', description: 'text to fill / option to select / yes|no for check ("" for click/park)' },
               reason: { type: 'string', description: 'one line: why, grounded in the profile/resume' },
             },
           },

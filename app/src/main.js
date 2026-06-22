@@ -108,6 +108,24 @@ function createWindow() {
   mainWindow.loadFile(path.join(__dirname, 'app', 'app.html'));
   mainWindow.once('ready-to-show', () => mainWindow.show());
 
+  // CRASH RECOVERY (the 8h "black screen"): after a long run the RENDERER process can die
+  // (GPU fault / OOM) while the main process + server keep running — the window goes black and a
+  // relaunch just re-showed the same dead renderer (single-instance lock → showWindow), so the
+  // user was stuck until a hard kill. Auto-reload on any renderer death/hang so it self-heals.
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    log.error('renderer gone:', (details && details.reason) || '?', '— reloading the dashboard');
+    try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.reload(); } catch {}
+  });
+  mainWindow.on('unresponsive', () => {
+    log.warn('window unresponsive — reloading the dashboard');
+    try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.reload(); } catch {}
+  });
+  mainWindow.webContents.on('did-fail-load', (_e, code, desc) => {
+    if (code === -3) return;   // user-aborted / in-page hash nav — not a failure
+    log.warn('did-fail-load', code, desc, '— retrying load');
+    setTimeout(() => { try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadFile(path.join(__dirname, 'app', 'app.html')); } catch {} }, 800);
+  });
+
   mainWindow.on('close', (e) => {
     const s = db.getSettings().app;
     if (!isQuitting && s.closeToTray) {
@@ -119,8 +137,12 @@ function createWindow() {
 }
 
 function showWindow() {
-  if (!mainWindow) createWindow();
-  else { mainWindow.show(); mainWindow.focus(); }
+  if (!mainWindow || mainWindow.isDestroyed()) { createWindow(); return; }
+  // If a relaunch ("restart") lands here because the single instance is already running, make sure
+  // we don't just re-show a CRASHED/black renderer — reload it so the user actually gets the app.
+  try { if (mainWindow.webContents.isCrashed()) mainWindow.reload(); } catch {}
+  mainWindow.show();
+  mainWindow.focus();
 }
 
 function iconPath() {
@@ -542,25 +564,36 @@ app.whenReady().then(async () => {
     }),
     broadcast,
   });
-  try {
-    await startServer(port, {
-      getVersion: () => app.getVersion(),
-      userDataDir: app.getPath('userData'),
-      confirmPair,
-      notify: notifyEvent,
-      discovery: discoveryService,
-      onSettingsChanged: () => applyAppSettings(),
-    });
-    log.info(`server listening on http://127.0.0.1:${port}`);
-  } catch (e) {
-    log.error('failed to start server', e);
-    // Without the server there is no backend for the dashboard — show the reason in
-    // a custom window (closing it quits, which cleans up via will-quit) rather than
-    // a native error box.
-    showFatalError('Port in use',
-      `JAT could not listen on 127.0.0.1:${port} (${e.code || e.message}).\n\n` +
-      'Another program is using that port. Close it, or change the port in Settings → General, then restart.');
-    return;
+  const serverOpts = {
+    getVersion: () => app.getVersion(),
+    userDataDir: app.getPath('userData'),
+    confirmPair,
+    notify: notifyEvent,
+    discovery: discoveryService,
+    onSettingsChanged: () => applyAppSettings(),
+  };
+  // Bind with a short EADDRINUSE retry: a prior JAT process's socket can still be releasing
+  // (TIME_WAIT / a renderer-crash zombie) right when the user restarts — without this the new
+  // instance failed to bind and the dashboard had no backend (the "black screen on restart").
+  // The single-instance lock prevents a genuine second instance, so a retry is safe.
+  let serverUp = false;
+  for (let attempt = 1; attempt <= 6 && !serverUp; attempt++) {
+    try {
+      await startServer(port, serverOpts);
+      serverUp = true;
+      log.info(`server listening on http://127.0.0.1:${port}${attempt > 1 ? ` (after ${attempt} attempts)` : ''}`);
+    } catch (e) {
+      if (e.code === 'EADDRINUSE' && attempt < 6) {
+        log.warn(`port ${port} busy — retry ${attempt}/5 in 1.5s (a stale JAT socket may still be releasing)`);
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
+      }
+      log.error('failed to start server', e);
+      showFatalError('Port in use',
+        `JAT could not listen on 127.0.0.1:${port} (${e.code || e.message}).\n\n` +
+        'Another program (or a stale JAT process) is using that port. End it in Task Manager, or change the port in Settings → General, then restart.');
+      return;
+    }
   }
 
   createWindow();
