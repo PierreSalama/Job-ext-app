@@ -81,8 +81,25 @@ async function status() {
   });
 }
 
-// generate({ prompt, system, schema, model, timeoutMs }) → { text, json }
-async function generate({ prompt, system, schema, model, timeoutMs = 120000 }) {
+// generate({...}) → { text, json } — with ONE retry on a transient codex failure. The codex CLI
+// (alpha) intermittently exits 1 with no output on larger structured-output prompts (the apply-
+// rescue case: ~18/21 failed "codex exited 1"), while smaller prompts (answer-question) succeed
+// ~99.8%. A single retry recovers most of those without changing the contract. Auth/missing
+// errors are NOT retried (they won't get better).
+async function generate(opts) {
+  try { return await generateOnce(opts); }
+  catch (e) {
+    if (e.code === 'CODEX_EXIT' || e.code === 'CODEX_EMPTY' || e.code === 'CODEX_BADJSON' || e.code === 'CODEX_TIMEOUT') {
+      log.warn(`codex transient failure (${e.code}) — retrying once`);
+      await new Promise((r) => setTimeout(r, 900));
+      return await generateOnce(opts);
+    }
+    throw e;
+  }
+}
+
+// generateOnce({ prompt, system, schema, model, timeoutMs }) → { text, json }
+async function generateOnce({ prompt, system, schema, model, timeoutMs = 120000 }) {
   const cli = discoverCli();
   if (!cli) throw Object.assign(new Error('codex CLI not found'), { code: 'CODEX_MISSING' });
 

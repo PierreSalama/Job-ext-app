@@ -353,8 +353,18 @@ HARD RULES (truthfulness + safety — non-negotiable):
 - Work authorization / visa / citizenship / demographics (EEO) / criminal history / salary: only act if the profile explicitly has it; otherwise return a "park" action for that field.
 - NEVER choose a final-submit button ("Submit application", "Submit", "Send application") unless EVERY required field on the page is already satisfied. When unsure, advance ("Next"/"Review"/"Continue") instead, or "park".
 - For a choice/radio/select field, the value MUST be exactly one of its listed options.
-- "how many years of X" → a NUMBER from the resume (never a URL); estimate conservatively; if no relevant experience, a small number or park.
-- If you cannot make safe progress (a required field you can't ground, a login wall, a CAPTCHA), return a single "park" action with a clear reason. Do NOT guess.
+- If you cannot make safe progress (a login wall, a CAPTCHA, a truly ungroundable required field), return a single "park" action with a clear reason. Do NOT invent facts.
+
+ANSWER THESE COMMON QUESTIONS — DO NOT PARK THEM (they are safe to derive from the profile/resume; parking them needlessly is the #1 reason applications stall):
+- LOCATION / RESIDENCY ("located in / residing in / within commuting distance of <place>?"): derive from the candidate's city/region/country (e.g. Toronto → "in Ontario?"=Yes, "in Canada?"=Yes, "in BC?"=No).
+- WHICH-LOCATION ("what country / province / city are you in?"): the candidate's country / region / city (match an option verbatim if given).
+- PREFERRED LANGUAGE: "English" unless the profile says otherwise.
+- RELOCATION / REMOTE / ONSITE / HYBRID ("willing to relocate? / able to work remotely / comfortable onsite?"): default YES — a candidate who applied is presumed open to the job's arrangement.
+- YEARS WITH A SKILL/TOOL ("how many years of X?"): estimate from the resume; if the skill appears at all, give a concrete number (round down); only park if there is truly zero relevant experience. NEVER a URL — a number.
+- EDUCATION ("hold a <Bachelor's/Master's/Diploma>? / highest level? / minimum met?"): from the resume — if the candidate holds that level OR higher → Yes (or the matching option).
+- START DATE / NOTICE PERIOD ("when can you start?"): "Immediately" (or "2 weeks") unless the profile says otherwise.
+- BASIC SCREENING Yes/No (18+, legally able to work per the profile's authorization, willing to complete standard steps): answer truthfully, usually Yes.
+PARK ONLY: specific salary figures not in the profile, EEO/demographics, criminal history, visa/sponsorship specifics not in the profile, or a login/CAPTCHA wall.
 
 ACTION TYPES you may return (in order to perform):
 - {type:"fill", target:"<field label>", value:"<text>"}            — type into a text/number/textarea field
@@ -373,7 +383,7 @@ ${fieldBlock}
 ${buttonBlock}
 
 == VISIBLE PAGE TEXT (snippet) ==
-${clip(pageText || '', 1500)}
+${clip(pageText || '', 700)}
 
 == JOB CONTEXT ==
 ${jobBlock(job || {})}
@@ -382,7 +392,7 @@ ${jobBlock(job || {})}
 ${profileBlock(profile)}
 
 == RESUME ==
-${clip(resumeText, 3500) || '(none)'}
+${clip(resumeText, 1400) || '(none)'}
 
 == PREVIOUSLY GIVEN ANSWERS (this candidate, other applications) ==
 ${historyBlock || '(none)'}`,
