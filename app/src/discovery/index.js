@@ -146,6 +146,7 @@ async function defaultRunner(request, timeoutMs = 90000) {
 
 function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = defaultRunner } = {}) {
   let timer = null, warmup = null, running = false, stopped = false;
+  let lastTickAt = 0;   // self-throttle gate (see runTick) — prevents the idle-watchdog storm
 
   async function searchBoard({ source, keyword, location, limit, hoursOld = 72, force = false, country = 'Canada', remote = false }) {
     // location is ALWAYS a geography. Never let it be empty — fall back to the country so
@@ -183,6 +184,13 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     const settings = db.getSettings();
     const aa = settings.autoApply || {};
     if (!force && (!aa.enabled || !aa.discovery?.enabled)) return { ok: false, reason: 'disabled' };
+    // SELF-THROTTLE (anti subprocess-storm): the idle-watchdog (main.js) pokes runTick every few
+    // seconds whenever the queue is drained — and fast-failing applies keep it drained. Without a
+    // time gate that spawns a JobSpy subprocess (×up to 3 boards) every few seconds, pinning the
+    // CPU and freezing the machine. Never scrape more than once per the configured interval
+    // (floor 60s), no matter how often we're called. A manual/forced run bypasses this.
+    const ivMs = Math.max(1, Number(aa.discovery?.intervalMinutes) || 1) * 60000;
+    if (!force && (Date.now() - lastTickAt) < ivMs) return { ok: false, reason: 'throttled' };
     if (!force && db.queueList({ state: 'queued' }).length >= (aa.discovery?.refillBelow || 3)) return { ok: false, reason: 'queue-full' };
     const idx = Number(db.kvGet('discoveryPlannerIndex')) || 0;
     const query = planner(settings, idx);
@@ -205,6 +213,7 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     // Country-clamp every source; pass work-mode through as a boolean (never as location).
     const country = text(aa.country) || 'Canada';
     const remote = Array.isArray(aa.workModes) && aa.workModes.includes('remote');
+    lastTickAt = Date.now();   // stamp only once we actually proceed to scrape (gates the next call)
     running = true;
     try {
       const results = await Promise.all(selectedBoards.map((source) => searchBoard({

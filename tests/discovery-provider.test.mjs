@@ -130,3 +130,28 @@ test('typed provider failure queues one browser fallback, while a healthy empty 
   assert.equal(result.status, 'empty');
   assert.equal(db.discoveryHealth().pendingFallbacks, 0);
 });
+
+test('runTick self-throttles to the configured interval (anti subprocess-storm)', async () => {
+  // The idle-watchdog pokes runTick every few seconds whenever the queue is drained; without a
+  // time gate that spawns a JobSpy subprocess each time and pins the CPU (the live freeze: 791
+  // discovery batches in 25 min). The gate must let the FIRST run through, throttle rapid repeats,
+  // and let a forced/manual run bypass.
+  db.patchSettings({ autoApply: {
+    enabled: true, easyApplyOnly: false, keywords: ['developer'], boards: ['indeed'],
+    locations: ['Toronto'], country: 'Canada',
+    discovery: { enabled: true, intervalMinutes: 5, refillBelow: 3, perRunLimit: 10 },
+  } });
+  let runs = 0;
+  const svc = discovery.createDiscoveryService({
+    runner: async () => { runs++; return { ok: true, jobs: [] }; },
+    ingestJobs: async () => ({ enqueued: 0, duplicates: 0, rejected: 0 }),
+  });
+  const first = await svc.runTick();
+  assert.equal(first.ok, true, 'first tick runs');
+  const second = await svc.runTick();
+  assert.equal(second.ok, false);
+  assert.equal(second.reason, 'throttled', 'a second tick within the interval is throttled');
+  const forced = await svc.runTick({ force: true });
+  assert.equal(forced.ok, true, 'a forced/manual run bypasses the throttle');
+  assert.ok(runs >= 2, 'only the non-throttled runs scraped');
+});
