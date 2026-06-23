@@ -2639,9 +2639,31 @@ export async function run(task, context, helpers) {
     // success? + confirmation-node signature count) so the post-click diff is auditable.
     if (submitBaseline) vlog('submit', `baseline url=${pagePathOf()} successTextAlready=${submitBaseline.successText} nodeSig=${submitBaseline.nodeSig?.size ?? 0} formGrounded=${formGrounded}`);
     const submitClickAt = Date.now();
+    // POPUP-BLOCKED-HANDOFF FIX: clear any stale captured URL before clicking. The SW's
+    // MAIN-world hook (installed at arm) records the opener's window.open()/target=_blank URL
+    // onto data-jat-exturl when our synthetic click fires the page's handler.
+    if (externalClick && handoffToken) { try { document.documentElement.removeAttribute('data-jat-exturl'); } catch {} }
     syntheticClick(clickBtn);
     if (externalClick && handoffToken) {
       setStatus('Transferring control to the company application…');
+      // The opener usually opens the company site via window.open(), which Chrome BLOCKS under
+      // our untrusted synthetic click — so no tab opens by itself ("apply handoff did not
+      // attach"). Recover the intended URL (from the MAIN-world hook, or the control's own
+      // off-site href) and have the SW open it directly; the existing handoff then drives it.
+      // Rely ONLY on the hook's capture (window.open URL, or a target=_blank anchor href). We do
+      // NOT fall back to the control's own href: a same-tab opener (plain anchor / location.assign)
+      // has an href too, and opening it directly would race a competing tab against the in-tab
+      // navigation the SW already handles (EXT-2). Poll briefly in case the open() is async.
+      let exturl = '';
+      for (let i = 0; i < 12 && !exturl; i++) {
+        try { exturl = document.documentElement.getAttribute('data-jat-exturl') || ''; } catch {}
+        if (!exturl) await sleep(150);
+      }
+      if (exturl) {
+        logLine('ok', 'recovered company-site URL from the opener — opening it directly');
+        try { await send({ type: 'jat11.external-handoff-open', token: handoffToken, url: exturl }); } catch {}
+        try { document.documentElement.removeAttribute('data-jat-exturl'); } catch {}
+      }
       const handoff = await handoffPromise;
       if (handoff?.captured) {
         const childResult = handoff.result || null;

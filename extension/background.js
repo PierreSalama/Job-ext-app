@@ -241,6 +241,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'jat11.external-handoff-run':
       respond(runExternalHandoff(sender?.tab?.id, msg.token, msg.task, msg.context));
       return true;
+    case 'jat11.external-handoff-open':
+      // The opener's window.open() was popup-blocked; the executor captured the intended URL
+      // (MAIN-world hook → data-jat-exturl, or the control's href) and asks us to open it
+      // directly. We register the new tab as this handoff's child so the in-flight
+      // runExternalHandoff adopts + drives it.
+      respond(openExternalUrl(sender?.tab?.id, msg.token, msg.url));
+      return true;
     case 'run-discovery':
       respond(api.call('POST', '/auto-apply/discover-now', {}, 180000));
       return true;
@@ -726,6 +733,54 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
 });
 
+// POPUP-BLOCKED-HANDOFF FIX: an external "Apply on company site (opens in a new tab)" control
+// usually opens via window.open(). Chrome blocks window.open under our SYNTHETIC (untrusted)
+// click, so the company tab never opens and the handoff finds nothing ("apply handoff did not
+// attach" — the dominant Indeed failure in the live logs). We can't synthesize a trusted click
+// from a content script, so instead we hook window.open in the page's MAIN world to RECORD the
+// URL the page wanted to open (onto a shared DOM attribute the isolated content world can read),
+// suppress the (blocked-anyway) popup, and then open that URL ourselves via chrome.tabs.create.
+// Also captures target=_blank anchor clicks. Best-effort + idempotent; never breaks the page.
+async function installOpenHook(tabId) {
+  if (!chrome.scripting?.executeScript || tabId == null) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      world: 'MAIN',
+      func: () => {
+        if (window.__jatOpenHooked) return;
+        window.__jatOpenHooked = true;
+        const rec = (u) => { try { if (u) document.documentElement.setAttribute('data-jat-exturl', String(u)); } catch (e) {} };
+        const orig = window.open;
+        try {
+          window.open = function (u) { rec(u); return null; };   // suppress the blocked popup; we open it via the SW
+          window.open.toString = () => orig.toString();
+        } catch (e) {}
+        document.addEventListener('click', (e) => {
+          // ONLY target=_blank is a genuine new-tab intent. rel="noopener" alone does NOT mean a
+          // new tab (plain same-tab links carry it too) — capturing those would wrongly open a
+          // competing tab alongside a same-tab navigation. window.open (above) covers the rest.
+          try { const a = e.target && e.target.closest && e.target.closest('a[href]'); if (a && a.target === '_blank') rec(a.href); } catch (_) {}
+        }, true);
+      },
+    });
+  } catch {}
+}
+
+// Open the captured external URL directly (bypassing the popup block) and register it as THIS
+// handoff's child, so the existing waitForExternalTarget/runExternalHandoff path drives it.
+async function openExternalUrl(sourceTabId, token, url) {
+  const h = externalHandoffs.get(sourceTabId);
+  if (!h || h.token !== token || h.childTabId != null || !url) return { ok: false };
+  if (!/^https?:\/\//i.test(String(url))) return { ok: false };   // only real http(s) targets
+  let winId;
+  try { winId = (await chrome.tabs.get(sourceTabId))?.windowId; } catch {}
+  let tab = null;
+  try { tab = await chrome.tabs.create({ url, active: false, ...(winId != null ? { windowId: winId } : {}) }); } catch {}
+  if (tab?.id != null) { captureExternalChild(sourceTabId, tab.id); return { ok: true, tabId: tab.id }; }
+  return { ok: false };
+}
+
 async function armExternalHandoff(sourceTabId, taskId, routeState) {
   if (sourceTabId == null) return null;
   for (const [id, stale] of externalHandoffs) {
@@ -735,6 +790,7 @@ async function armExternalHandoff(sourceTabId, taskId, routeState) {
   let initialUrl = '';
   try { initialUrl = (await chrome.tabs.get(sourceTabId))?.url || ''; } catch {}
   externalHandoffs.set(sourceTabId, { token, childTabId: null, createdAt: Date.now(), initialUrl, taskId: taskId || null });
+  await installOpenHook(sourceTabId);   // record where the opener's window.open() wants to go
   if (taskId) {
     await api.call('PATCH', '/queue/' + taskId, {
       handoffToken: token, routeState: routeState || 'unknown', applyRoute: 'external',
