@@ -151,7 +151,16 @@ function jobFit(jobOrTitle, aa) {
   const t = String(title || '').toLowerCase();
   for (const kw of (aa && aa.excludeKeywords) || []) {
     const k = String(kw || '').trim().toLowerCase();
-    if (k && t.includes(k)) return { ok: false, reason: `excluded keyword "${k}"` };
+    if (!k) continue;
+    // Single tokens match WHOLE-WORD so 'sales' no longer nukes 'Salesforce Developer' and
+    // 'lead' doesn't hit 'Leadership Program'; multi-word phrases ('account executive') stay
+    // plain substrings (already specific enough). Deliberately TITLE-ONLY — matching the
+    // description would over-exclude on words like 'senior'/'manager'/'lead' that appear in
+    // almost every JD body, silently killing legitimate eng roles.
+    const hit = /\s/.test(k)
+      ? t.includes(k)
+      : new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(t);
+    if (hit) return { ok: false, reason: `excluded keyword "${k}"` };
   }
   const company = String(job.company || '').toLowerCase();
   for (const kw of (aa && aa.excludeCompanies) || []) {

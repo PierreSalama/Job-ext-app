@@ -47,6 +47,17 @@ def main():
     }
     if source in ("indeed", "glassdoor"):
         kwargs["country_indeed"] = country
+    # Google Jobs is driven by ONE natural-language query string (google_search_term);
+    # JobSpy IGNORES the plain `search_term` for the google site, so without this the Google
+    # scraper returns an empty frame. Compose the term + geography + a freshness hint into the
+    # kind of phrase a person would type into Google ("software engineer jobs near Toronto, ON
+    # since yesterday"). hours_old above already clamps the freshness window.
+    if source == "google":
+        term = str(request.get("keyword") or "").strip()
+        hrs = max(1, min(720, int(request.get("hours_old") or 72)))
+        since = "since yesterday" if hrs <= 24 else ("in the last week" if hrs <= 168 else "in the last month")
+        parts = [p for p in [term, "jobs", ("near " + location) if location else "", since] if p]
+        kwargs["google_search_term"] = " ".join(parts)
     # Work-mode filter: jobspy exposes is_remote across its supported boards. Only set it
     # when the request explicitly asks for remote — otherwise leave results unfiltered.
     if request.get("remote"):

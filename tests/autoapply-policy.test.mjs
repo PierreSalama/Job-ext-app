@@ -22,6 +22,22 @@ function addTask({ source = 'linkedin', url, state = 'queued', lastError = '', p
   return { job, task: db.queueList({}).find((t) => t.id === task.id) };
 }
 
+test('jobFit excludeKeywords: whole-word for single tokens, substring for phrases, title-only', () => {
+  const aa = { seniorityMax: 'any', excludeKeywords: ['sales', 'senior', 'lead', 'account executive', 'business development'] };
+  // Sales/seniority roles whose TITLE carries the word → rejected.
+  assert.equal(server.jobFit({ title: 'Sales Representative' }, aa).ok, false);
+  assert.equal(server.jobFit({ title: 'Senior Software Engineer' }, aa).ok, false);
+  assert.equal(server.jobFit({ title: 'Account Executive' }, aa).ok, false);          // phrase substring
+  assert.equal(server.jobFit({ title: 'Business Development Manager' }, aa).ok, false); // phrase substring
+  // Whole-word must NOT false-positive on a legit eng title that merely CONTAINS the token.
+  assert.equal(server.jobFit({ title: 'Salesforce Developer' }, aa).ok, true);   // 'sales' ⊄ whole-word in 'salesforce'
+  assert.equal(server.jobFit({ title: 'Leadership Tooling Engineer' }, aa).ok, true); // 'lead' ⊄ 'leadership'
+  assert.equal(server.jobFit({ title: 'Software Engineer' }, aa).ok, true);
+  // Description never triggers exclusion (title-only) — a JD that says "report to a Senior Manager"
+  // must NOT be excluded by the 'senior'/'manager' keywords.
+  assert.equal(server.jobFit({ title: 'Backend Developer', description: 'You will report to a Senior Manager and lead nothing.' }, aa).ok, true);
+});
+
 test('classifyQueueFailure maps failures to retry/user/inspect policy', () => {
   assert.equal(db.classifyQueueFailure({ state: 'failed', last_error: 'Easy-Apply form did not hydrate — will retry' }).action, 'retry');
   assert.equal(db.classifyQueueFailure({ state: 'parked', pending_questions: JSON.stringify([{ question: 'Salary?', reason: 'missing answer' }]) }).action, 'user');
