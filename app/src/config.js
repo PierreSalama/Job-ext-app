@@ -27,8 +27,13 @@ const DEFAULTS = {
 
   ai: {
     // Priority order — tried top to bottom, first one that's configured wins.
-    // Reorder freely in Settings. Default: Claude → ChatGPT → local.
-    order: ['claude', 'chatgpt', 'local'],
+    // Reorder freely in Settings. Default: ChatGPT → Claude → local.
+    // ChatGPT (Codex CLI subscription) is first because it's the signed-in, working
+    // provider on this machine; the Claude Code CLI returns 401 until signed in, and
+    // each failed attempt costs an ai_log row + latency. Claude/local stay as fallbacks,
+    // and answer-question always has a deterministic floor, so a provider outage never
+    // strands a run.
+    order: ['chatgpt', 'claude', 'local'],
 
     // Claude (Anthropic). Two ways: your Claude subscription via the official Claude Code CLI
     // (the `claude` binary, invoked as a SUBPROCESS — the CLI owns its own auth + refresh; the

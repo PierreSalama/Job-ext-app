@@ -10,7 +10,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { pageActionUrlKey, shouldResetPageActionBreaker } from '../extension/content/replay.js';
+import { pageActionUrlKey, shouldResetPageActionBreaker, externalTargetFromNav } from '../extension/content/replay.js';
 
 // ---- pageActionUrlKey: host+path identity (query/hash/trailing-slash/www are render noise) ----
 test('pageActionUrlKey normalizes www, trailing slash, query, and hash', () => {
@@ -80,8 +80,79 @@ test('missing args default to NO reset (never reset blindly)', () => {
   assert.equal(shouldResetPageActionBreaker({}), false);
 });
 
+// ---- externalTargetFromNav (EXT-2): a host-OR-path change is a transfer; query/hash is noise ----
+test('externalTargetFromNav: HOST change is a transfer (linkedin → company)', () => {
+  assert.equal(externalTargetFromNav({
+    initialUrl: 'https://www.linkedin.com/jobs/view/123',
+    currentUrl: 'https://jobs.acme.com/apply/123',
+  }), true);
+});
+
+test('externalTargetFromNav: PATH-only change on the same host is a transfer (slow /jobs → /jobs/apply)', () => {
+  assert.equal(externalTargetFromNav({
+    initialUrl: 'https://jobs.acme.com/jobs/123',
+    currentUrl: 'https://jobs.acme.com/jobs/123/apply',
+  }), true);
+});
+
+test('externalTargetFromNav: QUERY/HASH-only change is NOT a transfer (render noise, must not capture)', () => {
+  assert.equal(externalTargetFromNav({
+    initialUrl: 'https://www.linkedin.com/jobs/view/123',
+    currentUrl: 'https://www.linkedin.com/jobs/view/123?refId=abc',
+  }), false);
+  assert.equal(externalTargetFromNav({
+    initialUrl: 'https://www.linkedin.com/jobs/view/123',
+    currentUrl: 'https://www.linkedin.com/jobs/view/123#apply',
+  }), false);
+});
+
+test('externalTargetFromNav: identical / missing URLs are NOT a transfer (never capture blind)', () => {
+  assert.equal(externalTargetFromNav({ initialUrl: 'https://x/y', currentUrl: 'https://x/y' }), false);
+  assert.equal(externalTargetFromNav({ initialUrl: '', currentUrl: 'https://x/y' }), false);
+  assert.equal(externalTargetFromNav({ initialUrl: 'https://x/y', currentUrl: '' }), false);
+  assert.equal(externalTargetFromNav(), false);
+});
+
+test('externalTargetFromNav: malformed URLs never throw and degrade safely', () => {
+  assert.doesNotThrow(() => externalTargetFromNav({ initialUrl: 'about:blank', currentUrl: 'chrome://newtab' }));
+});
+
+// ---- background wiring: the service worker must use externalTargetFromNav for same-tab detection ----
+const BG = fs.readFileSync(new URL('../extension/background.js', import.meta.url), 'utf8');
+
+test('background imports externalTargetFromNav and uses it in waitForExternalTarget', () => {
+  assert.match(BG, /import \{ externalTargetFromNav \} from '\.\/content\/replay\.js'/);
+  const fnIdx = BG.indexOf('async function waitForExternalTarget');
+  const useIdx = BG.indexOf('externalTargetFromNav({ initialUrl: handoff.initialUrl');
+  assert.ok(fnIdx > 0 && useIdx > fnIdx, 'externalTargetFromNav is called inside waitForExternalTarget');
+});
+
+test('waitForExternalTarget window is at least 25s (slow same-tab redirect headroom)', () => {
+  const m = BG.match(/async function waitForExternalTarget\(sourceTabId, token, timeoutMs = (\d+)\)/);
+  assert.ok(m, 'waitForExternalTarget signature found');
+  assert.ok(Number(m[1]) >= 25000, `timeout should be >=25000, got ${m[1]}`);
+});
+
 // ---- executor wiring: the source must use the helpers and arm the URL alongside the breaker ----
 const SRC = fs.readFileSync(new URL('../extension/content/executor.js', import.meta.url), 'utf8');
+
+// ---- EXT-1: the same-tab external fallback must CLEAR the breaker + the no-progress counters,
+// so the company landing page's own legitimate "Apply" button isn't read as a repeat. ----
+test('EXT-1: external in-tab fallback clears the breaker and the external no-progress counters', () => {
+  // Anchor on the in-tab fallback log line, then assert the clears happen before the continue.
+  const anchor = SRC.indexOf('external target navigated in-tab — continuing to drive it here');
+  assert.ok(anchor > 0, 'in-tab fallback branch present');
+  const window = SRC.slice(anchor, anchor + 1600);
+  assert.match(window, /lastPageAction = ''; lastPageActionUrl = ''/, 'clears the duplicate-opener breaker');
+  assert.match(window, /extRepeat = 0; extLastLabel = ''; extLastUrl = ''/, 'resets the external no-progress cap');
+  assert.match(window, /noChange = 0/, 'resets the stall counter');
+});
+
+// ---- EXT-4: the AI rescue must DEDUP on an unchanged page within a window (token moderation). ----
+test('EXT-4: AI rescue dedups on a stable page signature within 60s', () => {
+  assert.match(SRC, /const rescueSig = \[/, 'computes a rescue page signature');
+  assert.match(SRC, /rescueSig === lastRescueSig && \(Date\.now\(\) - lastRescueAt\) < 60000/, 'skips a duplicate call within 60s on the same signature');
+});
 
 test('executor imports and calls shouldResetPageActionBreaker before the duplicate-action check', () => {
   assert.match(SRC, /shouldResetPageActionBreaker/);

@@ -25,22 +25,27 @@ test('resolveOrder: array passes through, legacy strings map', () => {
   assert.deepEqual(provider.resolveOrder(['ollama', 'codex']), ['local', 'chatgpt']);
 });
 
-test('buildAttempts: full config yields claude → codex → openai → ollama', () => {
+test('buildAttempts: full config yields claude-cli → claude → codex → openai → ollama', () => {
+  // useSubscription defaults ON for both cloud providers, so each yields its CLI-subscription
+  // attempt FIRST (claude-cli / codex), then its API-key attempt (claude / openai) as fallback.
   const s = {
     order: ['claude', 'chatgpt', 'local'],
-    claude: { apiKey: 'k', model: 'claude-sonnet-4-6' },
+    claude: { useSubscription: true, apiKey: 'k', model: 'claude-sonnet-4-6' },
     chatgpt: { useSubscription: true, apiKey: 'k2', model: 'gpt-5.4' },
     local: { autoPick: true },
   };
-  assert.deepEqual(names(provider.buildAttempts(s, {})), ['claude', 'codex', 'openai', 'ollama']);
+  assert.deepEqual(names(provider.buildAttempts(s, {})), ['claude-cli', 'claude', 'codex', 'openai', 'ollama']);
 });
 
 test('buildAttempts: unconfigured providers are skipped', () => {
   const base = { order: ['claude', 'chatgpt', 'local'], local: { autoPick: true } };
-  // no claude key → claude skipped
-  assert.deepEqual(names(provider.buildAttempts({ ...base, claude: {}, chatgpt: { useSubscription: true } }, {})), ['codex', 'ollama']);
-  // subscription off + no openai key → chatgpt skipped entirely
-  assert.deepEqual(names(provider.buildAttempts({ ...base, claude: { apiKey: 'k' }, chatgpt: { useSubscription: false } }, {})), ['claude', 'ollama']);
+  // claude subscription OFF + no key → claude skipped entirely; chatgpt subscription ON → codex.
+  assert.deepEqual(names(provider.buildAttempts({ ...base, claude: { useSubscription: false }, chatgpt: { useSubscription: true } }, {})), ['codex', 'ollama']);
+  // claude API key only (subscription OFF) → anthropic 'claude'; chatgpt subscription OFF + no key → skipped.
+  assert.deepEqual(names(provider.buildAttempts({ ...base, claude: { useSubscription: false, apiKey: 'k' }, chatgpt: { useSubscription: false } }, {})), ['claude', 'ollama']);
+  // an EMPTY claude config still attempts the CLI subscription (default ON) — this is the live
+  // 401 source the chatgpt-first default order works around.
+  assert.deepEqual(names(provider.buildAttempts({ ...base, claude: {}, chatgpt: { useSubscription: false } }, {})), ['claude-cli', 'ollama']);
 });
 
 test('buildAttempts: legacy ai.cloud OpenAI key survives the bridge (backward compat)', () => {
@@ -56,8 +61,9 @@ test('buildAttempts: legacy ai.cloud OpenAI key survives the bridge (backward co
 });
 
 test('buildAttempts: providerOverride restricts to one provider', () => {
-  const s = { order: ['claude', 'chatgpt', 'local'], claude: { apiKey: 'k' }, chatgpt: { useSubscription: true }, local: {} };
-  assert.deepEqual(names(provider.buildAttempts(s, { providerOverride: 'claude' })), ['claude']);
+  const s = { order: ['claude', 'chatgpt', 'local'], claude: { useSubscription: true, apiKey: 'k' }, chatgpt: { useSubscription: true }, local: {} };
+  // override to claude → only claude's attempts (CLI subscription first, then the API key).
+  assert.deepEqual(names(provider.buildAttempts(s, { providerOverride: 'claude' })), ['claude-cli', 'claude']);
   assert.deepEqual(names(provider.buildAttempts(s, { providerOverride: 'local' })), ['ollama']);
 });
 

@@ -265,3 +265,18 @@ export function shouldResetPageActionBreaker({ lastActionUrl, currentUrl, hasPen
   if (lastActionUrl == null) return false;  // armed without a recorded URL → don't reset blind
   return pageActionUrlKey(lastActionUrl) !== pageActionUrlKey(currentUrl);
 }
+
+// EXT-2: did an armed external handoff actually TRANSFER the source tab? The service worker
+// polls the source tab's URL after the external "Apply" click. The obvious transfer is a HOST
+// change (linkedin.com → company.com), but some company ATSes redirect via a PATH-only change
+// on the same host (a slow /jobs → /jobs/apply, an SSO bounce that keeps the host), and a few
+// openers route through a same-host interstitial before bouncing off-site. We treat any host-OR-
+// path change as a transfer (waitTabComplete settles further redirects before we drive it), but
+// a QUERY/HASH-only change is render noise, NOT a navigation — so we must not capture it as the
+// target. pageActionUrlKey already collapses query/hash and keeps host+path, so a key change is
+// exactly the host-or-path transfer we want. Malformed URLs never throw (pageActionUrlKey guards).
+export function externalTargetFromNav({ initialUrl, currentUrl } = {}) {
+  if (!initialUrl || !currentUrl) return false;
+  if (currentUrl === initialUrl) return false;
+  return pageActionUrlKey(initialUrl) !== pageActionUrlKey(currentUrl);
+}

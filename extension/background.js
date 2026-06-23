@@ -24,6 +24,7 @@ import { pickApplyWindowBounds } from './lib/window-place.js';
 import { buildSearchUrl } from './lib/search-url.js';
 import { NARROWEST_TIER, nextFreshnessTier } from './lib/freshness.js';
 import { applyHardCapMs, APPLY_HIDDEN_STALL_CAP_MS } from './lib/apply-cap.js';
+import { externalTargetFromNav } from './content/replay.js';
 
 // ---------- browser capability probe (cross-browser parity, Apprenticeship Engine P8) ----------
 // Firefox lacks some Chrome MV3 surfaces (tabGroups, storage.session). The existing apply-pool
@@ -759,7 +760,7 @@ try {
   chrome.webNavigation.onCreatedNavigationTarget.addListener((d) => captureExternalChild(d?.sourceTabId, d?.tabId));
 } catch {}
 
-async function waitForExternalTarget(sourceTabId, token, timeoutMs = 20000) {
+async function waitForExternalTarget(sourceTabId, token, timeoutMs = 25000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     const handoff = externalHandoffs.get(sourceTabId);
@@ -767,10 +768,12 @@ async function waitForExternalTarget(sourceTabId, token, timeoutMs = 20000) {
     if (handoff.childTabId != null) return { tabId: handoff.childTabId, child: true };
     try {
       const source = await chrome.tabs.get(sourceTabId);
-      if (source?.url && handoff.initialUrl && source.url !== handoff.initialUrl) {
-        const beforeHost = new URL(handoff.initialUrl).hostname.replace(/^www\./, '');
-        const afterHost = new URL(source.url).hostname.replace(/^www\./, '');
-        if (beforeHost !== afterHost) return { tabId: sourceTabId, child: false };
+      // EXT-2: a host-OR-path change on the source tab means the external handoff transferred
+      // it in-tab (host change = the obvious linkedin.com→company.com; path-only change = a slow
+      // /jobs→/jobs/apply or an SSO bounce that keeps the host). A query/hash-only change is
+      // render noise, not a navigation — externalTargetFromNav (via pageActionUrlKey) ignores it.
+      if (externalTargetFromNav({ initialUrl: handoff.initialUrl, currentUrl: source?.url })) {
+        return { tabId: sourceTabId, child: false };
       }
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -1075,7 +1078,13 @@ async function nudgeApplyWindows() {
 // time. The run-level restoreUserFocus() owns handing focus back, so release here only clears
 // the safety timer (no per-release focus yank → no thrash). Only ever touches OUR windows.
 const frontHeld = new Map();   // applyWindowId → { timer }
-const FRONT_HARD_CAP_MS = 4000;   // safety-net only; the apply window is normally already front
+// EXT-3: 4s was too short for a Chrome-throttled SPA resuming from background to render the
+// Easy-Apply / "Apply on company site" handoff link before we released focus. 14s gives a heavy
+// external ATS time to hydrate while reactively fronted, then self-releases. This is STILL the
+// safety-net path only (fires from nudge-apply-window when a tab reports itself occluded AND not
+// hydrating); the normal path never fronts. bringToFrontToHydrate stays OFF by default — we do
+// NOT steal focus on every apply, only on a tab that proved it was stuck behind the throttle.
+const FRONT_HARD_CAP_MS = 14000;   // safety-net only; the apply window is normally already front
 
 // ---- HIDDEN-NON-HYDRATING fast-fail (FIX 1) ----------------------------------------
 // THROUGHPUT BUG (live): a hidden apply tab that won't hydrate used to burn the FULL

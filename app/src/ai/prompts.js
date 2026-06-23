@@ -12,7 +12,7 @@ const SYSTEM_BASE =
 
 function clip(s, n) { return String(s || '').slice(0, n); }
 
-function jobBlock(job) {
+function jobBlock(job, descMax = 6000) {
   return [
     `Title: ${clip(job.title, 200)}`,
     `Company: ${clip(job.company, 200)}`,
@@ -20,7 +20,7 @@ function jobBlock(job) {
     job.compensation ? `Compensation: ${clip(job.compensation, 120)}` : '',
     job.workMode ? `Work mode: ${clip(job.workMode, 60)}` : '',
     job.employmentType ? `Type: ${clip(job.employmentType, 60)}` : '',
-    job.description ? `Description:\n${clip(job.description, 6000)}` : '',
+    job.description ? `Description:\n${clip(job.description, descMax)}` : '',
   ].filter(Boolean).join('\n');
 }
 
@@ -386,7 +386,7 @@ ${buttonBlock}
 ${clip(pageText || '', 700)}
 
 == JOB CONTEXT ==
-${jobBlock(job || {})}
+${jobBlock(job || {}, 2500)}
 
 == CANDIDATE PROFILE ==
 ${profileBlock(profile)}

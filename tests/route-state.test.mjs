@@ -36,8 +36,10 @@ test('observed transitions distinguish modal, child tab, and same-tab navigation
 test('service worker owns same-tab external navigation before the source executor unloads', () => {
   const src = fs.readFileSync(new URL('../extension/background.js', import.meta.url), 'utf8');
   assert.match(src, /waitForExternalTarget/);
-  assert.match(src, /beforeHost\s*!==\s*afterHost/);
-  assert.match(src, /same-tab external handoff/i);
+  // The host-OR-path transfer decision now lives in the shared, node-tested externalTargetFromNav
+  // helper (EXT-2) — it catches slow same-host path-only redirects the old host-only check missed.
+  assert.match(src, /externalTargetFromNav\(\{ initialUrl: handoff\.initialUrl, currentUrl: source\?\.url \}\)/);
+  assert.match(src, /host-OR-path change on the source tab/i);
 });
 
 test('a LinkedIn resume-choice interstitial advances (picks most-recent resume, clicks Continue)', () => {

@@ -1362,6 +1362,13 @@ export async function run(task, context, helpers) {
   // guessed. Bounded per task so a confused page can't loop or rack up cost.
   let aiRescueCount = 0;
   const MAX_AI_RESCUE = 2;
+  // EXT-4 token moderation: the rescue already fires ONLY from the hard-stall path
+  // (noChange >= stallLimit), so the deterministic ladder always runs first and most
+  // applies spend ZERO rescue tokens. The remaining leak is calling the model AGAIN on a
+  // page that hasn't changed since the last call (a genuinely stuck screen stalls twice).
+  // Dedup on the page signature within a 60s window so the 2nd identical call is skipped.
+  let lastRescueSig = '';
+  let lastRescueAt = 0;
   async function tryAiRescue(reason) {
     if (aiRescueCount >= MAX_AI_RESCUE || S.cancelled) return false;
     const root = findApplyDialog() || (typeof findLinkedInApplyPageRoot === 'function' ? findLinkedInApplyPageRoot() : null) || detectApplyForm()?.form || document.body;
@@ -1391,7 +1398,24 @@ export async function run(task, context, helpers) {
     }
     const btnRefs = qsa('button, [role="button"], input[type="submit"], a[role="button"]', root)
       .map((el) => ({ el, label: btnText(el) })).filter((b) => b.label).slice(0, 25);
-    const pageText = String(root.innerText || '').replace(/\s+/g, ' ').slice(0, 1500);
+    // pageText kept small (≈900 chars) — the structured field/button list carries the
+    // actionable state; pageText is only orienting context, so it doesn't need the full DOM.
+    const pageText = String(root.innerText || '').replace(/\s+/g, ' ').slice(0, 900);
+
+    // EXT-4 dedup: a stable signature of the actionable surface (url + unanswered required
+    // fields + button labels). If it matches the last rescue within 60s, the page genuinely
+    // hasn't moved since we already asked — skip the duplicate call (the per-task cap would
+    // otherwise let a stuck screen burn the 2nd attempt on an identical prompt).
+    const rescueSig = [
+      location.href,
+      fieldRefs.filter((f) => f.required && !f.value).map((f) => f.label).join('|'),
+      btnRefs.map((b) => b.label).join('|'),
+    ].join('§');
+    if (rescueSig === lastRescueSig && (Date.now() - lastRescueAt) < 60000) {
+      vlog('rescue', `skipped — same page signature within 60s (no change since last rescue)`);
+      return false;
+    }
+    lastRescueSig = rescueSig; lastRescueAt = Date.now();
 
     aiRescueCount++;
     vlog('rescue', `asking AI [${reason}] — ${fieldRefs.length} field(s), ${btnRefs.length} button(s)`);
@@ -2679,6 +2703,16 @@ export async function run(task, context, helpers) {
         if (S.routeState === 'external_same_tab' || S.routeState === 'external_new_tab') {
           S.routeState = 'same_tab_application';
         }
+        // EXT-1: a real transition to the company site happened. The opener fingerprint we
+        // just armed (lastPageAction) belongs to the PRIOR LinkedIn page; the company
+        // landing page very often has its OWN legitimate "Apply"/"Apply on company site"
+        // button. If we leave the breaker armed, that first genuine click is mistaken for a
+        // repeat and the run dies with "repeated page-level action did not transfer". The
+        // page transitioned, so the prior opener is stale — clear the breaker and reset the
+        // external no-progress + stall counters so the company site starts with a clean slate.
+        lastPageAction = ''; lastPageActionUrl = '';
+        extRepeat = 0; extLastLabel = ''; extLastUrl = '';
+        noChange = 0;
         continue;
       }
       // No transition and no captured child → a transient miss (child tab not yet owned,
