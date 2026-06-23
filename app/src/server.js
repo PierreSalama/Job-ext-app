@@ -1560,6 +1560,14 @@ async function handle(req, res, parsed) {
     broadcast('emails.updated', {});
     return sendJson(res, 200, r);
   }
+  // Re-run classification + matching over the already-stored inbox (one-shot after an upgrade).
+  if (pathname === '/emails/reprocess' && req.method === 'POST') {
+    const email = require('./email');
+    const r = email.reprocessStored();
+    broadcast('emails.updated', {});
+    broadcast('jobs.updated', { action: 'email-reprocess' });
+    return sendJson(res, 200, { ok: true, ...r });
+  }
   const emAcct = pathname.match(/^\/email\/accounts\/([^/]+?)(\/enable)?$/);
   if (emAcct && pathname !== '/email/accounts/test') {
     const email = require('./email');

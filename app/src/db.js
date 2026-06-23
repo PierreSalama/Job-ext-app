@@ -3429,6 +3429,23 @@ function jobsForMatching() {
   return all('SELECT id, title, company, source, submitted_at, created_at FROM jobs ORDER BY created_at DESC LIMIT 2000')
     .map((r) => ({ id: r.id, title: r.title, company: r.company, source: r.source, submittedAt: r.submitted_at, createdAt: r.created_at }));
 }
+// Re-run classification + matching over ALREADY-STORED emails — used once after a classifier or
+// matcher upgrade so the existing inbox is corrected, not just future syncs. NEVER touches
+// user-pinned rows (match_source manual/dismissed). matchFn(email) → { category, matchedJobId,
+// matchConfidence, matchSource }. Returns { processed, changed }.
+function reprocessEmails(matchFn) {
+  let processed = 0, changed = 0;
+  for (const row of all("SELECT * FROM emails WHERE match_source IS NULL OR match_source IN ('auto','suggested')")) {
+    processed++;
+    let a; try { a = matchFn(rowToEmail(row)); } catch { continue; }
+    if (!a) continue;
+    const cat = a.category || row.category, mj = a.matchedJobId || null, ms = a.matchSource || null, mc = a.matchConfidence || 0;
+    if (cat === row.category && mj === row.matched_job_id && ms === row.match_source) continue;
+    run('UPDATE emails SET category=?, matched_job_id=?, match_confidence=?, match_source=? WHERE id=?', [cat, mj, mc, ms, row.id]);
+    changed++;
+  }
+  return { processed, changed };
+}
 
 // ============================================================
 // Reward Engine — credit assignment + confirm-and-train  [P6]
@@ -4148,7 +4165,7 @@ module.exports = {
   setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,
-  emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching, findJobByThread, gmailStatusFromCategory,
+  emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching, findJobByThread, gmailStatusFromCategory, reprocessEmails,
   recordOutcome, creditOutcomeForEmail, emailsNeedingConfirm, confirmEmailLink, outcomesForJob,
   punish, unpunish, listPunishments, punishmentPenalty, isPunished, punishCompanyCascade,
   geoPenalty, rankJob,

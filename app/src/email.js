@@ -109,12 +109,22 @@ const CATEGORY_RX = [
   // Checked BEFORE interview so a coding challenge / take-home / online test is its OWN stage
   // ('assessment') rather than being lumped into 'interview' — the user wants this surfaced.
   ['assessment', /online assessment|coding (?:challenge|assessment|test|exercise)|take[- ]?home|hackerrank|codility|codesignal|\bkattis\b|technical (?:assessment|test|exercise)|complete (?:the |a |an )?(?:assessment|test|challenge|exercise)|skills?(?: |-)?(?:test|assessment)|aptitude test/i],
-  ['interview', /interview|schedule (?:a |your )?(?:call|chat|meeting|time)|your availability|phone screen|technical screen|next (?:round|step|stage)|hiring manager|meet (?:the|our) team/i],
-  ['application_confirmation', /thank you for applying|application (?:was |has been )?(?:received|submitted|sent)|we(?:'| ha)ve received your application|successfully applied|application (?:confirmation|received)|your application to/i],
+  // application_confirmation is checked BEFORE interview: a "your application was sent/received to
+  // X" email is a confirmation even though its body/footer often mentions "interview" (tips). This
+  // ordering fixes the live mis-tag where 240/300 LinkedIn confirmations were called 'interview'.
+  ['application_confirmation', /thank you for applying|application (?:was |has been )?(?:received|submitted|sent)|we(?:'| ha)ve received your application|successfully applied|application (?:confirmation|received)|your application (?:to|was sent)/i],
+  // interview requires real INVITE / scheduling language — NOT the bare word "interview" (which
+  // shows up in newsletters, "interview tips" footers, and confirmation bodies).
+  ['interview', /interview invitation|invitation to interview|invit\w* (?:you )?(?:to|for) (?:an? )?interview|(?:schedule|set ?up|arrange|book) (?:a |an |your )?(?:interview|call|chat|meeting|screen)|available for (?:a |an )?(?:call|chat|interview|screen)|phone screen|video (?:call|interview)|technical screen|move (?:you )?forward to (?:the )?(?:next|interview)|next round of interview|hiring manager (?:would|wants|will)/i],
   ['recruiter', /recruiter|talent (?:team|acquisition|partner)|sourcer|reaching out|came across your (?:profile|background)|opportunity (?:at|with)|interested in your/i],
 ];
+// SUBJECT-FIRST: the subject is the reliable intent signal; the body is noisy (footers, tips,
+// marketing). Classify on the subject alone first; only if that's inconclusive fall back to the
+// (clipped) body. Combined with the ordering above, this stops body-noise false positives.
 function classify(subject, body) {
-  const t = `${subject || ''}\n${(body || '').slice(0, 2500)}`.toLowerCase();
+  const subj = String(subject || '').toLowerCase();
+  for (const [cat, rx] of CATEGORY_RX) if (rx.test(subj)) return cat;
+  const t = `${subj}\n${String(body || '').slice(0, 2000).toLowerCase()}`;
   for (const [cat, rx] of CATEGORY_RX) if (rx.test(t)) return cat;
   return 'other';
 }
@@ -168,7 +178,7 @@ function companyHints({ from, fromName, subject }) {
   }
   // The subject often names the company even for ATS / free-mail senders.
   const s = String(subject || '');
-  const m = s.match(/(?:applying to|application (?:to|for|at)|apply(?:ing)? (?:to|at)|interview (?:with|at)|join|from)\s+([A-Za-z][\w&.'\- ]{1,40})/i)
+  const m = s.match(/(?:applying to|application (?:to|for|at)|application was sent to|apply(?:ing)? (?:to|at)|(?:was |were )?sent to|interview (?:with|at)|join|from)\s+([A-Za-z][\w&.'\- ]{1,40})/i)
     || s.match(/^([A-Za-z][\w&.'\- ]{1,40})\s*[-—:|]/);
   if (m) {
     const cand = m[1].trim().replace(/\b(received|confirmation|application|applications|update|team|careers|recruiting|recruitment|talent|hiring|inc|llc|ltd|corp|co)\b.*$/i, '').trim();
@@ -358,6 +368,12 @@ async function aiDisambiguateSuggested({ runFn } = {}) {
   return { upgraded };
 }
 
+// Re-classify + re-match the already-stored inbox (one-shot cleanup after a classifier upgrade).
+function reprocessStored() {
+  const jobs = db.jobsForMatching();
+  return db.reprocessEmails((email) => matchEmailToJob(email, jobs));
+}
+
 let syncing = false;
 async function syncAll({ accountId, disambiguate = true } = {}) {
   if (syncing) return { ok: false, error: 'a sync is already running' };
@@ -376,5 +392,5 @@ async function syncAll({ accountId, disambiguate = true } = {}) {
 module.exports = {
   PRESETS, presetsPublic, listAccounts, publicAccount, getAccount, addAccount, removeAccount, setEnabled,
   testConnection, syncAccount, syncAll, classify, classifyEmailReward, matchEmailToJob, companyHints, senderDomain,
-  aiPickJob, aiDisambiguateSuggested, isSyncing: () => syncing,
+  aiPickJob, aiDisambiguateSuggested, reprocessStored, isSyncing: () => syncing,
 };

@@ -93,6 +93,23 @@ test('AI disambiguation (pickEmailJob): picks the model index, respects confiden
   assert.equal(d, null);
 });
 
+test('classification precedence: a LinkedIn "application was sent to X" is a confirmation, not an interview', () => {
+  // The live bug: 240/300 of these were mis-tagged 'interview' because the body footer says
+  // "interview tips" and interview was checked before application_confirmation.
+  assert.equal(email.classify('pierre, your application was sent to Crossing Hurdles', 'Thanks! Here are some interview tips to help you prepare.'), 'application_confirmation');
+  assert.equal(email.classify('Your application to Python Developer at Maxim', 'we received it'), 'application_confirmation');
+  // bare "interview" in a newsletter/body must NOT classify as interview (no invite language)
+  assert.equal(email.classify('Weekly digest: ace your next interview', 'top interview tips and tricks inside'), 'other');
+  // a REAL interview invite still classifies as interview
+  assert.equal(email.classify('Interview invitation — Software Engineer', 'please pick a time'), 'interview');
+  assert.equal(email.classify('Next steps', "We'd like to schedule a call with you"), 'interview');
+});
+
+test('companyHints parses LinkedIn "application was sent to X" so confirmations can match a job', () => {
+  const hints = email.companyHints({ from: 'jobs-noreply@linkedin.com', subject: 'pierre, your application was sent to Crossing Hurdles' });
+  assert.ok(hints.some((h) => h.includes('crossing') || 'crossinghurdles'.includes(h)), `expected a Crossing Hurdles hint, got ${JSON.stringify(hints)}`);
+});
+
 test('pickEmailJob prompt carries a strict schema and the none (-1) option', () => {
   const prompts = require(path.join(here, '..', 'app', 'src', 'ai', 'prompts.js'));
   const p = prompts.pickEmailJob({ email: { from: 'a@b.com', subject: 's', body: 'b' }, candidates: [{ company: 'C', title: 'T' }] });
