@@ -48,20 +48,44 @@ function placeInArea(area, corner) {
   return { left, top, width: Math.round(width), height: Math.round(height) };
 }
 
-export function pickApplyWindowBounds(displays) {
+// Tile window `slot` of `slots` as side-by-side columns inside `area`. Every tile is FULLY
+// visible (no overlap), so none of the parallel apply windows occlude each other — and an
+// un-occluded window is never Chrome-throttled, which is the whole point at concurrency > 1
+// (stacked windows = the covered ones throttle and never hydrate). Columns, not a grid: a
+// ~1/3-width window is still wide enough to render an ATS form, and a single row is simplest
+// to reason about for the 2–3 workers we cap at.
+function tileInArea(area, slot, slots) {
+  const GAP = 16;
+  const n = Math.max(1, slots | 0);
+  const i = Math.max(0, Math.min(n - 1, slot | 0));
+  const width = Math.max(420, Math.floor((area.width - GAP * (n + 1)) / n));
+  const height = Math.max(360, area.height - 2 * INSET);
+  let left = area.left + GAP + i * (width + GAP);
+  let top = area.top + INSET;
+  left = Math.round(Math.max(area.left, Math.min(left, area.left + area.width - width)));
+  top = Math.round(Math.max(area.top, Math.min(top, area.top + area.height - height)));
+  return { left, top, width: Math.round(width), height: Math.round(height) };
+}
+
+// opts.slots = total parallel apply windows (concurrency); opts.slot = this window's 0-based
+// index. Defaults to a single window (slots:1) = the original, unchanged placement.
+export function pickApplyWindowBounds(displays, opts = {}) {
   if (!Array.isArray(displays) || displays.length === 0) return null;
+  const slots = Math.max(1, Number(opts.slots) || 1);
+  const slot = Math.max(0, Number(opts.slot) || 0);
 
-  if (displays.length >= 2) {
-    // Prefer a NON-primary display so the apply window never sits on the user's main screen.
-    const secondary = displays.find((d) => !d?.isPrimary) || displays[1] || displays[0];
-    const area = workAreaOf(secondary);
-    if (!area) return null;
-    // Top-left of the secondary display (it's a whole free screen — no need to hide it).
-    return placeInArea(area, 'top-left');
-  }
-
-  // Single display: keep it out of the way (bottom-right of the work area).
-  const area = workAreaOf(displays[0]);
+  // Choose the display: a NON-primary one when available (keeps apply windows off the user's
+  // main screen entirely), else the single display.
+  const chosen = displays.length >= 2
+    ? (displays.find((d) => !d?.isPrimary) || displays[1] || displays[0])
+    : displays[0];
+  const area = workAreaOf(chosen);
   if (!area) return null;
-  return placeInArea(area, 'bottom-right');
+
+  // PARALLEL (concurrency > 1): tile the N windows side-by-side so none occlude → none throttle.
+  if (slots >= 2) return tileInArea(area, slot, slots);
+
+  // SINGLE worker: unchanged — secondary display → top-left (whole free screen); single
+  // display → bottom-right (out of the user's way).
+  return placeInArea(area, displays.length >= 2 ? 'top-left' : 'bottom-right');
 }

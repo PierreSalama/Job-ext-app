@@ -1011,14 +1011,16 @@ async function recoverAaGroup() {
 //     Chrome won't throttle AND it never covers the user's main-display work).
 //   • 1 display    → place out of the way (bottom-right) and DON'T steal focus.
 // Falls back to today's top-left placement if display info is unavailable.
-async function resolveApplyWindowCreate(base = {}) {
+async function resolveApplyWindowCreate(base = {}, tile = {}) {
   const fallback = { left: 60, top: 60, width: 1200, height: 900, ...base };
   let displays = null;
   try {
     if (chrome.system?.display?.getInfo) displays = await chrome.system.display.getInfo();
   } catch { displays = null; }
   if (!Array.isArray(displays) || !displays.length) return { create: fallback, multiDisplay: false };
-  const bounds = pickApplyWindowBounds(displays);
+  // `tile` = { slot, slots } — when slots>1 (concurrency>1) each worker window gets a distinct
+  // side-by-side tile so parallel windows never occlude/throttle each other.
+  const bounds = pickApplyWindowBounds(displays, tile);
   if (!bounds) return { create: fallback, multiDisplay: false };
   return { create: { ...base, ...bounds }, multiDisplay: displays.length >= 2 };
 }
@@ -1144,7 +1146,14 @@ async function acquireApplyWindow(focus = false) {
     // when available (off the user's screen + un-throttled), else out of the way.
     try {
       if (focus) await captureUserFocusOnce();
-      const placement = await resolveApplyWindowCreate({ focused: !!focus, state: 'normal' });
+      // Tile this worker's window into its own slot (its index in the pool) of `cap` columns,
+      // so concurrency>1 lays the windows side-by-side instead of stacking them (stacked =
+      // occluded = Chrome-throttled = never hydrates). Single-worker runs pass slots:1 → the
+      // original out-of-the-way placement.
+      const placement = await resolveApplyWindowCreate(
+        { focused: !!focus, state: 'normal' },
+        { slot: aaWindowPool.length, slots: cap },
+      );
       const w = await chrome.windows.create(placement.create);
       if (w) {
         win = w.id;

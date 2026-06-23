@@ -40,6 +40,32 @@ test('1 display → out of the way (bottom-right), not top-left over the user co
   assert.ok(b.left > 60 && b.top > 60, 'not pinned to top-left');
 });
 
+test('concurrency tiling: 3 worker windows on one display are side-by-side and never overlap', () => {
+  const tiles = [0, 1, 2].map((slot) => pickApplyWindowBounds([primary], { slot, slots: 3 }));
+  for (const t of tiles) {
+    assert.ok(t, 'tile returned');
+    assert.ok(t.left >= primary.workArea.left, 'left inside work area');
+    assert.ok(t.left + t.width <= primary.workArea.left + primary.workArea.width + 1, 'right edge fits');
+    assert.ok(t.top + t.height <= primary.workArea.top + primary.workArea.height + 1, 'bottom edge fits');
+  }
+  // Strictly left-to-right, non-overlapping columns: each tile starts at/after the previous one's right edge.
+  assert.ok(tiles[0].left + tiles[0].width <= tiles[1].left, 'tile 0 does not overlap tile 1');
+  assert.ok(tiles[1].left + tiles[1].width <= tiles[2].left, 'tile 1 does not overlap tile 2');
+  // And they're genuinely distinct positions.
+  assert.notEqual(tiles[0].left, tiles[1].left);
+  assert.notEqual(tiles[1].left, tiles[2].left);
+});
+
+test('concurrency tiling: tiles land on the NON-primary display when ≥2 exist', () => {
+  const t = pickApplyWindowBounds([primary, secondary], { slot: 1, slots: 3 });
+  assert.ok(t.left >= secondary.workArea.left, 'tiled on the secondary display');
+  assert.ok(t.left + t.width <= secondary.workArea.left + secondary.workArea.width + 1, 'fits secondary');
+});
+
+test('slots:1 (single worker) is unchanged — identical to the no-opts call', () => {
+  assert.deepEqual(pickApplyWindowBounds([primary], { slot: 0, slots: 1 }), pickApplyWindowBounds([primary]));
+});
+
 test('no usable display info → null (caller falls back to legacy placement)', () => {
   assert.equal(pickApplyWindowBounds([]), null);
   assert.equal(pickApplyWindowBounds(null), null);
