@@ -228,6 +228,43 @@ ${jobBlock(job)}`,
   };
 }
 
+// ---------- email → job disambiguation (used ONLY when deterministic matching is ambiguous) ----------
+// Given an inbound email and a short list of CANDIDATE applications, pick the single application
+// this email is about — or NONE. Used sparingly (a bounded post-pass over 'suggested' matches),
+// so the deterministic ladder does the bulk and AI only breaks ties. MUST be allowed to answer
+// "none" rather than force a wrong link.
+function pickEmailJob({ email = {}, candidates = [] }) {
+  const list = (candidates || []).slice(0, 8).map((c, i) =>
+    `[${i}] company="${clip(c.company, 80)}" title="${clip(c.title, 80)}"${c.appliedAt ? ` applied=${clip(c.appliedAt, 10)}` : ''}`).join('\n') || '(none)';
+  return {
+    kind: 'pick-email-job',
+    system: SYSTEM_BASE,
+    prompt:
+`A job-seeker received this email. Decide which of their job applications it is about — or NONE.
+Use the sender, company, role, and any thread/subject cues. If it does not clearly correspond to
+ONE of the listed applications, return index -1 (none) — NEVER guess to force a match.
+
+== EMAIL ==
+From: ${clip(email.from, 160)}${email.fromName ? ` (${clip(email.fromName, 80)})` : ''}
+Subject: ${clip(email.subject, 240)}
+Body:
+${clip(email.body, 1200)}
+
+== CANDIDATE APPLICATIONS ==
+${list}`,
+    schema: {
+      type: 'object',
+      required: ['index', 'confidence', 'reason'],
+      additionalProperties: false,
+      properties: {
+        index: { type: 'integer', description: 'index of the matching application, or -1 for none' },
+        confidence: { type: 'number', minimum: 0, maximum: 1 },
+        reason: { type: 'string' },
+      },
+    },
+  };
+}
+
 // ---------- follow-up email ----------
 function followUp({ job, profile, daysSince }) {
   return {
@@ -428,5 +465,5 @@ ${historyBlock || '(none)'}`,
 module.exports = {
   SYSTEM_BASE,
   fitScore, coverLetter, tailorResume, answerQuestion, applyRescue,
-  classifyEmail, summarizeJob, followUp, resumeParse, validateCapture,
+  classifyEmail, pickEmailJob, summarizeJob, followUp, resumeParse, validateCapture,
 };

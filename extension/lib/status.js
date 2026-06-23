@@ -7,6 +7,7 @@ export const STATUSES = [
   { id: 'started',         label: 'Started',          order: 10, terminal: false, category: 'pre' },
   { id: 'submitted',       label: 'Submitted',        order: 20, terminal: false, category: 'active' },
   { id: 'contacted',       label: 'Contacted',        order: 30, terminal: false, category: 'active' },
+  { id: 'assessment',      label: 'Assessment',       order: 35, terminal: false, category: 'active' },
   { id: 'interview_1',     label: 'First interview',  order: 40, terminal: false, category: 'active' },
   { id: 'interview_2',     label: 'Second interview', order: 50, terminal: false, category: 'active' },
   { id: 'interview_final', label: 'Final interview',  order: 60, terminal: false, category: 'active' },

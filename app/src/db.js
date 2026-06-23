@@ -29,6 +29,7 @@ const log = scope('db');
 // ---- Status FSM (mirror of extension/lib/status.js — keep in lockstep) ----
 const STATUS_ORDER = {
   started: 10, submitted: 20, contacted: 30,
+  assessment: 35,                                  // online assessment / coding challenge / take-home
   interview_1: 40, interview_2: 50, interview_final: 60,
   offer: 70, hired: 80,
   rejected: 90, withdrawn: 91, ghosted: 92,
@@ -3650,11 +3651,48 @@ function gmailStatusFromCategory(category) {
   switch (category) {
     case 'offer':                    return 'offer';
     case 'interview':                return 'interview_1';
+    case 'assessment':               return 'assessment';
     case 'rejection':                return 'rejected';
     case 'recruiter':                return 'contacted';
     case 'application_confirmation': return 'submitted';
     default:                         return null;
   }
+}
+
+// THREAD-BASED MATCHING ("trace the reply back to the original submission"): an inbound email
+// that is part of a conversation we already linked — same Gmail thread_id, OR whose
+// In-Reply-To / References headers name the Message-ID of an email we already matched — inherits
+// that email's job, even when the sender/subject no longer name the company or role (a recruiter
+// replying from a personal address, a bare "Re: your application"). We inherit ONLY from
+// confidently-matched emails (auto/manual), never from an unconfirmed 'suggested' guess, so a bad
+// guess can't propagate down a thread. Returns { jobId, via } or null.
+function findJobByThread({ threadId, inReplyTo, references, excludeEmailId } = {}) {
+  const msgIds = [];
+  const push = (v) => { if (v == null) return; for (const m of String(v).split(/\s+/)) { const t = m.trim().replace(/^<|>$/g, ''); if (t) msgIds.push(t); } };
+  push(inReplyTo); push(references);
+  // 1) Reply-chain: an email whose Message-ID we stored AND already matched (strongest — RFC 5322).
+  if (msgIds.length) {
+    const ph = msgIds.map(() => '?').join(',');
+    const row = get(
+      `SELECT matched_job_id FROM emails
+         WHERE matched_job_id IS NOT NULL AND match_source IN ('auto','manual')
+           AND REPLACE(REPLACE(message_id,'<',''),'>','') IN (${ph})
+           ${excludeEmailId ? 'AND id != ?' : ''}
+         ORDER BY sent_at DESC LIMIT 1`,
+      excludeEmailId ? [...msgIds, excludeEmailId] : msgIds);
+    if (row?.matched_job_id) return { jobId: row.matched_job_id, via: 'reply-chain' };
+  }
+  // 2) Same provider thread (Gmail thread_id) already matched.
+  if (threadId) {
+    const row = get(
+      `SELECT matched_job_id FROM emails
+         WHERE thread_id = ? AND matched_job_id IS NOT NULL AND match_source IN ('auto','manual')
+           ${excludeEmailId ? 'AND id != ?' : ''}
+         ORDER BY sent_at DESC LIMIT 1`,
+      excludeEmailId ? [threadId, excludeEmailId] : [threadId]);
+    if (row?.matched_job_id) return { jobId: row.matched_job_id, via: 'thread' };
+  }
+  return null;
 }
 
 // ============================================================
@@ -4110,7 +4148,7 @@ module.exports = {
   setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,
-  emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching,
+  emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching, findJobByThread, gmailStatusFromCategory,
   recordOutcome, creditOutcomeForEmail, emailsNeedingConfirm, confirmEmailLink, outcomesForJob,
   punish, unpunish, listPunishments, punishmentPenalty, isPunished, punishCompanyCascade,
   geoPenalty, rankJob,

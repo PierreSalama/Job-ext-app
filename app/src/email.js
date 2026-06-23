@@ -106,7 +106,10 @@ async function testConnection(a) {
 const CATEGORY_RX = [
   ['offer', /job offer|offer letter|pleased to offer|like to offer|offer(?:ing)? you (?:the |a |this )?(?:role|position|job|opportunity)|extend(?:ing)? an offer|congratulations[^.]*offer/i],
   ['rejection', /unfortunately|we regret|not (?:moving|move) forward|decided (?:not to|to not)|other candidates|will not be proceeding|position (?:has been|is) filled|no longer under consideration/i],
-  ['interview', /interview|schedule (?:a |your )?(?:call|chat|meeting|time)|your availability|phone screen|technical (?:screen|assessment)|coding (?:challenge|assessment)|next (?:round|step|stage)|hiring manager/i],
+  // Checked BEFORE interview so a coding challenge / take-home / online test is its OWN stage
+  // ('assessment') rather than being lumped into 'interview' — the user wants this surfaced.
+  ['assessment', /online assessment|coding (?:challenge|assessment|test|exercise)|take[- ]?home|hackerrank|codility|codesignal|\bkattis\b|technical (?:assessment|test|exercise)|complete (?:the |a |an )?(?:assessment|test|challenge|exercise)|skills?(?: |-)?(?:test|assessment)|aptitude test/i],
+  ['interview', /interview|schedule (?:a |your )?(?:call|chat|meeting|time)|your availability|phone screen|technical screen|next (?:round|step|stage)|hiring manager|meet (?:the|our) team/i],
   ['application_confirmation', /thank you for applying|application (?:was |has been )?(?:received|submitted|sent)|we(?:'| ha)ve received your application|successfully applied|application (?:confirmation|received)|your application to/i],
   ['recruiter', /recruiter|talent (?:team|acquisition|partner)|sourcer|reaching out|came across your (?:profile|background)|opportunity (?:at|with)|interested in your/i],
 ];
@@ -129,11 +132,12 @@ function classify(subject, body) {
 // Returns { kind, reward } where reward is the *base* (pre confidence-weight, pre clip).
 function classifyEmailReward(categoryOrSubject, body) {
   // Accept either an already-classified category or a raw (subject[, body]) pair.
-  const KNOWN = new Set(['offer', 'rejection', 'interview', 'application_confirmation', 'recruiter', 'other']);
+  const KNOWN = new Set(['offer', 'rejection', 'interview', 'assessment', 'application_confirmation', 'recruiter', 'other']);
   const cat = KNOWN.has(categoryOrSubject) ? categoryOrSubject : classify(categoryOrSubject, body);
   switch (cat) {
     case 'offer':                   return { kind: 'email_reply', reward: 1.0 };
     case 'interview':               return { kind: 'email_reply', reward: 0.7 };
+    case 'assessment':              return { kind: 'email_reply', reward: 0.5 };
     case 'application_confirmation': return { kind: 'email_reply', reward: 0.1 };
     case 'rejection':               return { kind: 'rejection', reward: -0.3 };
     case 'recruiter':               return { kind: 'neutral', reward: 0 };
@@ -173,7 +177,16 @@ function companyHints({ from, fromName, subject }) {
   return [...hints].map((h) => db.normKey(h)).filter((h) => h && h.length > 1);
 }
 function matchEmailToJob(email, jobs) {
-  const fallback = { matchedJobId: null, matchConfidence: 0, matchSource: null, category: classify(email.subject, email.body) };
+  const category = classify(email.subject, email.body);
+  // THREAD-FIRST ("trace the reply back to the original submission"): if this message continues a
+  // conversation we already linked — same provider thread, or it replies to a Message-ID we
+  // matched — inherit that job with high confidence, EVEN IF the sender/subject no longer name the
+  // company or role (a recruiter replying from a personal address, a bare "Re: your application").
+  try {
+    const t = db.findJobByThread({ threadId: email.threadId, inReplyTo: email.inReplyTo, references: email.references });
+    if (t && t.jobId) return { matchedJobId: t.jobId, matchConfidence: 0.95, matchSource: 'auto', category, via: t.via };
+  } catch {}
+  const fallback = { matchedJobId: null, matchConfidence: 0, matchSource: null, category };
   const hints = companyHints(email);
   if (!hints.length) return fallback;
   const sentMs = Date.parse(email.sentAt) || Date.now();
@@ -207,7 +220,6 @@ function matchEmailToJob(email, jobs) {
   cands = cands.map((j) => ({ j, s: score(j) })).filter((x) => x.s >= 0).sort((a, b) => b.s - a.s);
   if (!cands.length) return fallback;
   const best = cands[0], second = cands[1];
-  const category = classify(email.subject, email.body);
   const clear = !second || (best.s - second.s) > 0.25;   // one obvious winner among same-company jobs
   if (best.s >= 0.6 && clear) return { matchedJobId: best.j.id, matchConfidence: Number(Math.min(0.96, 0.7 + best.s * 0.25).toFixed(2)), matchSource: 'auto', category };
   return { matchedJobId: best.j.id, matchConfidence: Number(Math.min(0.69, 0.4 + best.s * 0.3).toFixed(2)), matchSource: 'suggested', category };
@@ -216,13 +228,24 @@ function matchEmailToJob(email, jobs) {
 // ---------- parse one fetched message ----------
 async function parseMessage(msg) {
   const env = msg.envelope || {};
-  let body = '';
-  try { if (msg.source) { const p = await simpleParser(msg.source); body = String(p.text || p.html || ''); } } catch {}
+  let body = '', inReplyTo = null, references = null, parsedMsgId = null;
+  try {
+    if (msg.source) {
+      const p = await simpleParser(msg.source);
+      body = String(p.text || p.html || '');
+      // RFC 5322 reply chain — the headers that let us trace a reply back to its thread even when
+      // the body/sender no longer name the company. references can be a string or an array.
+      inReplyTo = p.inReplyTo || null;
+      references = Array.isArray(p.references) ? p.references.join(' ') : (p.references || null);
+      parsedMsgId = p.messageId || null;
+    }
+  } catch {}
   const fromObj = (env.from && env.from[0]) || {};
   let sentAt;
   try { const d = env.date || msg.internalDate; sentAt = (d instanceof Date ? d : new Date(d)).toISOString(); } catch { sentAt = new Date().toISOString(); }
   return {
-    messageId: env.messageId || null,
+    messageId: parsedMsgId || env.messageId || null,
+    inReplyTo, references, threadId: null,   // IMAP has no Gmail thread id; the reply headers carry the chain
     from: fromObj.address || '', fromName: fromObj.name || '',
     to: (env.to && env.to[0] && env.to[0].address) || '',
     subject: env.subject || '(no subject)',
@@ -286,19 +309,72 @@ async function syncAccount(a, { firstRunMax = 150, perRunMax = 400 } = {}) {
   return res;
 }
 
+// ---------- AI disambiguation (used ONLY when deterministic matching is ambiguous) ----------
+// `runFn` is injected for testability (defaults to the real provider chain). Returns
+// { jobId, confidence } or null. The model may return -1 (none) — we never force a wrong link,
+// and we require a healthy confidence before upgrading a 'suggested' guess to a confirmed match.
+const AI_PICK_MIN_CONFIDENCE = 0.7;
+async function aiPickJob(email, candidates, runFn) {
+  if (!candidates || !candidates.length) return null;
+  const run = runFn || (async (p) => require('./ai/provider').run(p));
+  try {
+    const prompts = require('./ai/prompts');
+    const p = prompts.pickEmailJob({ email, candidates });
+    const out = await run({ kind: p.kind, system: p.system, prompt: p.prompt, schema: p.schema });
+    const j = (out && out.json) || out;
+    if (!j || typeof j.index !== 'number' || j.index < 0 || j.index >= candidates.length) return null;
+    if ((j.confidence ?? 0) < AI_PICK_MIN_CONFIDENCE) return null;
+    return { jobId: candidates[j.index].id, confidence: j.confidence, reason: j.reason || '' };
+  } catch { return null; }
+}
+
+// Bounded post-pass: after a deterministic sync, ask the AI to resolve a few of the AMBIGUOUS
+// ('suggested') high-value emails (interview/offer/assessment) — capped so token use stays
+// moderate. A confident pick upgrades the link to 'auto' + elevates the job stage; otherwise the
+// email stays 'suggested' for one-click human confirm. The deterministic ladder + threading
+// already handle the bulk, so this only breaks genuine ties.
+const AI_DISAMBIGUATE_CAP = 6;
+async function aiDisambiguateSuggested({ runFn } = {}) {
+  let upgraded = 0;
+  let suggested = [];
+  try { suggested = db.listEmails({ unmatchedOnly: false, limit: 500 }).filter((e) => e.matchSource === 'suggested'); } catch { return { upgraded: 0 }; }
+  const highValue = suggested.filter((e) => ['interview', 'offer', 'assessment'].includes(e.category)).slice(0, AI_DISAMBIGUATE_CAP);
+  if (!highValue.length) return { upgraded: 0 };
+  const jobs = db.jobsForMatching();
+  for (const e of highValue) {
+    const hints = companyHints(e);
+    const candidates = jobs.filter((j) => { const ck = db.normKey(j.company || ''); return ck && hints.some((h) => ck.includes(h) || h.includes(ck)); })
+      .slice(0, 8).map((j) => ({ id: j.id, company: j.company, title: j.title, appliedAt: j.submittedAt || j.createdAt }));
+    if (candidates.length < 2) continue;   // a single candidate is already the suggestion; nothing to disambiguate
+    const pick = await aiPickJob(e, candidates, runFn);
+    if (pick && pick.jobId) {
+      try {
+        db.setEmailMatch(e.id, { jobId: pick.jobId, source: 'auto', confidence: Math.min(0.95, pick.confidence) });
+        db.creditOutcomeForEmail(e.id);
+        upgraded++;
+      } catch (err) { log.warn('ai disambiguation upgrade failed:', err.message); }
+    }
+  }
+  return { upgraded };
+}
+
 let syncing = false;
-async function syncAll({ accountId } = {}) {
+async function syncAll({ accountId, disambiguate = true } = {}) {
   if (syncing) return { ok: false, error: 'a sync is already running' };
   syncing = true;
   try {
     const accts = listAccounts().filter((a) => a.enabled && a.password && (!accountId || a.id === accountId));
     const results = [];
     for (const a of accts) results.push(await syncAccount(a).catch((e) => ({ account: a.id, error: humanizeImapError(e) })));
-    return { ok: true, results };
+    // AI tie-break the ambiguous high-value emails (bounded). Guarded — never breaks the sync.
+    let ai = { upgraded: 0 };
+    if (disambiguate) { try { ai = await aiDisambiguateSuggested(); } catch (e) { log.warn('ai disambiguation pass failed:', e.message); } }
+    return { ok: true, results, aiUpgraded: ai.upgraded };
   } finally { syncing = false; }
 }
 
 module.exports = {
   PRESETS, presetsPublic, listAccounts, publicAccount, getAccount, addAccount, removeAccount, setEnabled,
-  testConnection, syncAccount, syncAll, classify, classifyEmailReward, matchEmailToJob, companyHints, senderDomain, isSyncing: () => syncing,
+  testConnection, syncAccount, syncAll, classify, classifyEmailReward, matchEmailToJob, companyHints, senderDomain,
+  aiPickJob, aiDisambiguateSuggested, isSyncing: () => syncing,
 };

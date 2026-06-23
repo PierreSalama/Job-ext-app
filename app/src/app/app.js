@@ -19,6 +19,7 @@ const STATUSES = [
   { id: 'started',         label: 'Started',          order: 10 },
   { id: 'submitted',       label: 'Submitted',        order: 20 },
   { id: 'contacted',       label: 'Contacted',        order: 30 },
+  { id: 'assessment',      label: 'Assessment',       order: 35 },
   { id: 'interview_1',     label: 'First interview',  order: 40 },
   { id: 'interview_2',     label: 'Second interview', order: 50 },
   { id: 'interview_final', label: 'Final interview',  order: 60 },
@@ -30,7 +31,7 @@ const STATUSES = [
 ];
 const STATUS_LABEL = Object.fromEntries(STATUSES.map((s) => [s.id, s.label]));
 const STATUS_INDEX = Object.fromEntries(STATUSES.map((s, i) => [s.id, i]));
-const PIPELINE_ACTIVE = ['submitted', 'contacted', 'interview_1', 'interview_2', 'interview_final', 'offer'];
+const PIPELINE_ACTIVE = ['submitted', 'contacted', 'assessment', 'interview_1', 'interview_2', 'interview_final', 'offer'];
 
 const QUEUE_STATE_ORDER = ['running', 'awaiting_review', 'parked', 'awaiting_input', 'queued', 'scheduled', 'done', 'failed', 'skipped'];
 const QUEUE_STATE_LABEL = {
@@ -1685,7 +1686,7 @@ route('/pipeline', async () => {
   for (const j of filtered) (byStatus[j.status] || (byStatus[j.status] = [])).push(j);
   for (const s of STATUSES) byStatus[s.id].sort(cmp);
 
-  const GROUPS = { started: 'Pre', submitted: 'Active', contacted: 'Active', interview_1: 'Interviews', interview_2: 'Interviews', interview_final: 'Interviews', offer: 'Closing', hired: 'Closing', rejected: 'Closed', withdrawn: 'Closed', ghosted: 'Closed' };
+  const GROUPS = { started: 'Pre', submitted: 'Active', contacted: 'Active', assessment: 'Active', interview_1: 'Interviews', interview_2: 'Interviews', interview_final: 'Interviews', offer: 'Closing', hired: 'Closing', rejected: 'Closed', withdrawn: 'Closed', ghosted: 'Closed' };
   const TERMINAL_S = ['hired', 'rejected', 'withdrawn', 'ghosted'];
   const STALE_DAYS = 14;
 
