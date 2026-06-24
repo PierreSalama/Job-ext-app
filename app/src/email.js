@@ -118,13 +118,14 @@ const CATEGORY_RX = [
   ['interview', /interview invitation|invitation to interview|invit\w* (?:you )?(?:to|for) (?:an? )?interview|(?:schedule|set ?up|arrange|book) (?:a |an |your )?(?:interview|call|chat|meeting|screen)|available for (?:a |an )?(?:call|chat|interview|screen)|phone screen|video (?:call|interview)|technical screen|move (?:you )?forward to (?:the )?(?:next|interview)|next round of interview|hiring manager (?:would|wants|will)/i],
   ['recruiter', /recruiter|talent (?:team|acquisition|partner)|sourcer|reaching out|came across your (?:profile|background)|opportunity (?:at|with)|interested in your/i],
 ];
-// SUBJECT-FIRST: the subject is the reliable intent signal; the body is noisy (footers, tips,
-// marketing). Classify on the subject alone first; only if that's inconclusive fall back to the
-// (clipped) body. Combined with the ordering above, this stops body-noise false positives.
+// Classify over the combined subject + (clipped) body. The ORDER of CATEGORY_RX is what
+// prevents false positives: terminal signals (offer/rejection) outrank confirmation, and
+// confirmation outranks interview (so a "your application was sent to X" email whose footer
+// mentions interview tips is a confirmation, not an interview). NOTE: do NOT switch this to
+// subject-only — rejections/offers routinely carry a neutral "Your application to X" subject
+// with the real news in the body, and subject-first mis-tags those as confirmations.
 function classify(subject, body) {
-  const subj = String(subject || '').toLowerCase();
-  for (const [cat, rx] of CATEGORY_RX) if (rx.test(subj)) return cat;
-  const t = `${subj}\n${String(body || '').slice(0, 2000).toLowerCase()}`;
+  const t = `${String(subject || '')}\n${String(body || '').slice(0, 2000)}`.toLowerCase();
   for (const [cat, rx] of CATEGORY_RX) if (rx.test(t)) return cat;
   return 'other';
 }
