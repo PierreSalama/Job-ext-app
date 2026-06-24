@@ -299,10 +299,12 @@ async function syncAccount(a, { firstRunMax = 150, perRunMax = 400 } = {}) {
         if (!msg) continue;
         res.fetched++;
         const parsed = await parseMessage(msg);
-        const assoc = matchEmailToJob(parsed, jobs);
+        const assoc = associate(parsed, jobs);
         const up = db.emailUpsert({ accountId: a.id, provider: a.provider, uid, ...parsed, ...assoc });
         if (up.action === 'created') res.created++;
         if (assoc.matchSource === 'auto') res.matched++; else if (assoc.matchSource === 'suggested') res.suggested++;
+        // Reflect the match in the pipeline (forward-only stage elevation from the email category).
+        if (assoc.matchSource === 'auto') { try { db.elevateJobFromEmail(up.id); } catch {} }
         // North-star reward (P6): an auto-linked email releases its credit immediately;
         // 'suggested' rewards are HELD until the user confirms the link. Guard so a bad row
         // never breaks the sync.
@@ -369,10 +371,48 @@ async function aiDisambiguateSuggested({ runFn } = {}) {
   return { upgraded };
 }
 
+// Derive {title, company} from an application-confirmation subject. Handles the two LinkedIn
+// shapes: "Your application to <role> at <company>" and "your application was sent to <company>".
+const normExtId = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 40);
+function jobFieldsFromConfirmation(email) {
+  const s = String(email.subject || '');
+  let m = s.match(/application (?:to|for)\s+(.+?)\s+at\s+([A-Za-z0-9][\w&.,'\- ]{1,55})/i);
+  if (m) return { title: m[1].trim().slice(0, 110) || 'Application (via email)', company: m[2].trim().replace(/\s+(was|has been)\b.*$/i, '').trim().slice(0, 70) };
+  m = s.match(/application was sent to\s+([A-Za-z0-9][\w&.,'\- ]{1,55})/i);
+  if (m) return { title: 'Application (via email)', company: m[1].trim().slice(0, 70) };
+  return null;
+}
+// When a confirmation can't be matched to an existing tracked job, CREATE one (status submitted,
+// source 'email') so applications made outside JAT — LinkedIn reposts, staffing agencies — still
+// appear in the pipeline. Deduped by externalId; pushes into `jobs` so later emails in the same
+// run match it instead of creating a duplicate. Returns the job id or null (no derivable company).
+function ensureJobForConfirmation(email, jobs) {
+  const f = jobFieldsFromConfirmation(email);
+  if (!f || !f.company) return null;
+  const externalId = 'email:' + normExtId(f.company) + ':' + normExtId(f.title);
+  try {
+    const r = db.upsertJob({ externalId, title: f.title, company: f.company, source: 'email', status: 'submitted', jobUrl: 'email://' + normExtId(f.company), tags: 'from-email' });
+    const id = r?.job?.id || null;
+    if (id && Array.isArray(jobs) && !jobs.some((j) => j.id === id)) jobs.push({ id, title: f.title, company: f.company, source: 'email', submittedAt: email.sentAt, createdAt: email.sentAt });
+    return id;
+  } catch { return null; }
+}
+// Match an email; if it's an unmatched application_confirmation, auto-create a tracked job for it.
+function associate(email, jobs) {
+  const assoc = matchEmailToJob(email, jobs);
+  if (!assoc.matchedJobId && assoc.category === 'application_confirmation') {
+    const jid = ensureJobForConfirmation(email, jobs);
+    if (jid) { assoc.matchedJobId = jid; assoc.matchSource = 'auto'; assoc.matchConfidence = 0.9; assoc.via = 'auto-created'; }
+  }
+  return assoc;
+}
+
 // Re-classify + re-match the already-stored inbox (one-shot cleanup after a classifier upgrade).
+// db.reprocessEmails elevates the job stage for each match; associate() also auto-creates a job
+// for any unmatched confirmation so the whole inbox lands in the pipeline.
 function reprocessStored() {
   const jobs = db.jobsForMatching();
-  return db.reprocessEmails((email) => matchEmailToJob(email, jobs));
+  return db.reprocessEmails((email) => associate(email, jobs));
 }
 
 let syncing = false;
@@ -393,5 +433,5 @@ async function syncAll({ accountId, disambiguate = true } = {}) {
 module.exports = {
   PRESETS, presetsPublic, listAccounts, publicAccount, getAccount, addAccount, removeAccount, setEnabled,
   testConnection, syncAccount, syncAll, classify, classifyEmailReward, matchEmailToJob, companyHints, senderDomain,
-  aiPickJob, aiDisambiguateSuggested, reprocessStored, isSyncing: () => syncing,
+  aiPickJob, aiDisambiguateSuggested, reprocessStored, associate, ensureJobForConfirmation, isSyncing: () => syncing,
 };

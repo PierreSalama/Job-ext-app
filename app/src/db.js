@@ -3443,6 +3443,9 @@ function reprocessEmails(matchFn) {
     if (cat === row.category && mj === row.matched_job_id && ms === row.match_source) continue;
     run('UPDATE emails SET category=?, matched_job_id=?, match_confidence=?, match_source=? WHERE id=?', [cat, mj, mc, ms, row.id]);
     changed++;
+    // Reflect the match in the pipeline: elevate the job's stage from the email category
+    // (forward-only). Without this, reprocess/sync links emails but the board never moves.
+    if (mj && (ms === 'auto' || ms === 'manual')) { try { elevateJobFromEmailRow({ matched_job_id: mj, category: cat, match_source: ms }); } catch {} }
   }
   return { processed, changed };
 }
@@ -3674,6 +3677,26 @@ function gmailStatusFromCategory(category) {
     case 'application_confirmation': return 'submitted';
     default:                         return null;
   }
+}
+
+// Elevate a job's pipeline STAGE from a matched email's category (confirmation→submitted,
+// assessment→assessment, interview→interview_1, offer→offer, rejection→rejected,
+// recruiter→contacted). Forward-only — never demotes, never touches a terminal job. This is what
+// makes the pipeline reflect the inbox automatically on every auto/manual match (sync + reprocess),
+// instead of only on a manual one-click confirm. Returns the new status or null (no change).
+function elevateJobFromEmailRow(row) {
+  if (!row || !row.matched_job_id) return null;
+  if (row.match_source !== 'auto' && row.match_source !== 'manual') return null;
+  const st = gmailStatusFromCategory(row.category);
+  if (!st) return null;
+  const job = getJob(row.matched_job_id);
+  if (!job || TERMINAL.has(job.status)) return null;
+  if ((STATUS_ORDER[st] || 0) <= (STATUS_ORDER[job.status] || 0)) return null;   // forward-only
+  patchJob(row.matched_job_id, { status: st });
+  return st;
+}
+function elevateJobFromEmail(emailId) {
+  return elevateJobFromEmailRow(get('SELECT matched_job_id, category, match_source FROM emails WHERE id = ?', [emailId]));
 }
 
 // THREAD-BASED MATCHING ("trace the reply back to the original submission"): an inbound email
@@ -4165,7 +4188,7 @@ module.exports = {
   setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,
-  emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching, findJobByThread, gmailStatusFromCategory, reprocessEmails,
+  emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching, findJobByThread, gmailStatusFromCategory, reprocessEmails, elevateJobFromEmail,
   recordOutcome, creditOutcomeForEmail, emailsNeedingConfirm, confirmEmailLink, outcomesForJob,
   punish, unpunish, listPunishments, punishmentPenalty, isPunished, punishCompanyCascade,
   geoPenalty, rankJob,

@@ -110,6 +110,41 @@ test('companyHints parses LinkedIn "application was sent to X" so confirmations 
   assert.ok(hints.some((h) => h.includes('crossing') || 'crossinghurdles'.includes(h)), `expected a Crossing Hurdles hint, got ${JSON.stringify(hints)}`);
 });
 
+test('email match ELEVATES the job stage (forward-only) so the pipeline reflects the inbox', () => {
+  // a confirmation on a 'started' job → submitted
+  const j1 = db.upsertJob({ externalId: 'el1', title: 'Dev', company: 'Stark Industries', source: 'linkedin', status: 'started', jobUrl: 'https://x/el1' }).job;
+  const up1 = db.emailUpsert({ accountId: 'a1', uid: 901, from: 'jobs@stark.com', subject: 'Your application to Dev at Stark Industries', body: 'received', sentAt: iso(), matchedJobId: j1.id, matchConfidence: 0.9, matchSource: 'auto', category: 'application_confirmation' });
+  assert.equal(db.elevateJobFromEmail(up1.id), 'submitted');
+  assert.equal(db.getJob(j1.id).status, 'submitted');
+  // an interview email → interview_1
+  const j2 = db.upsertJob({ externalId: 'el2', title: 'Dev', company: 'Wayne Tech', source: 'linkedin', status: 'submitted', jobUrl: 'https://x/el2' }).job;
+  const up2 = db.emailUpsert({ accountId: 'a1', uid: 902, from: 'hr@waynetech.com', subject: 'Interview invitation', body: 'lets schedule', sentAt: iso(), matchedJobId: j2.id, matchConfidence: 0.9, matchSource: 'auto', category: 'interview' });
+  assert.equal(db.elevateJobFromEmail(up2.id), 'interview_1');
+  // forward-only: a confirmation must NOT demote an interview-stage job
+  const up3 = db.emailUpsert({ accountId: 'a1', uid: 903, from: 'jobs@waynetech.com', subject: 'Your application to Dev at Wayne Tech', body: 'x', sentAt: iso(), matchedJobId: j2.id, matchConfidence: 0.9, matchSource: 'auto', category: 'application_confirmation' });
+  assert.equal(db.elevateJobFromEmail(up3.id), null);
+  assert.equal(db.getJob(j2.id).status, 'interview_1');
+  // terminal job is never touched
+  const j4 = db.upsertJob({ externalId: 'el4', title: 'Dev', company: 'Oscorp', source: 'linkedin', status: 'rejected', jobUrl: 'https://x/el4' }).job;
+  const up4 = db.emailUpsert({ accountId: 'a1', uid: 904, from: 'hr@oscorp.com', subject: 'Interview invitation at Oscorp', body: 'x', sentAt: iso(), matchedJobId: j4.id, matchConfidence: 0.9, matchSource: 'auto', category: 'interview' });
+  assert.equal(db.elevateJobFromEmail(up4.id), null);
+  assert.equal(db.getJob(j4.id).status, 'rejected');
+});
+
+test('associate() auto-creates a tracked submitted job from an unmatched confirmation', () => {
+  const jobs = db.jobsForMatching();
+  const before = jobs.length;
+  const a = email.associate({ from: 'jobs-noreply@linkedin.com', subject: 'pierre, your application was sent to Nimbus Robotics Inc.', body: 'sent', sentAt: iso() }, jobs);
+  assert.ok(a.matchedJobId, 'creates + links a job');
+  assert.equal(a.via, 'auto-created');
+  assert.equal(jobs.length, before + 1, 'pushed into the run job list (dedupes subsequent emails)');
+  assert.equal(db.getJob(a.matchedJobId).status, 'submitted');
+  assert.equal(db.getJob(a.matchedJobId).source, 'email');
+  // a second confirmation for the SAME company+role dedupes to the same job (no duplicate)
+  const b = email.associate({ from: 'x@y.com', subject: 'pierre, your application was sent to Nimbus Robotics Inc.', body: 'sent', sentAt: iso() }, jobs);
+  assert.equal(b.matchedJobId, a.matchedJobId, 'deduped, not duplicated');
+});
+
 test('pickEmailJob prompt carries a strict schema and the none (-1) option', () => {
   const prompts = require(path.join(here, '..', 'app', 'src', 'ai', 'prompts.js'));
   const p = prompts.pickEmailJob({ email: { from: 'a@b.com', subject: 's', body: 'b' }, candidates: [{ company: 'C', title: 'T' }] });

@@ -263,11 +263,17 @@ async function syncNow() {
           body: body.slice(0, 8000),
           sentAt,
         };
-        const assoc = emailMod.matchEmailToJob(parsedEmail, jobsForMatch);
+        // associate(): match, and auto-create a tracked job for an unmatched confirmation so
+        // every application lands in the pipeline (LinkedIn reposts / staffing agencies included).
+        const assoc = emailMod.associate(parsedEmail, jobsForMatch);
         const up = db.emailUpsert({ accountId: 'gmail', provider: 'gmail', uid: id, ...parsedEmail, ...assoc });
         emailsWritten++;
-        // Auto-linked email → release its reward now; 'suggested' is held until confirmed.
-        if (assoc.matchSource === 'auto') { try { db.creditOutcomeForEmail(up.id); } catch (e) { log.warn('credit failed:', e.message); } }
+        // Auto-linked email → release its reward now AND elevate the job's pipeline stage from the
+        // email category (forward-only). 'suggested' is held until the user confirms.
+        if (assoc.matchSource === 'auto') {
+          try { db.creditOutcomeForEmail(up.id); } catch (e) { log.warn('credit failed:', e.message); }
+          try { db.elevateJobFromEmail(up.id); } catch (e) { log.warn('elevate failed:', e.message); }
+        }
       } catch (e) { log.warn('emails-table write failed:', e.message); }
 
       let parsed = parseLinkedIn(subject, body);
