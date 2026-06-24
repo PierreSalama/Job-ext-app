@@ -1658,7 +1658,10 @@ route('/pipeline', async () => {
   const jobs = r.items || [];
   const b = state.board;
   const emailAcctR = await api('/email/accounts').catch(() => null);
-  const hasEmail = !!(emailAcctR && (emailAcctR.accounts || []).length);
+  const gmailR = await api('/gmail/status').catch(() => null);
+  // "Connected" = an IMAP account OR an authorized Gmail (OAuth). Without the Gmail check the
+  // banner nags forever for users who connected via Gmail rather than an app-password.
+  const hasEmail = !!(emailAcctR && (emailAcctR.accounts || []).length) || !!(gmailR && gmailR.authorized);
   const emailBannerOff = (() => { try { return localStorage.getItem('jat11.emailBannerDismissed') === '1'; } catch { return false; } })();
 
   const sources = [...new Set(jobs.map((j) => j.source).filter(Boolean))].sort();
