@@ -110,3 +110,18 @@ test('queueActiveSiteKeys reports scheduled/running site keys for worker spreadi
   assert.ok(keys.some((k) => /linkedin\.com|linkedin/.test(k)), 'LinkedIn active site is visible');
   assert.ok(keys.some((k) => /indeed\.com|indeed/.test(k)), 'Indeed active site is visible');
 });
+
+test('queueNext re-applies jobFit at dispatch — an excluded-company job queued earlier is purged, not dispatched', async () => {
+  db.patchSettings({ autoApply: {
+    enabled: true, runAnytime: true, windowStart: '', windowEnd: '',
+    maxPerDay: 999, maxPerHour: 999, dailyCap: 0, minGapMinutes: 0, maxGapMinutes: 0,
+    concurrency: 1, easyApplyOnly: false, keywords: ['developer'],
+    excludeKeywords: [], excludeCompanies: ['qualis solutions'], excludeLocations: [],
+  } });
+  const job = db.upsertJob({ externalId: 'qn1', title: 'Developer', company: 'Qualis Solutions, LLC', source: 'linkedin', status: 'started', jobUrl: 'https://www.linkedin.com/jobs/view/qn1' }).job;
+  db.queueAdd(job.id, { mode: 'auto' });
+  await server.queueNext();
+  const t = db.queueList({}).find((x) => x.jobId === job.id);
+  assert.equal(t.state, 'skipped', 'excluded-company job is skipped at dispatch, not applied to');
+  assert.match(t.lastError || '', /filtered: excluded company/i);
+});

@@ -141,7 +141,14 @@ const DEFAULTS = {
     experienceYears: 0,           // your years of experience; >0 = skip jobs that demand many more
     seniorityMax: 'any',          // 'any' | 'entry' | 'mid' | 'senior' — skip roles above this level
     excludeKeywords: [],          // title terms to always skip, e.g. ['game','manager','sales']
-    excludeCompanies: [],         // company terms to always skip
+    // High-volume IT-staffing reposters / job aggregators / recruiters that flood discovery with
+    // duplicate, often-ghost listings (substring, case-insensitive). Curated from live data — these
+    // dominated the queue and convert poorly. Users can edit this list in Settings.
+    excludeCompanies: [
+      'hire feed', 'jobgether', 'stealth startup', 'qualis solutions', 'crossing hurdles',
+      'quantum world technologies', 'apptoza', 'pacer group', 'hunter bond', 'tmc canada',
+      'insight global', 'fdm',
+    ],          // company terms to always skip
     excludeLocations: [],         // location terms to always skip
     profileId: '',                // which profile to apply with ('' = default)
     resumeDocId: '',              // which résumé to attach ('' = default)

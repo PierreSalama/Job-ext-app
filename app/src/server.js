@@ -360,6 +360,16 @@ async function queueNext(force = false) {
       broadcast('queue.updated', { taskId: t.id, state: 'skipped' });
       continue;
     }
+    // RE-APPLY the relevance gate at dispatch (not just at ingest). excludeCompanies/
+    // excludeKeywords/seniority can be edited AFTER a job was queued; without this re-check the
+    // old queue keeps dispatching jobs the user just excluded (e.g. ~140 staffing reposters).
+    // This makes filter edits retroactive — they purge the standing queue on the next pump.
+    const fitNow = jobFit(j, s);
+    if (!fitNow.ok) {
+      db.queuePatch(t.id, { state: 'skipped', lastError: `filtered: ${fitNow.reason}` });
+      broadcast('queue.updated', { taskId: t.id, state: 'skipped' });
+      continue;
+    }
     if (cooledDown && !db.easyApplyEligible(j)) { easyApplyDeferred = true; continue; }
     const siteKey = db.taskSiteKey(j);
     if (!force && concurrency > 1 && siteKey && activeSiteKeys.has(siteKey)) {
