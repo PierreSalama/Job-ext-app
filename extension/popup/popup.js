@@ -80,7 +80,13 @@ async function paintConnection() {
     const a = $('#aa-state');
     a.textContent = st.autoApply.enabled ? `on · ${st.autoApply.mode} mode` : 'off';
     a.className = 'aa-state' + (st.autoApply.enabled ? ' on' : '');
+  } else {
+    $('#aa-row').hidden = true;   // authoritative: re-hide a stale auto-apply pill when the app is gone
   }
+  // Control Studio (Watch & Teach) only works when the app is reachable — hide the dead control
+  // during setup/offline so it isn't an actionable-looking affordance that can only fail. Gate on
+  // st.connected (true through the 60s health-blip grace) so a transient /health stall doesn't yank it.
+  $('#watch-teach-row').hidden = !st.connected;
 
   if (st.extUpdate?.hasUpdate) {
     $('#ext-mine').textContent = 'v' + st.extUpdate.mine;
@@ -137,7 +143,13 @@ async function paintPage() {
 }
 
 async function paintStatsAndRecent(st) {
-  if (!st?.health?.ok || !st.paired) return;
+  if (!st?.health?.ok || !st.paired) {
+    // Re-paint that finds the app GONE must clear stale at-a-glance data. Only hide when genuinely
+    // offline (!st.connected) — not on a transient /health blip inside the connected-grace window,
+    // which would flicker the sections on every Teach-induced stall.
+    if (!st?.connected) { $('#stats').hidden = true; $('#recent').hidden = true; }
+    return;
+  }
   const [statsR, jobsR] = await Promise.all([
     send({ type: 'api-call', method: 'GET', path: '/stats' }),
     send({ type: 'api-call', method: 'GET', path: '/jobs?limit=4' }),
@@ -148,7 +160,7 @@ async function paintStatsAndRecent(st) {
     $('#st-week').textContent = statsR.thisWeek ?? 0;
     const rv = $('#st-review');
     rv.textContent = statsR.needsReview ?? 0;
-    if (statsR.needsReview) rv.classList.add('warn');
+    rv.classList.toggle('warn', !!statsR.needsReview);   // clear a stale warn tint when the count drops to 0
   }
   if (jobsR?.ok && jobsR.items?.length) {
     $('#recent').hidden = false;

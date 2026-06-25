@@ -98,6 +98,12 @@ function runProcess(candidate, request, timeoutMs) {
     const finish = (fn, value) => { if (settled) return; settled = true; clearTimeout(timer); fn(value); };
     const timer = setTimeout(() => { try { child.kill(); } catch {} finish(reject, new Error(`JobSpy timed out after ${timeoutMs}ms`)); }, timeoutMs);
     child.on('error', (e) => finish(reject, e));
+    // When spawn fails (e.g. 'py'/'python' not on PATH — Dad's machine), Node emits an async 'error'
+    // on the stdin stream too; with no listener that surfaces as an UNCAUGHT exception (the documented
+    // 'spawn … ENOENT' crash class). Route it through finish() instead, and guard the write so a broken
+    // pipe can't throw synchronously. The candidate fall-through still works: child.on('error') fires
+    // first with a 'spawn … ENOENT' message that WORKER_NONVIABLE_RX matches, so the next launcher is tried.
+    child.stdin.on('error', (e) => finish(reject, e));
     child.stdout.on('data', (d) => { stdout += d.toString('utf8'); });
     child.stderr.on('data', (d) => { stderr += d.toString('utf8'); });
     child.on('close', (code) => {
@@ -108,7 +114,7 @@ function runProcess(candidate, request, timeoutMs) {
       if (result?.ok) finish(resolve, result);
       else finish(reject, new Error(result?.error || stderr.trim() || `JobSpy worker exited ${code}`));
     });
-    child.stdin.end(JSON.stringify(request) + '\n');
+    try { child.stdin.end(JSON.stringify(request) + '\n'); } catch (e) { finish(reject, e); }
   });
 }
 

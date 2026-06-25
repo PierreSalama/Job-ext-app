@@ -562,7 +562,19 @@ async function evaluate(reason) {
   if (probe.score < MIN_PAGE_SCORE) {
     if (!state.settings.askWhenUnsure || state.asked || !IS_TOP) return;
     if (sessionStorage.getItem('jat11.unsureAsked')) return;
-    if (!hasApplySignal) return;
+    // GATE the "Track this application?" card on a STRONG, job-specific signal — not the loose
+    // hasApplySignal (which is true for nearly any SPA: a '/careers' path scores 0.10 and generic
+    // words like remote/benefits/salary nudge the DOM-context score). That looseness is why the
+    // card popped on non-job sites like Plex. Require an unambiguous job signal: a known ATS host,
+    // a job-shaped URL (>=0.24, i.e. a real /jobs//job//apply path or job-id param — NOT the bare
+    // 'careers' bucket), JSON-LD JobPosting, a real Apply control, or a grounded apply form. Genuine
+    // job/apply pages satisfy >=1 of these; Plex/media/marketing SPAs satisfy none.
+    const strongJobSignal = onAtsHost()
+      || urlLooksJobby() >= 0.24
+      || !!readJsonLdJobPosting()
+      || hasApplyAction()
+      || !!applyFormHere;
+    if (!strongJobSignal) return;
     state.asked = true;
     sessionStorage.setItem('jat11.unsureAsked', '1');
     promptUnsure(probe.ctx, {

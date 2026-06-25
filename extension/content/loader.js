@@ -117,11 +117,17 @@
   });
 
   // ---- URL watcher (belt-and-braces beside webNavigation) ----
-  setInterval(() => {
+  // Capture the id and TEAR IT DOWN on pagehide (the detector's own ticker already does this) so it
+  // doesn't run for the whole life of every frame on every tab — including a suppressed host, which
+  // it now early-returns on. Stays live until pagehide so the LinkedIn feed→job pushState nav this
+  // file exists to catch is still caught (the engine loads on it, then detector's nav listeners cover it).
+  const urlPoll = setInterval(() => {
+    if (suppressed) return;
     if (location.href === lastHref) return;
     lastHref = location.href;
     maybeBoot('url-change');
   }, 1500);
+  window.addEventListener('pagehide', () => { try { clearInterval(urlPoll); } catch {} }, { once: true });
 
   // ---- late-mounting forms sentinel (cheap, debounced) ----
   let debounce = null;

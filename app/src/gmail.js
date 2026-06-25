@@ -217,6 +217,10 @@ async function syncNow() {
   syncing = true;
   const started = Date.now();
   let scanned = 0, matched = 0, updated = 0, emailsWritten = 0;
+  // Bound the AI second-stage per sync run (mirrors email.js AI_DISAMBIGUATE_CAP). On a backfill
+  // (SCAN_CAP=1200) an uncapped per-message AI call would fire hundreds of serial provider/subprocess
+  // calls and make a sync run for many minutes; the deterministic parser handles the bulk regardless.
+  let aiCalls = 0; const AI_CLASSIFY_CAP = 25;
   try {
     const watermark = db.kvGet('gmailWatermark') || 0;   // internalDate ms
     const afterSec = watermark ? Math.floor(watermark / 1000) : Math.floor((Date.now() - 30 * 86400000) / 1000);
@@ -285,8 +289,9 @@ async function syncNow() {
       let parsed = parseLinkedIn(subject, body);
       let status = classify(subject, body);
 
-      // Second stage: AI classification for non-LinkedIn recruiter mail.
-      if ((!parsed || !status) && s.includeRecruiterMail) {
+      // Second stage: AI classification for non-LinkedIn recruiter mail (bounded per run — see cap).
+      if ((!parsed || !status) && s.includeRecruiterMail && aiCalls < AI_CLASSIFY_CAP) {
+        aiCalls++;
         try {
           const provider = require('./ai/provider');
           const prompts = require('./ai/prompts');

@@ -241,6 +241,17 @@ const POSITIVE = [
   ['SuccessFactors', SUCCESSFACTORS, 'https://career.acme.com/careersection/apply'],
   ['Generic company careers form', GENERIC_CAREERS, 'https://acme.com/careers/apply'],
   ['School / PeopleAdmin board', SCHOOL_PEOPLEADMIN, 'https://district.schoolspring.com/job/apply/555'],
+  // Minimal apply form: a file input WITH corroborating resume/apply text must still detect, so the
+  // tightened file-input gate (corroboration-required) doesn't regress lean real forms.
+  ['Minimal apply form (file input + résumé label)', `
+    <form>
+      <h2>Apply for this role</h2>
+      <label for="r">Resume / CV</label>
+      <input type="file" id="r" />
+      <label for="n">Full name</label>
+      <input id="n" />
+      <button type="submit">Submit application</button>
+    </form>`, 'https://acme.com/jobs/apply'],
 ];
 
 for (const [name, html, url] of POSITIVE) {
@@ -252,10 +263,25 @@ for (const [name, html, url] of POSITIVE) {
   });
 }
 
+// A media/streaming SPA (Plex) carries a utility file input (poster/avatar) + generic words
+// (remote/benefits) but NO apply/résumé text — it must NOT be detected as an apply form. This is
+// the Plex "popup on the right" bug: a bare file input used to make the page body a false candidate.
+const PLEX_MEDIA = `
+<div class="plex-app">
+  <h1>Continue Watching</h1>
+  <input type="search" placeholder="Search your library" />
+  <input type="text" placeholder="Filter titles" />
+  <select><option>All libraries</option></select>
+  <input type="file" id="posterImg" />
+  <button>Play</button>
+  <button>Pause</button>
+  <p>Stream your movies, shows and music anywhere. Remote access enabled. Premium benefits for Plex Pass members.</p>
+</div>`;
 const NEGATIVE = [
   ['Sign-up form', SIGNUP],
   ['Contact form', CONTACT],
   ['Newsletter', NEWSLETTER],
+  ['Media SPA with a bare file input (Plex)', PLEX_MEDIA],
 ];
 for (const [name, html] of NEGATIVE) {
   test(`rejects non-apply form: ${name}`, () => {

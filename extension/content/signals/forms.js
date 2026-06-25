@@ -88,7 +88,11 @@ export function detectApplyForm() {
 function containsApplySignals(root) {
   if (!root || !isProbablyVisible(root)) return false;
   if (looksLikeAccountForm(root)) return false;
-  if (qsa('input[type="file"]', root).length) return true;
+  // A bare <input type=file> is NOT, on its own, an apply signal — media/streaming SPAs (Plex
+  // poster/subtitle/avatar uploaders) carry hidden file inputs and would otherwise make the page
+  // body a false "apply form" candidate. Fall through to the real signals: a genuine resume-upload
+  // surface, apply-surface text (resume/cv/cover letter/work-auth — always present on real ATS
+  // forms next to the file input), or an apply/next/submit action button.
   if (hasUploadSurface(root)) return true;
   const text = collectText(root, 4000).toLowerCase();
   if (APPLY_SURFACE_RX.test(text)) return true;
@@ -130,7 +134,10 @@ function scoreContainer(root) {
         || /submit/i.test((b.getAttribute?.('data-automation-id') || '') + (b.id || ''));
     });
 
-  if (hasRealFileInput) score += 0.34;
+  // The file-input bonus only counts with corroborating apply context (resume/cv/upload/work-auth
+  // text, or a real apply-form field label). A lone file input with no apply text — e.g. a Plex
+  // avatar/poster uploader — scores 0 here and cannot clear the 0.45 gate on its own.
+  if (hasRealFileInput && (APPLY_SURFACE_RX.test(fullText) || labelHits >= 1)) score += 0.34;
   if (hasUploadWidget) score += 0.18;
   score += Math.min(labelHits, 5) * 0.08;
   score += Math.min(interactiveFields, 6) * 0.03;

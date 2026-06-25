@@ -85,6 +85,7 @@ chrome.webNavigation.onReferenceFragmentUpdated.addListener((d) => rebootTab(d.t
 // the app is down api.call returns {ok:false} (never throws), so navigation never breaks.
 const NAV_LAST_KEY = 'jat11.navLast';        // { [tabId]: { url, ts } } — referrer + dedup
 const NAV_DEDUP_MS = 1500;                    // ignore the same url firing back-to-back
+const NAV_TTL_MS = 10 * 60 * 1000;            // sweep stale entries (a lost-update race with onRemoved can strand a closed tab's entry until SW eviction)
 
 async function recordNav(tabId, frameId, url) {
   if (frameId !== 0) return;                                   // top frame / main navigation only
@@ -97,6 +98,10 @@ async function recordNav(tabId, frameId, url) {
     // Dedup: same url in this tab within the window (history fires can double-tap).
     if (prev && prev.url === url && (nowMs - (prev.ts || 0)) < NAV_DEDUP_MS) return;
     const referrer = (prev && prev.url !== url) ? prev.url : undefined;   // intra-tab edge = referrer
+    // Sweep stale/stranded entries on write (minutes-scale TTL so a slow multi-step apply's referrer
+    // edge survives). This is the only durable symptom of the get→modify→set race with onRemoved, and
+    // removing it here needs no extra API or locking.
+    for (const k of Object.keys(store)) { if (!store[k] || (nowMs - (store[k].ts || 0)) > NAV_TTL_MS) delete store[k]; }
     store[tabId] = { url, ts: nowMs };
     await chrome.storage.local.set({ [NAV_LAST_KEY]: store });
     // Fire-and-forget; api.call swallows offline/unauthorized into {ok:false}.
@@ -727,6 +732,7 @@ function isBlankChromeTab(t) {
 // A user (or Chrome) closing a tab must drop it from the registry too.
 chrome.tabs.onRemoved.addListener((tabId) => {
   untrackAaTab(tabId);
+  aaFrontRequested.delete(tabId);   // authoritative cleanup for EVERY close path (supervised/reaper/Stop) — the per-run deletes in launchOne miss the supervised branch
   externalHandoffs.delete(tabId);
   for (const [sourceId, handoff] of externalHandoffs) {
     if (handoff.childTabId === tabId) externalHandoffs.delete(sourceId);

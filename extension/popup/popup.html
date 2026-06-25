@@ -60,8 +60,9 @@
     <span class="aa-state" id="aa-state">—</span>
   </div>
 
-  <!-- One entry point for recording, supervision, correction and recovery. -->
-  <div class="aa-row" id="watch-teach-row">
+  <!-- One entry point for recording, supervision, correction and recovery. Hidden until the app is
+       reachable (paintConnection toggles it on st.connected) — it dead-ends when the app is offline. -->
+  <div class="aa-row" id="watch-teach-row" hidden>
     <span class="aa-label">Control studio</span>
     <button class="aa-state" id="watch-teach-btn" type="button">Open</button>
   </div>
