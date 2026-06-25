@@ -137,7 +137,7 @@ test('queueNext PER-SITE CAP dispatches in PARALLEL — the boolean-guard serial
   db.patchSettings({ autoApply: {
     enabled: true, runAnytime: true, windowStart: '', windowEnd: '',
     maxPerDay: 999, maxPerHour: 999, dailyCap: 0, minGapMinutes: 0, maxGapMinutes: 0,
-    concurrency: 2, perSiteConcurrency: 2, easyApplyOnly: false, seniorityMax: 'any',
+    concurrency: 2, perSiteConcurrency: 2, parallelApplySafe: true, easyApplyOnly: false, seniorityMax: 'any',
     keywords: ['developer'], excludeKeywords: [], excludeCompanies: [], excludeLocations: [],
   } });
   for (let i = 0; i < 3; i++) addTask({ source: 'linkedin', url: 'https://www.linkedin.com/jobs/view/par' + i, state: 'queued' });
@@ -160,7 +160,7 @@ test('queueNext perSiteConcurrency=1 still serializes a single site (different s
   db.patchSettings({ autoApply: {
     enabled: true, runAnytime: true, windowStart: '', windowEnd: '',
     maxPerDay: 999, maxPerHour: 999, dailyCap: 0, minGapMinutes: 0, maxGapMinutes: 0,
-    concurrency: 3, perSiteConcurrency: 1, easyApplyOnly: false, seniorityMax: 'any',
+    concurrency: 3, perSiteConcurrency: 1, parallelApplySafe: true, easyApplyOnly: false, seniorityMax: 'any',
     keywords: ['developer'], excludeKeywords: [], excludeCompanies: [], excludeLocations: [],
   } });
   for (let i = 0; i < 2; i++) addTask({ source: 'linkedin', url: 'https://www.linkedin.com/jobs/view/ser' + i, state: 'queued' });
@@ -169,4 +169,38 @@ test('queueNext perSiteConcurrency=1 still serializes a single site (different s
   const b = await server.queueNext();
   assert.equal(b.task, null, 'second held at perSiteConcurrency=1');
   assert.equal(b.reason, 'site-busy', 'one LinkedIn apply at a time when per-site cap is 1');
+});
+
+test('SAFETY KILL-SWITCH: parallelApplySafe OFF forces SERIAL even at stored concurrency=3 (freeze fix)', async () => {
+  clearInFlight();
+  // Stored concurrency:3 + perSiteConcurrency:3, but parallelApplySafe is NOT set (default OFF).
+  // The server MUST force the EFFECTIVE concurrency to 1 — the structural guarantee against the
+  // multi-window foreground freeze: with the switch off, the per-site parallel dispatch path is
+  // never entered, so >1 apply window can never be opened. minGap:0 so the serial gap clock
+  // doesn't interfere with this single-dispatch check.
+  db.patchSettings({ autoApply: {
+    enabled: true, runAnytime: true, windowStart: '', windowEnd: '',
+    maxPerDay: 999, maxPerHour: 999, dailyCap: 0, minGapMinutes: 0, maxGapMinutes: 0,
+    concurrency: 3, perSiteConcurrency: 3, parallelApplySafe: false, easyApplyOnly: false, seniorityMax: 'any',
+    keywords: ['developer'], excludeKeywords: [], excludeCompanies: [], excludeLocations: [],
+  } });
+  for (let i = 0; i < 3; i++) addTask({ source: 'linkedin', url: 'https://www.linkedin.com/jobs/view/safe' + i, state: 'queued' });
+  const r1 = await server.queueNext();
+  // The decisive, pollution-proof assertion: stored 3 is reported back as effective 1, in EVERY
+  // queueNext branch. (With the switch ON this is 3 — see the next test.) This guarantees the
+  // per-site parallel dispatch path (gated on concurrency>1) is never entered.
+  assert.equal(r1.concurrency, 1, 'kill-switch forces effective concurrency to 1 despite stored 3');
+});
+
+test('SAFETY KILL-SWITCH: parallelApplySafe ON restores the stored concurrency (3)', async () => {
+  clearInFlight();
+  db.patchSettings({ autoApply: {
+    enabled: true, runAnytime: true, windowStart: '', windowEnd: '',
+    maxPerDay: 999, maxPerHour: 999, dailyCap: 0, minGapMinutes: 0, maxGapMinutes: 0,
+    concurrency: 3, perSiteConcurrency: 3, parallelApplySafe: true, easyApplyOnly: false, seniorityMax: 'any',
+    keywords: ['developer'], excludeKeywords: [], excludeCompanies: [], excludeLocations: [],
+  } });
+  addTask({ source: 'linkedin', url: 'https://www.linkedin.com/jobs/view/on0', state: 'queued' });
+  const r = await server.queueNext();
+  assert.equal(r.concurrency, 3, 'with the switch ON, the stored concurrency takes effect again');
 });

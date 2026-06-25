@@ -278,11 +278,18 @@ async function queueNext(force = false) {
   // The extension now runs each worker in its OWN dedicated window (one active/visible,
   // un-throttled tab per window — see acquireApplyWindow), so parallelism is safe again.
   // Clamp to a sane max of 3 (more windows = more flag risk + machine load).
-  const concurrency = Math.max(1, Math.min(5, Number(s.concurrency) || 1));
+  const rawConcurrency = Math.max(1, Math.min(5, Number(s.concurrency) || 1));
+  // SAFETY KILL-SWITCH (v11.46.0). In live testing, >1 parallel apply WINDOWS fought for the
+  // foreground (multiple windows + the front-to-hydrate net each yanking its window to the front)
+  // and FROZE the machine / locked mouse input — the user couldn't even Stop it. Until that
+  // focus-steal is made safe for >1 window, FORCE SERIAL regardless of the stored concurrency,
+  // gated behind an explicit, default-OFF `parallelApplySafe` flag. The user's concurrency setting
+  // is preserved (not reset) but stays INERT until parallel is proven safe again. See [freeze RCA].
+  const concurrency = s.parallelApplySafe === true ? rawConcurrency : 1;
   // PER-SITE cap: how many applies may run concurrently on ONE siteKey. All LinkedIn jobs
   // share siteKey 'ats:linkedin', so this is the real LinkedIn parallelism. Default 2 (ban-safe);
   // clamped 1..concurrency. This REPLACES the old boolean "one-per-site" guard that collapsed the
-  // whole LinkedIn-dominant queue to serial-of-1 even at concurrency=3.
+  // whole LinkedIn-dominant queue to serial-of-1 even at concurrency=3. (Inert while serial-forced.)
   const perSiteCap = Math.max(1, Math.min(concurrency, Number(s.perSiteConcurrency) || 2));
   if (!s.enabled) return { task: null, reason: 'disabled', concurrency };
   if (!force) {
@@ -1251,7 +1258,8 @@ async function handle(req, res, parsed) {
   // throttle is visible). Polled + refreshed on the queue.updated SSE.
   if (req.method === 'GET' && pathname === '/auto-apply/live') {
     const s = db.getSettings().autoApply;
-    const concurrency = Math.max(1, Math.min(5, Number(s.concurrency) || 1));   // per-worker windows (see queueNext)
+    // Mirror queueNext's serial kill-switch so the displayed effective rate is honest.
+    const concurrency = (s.parallelApplySafe === true) ? Math.max(1, Math.min(5, Number(s.concurrency) || 1)) : 1;   // per-worker windows (see queueNext)
     // Effective parallelism for a single-site (LinkedIn-dominant) queue is bounded by perSiteCap,
     // not raw concurrency — the gap now paces per site at baseGap/perSiteCap. Use it for the rate
     // estimate so the dashboard's "effective per hour" stays honest.
