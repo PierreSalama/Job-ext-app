@@ -145,6 +145,15 @@ test('associate() auto-creates a tracked submitted job from an unmatched confirm
   assert.equal(b.matchedJobId, a.matchedJobId, 'deduped, not duplicated');
 });
 
+test('answerMemory surfaces saved profile-fields + qa to the AI (the saved-answer-reuse fix)', () => {
+  const pid = db.ensureDefaultProfileId();
+  db.profileFieldUpsert({ profileId: pid, question: 'What is your level of French?', value: 'Fluent (8/10)', fromUser: true, confidence: 1 });
+  db.qaRecord({ profileId: pid, question: 'How many years of Python experience do you have?', answer: '2' });
+  const mem = db.answerMemory(pid, 16);
+  assert.ok(mem.some((m) => /french/i.test(m.question) && /fluent/i.test(m.answer)), 'includes the LOCKED profile-field answer (was invisible to the AI before this fix)');
+  assert.ok(mem.some((m) => /python/i.test(m.question) && m.answer === '2'), 'includes the qa answer too');
+});
+
 test('pickEmailJob prompt carries a strict schema and the none (-1) option', () => {
   const prompts = require(path.join(here, '..', 'app', 'src', 'ai', 'prompts.js'));
   const p = prompts.pickEmailJob({ email: { from: 'a@b.com', subject: 's', body: 'b' }, candidates: [{ company: 'C', title: 'T' }] });

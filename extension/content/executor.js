@@ -329,6 +329,20 @@ function captchaOrLoginPresent() {
   return null;
 }
 
+// HUMAN-ASSIST for a CAPTCHA. We NEVER auto-solve or bypass a CAPTCHA (hard line) — instead the
+// caller brings the apply window to the front so the USER can solve it, and this polls for the
+// challenge to clear. Returns true if it's gone (the user solved it) within the window, else false
+// (the caller then parks awaiting_input as before). Bounded so an unattended run doesn't hang.
+async function waitForCaptchaCleared(timeoutMs) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    await sleep(2000);
+    if (S.cancelled) return false;
+    try { if (captchaOrLoginPresent() !== 'captcha' && !detectBotChallengeOnPage().blocked) return true; } catch { return true; }
+  }
+  return false;
+}
+
 // Bot-challenge / Cloudflare circuit-breaker probe. Builds a DOM-free description of the
 // live page and hands it to the pure detector in lib/challenge.js. Returns the detector
 // verdict; the executor uses `blocked` to bail TERMINALLY-but-honestly (a site gate, not an
@@ -1887,7 +1901,23 @@ export async function run(task, context, helpers) {
     const captchaOwnedByPack = blocker === 'captcha'
       && driveablePack && driveablePack.submitGate === 'captcha';
     if (blocker && !captchaOwnedByPack) {
-      logLine('warn', `${blocker} detected — handing back to you`);
+      // CAPTCHA human-assist: we never auto-solve/bypass (hard line), but the rest of the form is
+      // already filled — so bring the window to the FRONT and give the user a bounded window to
+      // solve it, then CONTINUE the application if they do. Only park if it isn't solved in time.
+      // (Login walls still hand straight back — they need credentials we won't enter.)
+      if (blocker === 'captcha') {
+        logLine('warn', 'CAPTCHA — bringing the window to the front so you can solve it');
+        setStatus('CAPTCHA — solve it in the window (waiting ~45s)…');
+        try { await send({ type: 'jat11.nudge-apply-window' }); } catch {}
+        if (await waitForCaptchaCleared(45000)) {
+          logLine('ok', 'CAPTCHA cleared by you — continuing the application');
+          report({ transcriptAppend: { kind: 'recovery', note: 'CAPTCHA solved by user (human-assist) — resuming apply' } });
+          noChange = 0;
+          continue;
+        }
+      } else {
+        logLine('warn', `${blocker} detected — handing back to you`);
+      }
       setStatus(blocker === 'captcha' ? 'CAPTCHA — your move' : 'Login required — your move');
       const question = blocker === 'captcha' ? 'Complete the site CAPTCHA, then retry this application.' : 'Sign into this site in Chrome, then retry this application.';
       report({ state: 'awaiting_input', lastError: question, parkReason: blocker, pendingQuestions: [{ question, fieldType: 'site_gate', reason: blocker }], transcriptAppend: { kind: 'recovery', note: `${blocker} requires user intervention before retry` } });

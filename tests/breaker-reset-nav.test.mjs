@@ -148,6 +148,20 @@ test('EXT-1: external in-tab fallback clears the breaker and the external no-pro
   assert.match(window, /noChange = 0/, 'resets the stall counter');
 });
 
+// ---- CAPTCHA human-assist: front the window + wait for the USER to solve, NEVER auto-solve. ----
+test('CAPTCHA human-assist: executor fronts the window and waits for the user, never auto-solves', () => {
+  assert.match(SRC, /async function waitForCaptchaCleared/, 'has the bounded wait-for-user helper');
+  // on a CAPTCHA it fronts the apply window so the user can solve it…
+  const i = SRC.indexOf('CAPTCHA — bringing the window to the front');
+  assert.ok(i > 0, 'fronts the window on a CAPTCHA');
+  const w = SRC.slice(i, i + 600);
+  assert.match(w, /jat11\.nudge-apply-window/, 'sends the front-window message');
+  assert.match(w, /waitForCaptchaCleared\(/, 'waits for the user to clear it');
+  assert.match(SRC, /CAPTCHA cleared by you — continuing the application/, 'continues only after the USER clears it');
+  // the never-auto-solve invariant: no code that clicks/checks a captcha widget to bypass it.
+  assert.ok(!/solveCaptcha|bypassCaptcha|clickCaptcha/i.test(SRC), 'no auto-solve/bypass path exists');
+});
+
 // ---- EXT-4: the AI rescue must DEDUP on an unchanged page within a window (token moderation). ----
 test('EXT-4: AI rescue dedups on a stable page signature within 60s', () => {
   assert.match(SRC, /const rescueSig = \[/, 'computes a rescue page signature');

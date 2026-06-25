@@ -1515,6 +1515,25 @@ function qaList(profileId, limit = 500) {
   if (!profileId) return [];
   return all('SELECT * FROM qa WHERE profile_id = ? ORDER BY updated_at DESC LIMIT ?', [profileId, limit]);
 }
+// MERGED answer memory for the AI prompts (answerQuestion + applyRescue). The AI paths used to
+// see only the `qa` table and NOT the locked `profile_fields` (the answers the user explicitly
+// gave — French level, contractor rate, .NET years…), so those saved answers were never reused and
+// the same question kept parking. This surfaces BOTH, profile-fields first (highest trust: locked,
+// user-given), deduped by normalized question. Returns [{question, answer}].
+function answerMemory(profileId, limit = 16) {
+  if (!profileId) return [];
+  const out = [];
+  for (const f of profileFieldList(profileId)) {
+    const q = f.label || ''; const a = f.value || '';
+    if (q && a) out.push({ question: q, answer: a });
+  }
+  for (const r of qaList(profileId, 60)) {
+    if (r.question && r.answer != null && r.answer !== '') out.push({ question: r.question, answer: r.answer });
+  }
+  const seen = new Set(); const dedup = [];
+  for (const x of out) { const k = normalizeQuestion(x.question); if (k && !seen.has(k)) { seen.add(k); dedup.push(x); } }
+  return dedup.slice(0, limit);
+}
 function qaDelete(id) { return (run('DELETE FROM qa WHERE id = ?', [id])?.changes ?? 0) > 0; }
 
 // ============================================================
@@ -4169,7 +4188,7 @@ module.exports = {
   getSettings, patchSettings, normalizeAutoApply, kvGet, kvSet,
   listJobs, getJob, upsertJob, patchJob, deleteJob, stats, activityTrend,
   listEvents, listRecentEvents, recordEvent,
-  qaRecord, qaLookup, qaList, qaDelete, normalizeQuestion, guessLocale,
+  qaRecord, qaLookup, qaList, answerMemory, qaDelete, normalizeQuestion, guessLocale,
   profileFieldUpsert, profileFieldList, profileFieldSet, profileFieldDelete,
   profileFieldLookup, profileAutofillBundle, harvestAnswersToProfile, backfillProfileFromJobs, deriveProfileFromLearned,
   memoryToProfileData, pushProfileDataToMemory, ensureDefaultProfileId, resolveProfileId,

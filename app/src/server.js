@@ -800,7 +800,17 @@ async function handle(req, res, parsed) {
   }
   if (req.method === 'POST' && pathname === '/qa/lookup') {
     const body = await readJson(req);
-    return sendJson(res, 200, { ok: true, match: db.qaLookup(body.profileId || db.resolveProfileId(body.source), body.question || '') });
+    const pid = body.profileId || db.resolveProfileId(body.source);
+    const q = body.question || '';
+    // Check the locked profile-fields (the answers the user explicitly gave) in ADDITION to the
+    // qa store, so the executor's deterministic ladder reuses saved answers without an AI call.
+    // Profile-fields are higher trust (user-locked) → prefer on tie. Normalize their `.value` to
+    // the `.answer` shape the executor reads.
+    const pf = db.profileFieldLookup(pid, q);
+    const qa = db.qaLookup(pid, q);
+    const pfn = pf ? { ...pf, answer: pf.value } : null;
+    const match = (pfn && qa) ? (pfn.score >= qa.score ? pfn : qa) : (pfn || qa);
+    return sendJson(res, 200, { ok: true, match });
   }
   if (req.method === 'DELETE' && (jm = m(/^\/qa\/([^/]+)$/))) {
     return sendJson(res, db.qaDelete(jm[1]) ? 200 : 404, { ok: true });
@@ -1446,7 +1456,7 @@ async function handle(req, res, parsed) {
     const job = body.jobId ? db.getJob(body.jobId) : (body.job || {});
     const profile = db.profileForSource(job?.source);
     const resume = db.defaultDocument('resume');
-    const qaHistory = db.qaList(body.profileId || db.resolveProfileId(job?.source), 12);
+    const qaHistory = db.answerMemory(body.profileId || db.resolveProfileId(job?.source), 16);
     // Graceful: if AI is unavailable, return no answer (the executor parks the question
     // for the user) instead of a 500 — keeps the run clean on Dad's no-AI machine.
     try {
@@ -1475,7 +1485,7 @@ async function handle(req, res, parsed) {
     const job = body.jobId ? db.getJob(body.jobId) : (body.job || {});
     const profile = db.profileForSource(job?.source);
     const resume = db.defaultDocument('resume');
-    const qaHistory = db.qaList(body.profileId || db.resolveProfileId(job?.source), 12);
+    const qaHistory = db.answerMemory(body.profileId || db.resolveProfileId(job?.source), 16);
     try {
       const r = await provider.run(prompts.applyRescue({
         url: ps.url, routeState: ps.routeState, failureReason: ps.failureReason,
