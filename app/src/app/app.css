@@ -382,6 +382,7 @@ input[type="checkbox"] { accent-color: var(--primary); width: 15px; height: 15px
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
 }
+.stats-5 { grid-template-columns: repeat(5, 1fr); }
 .stat {
   padding: 22px 26px;
   border-right: 1px solid var(--border);
@@ -1697,6 +1698,22 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
 .lg::before { content: ''; width: 8px; height: 8px; }
 .lg-auto::before { background: var(--primary); }
 .lg-man::before { background: color-mix(in srgb, var(--muted) 60%, transparent); }
+
+/* "Submissions this week" — taller labeled stacked bars (auto over by-hand) */
+.wk-chart { display: flex; align-items: flex-end; gap: 10px; height: 110px; padding-top: 4px; }
+.wk-col { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; min-width: 0; height: 100%; gap: 5px; }
+.wk-n { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; min-height: 13px; }
+.wk-stack { width: 100%; max-width: 34px; display: flex; flex-direction: column-reverse; }
+.wk-day { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+/* Completed over time — 30-day mini bars */
+.c30 { display: flex; align-items: flex-end; gap: 2px; height: 50px; padding-top: 4px; }
+.c30-col { flex: 1; display: flex; align-items: flex-end; justify-content: center; min-width: 0; height: 100%; }
+.c30-bar { width: 100%; max-width: 9px; background: color-mix(in srgb, var(--primary) 72%, var(--muted)); min-height: 1px; }
+
+/* Learned-memory search */
+.pf-mem-tools { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.pf-mem-tools .input { max-width: 360px; }
+.pf-mem-count { font-size: 11px; }
 
 /* Two-column dashboard row (Funnel | Sources) */
 .dash-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }

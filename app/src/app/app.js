@@ -890,7 +890,7 @@ route('/', async () => {
     api('/gmail/status').catch(() => null),
     api('/auto-apply/live').catch(() => null),
     api('/auto-apply/breakdown?days=7').catch(() => null),
-    api('/stats/activity?days=14').catch(() => null),
+    api('/stats/activity?days=30').catch(() => null),
   ]);
   const stats = statsR;
   const jobs = jobsR.items || [];
@@ -925,32 +925,50 @@ route('/', async () => {
   const openRate = sessTried ? Math.round(100 * (sess.submitted || 0) / sessTried) : null;
   const topReasons = ((bdR && bdR.topReasons) || []).slice(0, 3);
 
-  // ---- 14-day submission sparkline (auto stacked over manual) ----
+  // ---- submission trend: this-week (7d) bars + 30-day completed mini ----
   const trend = (trendR && trendR.items) || [];
-  const maxDay = Math.max(1, ...trend.map((d) => d.auto + d.manual));
-  const SPK_H = 38;
-  const sparkBars = trend.map((d) => {
-    const total = d.auto + d.manual;
-    const h = total ? Math.max(2, Math.round((total / maxDay) * SPK_H)) : 1;
-    const ah = total ? Math.round((d.auto / total) * h) : 0;
-    const lbl = `${d.date}: ${d.auto} auto, ${d.manual} manual`;
-    return `<div class="spk-col" title="${lbl}"><div class="spk-stack" style="height:${h}px"><div class="spk-auto" style="height:${ah}px"></div><div class="spk-man" style="height:${h - ah}px"></div></div></div>`;
+  const trend7 = trend.slice(-7);
+  const wkAuto = trend7.reduce((s, d) => s + (d.auto || 0), 0);
+  const wkMan = trend7.reduce((s, d) => s + (d.manual || 0), 0);
+  const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const dayLabel = (iso) => { try { return DOW[new Date(iso + 'T12:00:00').getDay()]; } catch { return ''; } };
+  // This week — taller stacked bars (auto over by-hand) with per-day counts + weekday labels.
+  const wkMax = Math.max(1, ...trend7.map((d) => (d.auto || 0) + (d.manual || 0)));
+  const WK_H = 76;
+  const weekBars = trend7.map((d) => {
+    const total = (d.auto || 0) + (d.manual || 0);
+    const h = total ? Math.max(3, Math.round((total / wkMax) * WK_H)) : 1;
+    const ah = total ? Math.round(((d.auto || 0) / total) * h) : 0;
+    return `<div class="wk-col" title="${d.date}: ${d.auto || 0} auto · ${d.manual || 0} by hand"><div class="wk-n">${total || ''}</div><div class="wk-stack" style="height:${h}px"><div class="spk-auto" style="height:${ah}px"></div><div class="spk-man" style="height:${h - ah}px"></div></div><div class="wk-day">${dayLabel(d.date)}</div></div>`;
   }).join('');
-  const trendTotal = trend.reduce((s, d) => s + d.auto + d.manual, 0);
+  // Completed over time — total submissions per day, last 30 days.
+  const c30Max = Math.max(1, ...trend.map((d) => (d.auto || 0) + (d.manual || 0)));
+  const C30_H = 46;
+  const c30Bars = trend.map((d) => {
+    const total = (d.auto || 0) + (d.manual || 0);
+    const h = total ? Math.max(2, Math.round((total / c30Max) * C30_H)) : 1;
+    return `<div class="c30-col" title="${d.date}: ${total} submitted"><div class="c30-bar" style="height:${h}px"></div></div>`;
+  }).join('');
+  const trendTotal = trend.reduce((s, d) => s + (d.auto || 0) + (d.manual || 0), 0);
 
-  // ---- pipeline funnel (with stage-to-stage conversion) ----
+  // ---- pipeline funnel: DISCRETE stages from byStatus (auto-populates as the Gmail pipeline
+  // advances jobs to assessment/interview/offer). Cumulative "at or beyond" so it narrows
+  // monotonically; terminal states (rejected/withdrawn/ghosted) are excluded from the stages. ----
   const fn = stats.funnel || {};
+  const STAGE_RANK = { started: 10, submitted: 20, contacted: 30, assessment: 35, interview_1: 40, interview_2: 50, interview_final: 60, offer: 70, hired: 80 };
+  const TERMINAL_ST = { rejected: 1, withdrawn: 1, ghosted: 1 };
+  const atOrBeyond = (min) => Object.entries(byStatus).reduce((s, [st, n]) => s + (((STAGE_RANK[st] || 0) >= min && !TERMINAL_ST[st]) ? n : 0), 0);
   const fnStages = [
-    { label: 'Submitted', n: fn.submitted || 0 },
-    { label: 'Responded', n: fn.responded || 0 },
-    { label: 'Interviews', n: fn.interviews || 0 },
-    { label: 'Offers', n: fn.offers || 0 },
+    { label: 'Submitted', n: subTot, sub: `${subAuto} auto · ${subMan} by hand` },
+    { label: 'Assessment', n: atOrBeyond(35) },
+    { label: 'Interview', n: atOrBeyond(40) },
+    { label: 'Offer', n: atOrBeyond(70) },
   ];
-  const fnMax = Math.max(1, fn.submitted || 0);
+  const fnMax = Math.max(1, subTot);
   const funnelHtml = fnStages.map((st, i) => {
     const pct = Math.round((st.n / fnMax) * 100);
     const conv = i > 0 && fnStages[i - 1].n ? Math.round(100 * st.n / fnStages[i - 1].n) : null;
-    return `<div class="fn-row"><div class="fn-top"><span class="fn-label">${st.label}</span><span class="fn-n">${st.n}${conv != null ? ` <span class="muted">${conv}%</span>` : ''}</span></div><div class="fn-bar"><div class="fn-fill" style="width:${pct}%"></div></div></div>`;
+    return `<div class="fn-row"><div class="fn-top"><span class="fn-label">${st.label}${st.sub ? ` <span class="muted" style="font-size:10px">${st.sub}</span>` : ''}</span><span class="fn-n">${st.n}${conv != null ? ` <span class="muted">${conv}%</span>` : ''}</span></div><div class="fn-bar"><div class="fn-fill" style="width:${pct}%"></div></div></div>`;
   }).join('');
 
   // ---- source breakdown ----
@@ -986,11 +1004,25 @@ route('/', async () => {
 
     ${sysBits.length ? `<div class="sys-strip">${sysBits.join('')}</div>` : ''}
 
-    <section class="stats">
-      <div class="stat"><div class="stat-label">Applications</div><div class="stat-value">${stats.total || 0}</div><div class="stat-delta">All time</div></div>
-      <div class="stat"><div class="stat-label">Submitted</div><div class="stat-value gold">${subTot}</div><div class="stat-delta">${subAuto} auto · ${subMan} by hand</div></div>
+    <section class="stats stats-5">
+      <div class="stat"><div class="stat-label">Submitted</div><div class="stat-value gold">${subTot}</div><div class="stat-delta">${stats.submittedToday || 0} today · ${stats.total || 0} started</div></div>
+      <div class="stat"><div class="stat-label">Via auto-apply</div><div class="stat-value">${subAuto}</div><div class="stat-delta">${autoPct}% of submissions</div></div>
+      <div class="stat"><div class="stat-label">By hand</div><div class="stat-value">${subMan}</div><div class="stat-delta">${100 - autoPct}% of submissions</div></div>
       <div class="stat"><div class="stat-label">Response rate</div><div class="stat-value">${fn.responseRate == null ? '—' : fn.responseRate + '%'}</div><div class="stat-delta">${fn.responded || 0} replied${fn.interviews ? ` · ${fn.interviews} interview${fn.interviews === 1 ? '' : 's'}` : ''}</div></div>
       <div class="stat clickable" data-go-review><div class="stat-label">Needs review</div><div class="stat-value ${stats.needsReview ? 'warn' : ''}">${stats.needsReview || 0}</div><div class="stat-delta">${stats.thisWeek || 0} new this week</div></div>
+    </section>
+
+    <section class="section">
+      <header class="section-header">
+        <div><div class="section-eyebrow">Momentum</div><h2 class="section-title">Submissions this week</h2></div>
+        <span class="muted" style="font-size:12px">${wkAuto + wkMan} this week · ${wkAuto} auto · ${wkMan} by hand</span>
+      </header>
+      <div class="section-body">
+        <div class="wk-chart">${weekBars || '<span class="muted" style="font-size:12px">No submissions in the last 7 days.</span>'}</div>
+        <div class="spark-legend"><span class="lg lg-auto">Auto-apply</span><span class="lg lg-man">By hand</span></div>
+        <div class="dash-sub" style="margin-top:20px">Completed · last 30 days <span class="muted">(${trendTotal})</span></div>
+        <div class="c30">${c30Bars || '<span class="muted" style="font-size:12px">No submissions yet.</span>'}</div>
+      </div>
     </section>
 
     <section class="section">
@@ -1007,17 +1039,13 @@ route('/', async () => {
           <div class="mini"><div class="mini-label">Session open-rate</div><div class="mini-value">${openRate == null ? '—' : openRate + '%'}</div></div>
         </div>
         <div class="dash-aa-cols">
-          <div>
-            <div class="split-wrap">
-              <div class="split-head"><span class="muted">Submissions — auto-apply vs by hand</span><span>${subAuto} · ${subMan}</span></div>
-              <div class="split-bar" title="${autoPct}% via auto-apply"><div class="split-fill" style="width:${autoPct}%"></div></div>
-            </div>
-            ${topReasons.length ? `<div class="dash-blockers"><div class="dash-sub">Top blockers · 7 days</div>${topReasons.map((r) => `<div class="blk-row"><span class="blk-reason">${esc(r.reason)}</span><span class="blk-n">${r.count}×</span></div>`).join('')}</div>` : ''}
+          <div class="split-wrap">
+            <div class="split-head"><span class="muted">Submissions — auto-apply vs by hand</span><span>${subAuto} · ${subMan}</span></div>
+            <div class="split-bar" title="${autoPct}% via auto-apply"><div class="split-fill" style="width:${autoPct}%"></div></div>
           </div>
-          <div class="spark-wrap">
-            <div class="dash-sub">Submissions · 14 days <span class="muted">(${trendTotal})</span></div>
-            <div class="spark">${sparkBars || '<span class="muted" style="font-size:12px">No activity yet</span>'}</div>
-            <div class="spark-legend"><span class="lg lg-auto">Auto</span><span class="lg lg-man">Manual</span></div>
+          <div>
+            <div class="dash-sub">Top blockers · 7 days</div>
+            ${topReasons.length ? topReasons.map((r) => `<div class="blk-row"><span class="blk-reason">${esc(r.reason)}</span><span class="blk-n">${r.count}×</span></div>`).join('') : '<div class="muted" style="font-size:12px">None — clean run.</div>'}
           </div>
         </div>
         ${(live && live.running && live.running.length) ? `<div class="aa-dash-live">${live.running.map((w) => `<span class="aa-live-chip"><span class="aa-pulse"></span> ${esc(w.title || '…')} <span class="muted">${esc((w.step || '').slice(0, 44))}</span></span>`).join('')}</div>` : ''}
@@ -2878,6 +2906,7 @@ route('/profile', async () => {
           <header class="section-header"><div><div class="section-eyebrow">Memory</div><h2 class="section-title">${esc(cur.name || 'This profile')} — learned answers</h2>
             <div class="form-hint">Learned from your applications (EN + FR), private to this profile. Edit a value to override + lock it; “↑ Profile” copies an answer up into your structured fields above.</div></div>
             <div class="nowrap">${cur.id ? '<button class="btn small" data-save-to-memory title="Push your structured profile fields into this memory so auto-apply knows them">Save profile → memory</button> <button class="btn small" data-backfill title="Harvest answers from every past application into this profile">Build from past applications</button> ' : ''}<span class="section-link muted">${harvested.length} stored</span></div></header>
+          ${harvested.length ? `<div class="pf-mem-tools"><input class="input" id="pf-mem-search" placeholder="Search your learned answers…" autocomplete="off" spellcheck="false" /><span class="pf-mem-count muted" id="pf-mem-count"></span></div>` : ''}
           <div class="table-wrap"><table class="table">
             <thead><tr><th>Question</th><th>Answer</th><th>Seen</th><th></th></tr></thead>
             <tbody>${harvestRows}</tbody>
@@ -2891,6 +2920,25 @@ route('/profile', async () => {
   v.querySelector('#pf-sources-slot').appendChild(sources.node);
   const skills = chipsInput(d.skills || [], 'Add skill…');
   v.querySelector('#pf-skills-slot').appendChild(skills.node);
+
+  // Memory search — live client-side filter over the learned-answers rows (essential at hundreds
+  // of rows). Filtering keeps the search input focused, so the SSE no-refresh-while-editing guard
+  // preserves the query while you type.
+  const memSearch = v.querySelector('#pf-mem-search');
+  const memCount = v.querySelector('#pf-mem-count');
+  if (memSearch) {
+    memSearch.addEventListener('input', () => {
+      const q = memSearch.value.trim().toLowerCase();
+      let shown = 0;
+      v.querySelectorAll('tr[data-pf]').forEach((tr) => {
+        const hay = ((tr.querySelector('.title-cell')?.textContent || '') + ' ' + (tr.querySelector('[data-pf-answer]')?.value || '')).toLowerCase();
+        const match = !q || hay.includes(q);
+        tr.style.display = match ? '' : 'none';
+        if (match) shown++;
+      });
+      if (memCount) memCount.textContent = q ? `${shown} match${shown === 1 ? '' : 'es'}` : '';
+    });
+  }
 
   // Work + education history (editable rows) + the experience timeline chart.
   const redrawChart = () => { const slot = v.querySelector('#pf-chart-slot'); if (slot) slot.replaceChildren(experienceChart(work.get(), education.get())); };
