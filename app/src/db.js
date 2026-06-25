@@ -800,6 +800,7 @@ function open(userDataDir) {
   exec('PRAGMA foreign_keys = ON');
   runMigrations();
   migrateSecrets();
+  migrateGmailQuery();
   log.info('opened', file);
   return db;
 }
@@ -970,6 +971,28 @@ function patchSettings(patch) {
     }
   });
   return getSettings();
+}
+
+// One-time upgrade (v11.48): the old Gmail query 'from:jobs-noreply@linkedin.com' only fetched
+// LinkedIn's OWN confirmations/alerts — employer + ATS rejection / assessment / interview / offer
+// emails were never pulled, so the pipeline never moved past 'submitted'. Replace the STALE narrow
+// query with the broad job-mail default AND reset the sync watermark so the last 30 days are
+// re-scanned with it (pulling the status emails already sitting in the inbox). Only upgrades the
+// stale LinkedIn-only query (or an empty one) — never clobbers a query the user customised.
+function migrateGmailQuery() {
+  if (!db) return;
+  try {
+    if (kvGet('gmailQueryBroadV1')) return;
+    const OLD = 'from:jobs-noreply@linkedin.com';
+    const cur = safeParse(get("SELECT value FROM settings WHERE section = 'gmail'")?.value, {});
+    const broad = (DEFAULTS.gmail && DEFAULTS.gmail.query) || OLD;
+    if ((!cur.query || cur.query === OLD) && broad !== OLD) {
+      patchSettings({ gmail: { query: broad } });
+      kvSet('gmailWatermark', 0);   // re-scan the last 30 days with the broad query
+      log.info('migrated Gmail query → broad job-mail query; reset watermark for a re-scan');
+    }
+    kvSet('gmailQueryBroadV1', 1);
+  } catch (e) { log.warn && log.warn('gmail query migration skipped:', e.message); }
 }
 
 // ---- kv ----

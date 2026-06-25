@@ -109,13 +109,18 @@ const CATEGORY_RX = [
   // Checked BEFORE interview so a coding challenge / take-home / online test is its OWN stage
   // ('assessment') rather than being lumped into 'interview' — the user wants this surfaced.
   ['assessment', /online assessment|coding (?:challenge|assessment|test|exercise)|take[- ]?home|hackerrank|codility|codesignal|\bkattis\b|technical (?:assessment|test|exercise)|complete (?:the |a |an )?(?:assessment|test|challenge|exercise)|skills?(?: |-)?(?:test|assessment)|aptitude test/i],
-  // application_confirmation is checked BEFORE interview: a "your application was sent/received to
-  // X" email is a confirmation even though its body/footer often mentions "interview" (tips). This
-  // ordering fixes the live mis-tag where 240/300 LinkedIn confirmations were called 'interview'.
-  ['application_confirmation', /thank you for applying|application (?:was |has been )?(?:received|submitted|sent)|we(?:'| ha)ve received your application|successfully applied|application (?:confirmation|received)|your application (?:to|was sent)/i],
   // interview requires real INVITE / scheduling language — NOT the bare word "interview" (which
-  // shows up in newsletters, "interview tips" footers, and confirmation bodies).
+  // shows up in newsletters, "interview tips" footers, and confirmation bodies). Because the RX is
+  // this strict, interview is now checked BEFORE application_confirmation: a real interview email
+  // often carries a NEUTRAL "Your application to X" subject (which matches the confirmation RX) with
+  // the actual invite in the BODY — checking confirmation first mis-tagged those as 'submitted' and
+  // the pipeline never reached 'interview'. The strict invite RX still won't fire on a LinkedIn
+  // confirmation whose footer merely says "interview tips" (no invite/schedule language).
   ['interview', /interview invitation|invitation to interview|invit\w* (?:you )?(?:to|for) (?:an? )?interview|(?:schedule|set ?up|arrange|book) (?:a |an |your )?(?:interview|call|chat|meeting|screen)|available for (?:a |an )?(?:call|chat|interview|screen)|phone screen|video (?:call|interview)|technical screen|move (?:you )?forward to (?:the )?(?:next|interview)|next round of interview|hiring manager (?:would|wants|will)/i],
+  // application_confirmation: a "your application was sent/received to X" acknowledgement. Checked
+  // AFTER the terminal/active signals above so a real rejection/assessment/interview with a neutral
+  // "Your application to X" subject is staged correctly instead of collapsing to 'submitted'.
+  ['application_confirmation', /thank you for applying|application (?:was |has been )?(?:received|submitted|sent)|we(?:'| ha)ve received your application|successfully applied|application (?:confirmation|received)|your application (?:to|was sent)/i],
   ['recruiter', /recruiter|talent (?:team|acquisition|partner)|sourcer|reaching out|came across your (?:profile|background)|opportunity (?:at|with)|interested in your/i],
 ];
 // Classify over the combined subject + (clipped) body. The ORDER of CATEGORY_RX is what

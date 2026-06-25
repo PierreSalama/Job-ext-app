@@ -167,7 +167,14 @@ const DEFAULTS = {
 
   gmail: {
     enabled: false,
-    query: 'from:jobs-noreply@linkedin.com',
+    // BROAD job-mail query. The old 'from:jobs-noreply@linkedin.com' ONLY pulled LinkedIn's own
+    // confirmations/alerts — so rejection / assessment / interview / offer emails from EMPLOYERS and
+    // ATS systems (Greenhouse, Lever, Ashby, Workday, recruiters…) were never fetched, and the
+    // pipeline never moved past 'submitted'. This ORs in the major ATS senders + the body/subject
+    // phrases that mark each stage (Gmail searches subject AND body, so neutral-subject rejections
+    // are caught by their body wording). The classifier + matcher only ever elevate a job the user
+    // actually applied to, so extra mail this pulls is harmless (stays unmatched).
+    query: 'from:jobs-noreply@linkedin.com OR from:(greenhouse.io OR lever.co OR ashbyhq.com OR myworkdayjobs.com OR workday.com OR icims.com OR smartrecruiters.com OR workable.com OR bamboohr.com OR taleo.net OR jobvite.com OR recruitee.com OR breezy.hr OR successfactors.com) OR "thank you for applying" OR "your application" OR "we regret to inform" OR "not moving forward" OR "move forward with other" OR "no longer under consideration" OR "other candidates" OR "coding challenge" OR "take-home" OR "online assessment" OR "technical assessment" OR "schedule an interview" OR "interview invitation" OR "invite you to interview" OR "next steps" OR "pleased to offer" OR "offer of employment"',
     includeRecruiterMail: false,   // second-stage AI classification of generic recruiter mail
     intervalMinutes: 30,
     clientId: '',                  // Google OAuth desktop-app credentials (user-supplied)

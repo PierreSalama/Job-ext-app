@@ -105,6 +105,38 @@ test('classification precedence: a LinkedIn "application was sent to X" is a con
   assert.equal(email.classify('Next steps', "We'd like to schedule a call with you"), 'interview');
 });
 
+test('detects ALL pipeline statuses from realistic EMPLOYER emails → correct category → correct status', () => {
+  // These are the kinds of emails that USED to never reach the pipeline (the old Gmail query only
+  // pulled LinkedIn confirmations). Each must classify to the right category AND map to the right
+  // pipeline status, so jobs move past 'submitted' once the broad query fetches them. Rejection
+  // subjects are deliberately NEUTRAL ("Update on your application") with the news in the BODY.
+  const cases = [
+    ['rejection', 'rejected', 'Update on your application to Acme', 'Thank you for your interest. Unfortunately, we have decided to move forward with other candidates at this time.'],
+    ['rejection', 'rejected', 'Your application to Globex', 'After careful consideration we will not be proceeding with your application. We wish you the best.'],
+    ['assessment', 'assessment', 'Next steps for your application', 'Please complete the online assessment (HackerRank) within 3 days to continue.'],
+    ['assessment', 'assessment', 'Initech — coding challenge', 'The next step is a take-home coding exercise. Here is your link.'],
+    ['interview', 'interview_1', 'Interview invitation — Backend Engineer', "We'd like to invite you to interview. Please pick a time that works."],
+    ['interview', 'interview_1', 'Your application to Umbrella', 'The hiring manager would like to schedule a call with you next week.'],
+    ['offer', 'offer', 'Your offer from Stark Industries', 'We are pleased to offer you the position of Software Engineer. Offer letter attached.'],
+    ['application_confirmation', 'submitted', 'Thanks for applying to Wayne Enterprises', 'We have received your application and will be in touch.'],
+  ];
+  for (const [wantCat, wantStatus, subject, body] of cases) {
+    const cat = email.classify(subject, body);
+    assert.equal(cat, wantCat, `category for "${subject}" — got ${cat}`);
+    assert.equal(db.gmailStatusFromCategory(cat), wantStatus, `status for "${subject}" (${cat})`);
+  }
+});
+
+test('the default Gmail query is BROAD (employer/ATS mail), not LinkedIn-only (the live bug)', () => {
+  // Regression guard for the root cause: the default must fetch more than LinkedIn confirmations.
+  const require2 = createRequire(import.meta.url);
+  const cfg = require2(path.join(here, '..', 'app', 'src', 'config.js'));
+  const q = (cfg.DEFAULTS || cfg).gmail.query;
+  assert.notEqual(q, 'from:jobs-noreply@linkedin.com', 'default query must no longer be LinkedIn-only');
+  assert.match(q, /greenhouse|lever|ashby|workday/i, 'default query must include ATS senders');
+  assert.match(q, /regret|moving forward|assessment|interview|offer/i, 'default query must include stage phrases');
+});
+
 test('companyHints parses LinkedIn "application was sent to X" so confirmations can match a job', () => {
   const hints = email.companyHints({ from: 'jobs-noreply@linkedin.com', subject: 'pierre, your application was sent to Crossing Hurdles' });
   assert.ok(hints.some((h) => h.includes('crossing') || 'crossinghurdles'.includes(h)), `expected a Crossing Hurdles hint, got ${JSON.stringify(hints)}`);
