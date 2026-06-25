@@ -162,6 +162,20 @@ test('CAPTCHA human-assist: executor fronts the window and waits for the user, n
   assert.ok(!/solveCaptcha|bypassCaptcha|clickCaptcha/i.test(SRC), 'no auto-solve/bypass path exists');
 });
 
+// ---- "Have a go": self-clearing Cloudflare interstitials are waited out (no touch), only for
+// the cloudflare+selfClearing case, and the wait re-probes each tick. NEVER touches the widget. ----
+test('self-clearing Cloudflare: executor waits it out (no interaction), gated + re-probed', () => {
+  assert.match(SRC, /challenge\.kind === 'cloudflare' && challenge\.selfClearing/, 'auto-wait gated on cloudflare+selfClearing only (interactive captcha/verify never enter)');
+  const i = SRC.indexOf('waiting for it to clear itself');
+  assert.ok(i > 0, 'logs the no-touch wait');
+  const w = SRC.slice(i, i + 700);
+  assert.match(w, /detectBotChallengeOnPage\(\)/, 're-probes the live page each tick');
+  assert.match(w, /if \(!c2\.selfClearing\) break/, 'bails to park the instant a real interactive widget renders');
+  assert.match(w, /cleared on its own — continuing/, 'resumes only when the interstitial actually clears');
+  // hard line: the self-clearing path adds NO widget interaction (presence-only detection).
+  assert.ok(!/solveCaptcha|bypassCaptcha|clickCaptcha/i.test(SRC), 'self-clearing wait never touches a widget');
+});
+
 // ---- EXT-4: the AI rescue must DEDUP on an unchanged page within a window (token moderation). ----
 test('EXT-4: AI rescue dedups on a stable page signature within 60s', () => {
   assert.match(SRC, /const rescueSig = \[/, 'computes a rescue page signature');

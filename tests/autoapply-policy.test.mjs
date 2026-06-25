@@ -125,3 +125,48 @@ test('queueNext re-applies jobFit at dispatch — an excluded-company job queued
   assert.equal(t.state, 'skipped', 'excluded-company job is skipped at dispatch, not applied to');
   assert.match(t.lastError || '', /filtered: excluded company/i);
 });
+
+// Clean every in-flight (scheduled/running) task to 'skipped' so the per-site counter starts at 0
+// (skipped does NOT count as a submit, so it won't trip the easy-apply cooldown).
+function clearInFlight() {
+  for (const st of ['scheduled', 'running']) for (const t of db.queueList({ state: st })) db.queuePatch(t.id, { state: 'skipped', lastError: 'test cleanup' });
+}
+
+test('queueNext PER-SITE CAP dispatches in PARALLEL — the boolean-guard serialization fix', async () => {
+  clearInFlight();
+  db.patchSettings({ autoApply: {
+    enabled: true, runAnytime: true, windowStart: '', windowEnd: '',
+    maxPerDay: 999, maxPerHour: 999, dailyCap: 0, minGapMinutes: 0, maxGapMinutes: 0,
+    concurrency: 2, perSiteConcurrency: 2, easyApplyOnly: false, seniorityMax: 'any',
+    keywords: ['developer'], excludeKeywords: [], excludeCompanies: [], excludeLocations: [],
+  } });
+  for (let i = 0; i < 3; i++) addTask({ source: 'linkedin', url: 'https://www.linkedin.com/jobs/view/par' + i, state: 'queued' });
+  const r1 = await server.queueNext();
+  assert.ok(r1.task, 'first LinkedIn apply dispatched');
+  // The OLD boolean activeSiteKeys guard returned {task:null, reason:'site-busy'} here — all
+  // LinkedIn jobs share siteKey 'ats:linkedin'. The per-site COUNT cap (2) must now let a SECOND
+  // dispatch through, which is the entire point: concurrency=3 finally engages.
+  const r2 = await server.queueNext();
+  assert.ok(r2.task, 'second LinkedIn apply dispatched IN PARALLEL (was serial-of-1 before)');
+  assert.notEqual(r1.task.id, r2.task.id, 'two DISTINCT applies in flight at once');
+  // Third hits the per-site cap → site-busy (anti-flood on one site is preserved, not removed).
+  const r3 = await server.queueNext();
+  assert.equal(r3.task, null, 'third is held — per-site cap of 2 reached');
+  assert.equal(r3.reason, 'site-busy', 'the cap surfaces as site-busy');
+});
+
+test('queueNext perSiteConcurrency=1 still serializes a single site (different sites would parallelize)', async () => {
+  clearInFlight();
+  db.patchSettings({ autoApply: {
+    enabled: true, runAnytime: true, windowStart: '', windowEnd: '',
+    maxPerDay: 999, maxPerHour: 999, dailyCap: 0, minGapMinutes: 0, maxGapMinutes: 0,
+    concurrency: 3, perSiteConcurrency: 1, easyApplyOnly: false, seniorityMax: 'any',
+    keywords: ['developer'], excludeKeywords: [], excludeCompanies: [], excludeLocations: [],
+  } });
+  for (let i = 0; i < 2; i++) addTask({ source: 'linkedin', url: 'https://www.linkedin.com/jobs/view/ser' + i, state: 'queued' });
+  const a = await server.queueNext();
+  assert.ok(a.task, 'first dispatched');
+  const b = await server.queueNext();
+  assert.equal(b.task, null, 'second held at perSiteConcurrency=1');
+  assert.equal(b.reason, 'site-busy', 'one LinkedIn apply at a time when per-site cap is 1');
+});

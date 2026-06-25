@@ -51,7 +51,17 @@ function asText(v) { return String(v == null ? '' : v); }
 //   bodyText   : document.body innerText (the executor slices it; we re-cap defensively)
 //   hasRayId   : boolean — best-effort structural hint (a cf ray-id element/marker present)
 //   statusHint : number  — best-effort HTTP status if known (403/429/503 reinforce CF)
-export function detectBotChallenge({ url, title, bodyText, hasRayId, statusHint } = {}) {
+//   hasInteractiveWidget : boolean — a REAL interactive challenge widget (rendered reCAPTCHA/
+//                hCaptcha/Turnstile/Arkose iframe or checkbox) is present. Presence-only; the
+//                caller never clicks it. Splits a self-clearing JS/managed interstitial ("Checking
+//                your browser…", which resolves itself if you just WAIT) from an interactive
+//                challenge that genuinely needs a human. Drives the `selfClearing` verdict.
+//
+// The verdict gains `selfClearing`: true ONLY for a Cloudflare interstitial with NO interactive
+// widget present — the "have a go, just wait" case the executor auto-waits out (never touching the
+// widget). captcha/verify kinds are NEVER self-clearing. `selfClearing` is additive: it never
+// changes `blocked` or `kind`, so every existing detection verdict is unchanged.
+export function detectBotChallenge({ url, title, bodyText, hasRayId, statusHint, hasInteractiveWidget } = {}) {
   const u = asText(url);
   const t = asText(title);
   const body = asText(bodyText).slice(0, 20000);
@@ -59,8 +69,9 @@ export function detectBotChallenge({ url, title, bodyText, hasRayId, statusHint 
   const blob = `${u}\n${hay}`;
   const status = Number(statusHint) || 0;
   const cfStatus = status === 403 || status === 429 || status === 503;
+  const interactive = hasInteractiveWidget === true;
 
-  const no = { blocked: false, kind: null, reason: 'no-challenge' };
+  const no = { blocked: false, kind: null, reason: 'no-challenge', selfClearing: false };
 
   // --- CLOUDFLARE ---
   // Markers in the URL/scripts are the strongest signal (the challenge path / cf_chl param
@@ -74,18 +85,21 @@ export function detectBotChallenge({ url, title, bodyText, hasRayId, statusHint 
     const why = cfMarker ? 'cloudflare challenge marker'
       : cfText ? 'cloudflare interstitial copy'
         : 'cloudflare ray-id block page';
-    return { blocked: true, kind: 'cloudflare', reason: why };
+    // Self-clearing iff NO interactive widget is rendered: a managed/JS "checking your browser"
+    // interstitial resolves itself on a wait. A rendered Turnstile/reCAPTCHA iframe (interactive)
+    // does NOT — that stays a human-assist/park.
+    return { blocked: true, kind: 'cloudflare', reason: why, selfClearing: !interactive };
   }
 
   // --- CAPTCHA ---
   if (CAPTCHA_MARKER_RX.test(blob) || CAPTCHA_TEXT_RX.test(hay)) {
     const why = CAPTCHA_MARKER_RX.test(blob) ? 'captcha widget marker' : 'captcha challenge copy';
-    return { blocked: true, kind: 'captcha', reason: why };
+    return { blocked: true, kind: 'captcha', reason: why, selfClearing: false };
   }
 
   // --- GENERIC VERIFY / UNUSUAL-TRAFFIC ---
   if (VERIFY_TEXT_RX.test(hay)) {
-    return { blocked: true, kind: 'verify', reason: 'verify-you-are-human gate' };
+    return { blocked: true, kind: 'verify', reason: 'verify-you-are-human gate', selfClearing: false };
   }
 
   return no;

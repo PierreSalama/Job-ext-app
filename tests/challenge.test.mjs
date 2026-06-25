@@ -97,6 +97,30 @@ test('Indeed "Additional Verification Required" → blocked', () => {
   assert.ok(r.kind === 'cloudflare' || r.kind === 'verify', `kind was ${r.kind}`);
 });
 
+// --- SELF-CLEARING axis ("have a go"): a Cloudflare interstitial with NO interactive widget
+// is self-clearing (the executor waits it out, no interaction); a rendered widget is NOT. ---
+test('self-clearing: a Cloudflare interstitial with NO interactive widget is selfClearing', () => {
+  const r = detectBotChallenge({ ...CF_CHECKING, hasInteractiveWidget: false });
+  assert.equal(r.blocked, true);
+  assert.equal(r.kind, 'cloudflare');
+  assert.equal(r.selfClearing, true, 'managed/JS Cloudflare wall is safe to wait out');
+});
+
+test('self-clearing: a Cloudflare gate WITH a rendered interactive widget is NOT selfClearing', () => {
+  const r = detectBotChallenge({ ...CF_CHECKING, hasInteractiveWidget: true });
+  assert.equal(r.blocked, true);
+  assert.equal(r.kind, 'cloudflare');
+  assert.equal(r.selfClearing, false, 'a rendered Turnstile/captcha widget needs a human — never auto-waited-then-resumed');
+});
+
+test('self-clearing is NEVER true for an interactive captcha or a verify gate', () => {
+  const cap = detectBotChallenge({ ...HCAPTCHA, bodyText: HCAPTCHA.bodyText + ' ' + HCAPTCHA._extra });
+  assert.equal(cap.kind, 'captcha');
+  assert.equal(cap.selfClearing, false);
+  const ver = detectBotChallenge(INDEED_VERIFY);
+  if (ver.kind === 'verify') assert.equal(ver.selfClearing, false, 'verify/unusual-traffic gates do not self-clear');
+});
+
 test('hCaptcha widget marker → blocked (captcha)', () => {
   const r = detectBotChallenge({ ...HCAPTCHA, bodyText: HCAPTCHA.bodyText + ' ' + HCAPTCHA._extra });
   assert.equal(r.blocked, true);

@@ -629,7 +629,7 @@ const AA_PRIMARY_WINDOW_KEY = 'jat11.aaWindowId';
 const AA_WINDOW_POOL_KEY = 'jat11.aaWindowPool';
 const AA_TAB_MAX_AGE_MS = 8 * 60 * 1000;   // a single apply should never need >8 min
 const AA_TAB_CAP = 10;                       // hard ceiling on simultaneously-open AA tabs
-const AA_WINDOW_CAP = 3;                     // hard ceiling on owned AA windows (primary + workers)
+const AA_WINDOW_CAP = 5;                     // hard ceiling on owned AA windows (primary + workers); matches server concurrency clamp
 let aaTabs = {};                             // { [tabId]: createdAtMs }
 let aaWindowId = null;
 let aaWindowPool = [];                       // DEDICATED apply window ids (created by us only)
@@ -1068,7 +1068,18 @@ async function recoverAaGroup() {
 //   • 1 display    → place out of the way (bottom-right) and DON'T steal focus.
 // Falls back to today's top-left placement if display info is unavailable.
 async function resolveApplyWindowCreate(base = {}, tile = {}) {
-  const fallback = { left: 60, top: 60, width: 1200, height: 900, ...base };
+  // DEFENSIVE ANTI-STACK: when the display API is unavailable we can't tile to a real work area,
+  // but we must still NOT create every parallel worker window at the same coordinates — stacked
+  // windows occlude each other → Chrome throttles the covered ones → they never hydrate AND the
+  // front-until-hydrate net fights over the foreground. So cascade each slot by a fixed offset
+  // so parallel windows are at least distinct + individually reachable. Single-worker (slots<=1)
+  // keeps the original top-left placement.
+  const slots = Math.max(1, Number(tile.slots) || 1);
+  const slot = Math.max(0, Math.min(slots - 1, Number(tile.slot) || 0));
+  const fbLeft = 60 + (slots > 1 ? slot * 80 : 0);
+  const fbTop = 60 + (slots > 1 ? slot * 70 : 0);
+  const fbW = slots > 1 ? 1000 : 1200;
+  const fallback = { left: fbLeft, top: fbTop, width: fbW, height: 900, ...base };
   let displays = null;
   try {
     if (chrome.system?.display?.getInfo) displays = await chrome.system.display.getInfo();
@@ -1506,6 +1517,10 @@ async function launchOne(task, context) {
       if (result.parkReason != null) reconcile.parkReason = result.parkReason;
       if (Array.isArray(result.pendingQuestions) && result.pendingQuestions.length) reconcile.pendingQuestions = result.pendingQuestions;
       if (result.routeState != null) reconcile.routeState = result.routeState;
+      // Carry the apply ROUTE too — a dropped fire-and-forget report() otherwise loses it on this
+      // deterministic last write, so a relevance skip lands route-less and the server synthesizes
+      // "skipped without a diagnostic". (The executor's return now echoes applyRoute for skips.)
+      if (result.applyRoute != null) reconcile.applyRoute = result.applyRoute;
       await api.call('PATCH', '/queue/' + task.id, reconcile);
     }
     if (result?.nextRequested) setTimeout(() => { watchAndTeachOne().catch(() => {}); }, 900);

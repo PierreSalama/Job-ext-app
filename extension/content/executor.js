@@ -269,7 +269,7 @@ function cancel(reason) {
   if (!S.running) return;
   S.cancelled = true;
   setStatus(`Stopped (${reason})`);
-  report({ state: 'skipped', transcriptAppend: { note: `stopped by ${reason}` } });
+  report({ state: 'skipped', lastError: `stopped by ${reason}`, transcriptAppend: { note: `stopped by ${reason}` } });
 }
 
 let reportQueue = Promise.resolve();
@@ -291,7 +291,11 @@ function report(patch) {
   reportQueue = reportQueue.then(() =>
     send({ type: 'task-progress', taskId: S.task.id, patch })).catch(() => {});
 }
-const ROUTE_STATES = new Set(['done', 'awaiting_review', 'awaiting_input', 'parked', 'failed']);
+// 'skipped' is included so a skip that omits an explicit applyRoute still gets a route stamped
+// (→ 'unknown' rather than NULL) and never lands as the server's synthesized "skipped without a
+// diagnostic". An explicit applyRoute on the patch (e.g. the relevance gate's 'relevance', or the
+// external fast-skip's 'external') always wins via the `patch.applyRoute === undefined` guard.
+const ROUTE_STATES = new Set(['done', 'awaiting_review', 'awaiting_input', 'parked', 'failed', 'skipped']);
 
 // ============================================================
 // Helpers
@@ -359,11 +363,26 @@ function detectBotChallengeOnPage() {
         + 'iframe[src*="/cdn-cgi/"], .cf-turnstile, [class*="cf-turnstile"]'
       );
     } catch {}
+    // PRESENCE-ONLY probe (never clicked) for a REAL interactive challenge widget — a rendered
+    // reCAPTCHA/hCaptcha/Turnstile/Arkose iframe or checkbox. Its ABSENCE on a Cloudflare gate is
+    // what marks the interstitial self-clearing (safe to wait out). A bare .cf-turnstile CONTAINER
+    // without its iframe is the managed/JS challenge → NOT counted as interactive here.
+    let hasInteractiveWidget = false;
+    try {
+      hasInteractiveWidget = !!document.querySelector(
+        'iframe[src*="recaptcha" i], iframe[src*="hcaptcha" i], iframe[src*="api2/anchor" i], '
+        + 'iframe[title*="recaptcha" i], iframe[title*="hcaptcha" i], '
+        + '.g-recaptcha, #g-recaptcha, .h-captcha, [data-hcaptcha-widget-id], '
+        + 'iframe[src*="challenges.cloudflare.com/turnstile" i], '
+        + 'iframe[src*="arkoselabs" i], iframe[src*="funcaptcha" i]'
+      );
+    } catch {}
     return detectBotChallenge({
       url: location.href,
       title: document.title,
       bodyText,
       hasRayId,
+      hasInteractiveWidget,
     });
   } catch {
     return { blocked: false, kind: null, reason: 'probe-error' };
@@ -412,6 +431,20 @@ function looksLikeAdvance(el, { allowOpen = false } = {}) {
 function findAdvanceButton(root, { allowOpen = false } = {}) {
   for (const el of qsa('button, input[type="submit"], a[role="button"], [role="button"]', root || document)) {
     if (looksLikeAdvance(el, { allowOpen })) return el;
+  }
+  // OPEN-BRANCH ONLY: a plain <a href> "Apply for this job" CTA (Lever a.postings-btn and many
+  // ATS job-description pages) is NOT in the set above, so it was unreachable and the external
+  // child stalled at "no generic advance found". Reach it ONLY in the open branch (allowOpen) —
+  // the caller's shouldUseGenericOpenFallback already excludes LinkedIn job-view — and only for a
+  // visible apply-INTENT anchor with a real navigable href. The generic counterpart to the
+  // per-ATS openApply() adapters; a wrong click is bounded by the no-progress cap + breaker.
+  if (allowOpen) {
+    for (const a of qsa('a[href]', root || document)) {
+      if (!a || !isProbablyVisible(a)) continue;
+      const href = a.getAttribute('href') || '';
+      if (!href || href === '#' || /^javascript:/i.test(href)) continue;
+      if (looksLikeAdvance(a, { allowOpen: true })) return a;
+    }
   }
   return null;
 }
@@ -1044,10 +1077,14 @@ export async function run(task, context, helpers) {
   if (fitReason) {
     logLine('warn', `skipping — ${fitReason}`);
     setStatus(`Skipped — ${fitReason}`);
-    report({ state: 'skipped', lastError: fitReason, transcriptAppend: { note: 'relevance skip: ' + fitReason } });
+    // Carry an honest route ('relevance') + the concrete reason on BOTH the report AND the return.
+    // The report PATCH is fire-and-forget and can be dropped when the tab is torn down right after;
+    // background.js then rebuilds the PATCH from this return object, so the return MUST echo
+    // lastError+applyRoute or the server synthesizes "skipped without a diagnostic" + apply_route NULL.
+    report({ state: 'skipped', lastError: fitReason, applyRoute: 'relevance', routeState: 'relevance_skip', transcriptAppend: { note: 'relevance skip: ' + fitReason } });
     S.running = false;
     hideOverlay(3500);
-    return { ok: true, state: 'skipped', steps: 0 };
+    return { ok: true, state: 'skipped', steps: 0, lastError: fitReason, applyRoute: 'relevance', routeState: 'relevance_skip' };
   }
 
   // ---- account-walled ATS gate (Workday / iCIMS / Taleo) ----
@@ -1873,6 +1910,33 @@ export async function run(task, context, helpers) {
     // the host so background.js trips a per-run circuit breaker (one wall must not nuke every
     // same-host job). This is a SITE gate, not a failure of our flow — classified distinctly.
     const challenge = detectBotChallengeOnPage();
+    // "HAVE A GO" on a SELF-CLEARING Cloudflare interstitial — the managed/JS "checking your
+    // browser…" wall that resolves ITSELF on a short wait, with NO user action and NO widget
+    // interaction. Bounded (~15s), no-touch: we never front the window, never click/solve anything,
+    // never arm the host breaker during the wait. Re-runs the FULL probe each tick so the instant
+    // it clears we resume the apply; the instant a REAL interactive widget appears (late iframe
+    // injection → selfClearing flips false) or the budget elapses, we fall through to the honest
+    // terminal park below. This is the legitimate "try it" — waiting out the page's own JS — and
+    // it NEVER crosses the never-auto-solve line. Interactive captcha/verify gates skip this entirely.
+    if (challenge.blocked && challenge.kind === 'cloudflare' && challenge.selfClearing) {
+      logLine('info', 'Cloudflare interstitial — waiting for it to clear itself (no interaction)…');
+      setStatus('Cloudflare check — waiting for it to clear…');
+      const cf0 = Date.now();
+      let cfCleared = false;
+      while (Date.now() - cf0 < 15000 && !S.cancelled) {
+        await sleep(2000);
+        const c2 = detectBotChallengeOnPage();
+        if (!c2.blocked) { cfCleared = true; break; }
+        if (!c2.selfClearing) break;   // a real interactive widget rendered → stop; park below
+      }
+      if (cfCleared) {
+        logLine('ok', 'Cloudflare interstitial cleared on its own — continuing the application');
+        report({ transcriptAppend: { kind: 'recovery', note: 'self-clearing Cloudflare interstitial cleared on a no-touch wait — resuming' } });
+        noChange = 0;
+        continue;
+      }
+      logLine('warn', 'Cloudflare interstitial did not clear on its own — parking for you');
+    }
     if (challenge.blocked) {
       const why = botChallengeLastError(challenge.kind);
       logLine('warn', `${why} (${challenge.reason}) — stopping; not our flow's failure`);
@@ -3075,5 +3139,8 @@ export async function run(task, context, helpers) {
     pendingQuestions: S.lastReport?.pendingQuestions || [],
     submissionEvidence: S.lastReport?.submissionEvidence || null,
     routeState: S.routeState || 'unknown',
+    // Echo the route so background.js's reconcile preserves it on a loop-exit skip whose
+    // fire-and-forget report() was dropped (otherwise → "skipped without a diagnostic").
+    applyRoute: S.lastReport?.applyRoute || null,
   };
 }

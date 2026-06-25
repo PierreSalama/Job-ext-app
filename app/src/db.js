@@ -3182,6 +3182,26 @@ function queueRunStats() {
   return { doneDay, doneHour, dispatchedDay, lastRun, lastStart };
 }
 
+// PER-SITE start clock (parallel pacing). taskSiteKey is a JS classifier (not a column),
+// so we compute the most-recent scheduled_at PER siteKey over a short recent window in JS.
+// Used by queueNext so concurrency>1 paces starts WITHIN a site (anti-throttle) while letting
+// DIFFERENT sites start immediately — instead of a single global clock that re-serializes the
+// whole pool. Bounded scan (default 30 min) keeps it cheap; the gap is only minutes wide.
+function lastStartBySiteKey({ minutes = 30 } = {}) {
+  const since = new Date(Date.now() - Math.max(1, minutes) * 60000).toISOString();
+  const rows = all(
+    `SELECT t.scheduled_at AS s, j.source AS source, j.job_url AS job_url
+       FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
+      WHERE t.scheduled_at IS NOT NULL AND t.scheduled_at >= ?`, [since]);
+  const m = {};
+  for (const r of rows) {
+    const k = taskSiteKey({ source: r.source, job_url: r.job_url });
+    if (!k) continue;
+    if (!m[k] || r.s > m[k]) m[k] = r.s;
+  }
+  return m;
+}
+
 // ============================================================
 // LinkedIn Easy Apply daily cap (~50/24h) — detect, cool down, pivot.
 // The executor reports `easyapply-limit` when LinkedIn shows its limit modal; the
@@ -4203,7 +4223,7 @@ module.exports = {
   discoveryBatchStart, discoveryBatchGet, discoveryBatchComplete, discoveryBatchList, discoveryRecordJob,
   discoveryFallbackQueue, discoveryFallbackNext, discoveryFallbackComplete, discoveryHealth, reconcileDiscovery, pipelineHealth,
   queueList, queueHistory, queueBreakdown, summarizeRun, queueRunSummary, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, quarantineUntrustworthyDone, recoverRaceLostSubmissions, recoverVerifiedEvidenceFromTranscript, isTrustworthyEvidence, saveIntakeAnswer,
-  classifyQueueFailure, taskSiteKey, queueActiveSiteKeys,
+  classifyQueueFailure, taskSiteKey, queueActiveSiteKeys, lastStartBySiteKey,
   setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,

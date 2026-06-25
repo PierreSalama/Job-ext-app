@@ -29,12 +29,21 @@ export default {
   // Tight application container — never document.body.
   formSelector: 'form[action*="/apply"], .application-form, #application-form',
 
-  // The /apply URL already renders the form, so on /apply there is nothing to
-  // open — return false (no-op). Off the /apply form, the generic open path
-  // follows a.postings-btn ("Apply for this job") to …/apply, so openApply
-  // stays a safe no-op here too. Idempotent, never submits.
+  // The /apply URL already renders the form, so on /apply there is nothing to open.
+  // OFF the form (the job-description page), the CTA is a PLAIN anchor (a.postings-btn,
+  // "Apply for this job") — which the generic advance scanner never considered (it only
+  // enumerates button/[role=button]), so the child used to stall at "no generic advance
+  // found" and fail with everHadForm=false. CLICK that visible apply link to navigate to
+  // …/apply where the form renders. Idempotent (no-op once the form is present) and never
+  // a submit. This is the legitimate Apply CTA — no CAPTCHA/bot-detection interaction.
   openApply() {
-    return false;
+    if (qs(this.formSelector)) return false;          // form already on the page → nothing to open
+    const a = qs('a.postings-btn, a[href*="/apply"]');
+    if (!a) return false;
+    const label = compactText(a.textContent) || '';
+    if (/submit/i.test(label)) return false;          // never click a submit control
+    a.click();
+    return true;
   },
 
   // Lever's manual form has no honeypot fields.

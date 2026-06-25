@@ -278,7 +278,12 @@ async function queueNext(force = false) {
   // The extension now runs each worker in its OWN dedicated window (one active/visible,
   // un-throttled tab per window — see acquireApplyWindow), so parallelism is safe again.
   // Clamp to a sane max of 3 (more windows = more flag risk + machine load).
-  const concurrency = Math.max(1, Math.min(3, Number(s.concurrency) || 1));
+  const concurrency = Math.max(1, Math.min(5, Number(s.concurrency) || 1));
+  // PER-SITE cap: how many applies may run concurrently on ONE siteKey. All LinkedIn jobs
+  // share siteKey 'ats:linkedin', so this is the real LinkedIn parallelism. Default 2 (ban-safe);
+  // clamped 1..concurrency. This REPLACES the old boolean "one-per-site" guard that collapsed the
+  // whole LinkedIn-dominant queue to serial-of-1 even at concurrency=3.
+  const perSiteCap = Math.max(1, Math.min(concurrency, Number(s.perSiteConcurrency) || 2));
   if (!s.enabled) return { task: null, reason: 'disabled', concurrency };
   if (!force) {
     if (!withinWindow(s)) return { task: null, reason: 'outside-window', concurrency };
@@ -297,13 +302,12 @@ async function queueNext(force = false) {
     // otherwise a self-driving loop re-arms the gap on every completion and
     // collapses back to one-per-alarm-tick. The job's own runtime usually
     // absorbs the gap, so serial flows continuously; parallel spaces its starts.
-    if (stats.lastStart) {
-      // Divide the gap by concurrency so a pool of N may start N applications within
-      // one base gap window. This single global per-start clock otherwise serializes
-      // EVERY launch, so `concurrency` bought zero extra throughput (the v11.12 bug).
+    // SERIAL (concurrency<=1): single global start clock, as before. PARALLEL (concurrency>1):
+    // skip the global clock here — pacing is done PER SITE in the candidate loop below, so two
+    // DIFFERENT sites can start at once and a single site still can't burst.
+    if (concurrency <= 1 && stats.lastStart) {
       const baseGap = s.minGapMinutes + Math.random() * Math.max(0, s.maxGapMinutes - s.minGapMinutes);
-      const gapMin = baseGap / concurrency;
-      const eligibleAt = new Date(stats.lastStart).getTime() + gapMin * 60000;
+      const eligibleAt = new Date(stats.lastStart).getTime() + baseGap * 60000;
       if (Date.now() < eligibleAt) {
         return { task: null, reason: 'gap', nextEligibleAt: new Date(eligibleAt).toISOString(), concurrency };
       }
@@ -334,9 +338,16 @@ async function queueNext(force = false) {
   try { cooledDown = db.easyApplyCooledDown(); } catch {}
   let easyApplyDeferred = false;
   let siteDeferred = false;
-  let activeSiteKeys = new Set();
+  let siteGapDeferred = false;
+  let siteGapNextAt = null;
+  // PER-SITE in-flight COUNT (not a boolean) + per-site last-start clock — drives the cap +
+  // pacing below. Recomputed every /queue/next (queueActiveSiteKeys reads scheduled+running, so
+  // a freshly-scheduled task is counted, and queueNext returns one task per call → no over-pick).
+  const siteKeyCounts = new Map();
+  let siteLastStart = {};
   if (!force && concurrency > 1) {
-    try { activeSiteKeys = new Set(db.queueActiveSiteKeys().map((x) => x.siteKey).filter(Boolean)); } catch {}
+    try { for (const x of db.queueActiveSiteKeys()) { if (x.siteKey) siteKeyCounts.set(x.siteKey, (siteKeyCounts.get(x.siteKey) || 0) + 1); } } catch {}
+    try { siteLastStart = db.lastStartBySiteKey({ minutes: 30 }); } catch {}
   }
   const candidates = [];
   for (let i = queued.length - 1; i >= 0; i--) {
@@ -372,15 +383,30 @@ async function queueNext(force = false) {
     }
     if (cooledDown && !db.easyApplyEligible(j)) { easyApplyDeferred = true; continue; }
     const siteKey = db.taskSiteKey(j);
-    if (!force && concurrency > 1 && siteKey && activeSiteKeys.has(siteKey)) {
-      siteDeferred = true;
-      continue;
+    if (!force && concurrency > 1 && siteKey) {
+      // (1) PER-SITE CAP — never run more than perSiteCap applies on one site at once.
+      if ((siteKeyCounts.get(siteKey) || 0) >= perSiteCap) { siteDeferred = true; continue; }
+      // (2) PER-SITE GAP — space starts WITHIN a site (anti-throttle/ban) without serializing
+      // different sites. gapMin = baseGap/perSiteCap so the site fills to its cap over one window.
+      const last = siteLastStart[siteKey];
+      if (last) {
+        const baseGap = s.minGapMinutes + Math.random() * Math.max(0, s.maxGapMinutes - s.minGapMinutes);
+        const eligibleAt = new Date(last).getTime() + (baseGap / perSiteCap) * 60000;
+        if (Date.now() < eligibleAt) {
+          siteGapDeferred = true;
+          if (!siteGapNextAt || eligibleAt < siteGapNextAt) siteGapNextAt = eligibleAt;
+          continue;
+        }
+      }
     }
     candidates.push({ t, j, order: i });   // order = oldest-first index (lower = older)
   }
   // Nothing dispatchable BUT we held back LinkedIn jobs for the cooldown → tell the pump
   // why it's idling (it isn't out of work; it's waiting out the Easy-Apply cap).
   if (!candidates.length && easyApplyDeferred) return { task: null, reason: 'easyapply-cooldown', concurrency };
+  // Per-site gap wins over site-busy as the idle reason so the pump's gapTimer wakes it exactly
+  // when the next same-site start becomes eligible (bounded), instead of idling to the next alarm.
+  if (!candidates.length && siteGapDeferred) return { task: null, reason: 'gap', nextEligibleAt: new Date(siteGapNextAt).toISOString(), concurrency };
   if (!candidates.length && siteDeferred) return { task: null, reason: 'site-busy', concurrency };
   if (!candidates.length) return { task: null, reason: 'empty', concurrency };
   // Rank candidates: highest rankJob first; ties broken by oldest-first (stable original order).
@@ -1225,14 +1251,18 @@ async function handle(req, res, parsed) {
   // throttle is visible). Polled + refreshed on the queue.updated SSE.
   if (req.method === 'GET' && pathname === '/auto-apply/live') {
     const s = db.getSettings().autoApply;
-    const concurrency = Math.max(1, Math.min(3, Number(s.concurrency) || 1));   // per-worker windows (see queueNext)
+    const concurrency = Math.max(1, Math.min(5, Number(s.concurrency) || 1));   // per-worker windows (see queueNext)
+    // Effective parallelism for a single-site (LinkedIn-dominant) queue is bounded by perSiteCap,
+    // not raw concurrency — the gap now paces per site at baseGap/perSiteCap. Use it for the rate
+    // estimate so the dashboard's "effective per hour" stays honest.
+    const perSiteCap = concurrency > 1 ? Math.max(1, Math.min(concurrency, Number(s.perSiteConcurrency) || 2)) : 1;
     const live = db.queueLive({ startedAt: s.startedAt || '' });
     const stats = db.queueRunStats();
     // R3 — honest, run-scoped breakdown (verified submits vs. site-gates vs. our failures).
     const runSummary = db.queueRunSummary({ startedAt: s.startedAt || '' });
     const maxPerHour = Number(s.maxPerHour) || 0;
     const avgGap = Math.max(0.05, (Number(s.minGapMinutes) + Number(s.maxGapMinutes)) / 2);
-    const gapPerHour = Math.round((60 / avgGap) * concurrency);   // gap divides by concurrency now
+    const gapPerHour = Math.round((60 / avgGap) * perSiteCap);   // gap divides by perSiteCap (per-site pacing)
     const effectivePerHour = maxPerHour ? Math.min(maxPerHour, gapPerHour) : gapPerHour;
     const bindingCap = maxPerHour && maxPerHour <= gapPerHour ? 'hourly-cap' : 'gap';
     const dailyCap = Number(s.dailyCap) || 0;

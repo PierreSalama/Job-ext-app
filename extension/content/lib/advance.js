@@ -21,8 +21,14 @@ export const ADVANCE_KEYWORDS = [
   /^send application$/i, /^suivant$/i, /^continuer$/i, /^soumettre$/i, /^envoyer/i,
 ];
 
+// OPEN_KEYWORDS are matched ONLY in the open branch (allowOpen:true), which the executor gates
+// to non-LinkedIn-job-view pages (shouldUseGenericOpenFallback). Word-boundary PREFIXES so a
+// company-ATS opener like "Apply for this job" / "Apply for this position" / "Postuler à ce poste"
+// matches — the anchored-exact set used to miss those, the dominant cause of external "no generic
+// advance found" stalls. Still scoped to apply-intent leading words; the 40-char guard in
+// isAdvanceLabel bounds run-on labels, and ADVANCE_KEYWORDS (in-form) is deliberately unchanged.
 export const OPEN_KEYWORDS = [
-  /^apply now$/i, /^apply$/i, /^easy apply/i, /^postuler$/i,
+  /^apply\b/i, /^easy apply/i, /^postuler\b/i,
 ];
 
 export function isAdvanceLabel(text, { allowOpen = false } = {}) {
