@@ -25,6 +25,18 @@ test('failed and skipped tasks always retain diagnostics', () => {
   assert.match(skipped.lastError, /without a diagnostic/);
 });
 
+test('a diagnostic-less skip that was a STOP reads "stopped by you", not "without a diagnostic"', () => {
+  // The common case: auto-apply paused mid-run cancels in-flight tasks; older extensions emit the
+  // "stopped from dashboard" transcript note but omit lastError. The server must label it honestly.
+  const t = task(20);
+  const r = db.queuePatch(t.id, { state: 'skipped', transcriptAppend: { note: 'stopped from dashboard' } });
+  assert.match(r.lastError, /stopped by you/i);
+  assert.doesNotMatch(r.lastError, /without a diagnostic/);
+  // And a genuine no-signal skip still gets the honest fallback.
+  const r2 = db.queuePatch(task(21).id, { state: 'skipped' });
+  assert.match(r2.lastError, /without a diagnostic/);
+});
+
 test('empty user-wait states become failures', () => {
   const result = db.queuePatch(task(3).id, { state: 'awaiting_input', parkReason: 'missing information' });
   assert.equal(result.state, 'failed');

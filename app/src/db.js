@@ -3047,7 +3047,16 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
   // interrupted or old extension versions can omit fields, but the ledger must never
   // contain an unexplained failure, a fake user-wait, or an unproven submission.
   if (nextState === 'failed' && !String(nextError || '').trim()) nextError = 'auto-apply failed without a diagnostic';
-  if (nextState === 'skipped' && !String(nextError || '').trim()) nextError = 'auto-apply skipped without a diagnostic';
+  if (nextState === 'skipped' && !String(nextError || '').trim()) {
+    // Derive an HONEST reason instead of the opaque fallback. A skip with no diagnostic is almost
+    // always a user/teardown STOP — cancel() records a "stopped by …" transcript note even when an
+    // older extension omits the lastError field. Reading it here makes the dashboard + doctor show
+    // "stopped by you" for a deliberate pause instead of the alarming "skipped without a diagnostic".
+    const trail = `${transcriptAppend ? JSON.stringify(transcriptAppend) : ''} ${String(cur.transcript || '').slice(-800)}`.toLowerCase();
+    nextError = /stopped (?:from dashboard|by )|auto-apply (?:stopped|paused)|user[- ]?stop|\bcancell?ed\b/.test(trail)
+      ? 'stopped by you (auto-apply was paused)'
+      : 'auto-apply skipped without a diagnostic';
+  }
   if ((nextState === 'awaiting_input' || nextState === 'parked') && !nextPending.some((q) => q && String(q.question || q.reason || '').trim())) {
     nextState = 'failed';
     nextError = String(nextError || nextParkReason || 'user-wait state had no actionable question');
