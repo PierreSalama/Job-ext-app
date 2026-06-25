@@ -801,6 +801,7 @@ function open(userDataDir) {
   runMigrations();
   migrateSecrets();
   migrateGmailQuery();
+  migrateGmailBackfill();
   log.info('opened', file);
   return db;
 }
@@ -993,6 +994,21 @@ function migrateGmailQuery() {
     }
     kvSet('gmailQueryBroadV1', 1);
   } catch (e) { log.warn && log.warn('gmail query migration skipped:', e.message); }
+}
+
+// One-time (v11.49): the v11.48 re-scan ran under a 300-email cap that the broad query's LinkedIn
+// volume crowded out, so it only reached ~2 weeks back and older employer rejection/assessment
+// emails were missed (and the watermark then advanced past them). Now that the backfill cap is
+// raised (gmail.js), reset the watermark ONCE more so the next sync does a full 30-day backfill and
+// catches the status emails that were cut off. Only when Gmail is actually connected.
+function migrateGmailBackfill() {
+  if (!db) return;
+  try {
+    if (kvGet('gmailBackfillV2')) return;
+    const g = safeParse(get("SELECT value FROM settings WHERE section = 'gmail'")?.value, {});
+    if (g.enabled) { kvSet('gmailWatermark', 0); log.info('reset Gmail watermark for a full backfill (raised cap)'); }
+    kvSet('gmailBackfillV2', 1);
+  } catch (e) { log.warn && log.warn('gmail backfill migration skipped:', e.message); }
 }
 
 // ---- kv ----

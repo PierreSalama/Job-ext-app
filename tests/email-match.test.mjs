@@ -119,6 +119,9 @@ test('detects ALL pipeline statuses from realistic EMPLOYER emails → correct c
     ['interview', 'interview_1', 'Your application to Umbrella', 'The hiring manager would like to schedule a call with you next week.'],
     ['offer', 'offer', 'Your offer from Stark Industries', 'We are pleased to offer you the position of Software Engineer. Offer letter attached.'],
     ['application_confirmation', 'submitted', 'Thanks for applying to Wayne Enterprises', 'We have received your application and will be in touch.'],
+    // phrasings that USED to fall through to 'other' (ceipal/workable confirmations seen live)
+    ['application_confirmation', 'submitted', 'Thank you for your application for Coder', 'Your application has been logged.'],
+    ['application_confirmation', 'submitted', 'Thanks for applying to ResponsiveAds, Inc.', 'We appreciate your interest.'],
   ];
   for (const [wantCat, wantStatus, subject, body] of cases) {
     const cat = email.classify(subject, body);

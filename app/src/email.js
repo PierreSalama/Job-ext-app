@@ -120,7 +120,7 @@ const CATEGORY_RX = [
   // application_confirmation: a "your application was sent/received to X" acknowledgement. Checked
   // AFTER the terminal/active signals above so a real rejection/assessment/interview with a neutral
   // "Your application to X" subject is staged correctly instead of collapsing to 'submitted'.
-  ['application_confirmation', /thank you for applying|application (?:was |has been )?(?:received|submitted|sent)|we(?:'| ha)ve received your application|successfully applied|application (?:confirmation|received)|your application (?:to|was sent)/i],
+  ['application_confirmation', /thank(?:s| you)? (?:so much )?for (?:applying|your application)|application (?:was |has been )?(?:received|submitted|sent)|we(?:'| ha)ve received your application|successfully applied|application (?:confirmation|received)|your application (?:to|for|was sent)|received your application/i],
   ['recruiter', /recruiter|talent (?:team|acquisition|partner)|sourcer|reaching out|came across your (?:profile|background)|opportunity (?:at|with)|interested in your/i],
 ];
 // Classify over the combined subject + (clipped) body. The ORDER of CATEGORY_RX is what

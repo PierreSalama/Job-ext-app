@@ -228,11 +228,17 @@ async function syncNow() {
     let pageToken = '';
     let newWatermark = watermark;
     const ids = [];
+    // BACKFILL vs INCREMENTAL cap. A reset/zero watermark means a full re-scan of the 30-day window
+    // (after a query upgrade) — the broad query's LinkedIn volume crowds out employer status emails,
+    // so a low cap (300) only reached ~2 weeks and missed older rejection/assessment mail. Use a high
+    // cap for the backfill so the whole window is covered; the incremental tick (watermark set) only
+    // ever sees a sync-interval's worth of NEW mail, so 300 is plenty there.
+    const SCAN_CAP = watermark ? 300 : 1200;
     do {
       const page = await gmailGet(`/messages?q=${encodeURIComponent(q)}&maxResults=50${pageToken ? `&pageToken=${pageToken}` : ''}`, token);
       for (const m of page.messages || []) ids.push(m.id);
       pageToken = page.nextPageToken || '';
-    } while (pageToken && ids.length < 300);
+    } while (pageToken && ids.length < SCAN_CAP);
 
     for (const id of ids) {
       const msg = await gmailGet(`/messages/${id}?format=full`, token);
