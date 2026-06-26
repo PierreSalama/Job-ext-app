@@ -2710,6 +2710,29 @@ export async function run(task, context, helpers) {
     const indeedNative = !haveForm && controlRoute.state === 'indeed_native';
     const externalClick = !haveForm && ((allowExternal && controlRoute.state.startsWith('external_')) || indeedNative);
     if (!haveForm && controlRoute.state === 'linkedin_easy_apply_modal') S.routeState = 'linkedin_easy_apply_modal';
+    // FAST-SKIP an EXTERNAL Indeed posting in easy-apply-only mode (mirror of the LinkedIn fast-skip).
+    // On an Indeed job whose only apply control is an off-Indeed "Apply on company site" link (NOT the
+    // Indeed-Apply widget → indeed_native), there is nothing in-board to drive. Without this the
+    // executor clicked the external opener, its target=_blank tab was blocked, and it looped to a
+    // RETRIABLE failure (re-dispatched forever) — pure waste. Skip honestly in ~0s. In BOTH mode
+    // (allowExternal) externalClick drives the company handoff instead, so this never fires there.
+    if (!haveForm && !allowExternal && !indeedNative && controlRoute.state.startsWith('external_')
+        && /(^|\.)indeed\.[a-z]+(\.[a-z]+)?$/i.test(location.hostname)) {
+      vlog('button', 'fast-skip: external Indeed posting (off-Indeed apply, no Indeed-Apply widget) — skipping in ~0s');
+      logLine('warn', 'external posting — no Indeed-Apply on this job; skipping fast (easy-apply-only)');
+      S.routeState = 'external_same_tab';
+      signalHydrated();
+      setStatus('External posting — no Indeed-Apply; skipped');
+      report({
+        state: 'skipped',
+        lastError: 'external posting — no Indeed-Apply on this job (skipped, easy-apply-only)',
+        applyRoute: 'external',
+        routeState: 'external_same_tab',
+        transcriptAppend: { kind: 'recovery', note: 'fast-skip external Indeed posting — no Indeed-Apply, not re-dispatched' },
+      });
+      finalState = 'skipped';
+      break;
+    }
     const pageAction = !haveForm
       ? recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label, stage: externalClick ? 'external-opener' : 'apply-opener' })
       : '';

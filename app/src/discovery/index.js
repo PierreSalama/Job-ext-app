@@ -81,7 +81,11 @@ function classifyProviderError(error) {
 function selectBoards(boards, easyApplyOnly) {
   const list = (Array.isArray(boards) ? boards : []).filter(Boolean);
   if (!easyApplyOnly) return list;
-  return list.filter((b) => b === 'linkedin');
+  // Easy-Apply-only mode keeps the boards that HAVE an in-board (no-company-site) apply: LinkedIn
+  // (Easy Apply) AND Indeed (Indeed-Apply → smartapply, now drivable in-tab even in easyApplyOnly —
+  // see route.js indeed_native). Pure aggregators with no native apply (Glassdoor/Google/Zip) stay
+  // dropped. Without Indeed here, turning on easyApplyOnly silently starved the whole Indeed stream.
+  return list.filter((b) => b === 'linkedin' || b === 'indeed');
 }
 
 function planner(settings, index = 0) {

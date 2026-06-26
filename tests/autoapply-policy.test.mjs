@@ -81,13 +81,18 @@ test('classification exposes the retry gate used by stale retry', () => {
   assert.notEqual(db.classifyQueueFailure(db.queueList({}).find((t) => t.id === external.id)).action, 'retry');
 });
 
-test('FIX 5(b): easyApplyIngestEligible drops non-LinkedIn postings only when easyApplyOnly is ON', () => {
+test('FIX 5(b): easyApplyIngestEligible keeps LinkedIn + Indeed under EA-only, drops pure aggregators', () => {
   // easyApplyOnly OFF → everything is eligible (behaviour unchanged).
   for (const src of ['linkedin', 'indeed', 'glassdoor', 'ziprecruiter', 'google', 'workday', '']) {
     assert.equal(server.easyApplyIngestEligible(src, false), true, `OFF should keep ${src || '(empty)'}`);
   }
-  // easyApplyOnly ON → non-LinkedIn boards are always dropped (no real Easy-Apply concept).
-  for (const src of ['indeed', 'glassdoor', 'ziprecruiter', 'google', 'workday', '', null, undefined]) {
+  // easyApplyOnly ON → KEEP LinkedIn (Easy Apply) + Indeed (Indeed-Apply → smartapply); the executor
+  // fast-skips whichever postings turn out external.
+  for (const src of ['linkedin', 'indeed']) {
+    assert.equal(server.easyApplyIngestEligible(src, true), true, `ON should keep ${src}`);
+  }
+  // Pure aggregators with no native in-board apply stay dropped.
+  for (const src of ['glassdoor', 'ziprecruiter', 'google', 'workday', '', null, undefined]) {
     assert.equal(server.easyApplyIngestEligible(src, true), false, `ON should drop ${src || '(empty)'}`);
   }
 });
@@ -106,8 +111,10 @@ test('ANTI-STARVATION: easyApplyOnly KEEPS all LinkedIn ingest (no capability ga
   assert.equal(server.easyApplyIngestEligible('LinkedIn', true), true, 'case-insensitive source');
   // Source can come from the record alone (browser-fallback / ingest-endpoint path).
   assert.equal(server.easyApplyIngestEligible(null, true, { source: 'linkedin' }), true);
-  // Non-LinkedIn boards stay dropped under EA-only (no Easy-Apply concept there).
-  assert.equal(server.easyApplyIngestEligible('indeed', true, { applyCapability: 'easy-apply' }), false, 'non-LinkedIn dropped even if mislabeled');
+  // Indeed is now KEPT under EA-only (Indeed-Apply → smartapply is a real in-board apply); the
+  // executor fast-skips the external Indeed postings. Pure aggregators stay dropped.
+  assert.equal(server.easyApplyIngestEligible('indeed', true), true, 'Indeed kept (Indeed-Apply is drivable)');
+  assert.equal(server.easyApplyIngestEligible('glassdoor', true), false, 'pure aggregator dropped');
   // easyApplyOnly OFF → everything kept.
   assert.equal(server.easyApplyIngestEligible('linkedin', false, { source: 'linkedin', applyCapability: 'unknown' }), true);
   assert.equal(server.easyApplyIngestEligible('indeed', false), true);

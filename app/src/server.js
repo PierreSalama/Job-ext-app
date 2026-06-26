@@ -197,15 +197,14 @@ function jobFit(jobOrTitle, aa) {
 function easyApplyIngestEligible(source, easyApplyOnly, job = null) {
   if (!easyApplyOnly) return true;
   const src = String(source || (job && job.source) || '').toLowerCase();
-  // Easy-Apply-only mode: KEEP all LinkedIn results, DROP non-LinkedIn boards (Indeed/
-  // Glassdoor/Google/Zip have no Easy-Apply concept). We do NOT gate LinkedIn on a
-  // capability flag: discovery is currently JobSpy-only (it sets applyCapability:'unknown'
-  // and the f_AL extension path that would stamp 'easy-apply' is not running), so a
-  // capability gate would drop EVERY LinkedIn job → empty queue → worse than the flood.
-  // Instead the EXECUTOR fast-skips a LinkedIn posting that's external/off-LinkedIn in
-  // ~35ms (detectLinkedInExternalPosting) and terminal-skips it (non-retriable), so the
-  // queue stays fed and the run blazes past externals to the real Easy-Apply jobs.
-  return src === 'linkedin';
+  // Easy-Apply-only mode: KEEP LinkedIn AND Indeed (both have a native in-board apply: LinkedIn
+  // Easy Apply, Indeed Indeed-Apply → smartapply). DROP pure aggregators (Glassdoor/Google/Zip).
+  // We do NOT gate on a capability flag: discovery is JobSpy-only (applyCapability:'unknown'),
+  // so a capability gate would drop EVERY job → empty queue → worse than the flood. Instead the
+  // EXECUTOR fast-skips a posting that's external/off-board in ~35ms (detectLinkedInExternalPosting
+  // for LinkedIn; the Indeed-host external fast-skip for Indeed) and terminal-skips it (non-retriable),
+  // so the queue stays fed and the run blazes past externals to the real Easy-Apply/Indeed-Apply jobs.
+  return src === 'linkedin' || src === 'indeed';
 }
 
 // One intake path for every discovery provider. JobSpy and the browser fallback

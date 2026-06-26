@@ -38,14 +38,16 @@ test('query planner rotates keyword and location profiles deterministically', ()
   assert.deepEqual(discovery.planner(settings, 3), { keyword: 'analyst', location: 'Remote', nextIndex: 0 });
 });
 
-test('FIX 5(a): selectBoards drops non-LinkedIn boards when easyApplyOnly is ON', () => {
+test('selectBoards keeps LinkedIn + Indeed when easyApplyOnly is ON, drops pure aggregators', () => {
   const all = ['linkedin', 'indeed', 'glassdoor', 'zip_recruiter', 'google'];
-  // easyApplyOnly ON → only LinkedIn (the only board with a real Easy-Apply filter).
-  assert.deepEqual(discovery.selectBoards(all, true), ['linkedin']);
+  // easyApplyOnly ON → LinkedIn (Easy Apply) + Indeed (Indeed-Apply → smartapply); aggregators dropped.
+  assert.deepEqual(discovery.selectBoards(all, true), ['linkedin', 'indeed']);
   // easyApplyOnly OFF → behaviour unchanged (all boards kept, order preserved).
   assert.deepEqual(discovery.selectBoards(all, false), all);
-  // ON but no LinkedIn configured → empty (caller treats this as "no easy-apply boards").
-  assert.deepEqual(discovery.selectBoards(['indeed', 'glassdoor'], true), []);
+  // ON, Indeed configured → Indeed kept (no LinkedIn needed).
+  assert.deepEqual(discovery.selectBoards(['indeed', 'glassdoor'], true), ['indeed']);
+  // ON, only aggregators → empty (caller treats this as "no easy-apply boards").
+  assert.deepEqual(discovery.selectBoards(['glassdoor', 'google'], true), []);
   // Defensive: non-array / falsy input never throws.
   assert.deepEqual(discovery.selectBoards(null, true), []);
   assert.deepEqual(discovery.selectBoards(undefined, false), []);
