@@ -1387,13 +1387,24 @@ function stats() {
   for (const r of all('SELECT source, COUNT(*) AS n FROM jobs GROUP BY source')) {
     bySource[r.source || 'unknown'] = r.n;
   }
-  // Manual vs auto-apply split of submitted applications (the dashboard distinction the
-  // user asked for): a job counts as AUTO if a completed auto-apply task exists for it;
-  // the rest of the submitted-or-beyond jobs were applied to by hand.
-  const submittedTotal = [...SUBMITTED_PLUS].reduce((s, st) => s + (byStatus[st] || 0), 0);
-  const submittedAuto = get(
-    `SELECT COUNT(DISTINCT t.job_id) AS n FROM auto_apply_tasks t WHERE t.state = 'done'`).n;
-  const submittedManual = Math.max(0, submittedTotal - submittedAuto);
+  // Manual vs auto-apply split — CONSISTENT with annotateAutoApply's per-job `via` tagging (the
+  // "via" badges on the applications list). A job is BY HAND **only when no mode='auto' task ever ran
+  // for it**. The old "submittedTotal − done-tasks" was wrong: it dumped every auto-apply that ended
+  // awaiting_review / skipped / failed — plus Gmail-confirmed captures the bot had tracked — into
+  // "manual", inflating it to ~49%. Now: manual = no auto task at all; auto = the rest (bot-involved),
+  // further broken into bot-SUBMITTED (a done/awaiting_review task) vs CAPTURED (bot tracked it but it
+  // reached submitted via Gmail/sync). auto + manual === submittedTotal so the dashboard math is clean.
+  const sp = [...SUBMITTED_PLUS];
+  const ph = sp.map(() => '?').join(',');
+  const submittedTotal = sp.reduce((s, st) => s + (byStatus[st] || 0), 0);
+  const submittedManual = get(
+    `SELECT COUNT(*) AS n FROM jobs j WHERE j.status IN (${ph})
+       AND NOT EXISTS (SELECT 1 FROM auto_apply_tasks t WHERE t.job_id = j.id AND t.mode = 'auto')`, sp).n;
+  const submittedAuto = Math.max(0, submittedTotal - submittedManual);
+  const submittedAutoSubmitted = get(
+    `SELECT COUNT(*) AS n FROM jobs j WHERE j.status IN (${ph})
+       AND EXISTS (SELECT 1 FROM auto_apply_tasks t WHERE t.job_id = j.id AND t.state IN ('done','awaiting_review'))`, sp).n;
+  const submittedAutoAssisted = Math.max(0, submittedAuto - submittedAutoSubmitted);
   const dayAgo = new Date(Date.now() - 86400 * 1000).toISOString();
   const submittedToday = get("SELECT COUNT(*) AS n FROM auto_apply_tasks WHERE state = 'done' AND updated_at >= ?", [dayAgo]).n;
   // Pipeline funnel + response signal for the dashboard.
@@ -1405,6 +1416,7 @@ function stats() {
   return {
     total, thisWeek, needsReview, byStatus, bySource,
     submittedTotal, submittedAuto, submittedManual, submittedToday,
+    submittedAutoSubmitted, submittedAutoAssisted,
     funnel: { submitted: submittedTotal, responded, interviews, offers, responseRate },
   };
 }

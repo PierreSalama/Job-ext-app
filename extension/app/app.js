@@ -919,6 +919,7 @@ route('/', async () => {
   const aaStatus = live ? live.status : 'off';
   const AA_STATUS_LABEL = { off: 'Off', running: 'Running', 'queue-empty': 'Idle · queue empty', 'hourly-cap': 'Hourly cap hit', pacing: 'Paced · waiting' };
   const subAuto = stats.submittedAuto || 0, subMan = stats.submittedManual || 0;
+  const subBot = stats.submittedAutoSubmitted || 0, subCap = stats.submittedAutoAssisted || 0;
   const subTot = stats.submittedTotal || (subAuto + subMan);
   const autoPct = (subAuto + subMan) ? Math.round(100 * subAuto / (subAuto + subMan)) : 0;
   const sessTried = (sess.submitted || 0) + (sess.failed || 0);
@@ -1006,8 +1007,8 @@ route('/', async () => {
 
     <section class="stats stats-5">
       <div class="stat"><div class="stat-label">Submitted</div><div class="stat-value gold">${subTot}</div><div class="stat-delta">${stats.submittedToday || 0} today · ${stats.total || 0} started</div></div>
-      <div class="stat"><div class="stat-label">Via auto-apply</div><div class="stat-value">${subAuto}</div><div class="stat-delta">${autoPct}% of submissions</div></div>
-      <div class="stat"><div class="stat-label">By hand</div><div class="stat-value">${subMan}</div><div class="stat-delta">${100 - autoPct}% of submissions</div></div>
+      <div class="stat"><div class="stat-label">Via auto-apply</div><div class="stat-value">${subAuto}</div><div class="stat-delta">${autoPct}% · ${subBot} submitted${subCap ? ` · ${subCap} captured` : ''}</div></div>
+      <div class="stat"><div class="stat-label">By hand</div><div class="stat-value">${subMan}</div><div class="stat-delta">${100 - autoPct}% — no auto-apply task</div></div>
       <div class="stat"><div class="stat-label">Response rate</div><div class="stat-value">${fn.responseRate == null ? '—' : fn.responseRate + '%'}</div><div class="stat-delta">${fn.responded || 0} replied${fn.interviews ? ` · ${fn.interviews} interview${fn.interviews === 1 ? '' : 's'}` : ''}</div></div>
       <div class="stat clickable" data-go-review><div class="stat-label">Needs review</div><div class="stat-value ${stats.needsReview ? 'warn' : ''}">${stats.needsReview || 0}</div><div class="stat-delta">${stats.thisWeek || 0} new this week</div></div>
     </section>

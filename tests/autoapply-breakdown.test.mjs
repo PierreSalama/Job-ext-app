@@ -43,6 +43,25 @@ test('a routeless patch preserves the prior route (COALESCE)', () => {
   assert.equal(got.applyRoute, 'easy-apply', 'route survives a later state-only patch');
 });
 
+test('stats(): MANUAL = submitted with no auto-apply task; awaiting_review/skipped tasks are AUTO, not manual', () => {
+  // The bug: "manual" was submittedTotal − done-tasks, so every auto-apply that ended
+  // awaiting_review/skipped/failed (and Gmail captures) was mislabeled "by hand" (~49%). Manual must
+  // mean "JAT never ran an auto task for it" — consistent with annotateAutoApply's `via` tagging.
+  const before = db.stats();
+  // (a) submitted, NO auto task → the only true MANUAL
+  db.upsertJob({ externalId: 'man-1', title: 'Hand Dev', company: 'HandCo', source: 'linkedin', status: 'submitted', jobUrl: 'https://x/man-1' });
+  // (b) submitted + an awaiting_review auto task (bot filled + clicked submit) → AUTO
+  const jb = db.upsertJob({ externalId: 'auto-ar', title: 'AR Dev', company: 'ARCo', source: 'linkedin', status: 'submitted', jobUrl: 'https://x/auto-ar' }).job;
+  db.queuePatch(db.queueAdd(jb.id, { mode: 'auto' }).id, { state: 'awaiting_review' });
+  // (c) submitted + only a SKIPPED auto task (bot tracked it; submitted via capture) → AUTO, not manual
+  const jc = db.upsertJob({ externalId: 'auto-sk', title: 'SK Dev', company: 'SKCo', source: 'linkedin', status: 'submitted', jobUrl: 'https://x/auto-sk' }).job;
+  db.queuePatch(db.queueAdd(jc.id, { mode: 'auto' }).id, { state: 'skipped', lastError: 'external' });
+  const after = db.stats();
+  assert.equal(after.submittedManual - before.submittedManual, 1, 'only the NO-task job is manual');
+  assert.equal(after.submittedAuto - before.submittedAuto, 2, 'awaiting_review + skipped-with-task are auto, not manual');
+  assert.equal(after.submittedAuto + after.submittedManual, after.submittedTotal, 'auto + manual === total');
+});
+
 test('queueBreakdown aggregates by outcome, board, route, and reasons', () => {
   const before = db.queueBreakdown({ days: 30 });
   queueJob({ source: 'linkedin', url: 'https://x/b1', state: 'done', applyRoute: 'easy-apply' });
