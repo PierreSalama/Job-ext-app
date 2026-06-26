@@ -2251,6 +2251,13 @@ export async function run(task, context, helpers) {
     // eligibility which doesn't bump `filled`) submitted but could never be VERIFIED → landed in
     // awaiting_review instead of a clean done (the obfuscated Ultrassure case).
     if (haveForm && (dialog || applyPageRoot || filled > 0 || att?.attached > 0 || resumeSatisfiedBySelect)) formGrounded = true;
+    // smartapply.indeed.com IS Indeed's hosted apply flow — every page there (resume / questions /
+    // review / post-apply) is a real application surface, never a random page. So being on that host
+    // is itself success-truth grounding. Without this, a smartapply job that lands DIRECTLY on the
+    // REVIEW step (no fillable field — Indeed pre-filled everything from the profile) had
+    // formGrounded=false, so its real submit (URL → /post-apply) downgraded to awaiting_review instead
+    // of a verified done. Live: this was the dominant Indeed-Apply loss (submitted but "unverified").
+    if (/(^|\.)smartapply\.indeed\.com$/i.test(location.hostname)) formGrounded = true;
     if (resume?.id && att.attempted && att.attached === 0 && !resumeSatisfiedBySelect) {
       // An attach was attempted but produced nothing. Split by whether a résumé is GENUINELY
       // required on THIS page (review finding): only then is it a terminal blocker.
