@@ -802,6 +802,7 @@ function open(userDataDir) {
   migrateSecrets();
   migrateGmailQuery();
   migrateGmailBackfill();
+  migrateMemoryPlaceholders();
   log.info('opened', file);
   return db;
 }
@@ -1009,6 +1010,22 @@ function migrateGmailBackfill() {
     if (g.enabled) { kvSet('gmailWatermark', 0); log.info('reset Gmail watermark for a full backfill (raised cap)'); }
     kvSet('gmailBackfillV2', 1);
   } catch (e) { log.warn && log.warn('gmail backfill migration skipped:', e.message); }
+}
+
+// One-time purge of placeholder-poisoned learned answers (e.g. "Select an option" captured from an
+// unselected dropdown). These poison the reuse path — the bot re-serves the placeholder, the control
+// never gets set, and the form parks. Going forward they're rejected on write + skipped on read; this
+// clears the ones already stored so the bot stops re-using them.
+function migrateMemoryPlaceholders() {
+  if (!db) return;
+  try {
+    if (kvGet('memoryPlaceholderPurgeV1')) return;
+    let pf = 0, qa = 0;
+    for (const r of all('SELECT id, value FROM profile_fields')) if (isPlaceholderAnswer(r.value)) { run('DELETE FROM profile_fields WHERE id = ?', [r.id]); pf++; }
+    for (const r of all('SELECT id, answer FROM qa')) if (isPlaceholderAnswer(r.answer)) { run('DELETE FROM qa WHERE id = ?', [r.id]); qa++; }
+    if (pf || qa) log.info(`purged placeholder-poisoned learned answers: ${pf} profile_fields + ${qa} qa`);
+    kvSet('memoryPlaceholderPurgeV1', 1);
+  } catch (e) { log.warn && log.warn('memory placeholder purge skipped:', e.message); }
 }
 
 // ---- kv ----
@@ -1506,10 +1523,22 @@ function normalizeQuestion(q) {
 const FR_HINT_RX = /\b(vous|votre|vos|français|francais|combien|années|prénom|courriel|veuillez|quel|quelle|salaire|expérience|téléphone|adresse|disponibilité|formation|compétences?)\b/i;
 function guessLocale(text) { return FR_HINT_RX.test(String(text || '')) ? 'fr' : 'en'; }
 
+// A dropdown/radio PLACEHOLDER ("Select an option", "Choose…", "--", FR "Sélectionner…") is NOT an
+// answer. The harvester sometimes captured an UNSELECTED control's placeholder as the "answer",
+// poisoning memory: the bot then re-"answers" with that garbage, the control never actually gets set,
+// and the form parks (the live "AI rescue" parks on work-auth / language / proficiency / relocate).
+// Reject these on WRITE and skip them on READ; migrateMemoryPlaceholders() purges existing ones.
+const PLACEHOLDER_ANSWER_RX = /^(?:(?:select|choose|s[ée]lectionne[rz]|choisir)(?:\s+(?:an?\s+|une?\s+|votre\s+|your\s+)?(?:option|answer|value|one|choice|response|r[ée]ponse|valeur))?\.{0,4}|please\s+(?:select|choose)\b.*|pick\s+(?:an?\s+)?(?:option|one)|--+|—+|\.{2,}|click\s+to\s+select|none\s+selected|veuillez\s+(?:s[ée]lectionner|choisir)\b.*)$/i;
+function isPlaceholderAnswer(v) {
+  const s = String(v == null ? '' : v).trim();
+  return !s || PLACEHOLDER_ANSWER_RX.test(s);
+}
+
 function qaRecord({ profileId, question, answer, source, fieldType, lineageSource }) {
   if (isSensitiveKey(question)) return null;   // write-boundary safety rail (see profileFieldUpsert)
   const qn = normalizeQuestion(question);
   if (!qn || answer == null || answer === '') return null;
+  if (isPlaceholderAnswer(answer)) return null;   // never store a dropdown placeholder as an answer
   if (!profileId) { log.warn('qaRecord: missing profileId — answer not saved'); return null; }
   const cur = get('SELECT * FROM qa WHERE profile_id = ? AND question_norm = ?', [profileId, qn]);
   const ts = now();
@@ -1543,11 +1572,12 @@ function qaLookup(profileId, question) {
   const qn = normalizeQuestion(question);
   if (!qn || !profileId) return null;
   const exact = get('SELECT * FROM qa WHERE profile_id = ? AND question_norm = ?', [profileId, qn]);
-  if (exact) return { ...exact, match: 'exact', score: 1 };
+  if (exact && !isPlaceholderAnswer(exact.answer)) return { ...exact, match: 'exact', score: 1 };
   const want = new Set(qn.split(' ').filter(Boolean));
   if (!want.size) return null;
   let best = null;
   for (const row of all('SELECT * FROM qa WHERE profile_id = ?', [profileId])) {
+    if (isPlaceholderAnswer(row.answer)) continue;   // a placeholder is not an answer — don't serve it
     const have = new Set(row.question_norm.split(' ').filter(Boolean));
     let hit = 0;
     for (const t of want) if (have.has(t)) hit++;
@@ -1576,10 +1606,10 @@ function answerMemory(profileId, limit = 16) {
   const out = [];
   for (const f of profileFieldList(profileId)) {
     const q = f.label || ''; const a = f.value || '';
-    if (q && a) out.push({ question: q, answer: a });
+    if (q && a && !isPlaceholderAnswer(a)) out.push({ question: q, answer: a });   // never feed a placeholder back to the AI
   }
   for (const r of qaList(profileId, 60)) {
-    if (r.question && r.answer != null && r.answer !== '') out.push({ question: r.question, answer: r.answer });
+    if (r.question && r.answer != null && r.answer !== '' && !isPlaceholderAnswer(r.answer)) out.push({ question: r.question, answer: r.answer });
   }
   const seen = new Set(); const dedup = [];
   for (const x of out) { const k = normalizeQuestion(x.question); if (k && !seen.has(k)) { seen.add(k); dedup.push(x); } }
@@ -1618,6 +1648,7 @@ function profileFieldUpsert({ profileId, question, value, locale, fieldType, sou
   const keyNorm = normalizeQuestion(label);
   const val = value == null ? '' : String(value).trim().slice(0, 2000);
   if (!keyNorm || !val) return null;
+  if (isPlaceholderAnswer(val)) return null;   // never store a dropdown placeholder ("Select an option") as a learned answer
   if (!profileId) { log.warn('profileFieldUpsert: missing profileId — answer not saved:', label); return null; }
   const ts = now();
   const loc = locale || guessLocale(label) || 'en';
@@ -1668,11 +1699,12 @@ function profileFieldLookup(profileId, question) {
   const qn = normalizeQuestion(question);
   if (!qn || !profileId) return null;
   const exact = get('SELECT * FROM profile_fields WHERE profile_id = ? AND key_norm = ?', [profileId, qn]);
-  if (exact) return { ...pfRow(exact), match: 'exact', score: 1 };
+  if (exact && !isPlaceholderAnswer(exact.value)) return { ...pfRow(exact), match: 'exact', score: 1 };
   const want = new Set(qn.split(' ').filter(Boolean));
   if (!want.size) return null;
   let best = null;
   for (const r of all('SELECT * FROM profile_fields WHERE profile_id = ?', [profileId])) {
+    if (isPlaceholderAnswer(r.value)) continue;   // a placeholder is not an answer — don't serve it
     const have = new Set(String(r.key_norm).split(' ').filter(Boolean));
     let hit = 0; for (const t of want) if (have.has(t)) hit++;
     const coverage = hit / want.size;

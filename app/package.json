@@ -1,6 +1,6 @@
 {
   "name": "jat11-app",
-  "version": "11.54.0",
+  "version": "11.55.0",
   "description": "Desktop companion for the Job Application Tracker v11 Chrome extension. SQLite store, token-guarded REST + SSE on localhost:7744, AI layer (Codex CLI cloud / Ollama local), auto-apply queue, Gmail status sync.",
   "main": "src/main.js",
   "scripts": {

@@ -33,6 +33,23 @@ test('memory is isolated per profile (fields + qa)', () => {
   assert.equal(db.qaLookup(b.id, 'Years of React?'), null, 'B qa lookup misses');
 });
 
+test('dropdown PLACEHOLDERS ("Select an option") are never stored or served as answers', () => {
+  const p = db.saveProfile({ name: 'PH', data: {} });
+  // write-side: placeholders are rejected (profile_fields + the mirrored qa)
+  for (const junk of ['Select an option', 'Choose...', 'Select', '--', 'Sélectionner', 'Please select an option']) {
+    assert.equal(db.profileFieldUpsert({ profileId: p.id, question: `Q ${junk}?`, value: junk, fromUser: true }), null, `rejected: ${junk}`);
+    assert.equal(db.qaRecord({ profileId: p.id, question: `Q ${junk}?`, answer: junk }), null, `qa rejected: ${junk}`);
+  }
+  assert.equal(db.profileFieldList(p.id).length, 0, 'no placeholder fields stored');
+  // real answers — including ones that merely START with select/choose — ARE stored
+  for (const real of ['Yes', 'Selected for the role', 'Choose Health Plan B', 'None', '5 years']) {
+    assert.ok(db.profileFieldUpsert({ profileId: p.id, question: `R ${real}?`, value: real, fromUser: true }), `kept: ${real}`);
+  }
+  assert.equal(db.profileFieldList(p.id).length, 5, 'all real answers stored');
+  // read-side: even a directly-saved placeholder is not served by lookup/answerMemory
+  assert.equal(db.qaLookup(p.id, 'R Yes?')?.answer, 'Yes', 'real answer still served');
+});
+
 test('the same question holds DIFFERENT values in two profiles', () => {
   const a = db.listProfiles().find((p) => p.name === 'A');
   const b = db.listProfiles().find((p) => p.name === 'B');
