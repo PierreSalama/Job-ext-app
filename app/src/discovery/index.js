@@ -9,6 +9,22 @@ const { scope } = require('../logger');
 const log = scope('discovery');
 const SUPPORTED = new Set(['linkedin', 'indeed', 'glassdoor', 'google', 'zip_recruiter']);
 const FALLBACK_STATUSES = new Set(['blocked', 'rate_limited', 'parser_drift', 'timeout', 'unavailable', 'failed']);
+
+// ---- App-side freshness ramp (mirrors the WIDE tiers of extension/lib/freshness.js — see
+// freshness-ramp.test.mjs). ROOT CAUSE of the overnight starvation (3 applies / 7h): the jobspy
+// discovery path was pinned at a STATIC 72h window, so a SATURATED (board|keyword|location) combo
+// — e.g. LinkedIn "frontend developer", every fresh posting already applied to — returned only
+// duplicates FOREVER (accepted=0) and the queue starved. The tested freshness ramp was never wired
+// into this path. Now each combo starts at the 72h floor and WIDENS one tier (7d → 14d → 30d) every
+// time its scan ingests 0 NEW jobs, resetting to 72h the instant it finds fresh ones — newest-first,
+// but a saturated niche keeps refilling from older not-yet-seen postings instead of grinding to zero.
+const FRESH_BASE_SEC = 259200;                                 // 72h floor (the prior static behavior)
+const FRESH_WIDE_TIERS = [259200, 604800, 1209600, 2592000];  // 72h → 7d → 14d → 30d
+function widerFreshTier(sec) {
+  const i = FRESH_WIDE_TIERS.indexOf(Number(sec));
+  if (i === -1) return FRESH_BASE_SEC;
+  return FRESH_WIDE_TIERS[Math.min(i + 1, FRESH_WIDE_TIERS.length - 1)];
+}
 const activeChildren = new Set();
 
 function text(v) { return v == null ? '' : String(v).trim(); }
@@ -222,10 +238,25 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     lastTickAt = Date.now();   // stamp only once we actually proceed to scrape (gates the next call)
     running = true;
     try {
-      const results = await Promise.all(selectedBoards.map((source) => searchBoard({
-        source, keyword: query.keyword, location: query.location, country, remote,
-        limit: Math.max(10, Math.min(50, Number(aa.discovery?.perRunLimit) || 25)), force,
-      })));
+      const results = await Promise.all(selectedBoards.map(async (source) => {
+        // Per-combo freshness tier: a saturated combo widens its window so it keeps surfacing
+        // older, not-yet-seen postings instead of re-finding the same duplicates at a fixed 72h.
+        const tierKey = `freshTier:${source}|${query.keyword}|${query.location}`;
+        const tierSec = Number(db.kvGet(tierKey)) || FRESH_BASE_SEC;
+        const done = await searchBoard({
+          source, keyword: query.keyword, location: query.location, country, remote,
+          limit: Math.max(10, Math.min(50, Number(aa.discovery?.perRunLimit) || 25)), force,
+          hoursOld: Math.round(tierSec / 3600),
+        });
+        // Ramp AFTER the scan: found NEW (accepted>0) → reset to the 72h floor (re-hammer fresh);
+        // a DRY scan (0 new on an ok/empty result — NOT a provider error) → widen one tier (cap 30d).
+        try {
+          const acc = Number(done?.accepted) || 0;   // discoveryBatchGet maps accepted_count → accepted
+          const errored = done?.status && !['ok', 'empty'].includes(done.status);
+          if (!errored) db.kvSet(tierKey, acc > 0 ? FRESH_BASE_SEC : widerFreshTier(tierSec));
+        } catch {}
+        return done;
+      }));
       db.kvSet('discoveryStatus', { provider: 'jobspy', query, results, at: new Date().toISOString() });
       return { ok: true, query, results };
     } finally { running = false; }

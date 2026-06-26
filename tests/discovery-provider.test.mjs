@@ -131,6 +131,34 @@ test('typed provider failure queues one browser fallback, while a healthy empty 
   assert.equal(db.discoveryHealth().pendingFallbacks, 0);
 });
 
+test('freshness ramp: a SATURATED combo widens 72h→7d→14d→30d, then resets when it finds new jobs', async () => {
+  // The overnight starvation (3 applies / 7h): the jobspy path was pinned at a static 72h, so a
+  // saturated combo (LinkedIn "frontend developer") returned only duplicates forever (accepted=0).
+  // Now a dry scan widens the window one tier; a fresh scan resets it to the 72h floor.
+  db.patchSettings({ autoApply: {
+    enabled: true, easyApplyOnly: false, keywords: ['frontend developer'], boards: ['linkedin'],
+    locations: ['toronto'], country: 'Canada',
+    discovery: { enabled: true, intervalMinutes: 5, refillBelow: 9999, perRunLimit: 10 },
+  } });
+  db.kvSet('discoveryPlannerIndex', 0); db.kvSet('discoveryBoardIndex', 0);
+  db.kvSet('freshTier:linkedin|frontend developer|toronto', 259200);  // start at the 72h floor
+  const hoursSeen = [];
+  let dry = true;   // simulate a saturated combo: 0 new ingested
+  const svc = discovery.createDiscoveryService({
+    runner: async (args) => { hoursSeen.push(args.hours_old); return { ok: true, jobs: [{ site: 'linkedin', title: 'Dev', company: 'Acme', job_url: 'https://www.linkedin.com/jobs/view/' + hoursSeen.length }] }; },
+    ingestJobs: async () => ({ enqueued: dry ? 0 : 1, duplicates: dry ? 1 : 0, rejected: 0 }),
+  });
+  const tick = () => svc.runTick({ force: true });   // force bypasses the interval throttle
+  await tick(); assert.equal(hoursSeen.at(-1), 72, 'starts at the 72h floor');
+  await tick(); assert.equal(hoursSeen.at(-1), 168, 'dry → widens to 7d');
+  await tick(); assert.equal(hoursSeen.at(-1), 336, 'dry → widens to 14d');
+  await tick(); assert.equal(hoursSeen.at(-1), 720, 'dry → widens to 30d');
+  await tick(); assert.equal(hoursSeen.at(-1), 720, 'capped at 30d');
+  dry = false;                 // the combo now surfaces fresh jobs
+  await tick();                // this scan ingests new → resets the tier to the floor
+  await tick(); assert.equal(hoursSeen.at(-1), 72, 'resets to 72h after finding fresh jobs');
+});
+
 test('runTick self-throttles to the configured interval (anti subprocess-storm)', async () => {
   // The idle-watchdog pokes runTick every few seconds whenever the queue is drained; without a
   // time gate that spawns a JobSpy subprocess each time and pins the CPU (the live freeze: 791
