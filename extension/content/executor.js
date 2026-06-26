@@ -31,7 +31,11 @@ import { confirmSignalsMatched, findPackSubmitBroadened } from './lib/ats-drive.
 
 const MAX_STEPS = 40;
 const STEP_TIMEOUT = 9000;
-const LEGAL_RX = /(work.*authoriz|sponsor|visa|citizen|clearance|ethnic|race|gender|disabilit|veteran|criminal|background.*check)/i;
+// Both word orders: "work authorization" AND "authorized to work" (the latter is the common
+// LinkedIn phrasing — without `authoriz.*work` it slipped past this gate to the AI ladder, so a
+// flaky/offline local AI could leave the most basic screening Q unanswered; now it's deterministically
+// grounded from the profile's stated work authorization).
+const LEGAL_RX = /(work.*authoriz|authoriz.*work|sponsor|visa|citizen|clearance|ethnic|race|gender|disabilit|veteran|criminal|background.*check)/i;
 // Demographic / sensitive fields we NEVER auto-fill from any source (not even
 // the profile) — the user must consciously answer these in the form. Work
 // authorization / sponsorship / citizenship stay fillable (that's the profile's
@@ -507,7 +511,21 @@ function findLinkedInApplyPageRoot() {
   return deriveApplyRootFromAdvanceButton(btn, {
     parentOf: (el) => el.parentElement,
     countFields: (el) => {
-      try { return qsa(APPLY_FIELD_SEL, el).filter(isProbablyVisible).length; } catch { return 0; }
+      try {
+        let n = qsa(APPLY_FIELD_SEL, el).filter(isProbablyVisible).length;
+        // LinkedIn renders Yes/No screening radios as a 0×0 native <input type=radio> hidden behind a
+        // styled label — invisible to the count above, so a page whose ONLY controls are radio
+        // questions (the "Additional Questions" step: work-auth / sponsorship / degree) grounded
+        // root=none, haveForm went false, and the radios were NEVER scanned/filled — the executor then
+        // clicked "Review" past the unanswered required radios and looped. Count each radio/checkbox
+        // GROUP by its VISIBLE affordance (the styled label/option), not the hidden native input.
+        const groups = new Set();
+        for (const r of qsa('input[type="radio"], input[type="checkbox"]', el)) {
+          const aff = r.closest('fieldset, [role="radiogroup"], [role="group"], [data-test-form-builder-radio-button-form-component], [class*="selectable-option"], label') || r;
+          if (isProbablyVisible(aff)) groups.add(r.name || aff);
+        }
+        return n + groups.size;
+      } catch { return 0; }
     },
     hasNav: (el) => { try { return !!el.querySelector?.(APPLY_NAV_SEL); } catch { return false; } },
   });
@@ -2210,12 +2228,37 @@ export async function run(task, context, helpers) {
     // (a verified dialog, or a probed form we filled/attached into) for THIS job.
     // A generic page-level Submit on a careers/search/newsletter/problem-report
     // page never reaches here with a form root, so it can never be grounded.
-    if (haveForm && (dialog || filled > 0 || att?.attached > 0 || resumeSatisfiedBySelect)) formGrounded = true;
+    // SUCCESS-TRUTH grounding signals: a verified modal `dialog`, a structurally-grounded full-page
+    // `applyPageRoot` (findLinkedInApplyPageRoot only returns a field-bearing, nav-free /apply/ root —
+    // never a stray newsletter form), a profile fill, or a résumé attach/select. Without applyPageRoot
+    // here, a full-page radios-ONLY flow (no branded dialog, eligibility answered via grounded-
+    // eligibility which doesn't bump `filled`) submitted but could never be VERIFIED → landed in
+    // awaiting_review instead of a clean done (the obfuscated Ultrassure case).
+    if (haveForm && (dialog || applyPageRoot || filled > 0 || att?.attached > 0 || resumeSatisfiedBySelect)) formGrounded = true;
     if (resume?.id && att.attempted && att.attached === 0 && !resumeSatisfiedBySelect) {
-      logLine('err', 'resume could not be attached — stopping for you to upload it');
-      report({ state: 'failed', lastError: 'resume attachment failed (will retry)' });
-      finalState = 'failed';
-      break;
+      // An attach was attempted but produced nothing. Split by whether a résumé is GENUINELY
+      // required on THIS page (review finding): only then is it a terminal blocker.
+      let resumeRequiredHere = false;
+      try { resumeRequiredHere = pageRequiresResume(compactText(root?.innerText || root?.textContent || '')); } catch {}
+      if (resumeRequiredHere) {
+        // Required + unattachable → retrying can NEVER satisfy it. PARK as user-actionable
+        // resume_required (terminal 'user' in db.js) instead of failing RETRIABLY, which used to
+        // re-dispatch the same unsatisfiable page to the 4× cap (the dominant Indeed-resume loss).
+        logLine('warn', 'résumé required but no upload/select control found — parking for you to add a résumé');
+        report({
+          state: 'parked',
+          parkReason: 'resume_required',
+          lastError: 'résumé required — add or select a résumé on this posting',
+          pendingQuestions: [{ question: 'This posting requires a résumé but none could be attached — select your résumé or add one', fieldType: 'resume', reason: 'resume_required' }],
+          transcriptAppend: { kind: 'recovery', note: 'resume required, no attachable control → parked (resume_required), not retried' },
+        });
+        finalState = 'parked';
+        break;
+      }
+      // Résumé was OPTIONAL here and the programmatic attach flaked — do NOT block the application.
+      // Continue and let the form submit without it (previously this terminal-failed/retried or
+      // over-parked an optional page).
+      logLine('warn', 'could not attach an optional résumé — continuing without it');
     }
 
     // ---- unknown questions → AI ladder ----
@@ -2239,7 +2282,28 @@ export async function run(task, context, helpers) {
     for (const u of unknown) {
       if (S.cancelled) break;
       if (LEGAL_RX.test(u.label)) {
-        // [TRACE 8] SCREENING — legal/eligibility never goes to AI; parked for the user.
+        // Legal/eligibility questions NEVER go to AI. But the well-known work-auth / sponsorship
+        // screening Qs are TRUTHFULLY grounded from the profile (authorizedToWork) — answer those
+        // HERE, in the MAIN pass, so they fill on this step. Previously this branch parked ALL
+        // eligibility eagerly and only the answer-rescan grounded them; that left a STALE pending
+        // entry, so the form filled + advanced to Review but the job still terminal-PARKED on an
+        // already-answered question (the Ultrassure radios-only "never submits" failure). Only
+        // genuinely unanswerable eligibility (EEO/criminal/clearance, or auth unknown) parks.
+        let grounded = null;
+        if (isEligibilityScreeningQuestion(u.label)) {
+          const opts = Array.isArray(u.options) ? u.options : [];
+          const yesText = opts.find((o) => /^\s*yes\b/i.test(o)) || 'Yes';
+          const noText = opts.find((o) => /^\s*no\b/i.test(o)) || 'No';
+          grounded = groundedEligibilityAnswer(u.label, { authorizedToWork, yesText, noText });
+        }
+        if (grounded != null && await engine.fill([{ input: u.input, value: grounded }])) {
+          // [TRACE 8] grounded-eligibility default applied from the profile (never invented).
+          vlog('screen', `grounded-eligibility "${redactLabel(u.label)}" = ${redactValue(grounded, u.label)} (from profile, authorizedToWork=${authorizedToWork})`);
+          logLine('ok', `answered eligibility "${u.label.slice(0, 40)}" → ${grounded} (from your work authorization)`);
+          try { await engine.recordAnswer({ question: u.label, answer: grounded, fieldType: u.fieldType, source: 'profile', jobId: job?.id }); } catch {}
+          continue;
+        }
+        // [TRACE 8] SCREENING — legal/eligibility we can't ground → never AI'd; parked for the user.
         vlog('screen', `legal/eligibility "${redactLabel(u.label)}" → not AI'd${(u.required || onJobBoard) ? ' → PARK' : ' → left (optional)'}`);
         logLine('warn', `legal/eligibility question not in profile: "${u.label.slice(0, 60)}" — leaving for you`);
         if (u.required || onJobBoard) park(u.label, u.fieldType, u.options, 'legal/eligibility — needs your answer');
@@ -2623,7 +2687,12 @@ export async function run(task, context, helpers) {
     }
     const label = btnText(clickBtn).slice(0, 30);
     const controlRoute = !haveForm ? classifyApplyControl(clickBtn) : { state: S.routeState || 'unknown' };
-    const externalClick = !haveForm && allowExternal && controlRoute.state.startsWith('external_');
+    // Indeed-native (smartapply) is Indeed's easy-apply equivalent: it navigates in-tab to the
+    // Indeed-hosted smartapply flow on a DIFFERENT host, so it rides the SAME cross-host handoff
+    // machinery as an external click — but it is ALLOWED even in easy-apply-only mode (it is NOT a
+    // company-site bounce) and is stamped 'easy-apply', not 'external'.
+    const indeedNative = !haveForm && controlRoute.state === 'indeed_native';
+    const externalClick = !haveForm && ((allowExternal && controlRoute.state.startsWith('external_')) || indeedNative);
     if (!haveForm && controlRoute.state === 'linkedin_easy_apply_modal') S.routeState = 'linkedin_easy_apply_modal';
     const pageAction = !haveForm
       ? recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label, stage: externalClick ? 'external-opener' : 'apply-opener' })
@@ -2710,7 +2779,7 @@ export async function run(task, context, helpers) {
     if (externalClick) {
       S.externalRoute = true;
       S.routeState = controlRoute.state;
-      logLine('ok', 'opening external/company apply route');
+      logLine('ok', indeedNative ? 'opening Indeed-native apply (smartapply) — driving in-tab' : 'opening external/company apply route');
       const armed = await send({ type: 'jat11.external-handoff-arm', taskId: task?.id, routeState: controlRoute.state });
       handoffToken = armed?.ok ? armed.token : null;
       if (handoffToken) {
@@ -2779,7 +2848,7 @@ export async function run(task, context, helpers) {
           lastError: childTerminalError,
           parkReason: childResult?.parkReason,
           pendingQuestions: childResult?.pendingQuestions,
-          applyRoute: 'external', routeState: controlRoute.state,
+          applyRoute: indeedNative ? 'easy-apply' : 'external', routeState: controlRoute.state,
           submissionEvidence: childResult?.submissionEvidence,
           handoffToken,
           transcriptAppend: { kind: 'handoff', note: `external child result adopted: ${childState}` },

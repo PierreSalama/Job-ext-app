@@ -124,6 +124,30 @@ test('queueBreakdown no longer folds awaiting_review into submitted', () => {
   assert.ok((bd.byOutcome.needs_you || 0) >= 1, 'awaiting_review now maps to needs_you, not submitted');
 });
 
+// ---- resume_required: a résumé is needed but none could be attached → TERMINAL user item, NOT
+// an invisible 'none' park and NOT an endless transient_page retry (the dominant Indeed-resume loss).
+test('classifyQueueFailure: a résumé-required park is terminal user-action, never transient/none', () => {
+  // The executor now PARKS with parkReason:'resume_required' (+ a pendingQuestions entry) instead of
+  // failing retriably. It must classify as its own resume_required bucket (action 'user'), NOT the
+  // generic missing_info, and NEVER transient_page (which would re-dispatch the unsatisfiable page).
+  const parked = db.classifyQueueFailure({
+    state: 'parked', park_reason: 'resume_required',
+    pending_questions: JSON.stringify([{ question: 'Select your résumé or add one', reason: 'resume_required' }]),
+    last_error: 'résumé required — add or select a résumé on this posting',
+  });
+  assert.equal(parked.failureClass, 'resume_required', 'dedicated bucket, not missing_info');
+  assert.equal(parked.action, 'user', 'user-actionable terminal, not retried');
+
+  // The legacy text phrasing must also classify resume_required (terminal), not transient_page retry.
+  const legacyText = db.classifyQueueFailure({ state: 'failed', last_error: 'resume required — could not find an upload control on this page' });
+  assert.equal(legacyText.failureClass, 'resume_required');
+  assert.notEqual(legacyText.action, 'retry', 'must NOT be a transient retry');
+
+  // A NON-resume parked task still falls through to the generic missing_info bucket (no over-match).
+  const other = db.classifyQueueFailure({ state: 'parked', pending_questions: JSON.stringify([{ question: 'Salary?', reason: 'missing answer' }]) });
+  assert.equal(other.failureClass, 'missing_info', 'non-résumé park unaffected');
+});
+
 // ---- R3: honest, run-scoped summarizeRun (pure) — one fixture per bucket + both rates ----
 test('summarizeRun buckets every category and keeps awaiting_review out of verified', () => {
   // Raw task-row shape (state/last_error/park_reason/pending_questions/transcript) — exactly

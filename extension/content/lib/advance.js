@@ -13,7 +13,10 @@
 // the structural Easy-Apply-opener guard remain in executor.js.
 
 export const ADVANCE_KEYWORDS = [
-  /^submit application$/i, /^submit$/i, /^submit & continue$/i,
+  // "submit application" (LinkedIn/ATS) + "submit your application" (Indeed smartapply's real
+  // final-submit label — without the "your" variant it was never found → smartapply stalled on
+  // its review step, "no advance button found").
+  /^submit( your)? application$/i, /^submit$/i, /^submit & continue$/i,
   /^review your application$/i, /^review$/i,
   /^next$/i, /^continue$/i, /^continue to/i, /^proceed/i,
   /^save and continue$/i, /^save & continue$/i,

@@ -2678,6 +2678,15 @@ function classifyQueueFailure(input = {}) {
   if (state === 'done') return mk('submitted', 'complete', 'Submitted');
   if (state === 'awaiting_review') return mk('review_gate', 'user', 'Ready for review');
   if (['queued', 'scheduled', 'running'].includes(state)) return mk('in_flight', 'wait', 'In flight');
+  // RÉSUMÉ REQUIRED (LinkedIn full-page / Indeed smartapply): a résumé is genuinely needed but none
+  // could be auto-attached (no saved résumé selected, no upload control found). TERMINAL + user-
+  // actionable — re-dispatching can NEVER satisfy it. Checked BEFORE the generic missing_info /
+  // parked branch (so it gets its own honest dashboard bucket) and BEFORE the transient_page regex
+  // (whose legacy "resume attachment failed" phrasing used to send it into an endless 4× retry).
+  if (input.parkReason === 'resume_required' || input.park_reason === 'resume_required'
+      || /r[eé]sum[eé] required|resume required|add a r[eé]sum[eé]|could not find an upload control|select your .{0,20}r[eé]sum[eé]/.test(text)) {
+    return mk('resume_required', 'user', 'Résumé needed — add or select one');
+  }
   if (pending.length || state === 'parked' || state === 'awaiting_input' || /missing answer|needs your answer|no confident answer|legal\/eligibility|unanswered question/.test(text)) {
     return mk('missing_info', 'user', 'Needs your answer, then retries');
   }
