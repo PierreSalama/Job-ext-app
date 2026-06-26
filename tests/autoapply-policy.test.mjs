@@ -50,6 +50,13 @@ test('classifyQueueFailure maps failures to retry/user/inspect policy', () => {
   // terminal external skips. Their lastError is kept free of external/company-site words.
   assert.equal(db.classifyQueueFailure({ state: 'failed', last_error: 'apply form did not hydrate on a throttled/occluded tab — will retry' }).action, 'retry');
   assert.equal(db.classifyQueueFailure({ state: 'failed', last_error: 'apply handoff did not attach — page did not change; will retry' }).action, 'retry');
+  // Account-walled ATS + un-groundable external sites are TERMINAL — never re-dispatched (they'd
+  // burn the retry cap on a job that can't be auto-submitted). Even when the text contains a
+  // transient word like "stuck", the account/external check runs FIRST.
+  assert.equal(db.classifyQueueFailure({ state: 'failed', last_error: 'Workday account required — sign in once and I will continue' }).action, 'user');
+  assert.equal(db.classifyQueueFailure({ state: 'failed', last_error: 'iCIMS account/login required' }).action, 'user');
+  assert.notEqual(db.classifyQueueFailure({ state: 'failed', last_error: 'no Easy Apply opener and no drivable form appeared (visible tab)' }).action, 'retry');
+  assert.equal(db.classifyQueueFailure({ state: 'failed', last_error: "couldn't drive the company application site — needs you (stuck on a step)" }).action, 'inspect');
   // Site bot-gate (Cloudflare / CAPTCHA / verify wall, or host-cooldown park) is its OWN
   // category — distinct from a benign sign-in/captcha `site_gate` and from our-flow failures.
   assert.equal(db.classifyQueueFailure({ state: 'skipped', last_error: 'bot challenge (cloudflare) — needs human verification', park_reason: 'bot_challenge' }).failureClass, 'bot_challenge');
