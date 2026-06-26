@@ -2661,6 +2661,13 @@ function classifyQueueFailure(input = {}) {
   if (/occlud|throttl|hydrate|not top frame|not loaded|component|timed out|interrupted|page stopped|stuck|no advance|did not change|did not attach|max steps|resume attachment|résumé did not attach|could not complete/.test(text)) {
     return mk('transient_page', 'retry', 'Transient page/load issue, retries');
   }
+  // Chrome tab / MV3 service-worker teardown RACES ("No tab with id …", tab closed mid-run, the
+  // messaging port dying when the SW is evicted, an extension reload orphaning the content script).
+  // These are recoverable on the next dispatch (a fresh tab), so RETRY rather than dying as a raw
+  // terminal unknown_failure with an ugly Chrome error string. (Observed live: "No tab with id …".)
+  if (/no tab with id|no tab with the given|tab (?:was|got) closed|frame (?:was|got) removed|message port closed|receiving end does not exist|extension context invalidated/.test(text)) {
+    return mk('transient_page', 'retry', 'Browser tab/worker race, retries');
+  }
   if (/already applied|punished|excluded keyword|above your level|academic\/research|relevance skip|needs ~\d+ yrs/.test(text)) return mk('relevance_skip', 'skip', 'Skipped by rules');
   if (state === 'skipped') return mk('skipped_other', 'inspect', 'Skipped, inspectable');
   if (state === 'failed') return mk('unknown_failure', 'inspect', 'Failed, needs inspection');
