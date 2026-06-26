@@ -45,7 +45,11 @@ const NEVER_AUTOFILL_RX = /(ethnic|race\b|gender|\bsex\b|disabilit|veteran|crimi
 // them BLANK and move on instead of parking the whole job. They're almost always
 // optional, and the AI correctly refuses to invent a photo URL.
 const OPTIONAL_SKIP_RX = /(head\s?shot|profile (photo|picture|image)|upload (a )?(photo|picture|image)|\bphoto\b|\bavatar\b|picture of you|middle name|middle initial)/i;
-const CAPTCHA_RX = /captcha|verify (that )?you('| a)re (a )?human|unusual activity|are you a robot/i;
+// Challenge COPY only — NOT the bare word "captcha", which matches the benign "protected by
+// reCAPTCHA" privacy badge that Indeed and most sites embed for background form protection (the
+// live false-positive that aborted every Indeed apply). A real wall says "complete the captcha",
+// "captcha to continue", "verify you're human", "press and hold", etc.
+const CAPTCHA_RX = /(?:complete|solve|enter|pass|type)\s+(?:the\s+)?(?:security\s+)?captcha|captcha\s+(?:to continue|required|verification|challenge)|verify (that )?you('| a)re (a )?human|unusual activity|are you a robot|press (?:and|&) hold/i;
 // LinkedIn caps Easy Apply at ~50 submissions / rolling 24h. When hit it shows a modal
 // "You reached today's Easy Apply limit." Detect it so the server can cool down the
 // route and PIVOT to external/company-site jobs instead of wasting the cooldown trying.
@@ -328,10 +332,30 @@ async function waitForChange(initialHash, timeoutMs = STEP_TIMEOUT) {
   return false;
 }
 
+// A REAL, rendered, interactive captcha challenge widget — NOT the invisible-recaptcha privacy
+// BADGE ("protected by reCAPTCHA") or a 0×0 invisible/score-based widget that sites (Indeed,
+// countless ATSs) embed for BACKGROUND form protection. Shared by both captcha detectors so
+// neither false-positives on the badge and aborts a normal application.
+function hasRealCaptchaWidget() {
+  try {
+    return Array.from(document.querySelectorAll(
+      'iframe[src*="recaptcha" i], iframe[src*="hcaptcha" i], '
+      + 'iframe[title*="recaptcha" i], iframe[title*="hcaptcha" i], '
+      + '.g-recaptcha, #g-recaptcha, .h-captcha, [data-hcaptcha-widget-id], '
+      + 'iframe[src*="challenges.cloudflare.com/turnstile" i], '
+      + 'iframe[src*="arkoselabs" i], iframe[src*="funcaptcha" i]'
+    )).some((el) => {
+      if (el.closest && el.closest('.grecaptcha-badge')) return false;          // the privacy badge
+      if (el.matches && el.matches('[data-size="invisible" i]')) return false;  // invisible/score-based
+      try { const r = el.getBoundingClientRect(); return r.width >= 60 && r.height >= 30; } catch { return false; }
+    });
+  } catch { return false; }
+}
+
 function captchaOrLoginPresent() {
   const text = (document.body?.innerText || '').slice(0, 6000);
   if (CAPTCHA_RX.test(text)) return 'captcha';
-  if (document.querySelector('iframe[src*="captcha" i], iframe[src*="recaptcha" i], iframe[src*="hcaptcha" i]')) return 'captcha';
+  if (hasRealCaptchaWidget()) return 'captcha';
   const pw = qsa('input[type="password"]').filter(isProbablyVisible);
   if (pw.length && /log\s*in|sign\s*in|se connecter/i.test(text.slice(0, 2500))) return 'login';
   return null;
@@ -371,16 +395,8 @@ function detectBotChallengeOnPage() {
     // reCAPTCHA/hCaptcha/Turnstile/Arkose iframe or checkbox. Its ABSENCE on a Cloudflare gate is
     // what marks the interstitial self-clearing (safe to wait out). A bare .cf-turnstile CONTAINER
     // without its iframe is the managed/JS challenge → NOT counted as interactive here.
-    let hasInteractiveWidget = false;
-    try {
-      hasInteractiveWidget = !!document.querySelector(
-        'iframe[src*="recaptcha" i], iframe[src*="hcaptcha" i], iframe[src*="api2/anchor" i], '
-        + 'iframe[title*="recaptcha" i], iframe[title*="hcaptcha" i], '
-        + '.g-recaptcha, #g-recaptcha, .h-captcha, [data-hcaptcha-widget-id], '
-        + 'iframe[src*="challenges.cloudflare.com/turnstile" i], '
-        + 'iframe[src*="arkoselabs" i], iframe[src*="funcaptcha" i]'
-      );
-    } catch {}
+    // A REAL rendered challenge widget (shared probe; excludes the privacy badge + invisible/0×0).
+    const hasInteractiveWidget = hasRealCaptchaWidget();
     return detectBotChallenge({
       url: location.href,
       title: document.title,

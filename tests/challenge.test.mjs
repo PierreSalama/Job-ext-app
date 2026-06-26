@@ -121,20 +121,25 @@ test('self-clearing is NEVER true for an interactive captcha or a verify gate', 
   if (ver.kind === 'verify') assert.equal(ver.selfClearing, false, 'verify/unusual-traffic gates do not self-clear');
 });
 
-test('hCaptcha widget marker → blocked (captcha)', () => {
-  const r = detectBotChallenge({ ...HCAPTCHA, bodyText: HCAPTCHA.bodyText + ' ' + HCAPTCHA._extra });
+test('a captcha marker WITH a rendered interactive widget → blocked (captcha)', () => {
+  // A real hCaptcha/reCAPTCHA challenge: the marker AND an actually-rendered widget present.
+  const r = detectBotChallenge({ url: 'https://jobs.example.com/apply', title: 'Apply', bodyText: 'hcaptcha h-captcha checkbox', hasInteractiveWidget: true });
   assert.equal(r.blocked, true);
   assert.equal(r.kind, 'captcha');
 });
 
-test('recaptcha marker in URL/markup → blocked (captcha)', () => {
+test('FALSE-POSITIVE GUARD: a captcha marker with NO rendered widget is NOT blocked (the invisible-reCAPTCHA badge)', () => {
+  // Indeed and most sites embed the "protected by reCAPTCHA" privacy BADGE + an invisible/score-based
+  // widget for BACKGROUND form protection — there is NO challenge to solve. Marker present, no
+  // interactive widget, no challenge copy → must NOT block. This false positive aborted EVERY Indeed
+  // apply as bot_challenge ("captcha widget marker" on a normal smartapply page).
   const r = detectBotChallenge({
-    url: 'https://jobs.example.com/apply',
-    title: 'Apply',
-    bodyText: 'Please complete the reCAPTCHA. <div class="g-recaptcha"></div>',
+    url: 'https://smartapply.indeed.com/beta/indeedapply/form/questions',
+    title: 'Apply: Backend Engineer | Indeed',
+    bodyText: 'Add your information. Full name. Email address. protected by reCAPTCHA · Privacy · Terms.',
+    hasInteractiveWidget: false,
   });
-  assert.equal(r.blocked, true);
-  assert.equal(r.kind, 'captcha');
+  assert.equal(r.blocked, false, `badge-only must NOT block (got ${r.kind}: ${r.reason})`);
 });
 
 test('press-and-hold human-verify wall → blocked (captcha)', () => {

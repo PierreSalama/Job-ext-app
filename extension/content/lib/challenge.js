@@ -92,8 +92,14 @@ export function detectBotChallenge({ url, title, bodyText, hasRayId, statusHint,
   }
 
   // --- CAPTCHA ---
-  if (CAPTCHA_MARKER_RX.test(blob) || CAPTCHA_TEXT_RX.test(hay)) {
-    const why = CAPTCHA_MARKER_RX.test(blob) ? 'captcha widget marker' : 'captcha challenge copy';
+  // A bare MARKER (the strings "recaptcha"/"hcaptcha"/… appearing in the page) is NOT a challenge.
+  // Indeed and countless job pages embed INVISIBLE/score-based reCAPTCHA for background form
+  // protection — its privacy BADGE ("protected by reCAPTCHA") is visible text that the old check
+  // matched, aborting EVERY Indeed apply as bot_challenge on a totally normal page. Block ONLY on
+  // real challenge COPY ("verify you are human" / "press and hold") OR a REAL rendered interactive
+  // widget (hasInteractiveWidget — a visible reCAPTCHA/hCaptcha/Turnstile, never the badge/invisible).
+  if (CAPTCHA_TEXT_RX.test(hay) || (CAPTCHA_MARKER_RX.test(blob) && interactive)) {
+    const why = CAPTCHA_TEXT_RX.test(hay) ? 'captcha challenge copy' : 'captcha widget';
     return { blocked: true, kind: 'captcha', reason: why, selfClearing: false };
   }
 
