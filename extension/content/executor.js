@@ -518,33 +518,46 @@ function findLinkedInApplyAdvanceButton() {
   }
   return null;
 }
+// RADIO-AWARE field count: visible fields PLUS each hidden-radio/checkbox GROUP counted by its
+// VISIBLE affordance (the styled label/option), not the 0×0 native input. This is what lets a
+// radios-ONLY apply step (LinkedIn "Additional Questions"; Indeed smartapply screening like "Are you
+// legally eligible to work…" / "ok with 3 days/week in office") be recognized as a form instead of
+// grounding root=none and getting "Continue" clicked past the unanswered required radios.
+function countApplyFieldsRadioAware(el) {
+  try {
+    const n = qsa(APPLY_FIELD_SEL, el).filter(isProbablyVisible).length;
+    const groups = new Set();
+    for (const r of qsa('input[type="radio"], input[type="checkbox"]', el)) {
+      const aff = r.closest('fieldset, [role="radiogroup"], [role="group"], [data-test-form-builder-radio-button-form-component], [class*="selectable-option"], label') || r;
+      if (isProbablyVisible(aff)) groups.add(r.name || aff);
+    }
+    return n + groups.size;
+  } catch { return 0; }
+}
+// Structurally ground a full-page apply step: walk UP from the visible advance button to the first
+// field-bearing, nav-free ancestor. Host-neutral (LinkedIn full-page + Indeed smartapply share the
+// pattern: no modal, obfuscated classes, hidden radios, a Next/Continue/Review/Submit button).
+function deriveRadioAwareApplyRoot(btn) {
+  if (!btn) return null;
+  return deriveApplyRootFromAdvanceButton(btn, {
+    parentOf: (el) => el.parentElement,
+    countFields: countApplyFieldsRadioAware,
+    hasNav: (el) => { try { return !!el.querySelector?.(APPLY_NAV_SEL); } catch { return false; } },
+  });
+}
 function findLinkedInApplyPageRoot() {
   if (!/(^|\.)linkedin\.com$/i.test(location.hostname)) return null;
   // Only the /apply/ route is the full-page flow; the plain job page is the opener's domain.
   if (!isLinkedInEasyApplyApplyUrl(location.pathname)) return null;
-  const btn = findLinkedInApplyAdvanceButton();
-  if (!btn) return null;
-  return deriveApplyRootFromAdvanceButton(btn, {
-    parentOf: (el) => el.parentElement,
-    countFields: (el) => {
-      try {
-        let n = qsa(APPLY_FIELD_SEL, el).filter(isProbablyVisible).length;
-        // LinkedIn renders Yes/No screening radios as a 0×0 native <input type=radio> hidden behind a
-        // styled label — invisible to the count above, so a page whose ONLY controls are radio
-        // questions (the "Additional Questions" step: work-auth / sponsorship / degree) grounded
-        // root=none, haveForm went false, and the radios were NEVER scanned/filled — the executor then
-        // clicked "Review" past the unanswered required radios and looped. Count each radio/checkbox
-        // GROUP by its VISIBLE affordance (the styled label/option), not the hidden native input.
-        const groups = new Set();
-        for (const r of qsa('input[type="radio"], input[type="checkbox"]', el)) {
-          const aff = r.closest('fieldset, [role="radiogroup"], [role="group"], [data-test-form-builder-radio-button-form-component], [class*="selectable-option"], label') || r;
-          if (isProbablyVisible(aff)) groups.add(r.name || aff);
-        }
-        return n + groups.size;
-      } catch { return 0; }
-    },
-    hasNav: (el) => { try { return !!el.querySelector?.(APPLY_NAV_SEL); } catch { return false; } },
-  });
+  return deriveRadioAwareApplyRoot(findLinkedInApplyAdvanceButton());
+}
+// Indeed smartapply analog: its questions steps render Yes/No screening radios the same hidden way,
+// and there's no LinkedIn /apply/ guard — so a radios-only smartapply step grounded root=none and the
+// executor clicked "Continue" past the unanswered radios (live: "Choose an option to continue"). This
+// grounds it radio-aware so the radios are scanned + answered before advancing.
+function findSmartApplyPageRoot() {
+  if (!/(^|\.)smartapply\.indeed\.com$/i.test(location.hostname)) return null;
+  return deriveRadioAwareApplyRoot(findLinkedInApplyAdvanceButton());
 }
 
 // LinkedIn shows intermediate modals between the Easy-Apply opener and the real
@@ -2071,12 +2084,17 @@ export async function run(task, context, helpers) {
     }
     const probedRoot = formProbe?.form || null;
     const onLinkedIn = /(^|\.)linkedin\.com$/i.test(location.hostname);
+    const onSmartApply = /(^|\.)smartapply\.indeed\.com$/i.test(location.hostname);
     // KEYSTONE: the new FULL-PAGE Easy Apply flow has no modal dialog. When findApplyDialog()
     // misses, recognise the /jobs/view/<id>/apply/ full-page form structurally (the visible
     // Next/Review/Submit button's field-bearing, nav-free ancestor). This is the root the
     // existing fill + F1 advance logic then drives. The old-modal `dialog` still WINS when a
     // real modal is present (search/collections split-view) so BOTH layouts work.
-    const applyPageRoot = (onLinkedIn && !dialog) ? findLinkedInApplyPageRoot() : null;
+    // Structural grounding when there's no modal: LinkedIn full-page /apply/ OR Indeed smartapply
+    // (its radios-only screening steps grounded root=none without this → "Continue" clicked blindly).
+    const applyPageRoot = (!dialog && onLinkedIn) ? findLinkedInApplyPageRoot()
+      : (!dialog && onSmartApply) ? findSmartApplyPageRoot()
+        : null;
     // OPENER → NAVIGATION recognition: the full-page opener NAVIGATES to .../apply/ instead
     // of opening an in-place modal. The moment the live URL is the /apply/ route, the form is
     // "opened" — latch everHadForm so the opener is NEVER re-clicked (this excludes the opener
