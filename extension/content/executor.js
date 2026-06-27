@@ -3148,6 +3148,28 @@ export async function run(task, context, helpers) {
           report({ state: 'failed', lastError: 'résumé did not attach (LinkedIn says it is required) — will retry' });
           finalState = 'failed'; break;
         }
+        // [DIAGNOSTIC] Stuck with NO detected blocker/field (parked + resumeBlocked already handled
+        // above) — the page won't advance but our scan found nothing to answer. On Indeed smartapply
+        // this is the dominant convertible loss: a required control the scanner can't see. Dump a
+        // compact inventory of EVERY control on the form so the next run reveals exactly what was
+        // missed (type, required, value-state, visibility, size) + iframe count (fields may be nested).
+        try {
+          const scope = root || document;
+          const ctrls = qsa('input:not([type="hidden"]), select, textarea, [role="combobox"], [role="radiogroup"], [role="radio"], [role="checkbox"], [contenteditable="true"]', scope);
+          const inv = ctrls.slice(0, 30).map((el) => {
+            const tag = (el.tagName || '').toLowerCase();
+            const type = el.getAttribute?.('type') || el.getAttribute?.('role') || '';
+            let lbl = '';
+            try { lbl = compactText(el.getAttribute?.('aria-label') || el.closest?.('label, fieldset, [class*="form"], [data-testid]')?.querySelector?.('label, legend')?.textContent || el.name || '').slice(0, 36); } catch {}
+            const req = (el.required || el.getAttribute?.('aria-required') === 'true') ? '!' : '';
+            const state = el.value ? 'val' : (el.checked ? 'chk' : (el.getAttribute?.('aria-checked') === 'true' ? 'chk' : '-'));
+            const vis = isProbablyVisible(el) ? 'v' : 'h';
+            let sz = ''; try { const b = el.getBoundingClientRect(); sz = `${Math.round(b.width)}x${Math.round(b.height)}`; } catch {}
+            return `${tag}/${type}${req} "${redactLabel(lbl)}" ${state} ${vis} ${sz}`;
+          });
+          let iframes = 0; try { iframes = qsa('iframe', scope).length; } catch {}
+          vlog('stuck-dump', `path=${pagePathOf()} controls=${ctrls.length} iframes=${iframes} :: ${inv.join(' | ')}`);
+        } catch {}
         // Report the SPECIFIC blocker (what was on screen), not a generic "stuck", so we
         // know exactly which field to resolve next.
         const why = blockerText ? `blocked: ${blockerText} — will retry` : 'stuck on a step (page stopped advancing) — will retry';
