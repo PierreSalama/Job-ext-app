@@ -35,6 +35,7 @@ let emailWarmup = null;
 let isQuitting = false;
 let suspended = false;       // machine asleep → pause all background work
 let maintenanceInterval = null;
+let ghostSweepInterval = null;
 let discoveryService = null;
 let keepAwakeId = null;
 let pipelineWatchdogInterval = null;
@@ -642,6 +643,22 @@ app.whenReady().then(async () => {
   setTimeout(() => { try { db.maintenance(); } catch (e) { log.warn('maintenance failed', e.message); } }, 25000);
   maintenanceInterval = setInterval(() => { try { db.maintenance(); } catch (e) { log.warn('maintenance failed', e.message); } }, 24 * 3600 * 1000);
 
+  // GHOSTING sweep: a submitted job with no inbox response after N days → 'ghosted'. Only meaningful
+  // when we're MONITORING the inbox (Gmail/IMAP on) — otherwise "no response" just means "not
+  // watched". Runs shortly after launch + every 6h.
+  const runGhostSweep = () => {
+    try {
+      const s = db.getSettings();
+      const monitoring = !!(s.gmail && s.gmail.enabled) || ((s.email && Array.isArray(s.email.accounts) && s.email.accounts.length) > 0);
+      if (!monitoring) return;
+      const days = Number(s.gmail && s.gmail.ghostAfterDays) || 28;
+      const r = db.sweepGhosted({ days });
+      if (r && r.swept) { log.info(`ghost sweep: ${r.swept} job(s) → ghosted (no response in ${days}d)`); broadcast('jobs.updated', { action: 'ghost-sweep' }); }
+    } catch (e) { log.warn('ghost sweep failed', e.message); }
+  };
+  setTimeout(runGhostSweep, 35000);
+  ghostSweepInterval = setInterval(runGhostSweep, 6 * 3600 * 1000);
+
   // Laptop-friendly: pause all background work while the machine sleeps; resume on
   // wake (each sync resumes from its own cursor, so nothing is lost or doubled).
   try {
@@ -670,6 +687,7 @@ app.on('will-quit', () => {
   if (updateInterval) clearInterval(updateInterval);
   if (autoInstallTimer) clearInterval(autoInstallTimer);
   if (backupInterval) clearInterval(backupInterval);
+  if (ghostSweepInterval) clearInterval(ghostSweepInterval);
   if (gmailInterval) clearInterval(gmailInterval);
   if (emailInterval) clearInterval(emailInterval);
   if (emailWarmup) clearTimeout(emailWarmup);

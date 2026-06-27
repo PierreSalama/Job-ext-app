@@ -1387,6 +1387,26 @@ function patchJobInner(id, patch) {
   return { job: getJob(id), previousStatus: cur.status, statusChanged: cur.status !== status };
 }
 
+// GHOSTING sweep: a job that was SUBMITTED but got NO response after `days` is ghosted — a real
+// pipeline outcome the user wants surfaced. Only still-'submitted' jobs are swept: any reply would
+// have elevated them (contacted/interview/offer) or a rejection email would have set 'rejected', so
+// remaining 'submitted' past the threshold means silence. submitted_at (fallback updated_at) older
+// than the cutoff → terminal 'ghosted'. Idempotent + forward (never touches a job that already moved).
+function sweepGhosted({ days = 28 } = {}) {
+  const n = Math.max(7, Number(days) || 28);
+  const cutoff = new Date(Date.now() - n * 86400000).toISOString();
+  const rows = all(`SELECT id FROM jobs WHERE status = 'submitted' AND COALESCE(submitted_at, updated_at) < ?`, [cutoff]);
+  let swept = 0;
+  for (const r of rows) {
+    const res = patchJob(r.id, { status: 'ghosted' });
+    if (res?.statusChanged) {
+      recordEvent({ jobId: r.id, type: 'status_changed', source: 'ghost-sweep', summary: `submitted → ghosted (no response in ${n}d)`, data: { from: 'submitted', to: 'ghosted', days: n } });
+      swept++;
+    }
+  }
+  return { swept, scanned: rows.length };
+}
+
 function deleteJob(id) {
   const r = run('DELETE FROM jobs WHERE id = ?', [id]);
   return (r?.changes ?? 0) > 0;
@@ -4321,7 +4341,7 @@ function getTeachScreenshotPath(id) {
 module.exports = {
   open, close, backupNow, dailyBackup, maintenance, transaction,
   getSettings, patchSettings, normalizeAutoApply, kvGet, kvSet,
-  listJobs, getJob, upsertJob, patchJob, deleteJob, stats, activityTrend,
+  listJobs, getJob, upsertJob, patchJob, deleteJob, sweepGhosted, stats, activityTrend,
   listEvents, listRecentEvents, recordEvent,
   qaRecord, qaLookup, qaList, answerMemory, qaDelete, normalizeQuestion, guessLocale,
   profileFieldUpsert, profileFieldList, profileFieldSet, profileFieldDelete,

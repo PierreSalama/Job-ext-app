@@ -103,6 +103,14 @@ test('classification precedence: a LinkedIn "application was sent to X" is a con
   // a REAL interview invite still classifies as interview
   assert.equal(email.classify('Interview invitation — Software Engineer', 'please pick a time'), 'interview');
   assert.equal(email.classify('Next steps', "We'd like to schedule a call with you"), 'interview');
+  // LIVE FALSE-POSITIVE (CMiC): a RECEIPT email ("submitted successfully" + "copy of your
+  // application") with interview/next-step boilerplate in the body must be a confirmation, NOT a
+  // first interview. The strong-receipt RX pre-empts interview.
+  assert.equal(email.classify('Thanks for applying to CMiC', 'Your application for the Software Engineer - API job was submitted successfully. Here\'s a copy of your application data. Our hiring team will review and may invite you to an interview.'), 'application_confirmation');
+  // broadened rejection coverage (the ones Pierre saw that weren\'t caught)
+  assert.equal(email.classify('Update on your application', 'We have decided to pursue other candidates for this role.'), 'rejection');
+  assert.equal(email.classify('Your application', "We won't be moving forward with your application at this time."), 'rejection');
+  assert.equal(email.classify('Application update', 'You have not been selected for this position.'), 'rejection');
 });
 
 test('detects ALL pipeline statuses from realistic EMPLOYER emails → correct category → correct status', () => {
@@ -195,4 +203,19 @@ test('pickEmailJob prompt carries a strict schema and the none (-1) option', () 
   assert.equal(p.kind, 'pick-email-job');
   assert.deepEqual(p.schema.required, ['index', 'confidence', 'reason']);
   assert.match(p.prompt, /-1 \(none\)|index -1/i, 'instructs the model it may return none');
+});
+
+test('sweepGhosted: a stale submitted job (no response) → ghosted; recent + non-submitted untouched', () => {
+  const old = new Date(Date.now() - 40 * 86400000).toISOString();
+  const recent = new Date(Date.now() - 3 * 86400000).toISOString();
+  const stale = db.upsertJob({ externalId: 'gh-stale', title: 'Stale', company: 'GhostCo', source: 'linkedin', status: 'submitted', jobUrl: 'https://x/ghstale', submittedAt: old }).job;
+  const fresh = db.upsertJob({ externalId: 'gh-fresh', title: 'Fresh', company: 'GhostCo', source: 'linkedin', status: 'submitted', jobUrl: 'https://x/ghfresh', submittedAt: recent }).job;
+  const started = db.upsertJob({ externalId: 'gh-start', title: 'Started', company: 'GhostCo', source: 'linkedin', status: 'started', jobUrl: 'https://x/ghstart' }).job;
+  const r = db.sweepGhosted({ days: 28 });
+  assert.ok(r.swept >= 1, 'at least the stale one was swept');
+  assert.equal(db.getJob(stale.id).status, 'ghosted', 'stale submitted with no response → ghosted');
+  assert.equal(db.getJob(fresh.id).status, 'submitted', 'recently-submitted job is NOT ghosted');
+  assert.equal(db.getJob(started.id).status, 'started', 'a non-submitted job is never ghosted');
+  // idempotent: a second sweep ghosts nothing new
+  assert.equal(db.sweepGhosted({ days: 28 }).swept, 0, 'second sweep is a no-op');
 });

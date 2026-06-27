@@ -105,7 +105,17 @@ async function testConnection(a) {
 // ---------- classify (category for the UI) ----------
 const CATEGORY_RX = [
   ['offer', /job offer|offer letter|pleased to offer|like to offer|offer(?:ing)? you (?:the |a |this )?(?:role|position|job|opportunity)|extend(?:ing)? an offer|congratulations[^.]*offer/i],
-  ['rejection', /unfortunately|we regret|not (?:moving|move) forward|decided (?:not to|to not)|other candidates|will not be proceeding|position (?:has been|is) filled|no longer under consideration/i],
+  // Broadened (Pierre saw rejections that weren't being caught): add the common closers
+  // — "pursue other candidates", "won't be moving forward", "moved forward with another",
+  // "not selected/chosen", "not a fit at this time", "position is no longer available".
+  ['rejection', /unfortunately|we regret|regret to inform|not (?:moving|move|be moving) forward|won'?t be moving forward|move(?:d|) forward with (?:other|another)|decided (?:not to|to not|to (?:proceed|move forward) with (?:other|another))|(?:other|another) candidate|pursu(?:e|ing) (?:other|another) (?:candidate|applicant)|will not be proceeding|position (?:has been|is) filled|filled the (?:position|role)|no longer (?:under consideration|available)|not (?:been )?(?:selected|chosen) (?:for|to|at)|not (?:a |the )?(?:right )?(?:fit|match) (?:at this time|for (?:this|the))/i],
+  // STRONG application RECEIPT — pre-empts the interview/assessment false-positives below. A receipt
+  // ("your application was submitted/received successfully", "here's a copy of your application") is
+  // an acknowledgement, NOT an invite — but its boilerplate footer often contains interview/next-step
+  // language that tripped the strict interview RX (live: CMiC "Thanks for applying … submitted
+  // successfully" was mis-staged as a first interview). A real interview/assessment invite never
+  // states the application was just submitted, so this is safe to check first.
+  ['application_confirmation', /application (?:was |has been )(?:submitted|received)(?: successfully)?|(?:here'?s |attached is )?a copy of your application|copy of your application data|we have received your application|your application (?:for [^.\n]{0,80} )?(?:was|has been) submitted/i],
   // Checked BEFORE interview so a coding challenge / take-home / online test is its OWN stage
   // ('assessment') rather than being lumped into 'interview' — the user wants this surfaced.
   ['assessment', /online assessment|coding (?:challenge|assessment|test|exercise)|take[- ]?home|hackerrank|codility|codesignal|\bkattis\b|technical (?:assessment|test|exercise)|complete (?:the |a |an )?(?:assessment|test|challenge|exercise)|skills?(?: |-)?(?:test|assessment)|aptitude test/i],

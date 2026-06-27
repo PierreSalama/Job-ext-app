@@ -1423,15 +1423,24 @@ route(/^\/applications\/(?<id>.+)$/, async ({ id }) => {
   const emailData = isNew ? { matched: [], suggested: [] } : (await api('/emails?jobId=' + encodeURIComponent(id)).catch(() => ({ matched: [], suggested: [] })));
   const j = job || {};
 
-  const emailRow = (e, mode) => `<div class="mail-row" data-email="${esc(e.id)}">
+  // Deep-link a synced email back to the real message in the user's Gmail. rfc822msgid: searches by
+  // the RFC-822 Message-ID header (most reliable across accounts); thread id is the fallback. Opened
+  // via target=_blank → the desktop app's will-navigate handler sends it to the default browser.
+  const gmailLink = (e) => {
+    const mid = String(e.messageId || '').replace(/[<>]/g, '').trim();
+    if (mid) return 'https://mail.google.com/mail/u/0/#search/' + encodeURIComponent('rfc822msgid:' + mid);
+    if (e.threadId) return 'https://mail.google.com/mail/u/0/#all/' + encodeURIComponent(e.threadId);
+    return null;
+  };
+  const emailRow = (e, mode) => { const gl = gmailLink(e); return `<div class="mail-row" data-email="${esc(e.id)}">
       <div class="mail-head"><span class="out-chip cat-${esc(e.category || 'other')}">${esc(String(e.category || 'other').replace(/_/g, ' '))}</span>
-        <span class="mail-subj">${esc(e.subject || '(no subject)')}</span></div>
+        ${gl ? `<a class="mail-subj" href="${esc(gl)}" target="_blank" rel="noopener" title="Open in Gmail">${esc(e.subject || '(no subject)')} ↗</a>` : `<span class="mail-subj">${esc(e.subject || '(no subject)')}</span>`}</div>
       <div class="mail-sub muted">${esc(e.fromName || e.from || '')} · ${esc(fmtRel(e.sentAt))}${e.matchConfidence ? ` · ${Math.round(e.matchConfidence * 100)}% match` : ''}</div>
       ${e.snippet ? `<div class="mail-snip muted">${esc(e.snippet)}</div>` : ''}
-      <div class="mail-actions">${mode === 'suggested'
+      <div class="mail-actions">${gl ? `<a class="btn small" href="${esc(gl)}" target="_blank" rel="noopener">Open in Gmail ↗</a> ` : ''}${mode === 'suggested'
         ? `<button class="btn small primary" data-email-confirm="${esc(e.id)}">Yes, link it</button> <button class="btn small" data-email-dismiss="${esc(e.id)}">Not this</button>`
         : `<button class="btn small" data-email-unlink="${esc(e.id)}">Unlink</button>`}</div>
-    </div>`;
+    </div>`; };
   const emailPanelHtml = isNew ? '<div class="muted">Save the application first.</div>' : `
     ${(emailData.matched || []).length ? (emailData.matched).map((e) => emailRow(e, 'matched')).join('') : '<div class="muted" style="font-size:13px">No emails matched yet. Connect your inbox in Settings → it auto-links replies here.</div>'}
     ${(emailData.suggested || []).length ? `<div class="mail-suggest-head">Suggested — does this belong to this job?</div>${emailData.suggested.map((e) => emailRow(e, 'suggested')).join('')}` : ''}
