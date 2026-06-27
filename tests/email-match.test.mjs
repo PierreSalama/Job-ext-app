@@ -219,3 +219,16 @@ test('sweepGhosted: a stale submitted job (no response) → ghosted; recent + no
   // idempotent: a second sweep ghosts nothing new
   assert.equal(db.sweepGhosted({ days: 28 }).swept, 0, 'second sweep is a no-op');
 });
+
+test('reprocessEmails ALWAYS elevates a matched email even when its category is UNCHANGED (historical catch-up)', () => {
+  const job = db.upsertJob({ externalId: 'rej-hist', title: 'Dev', company: 'RejCo', source: 'linkedin', status: 'started', jobUrl: 'https://x/rejhist' }).job;
+  db.emailUpsert({ accountId: 'a1', uid: 900, messageId: '<rej-hist@rejco.com>', from: 'no-reply@rejco.com',
+    subject: 'Update on your application', body: 'unfortunately we are moving forward with other candidates', sentAt: iso(),
+    matchedJobId: job.id, matchConfidence: 0.9, matchSource: 'auto', category: 'rejection' });
+  // The job is still 'started' — the email matched in an old sync but never elevated the board.
+  assert.equal(db.getJob(job.id).status, 'started');
+  // Reprocess with an IDENTITY matchFn (category unchanged) must STILL elevate → rejected.
+  const r = db.reprocessEmails((e) => ({ matchedJobId: e.matchedJobId, matchSource: e.matchSource, matchConfidence: e.matchConfidence, category: e.category }));
+  assert.ok(r.elevated >= 1, 'at least one matched email elevated its job');
+  assert.equal(db.getJob(job.id).status, 'rejected', 'a matched rejection elevates the job even with an unchanged category');
+});

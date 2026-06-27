@@ -3608,20 +3608,25 @@ function jobsForMatching() {
 // user-pinned rows (match_source manual/dismissed). matchFn(email) → { category, matchedJobId,
 // matchConfidence, matchSource }. Returns { processed, changed }.
 function reprocessEmails(matchFn) {
-  let processed = 0, changed = 0;
+  let processed = 0, changed = 0, elevated = 0;
   for (const row of all("SELECT * FROM emails WHERE match_source IS NULL OR match_source IN ('auto','suggested')")) {
     processed++;
     let a; try { a = matchFn(rowToEmail(row)); } catch { continue; }
     if (!a) continue;
     const cat = a.category || row.category, mj = a.matchedJobId || null, ms = a.matchSource || null, mc = a.matchConfidence || 0;
-    if (cat === row.category && mj === row.matched_job_id && ms === row.match_source) continue;
-    run('UPDATE emails SET category=?, matched_job_id=?, match_confidence=?, match_source=? WHERE id=?', [cat, mj, mc, ms, row.id]);
-    changed++;
-    // Reflect the match in the pipeline: elevate the job's stage from the email category
-    // (forward-only). Without this, reprocess/sync links emails but the board never moves.
-    if (mj && (ms === 'auto' || ms === 'manual')) { try { elevateJobFromEmailRow({ matched_job_id: mj, category: cat, match_source: ms }); } catch {} }
+    if (cat !== row.category || mj !== row.matched_job_id || ms !== row.match_source) {
+      run('UPDATE emails SET category=?, matched_job_id=?, match_confidence=?, match_source=? WHERE id=?', [cat, mj, mc, ms, row.id]);
+      changed++;
+    }
+    // ALWAYS elevate a matched auto/manual email — NOT only when the row changed. A rejection/
+    // interview that was correctly classified in an OLD sync but never moved the board (the email
+    // integration predates per-match elevation) stays mis-staged forever otherwise: the category is
+    // unchanged on reprocess, so the old "skip unchanged" guard never elevated it. elevateJobFromEmailRow
+    // is forward-only + idempotent, so re-running on already-correct jobs is a no-op (the live bug: a
+    // matched rejection email left its job at 'started' / 'submitted' instead of 'rejected').
+    if (mj && (ms === 'auto' || ms === 'manual')) { try { if (elevateJobFromEmailRow({ matched_job_id: mj, category: cat, match_source: ms })) elevated++; } catch {} }
   }
-  return { processed, changed };
+  return { processed, changed, elevated };
 }
 
 // ============================================================
