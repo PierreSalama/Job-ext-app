@@ -13,7 +13,7 @@
 // questions only ever come from the profile, never the AI (enforced by the
 // prompt server-side AND a local guard here).
 
-import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput, isFillable, radioGroupLabel, isSiteChromeInput, bestFuzzyIndex } from './autofill.js';
+import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput, isFillable, radioGroupLabel, selectGroupLabel, isSiteChromeInput, bestFuzzyIndex } from './autofill.js';
 import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
 import { pageTextLooksLikeSuccess, urlLooksLikeSuccess, evaluateSubmitEvidence } from './signals/success.js';
@@ -1415,8 +1415,8 @@ export async function run(task, context, helpers) {
       //    the field offers options (so a select/radio with "Yes, I am" still resolves).
       if (answer == null && isEligibilityScreeningQuestion(u.label)) {
         const opts = Array.isArray(u.options) ? u.options : [];
-        const yesText = opts.find((o) => /^\s*yes\b/i.test(o)) || 'Yes';
-        const noText = opts.find((o) => /^\s*no\b/i.test(o)) || 'No';
+        const yesText = opts.find((o) => /^\s*(yes|oui|s[ií]|ja)\b/i.test(o)) || 'Yes';
+        const noText = opts.find((o) => /^\s*(no|non|nein)\b/i.test(o)) || 'No';
         answer = groundedEligibilityAnswer(u.label, { authorizedToWork, yesText, noText });
         // [TRACE 8] grounded-eligibility default applied from the profile (never invented).
         if (answer != null) {
@@ -1481,7 +1481,11 @@ export async function run(task, context, helpers) {
         const key = isRadio ? `radio:${el.name || el.id || ''}` : (el.id || el.name || `f${fieldRefs.length}`);
         if (seen.has(key)) continue;
         seen.add(key);
-        const label = (isRadio ? radioGroupLabel(el) : '') || fieldLabel(el) || el.getAttribute('aria-label') || el.name || '';
+        // Radios use ONLY the recovered group prompt (never the "yes yes q_<id>" fieldLabel
+        // fallback); selects use the prompt-recovering resolver; everything else fieldLabel.
+        const label = isRadio
+          ? radioGroupLabel(el)
+          : (el.tagName === 'SELECT' ? selectGroupLabel(el) : fieldLabel(el)) || el.getAttribute('aria-label') || el.name || '';
         if (!label) continue;
         let options = null;
         if (el.tagName === 'SELECT') options = Array.from(el.options).map((o) => (o.textContent || '').trim()).filter(Boolean).slice(0, 20);
@@ -1491,7 +1495,12 @@ export async function run(task, context, helpers) {
         const reportedValue = (el.type === 'checkbox' || el.type === 'radio')
           ? (el.checked ? 'checked' : (isRadio ? (qsa('input[type="radio"]', root).some((r) => r.name === el.name && r.checked) ? 'checked' : '') : ''))
           : String(el.value || '').slice(0, 40);
-        fieldRefs.push({ el, label: String(label).slice(0, 160), type: el.type || el.tagName.toLowerCase(), required: !!(el.required || el.getAttribute('aria-required') === 'true'), value: reportedValue, options });
+        // Required also inferred from the prompt container/text (smartapply's loose radios carry no
+        // input.required) so the rescue treats them as blocking, same as scanUnknown.
+        const required = !!(el.required || el.getAttribute('aria-required') === 'true'
+          || el.closest?.('[aria-required="true"], [class*="required" i], [data-required]')
+          || /[*]|\brequired\b|\brequis\b|\bobligatoire\b/i.test(label));
+        fieldRefs.push({ el, label: String(label).slice(0, 160), type: el.type || el.tagName.toLowerCase(), required, value: reportedValue, options });
       } catch {}
     }
     const btnRefs = qsa('button, [role="button"], input[type="submit"], a[role="button"]', root)
@@ -2322,6 +2331,24 @@ export async function run(task, context, helpers) {
     }
     for (const u of unknown) {
       if (S.cancelled) break;
+      // GROUNDED ELIGIBILITY FIRST (any language), BEFORE the LEGAL_RX gate. LEGAL_RX's
+      // "work.*authoriz" misses the common "authorized to work" word order (and all French/Spanish
+      // phrasings), so those eligibility Qs used to fall through to the AI. isEligibilityScreeningQuestion
+      // is PRECISE (full-phrase EN/FR/ES), so grounding here answers them TRUTHFULLY from the profile
+      // without risking a non-eligibility false-park. Non-eligibility legal/sensitive Qs still fall to
+      // the LEGAL_RX park below.
+      if (isEligibilityScreeningQuestion(u.label) && authorizedToWork != null) {
+        const eopts = Array.isArray(u.options) ? u.options : [];
+        const yesText = eopts.find((o) => /^\s*(yes|oui|s[ií]|ja)\b/i.test(o)) || 'Yes';
+        const noText = eopts.find((o) => /^\s*(no|non|nein)\b/i.test(o)) || 'No';
+        const eg = groundedEligibilityAnswer(u.label, { authorizedToWork, yesText, noText });
+        if (eg != null && await engine.fill([{ input: u.input, value: eg }])) {
+          vlog('screen', `grounded-eligibility "${redactLabel(u.label)}" = ${redactValue(eg, u.label)} (authorizedToWork=${authorizedToWork})`);
+          logLine('ok', `answered eligibility "${u.label.slice(0, 40)}" → ${eg} (from your work authorization)`);
+          try { await engine.recordAnswer({ question: u.label, answer: eg, fieldType: u.fieldType, source: 'profile', jobId: job?.id }); } catch {}
+          continue;
+        }
+      }
       if (LEGAL_RX.test(u.label)) {
         // Legal/eligibility questions NEVER go to AI. But the well-known work-auth / sponsorship
         // screening Qs are TRUTHFULLY grounded from the profile (authorizedToWork) — answer those
@@ -2333,8 +2360,10 @@ export async function run(task, context, helpers) {
         let grounded = null;
         if (isEligibilityScreeningQuestion(u.label)) {
           const opts = Array.isArray(u.options) ? u.options : [];
-          const yesText = opts.find((o) => /^\s*yes\b/i.test(o)) || 'Yes';
-          const noText = opts.find((o) => /^\s*no\b/i.test(o)) || 'No';
+          // Language-aware: a French (Oui/Non) or Spanish (Sí/No) smartapply radio resolves to its
+          // OWN option string so the grounded answer matches (else "Yes" wouldn't match "Oui").
+          const yesText = opts.find((o) => /^\s*(yes|oui|s[ií]|ja)\b/i.test(o)) || 'Yes';
+          const noText = opts.find((o) => /^\s*(no|non|nein)\b/i.test(o)) || 'No';
           grounded = groundedEligibilityAnswer(u.label, { authorizedToWork, yesText, noText });
         }
         if (grounded != null && await engine.fill([{ input: u.input, value: grounded }])) {
@@ -3169,6 +3198,34 @@ export async function run(task, context, helpers) {
           });
           let iframes = 0; try { iframes = qsa('iframe', scope).length; } catch {}
           vlog('stuck-dump', `path=${pagePathOf()} controls=${ctrls.length} iframes=${iframes} :: ${inv.join(' | ')}`);
+        } catch {}
+        // DIAG (smartapply/React prompt recovery): if we're stuck and there are radio/select groups
+        // whose QUESTION prompt we could NOT resolve, dump a VALUE-FREE structural skeleton of each
+        // (tag/class/role/aria-labelledby + own text only — never input values) so the next live run
+        // reveals the real markup to tune the walk-up. Never-debug-blindly safety net: the fixtures
+        // are inferred from the symptom; this confirms against reality.
+        try {
+          const dscope = root || document;
+          const seenG = new Set();
+          const skel = [];
+          for (const el of qsa('input[type="radio"], select', dscope)) {
+            if (!isFillable(el) || isSiteChromeInput(el)) continue;
+            const gk = el.type === 'radio' ? `r:${el.name || ''}` : `s:${el.id || el.name || ''}`;
+            if (seenG.has(gk)) continue;
+            seenG.add(gk);
+            const lbl = el.type === 'radio' ? radioGroupLabel(el) : selectGroupLabel(el);
+            if (lbl && lbl.length >= 4) continue;   // prompt resolved fine — not a problem case
+            const chain = [];
+            let n = el, d = 0;
+            while (n && d++ < 5) {
+              const ownText = Array.from(n.childNodes || []).filter((c) => c.nodeType === 3).map((c) => c.textContent).join(' ').replace(/\s+/g, ' ').trim().slice(0, 50);
+              chain.push({ tag: (n.tagName || '').toLowerCase(), cls: (n.getAttribute?.('class') || '').slice(0, 50), role: n.getAttribute?.('role') || undefined, lblby: n.getAttribute?.('aria-labelledby') || undefined, txt: ownText || undefined });
+              n = n.parentElement;
+            }
+            skel.push({ g: gk, type: el.type || 'select', chain });
+            if (skel.length >= 4) break;
+          }
+          if (skel.length) vlog('prompt-unresolved', `${skel.length} group(s) with no recoverable question prompt: ` + JSON.stringify(skel).slice(0, 1400));
         } catch {}
         // Report the SPECIFIC blocker (what was on screen), not a generic "stuck", so we
         // know exactly which field to resolve next.

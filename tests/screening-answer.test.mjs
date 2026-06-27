@@ -32,6 +32,33 @@ test('isEligibilityScreeningQuestion: matches the well-known work-eligibility sc
   }
 });
 
+// i18n: Indeed smartapply screening questions are often French (or Spanish). Once the prompt is
+// recovered, the grounded default must still recognise + answer them across language.
+test('isEligibilityScreeningQuestion: matches French + Spanish work-eligibility questions', () => {
+  for (const q of [
+    'Êtes-vous légalement autorisé à travailler au Canada?',
+    'Êtes-vous autorisée à travailler au Canada pour tout employeur?',
+    'Avez-vous le droit de travailler au Canada?',
+    'Aurez-vous besoin d’un parrainage pour un visa de travail, maintenant ou à l’avenir?',
+    'Avez-vous besoin de parrainage?',
+    '¿Está autorizado para trabajar en este país?',
+    '¿Tiene derecho a trabajar aquí?',
+  ]) {
+    assert.equal(isEligibilityScreeningQuestion(q), true, `expected eligibility: "${q}"`);
+  }
+});
+
+test('groundedEligibilityAnswer: French — authorized user answers Oui to "autorisé à travailler", Non to "parrainage"', () => {
+  assert.equal(
+    groundedEligibilityAnswer('Êtes-vous autorisé à travailler au Canada?', { authorizedToWork: true, yesText: 'Oui', noText: 'Non' }),
+    'Oui',
+  );
+  assert.equal(
+    groundedEligibilityAnswer('Aurez-vous besoin d’un parrainage pour un visa de travail?', { authorizedToWork: true, yesText: 'Oui', noText: 'Non' }),
+    'Non',
+  );
+});
+
 test('isEligibilityScreeningQuestion: does NOT match non-eligibility questions (left to profile/qa/AI)', () => {
   for (const q of [
     'Are you comfortable commuting to this job’s location?',

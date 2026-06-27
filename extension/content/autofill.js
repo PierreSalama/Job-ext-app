@@ -57,7 +57,20 @@ export function fieldLabel(input) {
     input.placeholder,
     input.name,
   ];
-  const raw = sources.filter(Boolean).join(' ').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 300);
+  let raw = sources.filter(Boolean).join(' ').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 300);
+  // Collapse an EXACT "A A" doubling (two label sources — e.g. previousElementSibling AND the
+  // parent's [class*=label] — returned the same heading), which otherwise reads as gibberish and
+  // lowers AI answer confidence. Only the exact two-identical-halves case, so a label that
+  // genuinely repeats a word is never altered.
+  { const h = raw.length >> 1; if (raw.length % 2 === 1 && raw[h] === ' ' && raw.slice(0, h) === raw.slice(h + 1)) raw = raw.slice(0, h); }
+  // Strip TRAILING field-id noise that smartapply (Indeed) and other React ATS leave on the
+  // label when the real prompt isn't aria-wired: "languages * <uuid>_1_language",
+  // "… fluency_english", "referred by (name) q_<hex>". Left in, it drowns the real text and
+  // tanks AI answer confidence (the Indeed 0-submission root cause). END-ANCHORED, looped to
+  // peel a stacked tail ("<uuid>_1_language"), and only while ≥4 meaningful chars remain so a
+  // legitimate label is never truncated mid-string.
+  let prev;
+  do { prev = raw; raw = raw.replace(/[\s*]*(?:q_[0-9a-f]{8,}|[0-9a-f]{8}-[0-9a-f-]{12,}|_\d+_[a-z]+|fluency_[a-z]+)$/i, '').trim(); } while (raw !== prev && raw.length >= 4);
   // Return the clean label only. (Previously returned `raw + ' ' + stripAccents(raw)`,
   // which doubled every label — "search" became "search search" — making parked
   // questions read as gibberish to the user AND lowering the AI's answer confidence
@@ -72,12 +85,94 @@ function idRefText(root, ids) {
     .join(' ').trim();
 }
 
+// Field-id / option-value shapes that must NEVER be emitted as a question label. Deliberately
+// NARROW — id shapes + EXACT option-text equality only, never a length or generic-word
+// heuristic — so it can't reject a real (even short) question. `optionTexts` is the lowered
+// set of the group's own option strings.
+export function isLikelyOptionOrId(text, optionTexts) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!t || t.length < 2) return true;
+  if (/^(yes|no|oui|non|s[ií]|si|ja|nein|true|false|y|n|n\/?a)$/i.test(t)) return true;          // a bare option word
+  if (/\bq_[0-9a-f]{12,}\b/.test(t)) return true;                                                  // smartapply field id (q_<hex>)
+  if (/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/.test(t)) return true;     // uuid
+  if (/_\d+_[a-z]+$/.test(t) || /\bfluency_[a-z]+$/.test(t)) return true;                          // _1_language / fluency_english
+  if (optionTexts && optionTexts.has(t)) return true;                                              // exact option text
+  return false;
+}
+
+// The visible option text of a single radio (its <label> text minus the input, id-stripped).
+// Used both to build the AI's option list and as the prompt-walk-up blacklist.
+function optionLabelText(r) {
+  try {
+    let t = '';
+    const lab = r.closest?.('label');
+    if (lab) { const c = lab.cloneNode(true); c.querySelectorAll?.('input,select,textarea').forEach((n) => n.remove()); t = c.textContent; }
+    t = String(t || r.getAttribute?.('aria-label') || r.value || '').replace(/\s+/g, ' ').trim();
+    t = t.replace(/[\s*]*(?:q_[0-9a-f]{8,}|_\d+_[a-z]+)$/i, '').trim();   // drop a trailing field-id if the label was empty
+    return t.slice(0, 60);
+  } catch { return ''; }
+}
+
+function optionTextsForGroup(input, root) {
+  const set = new Set();
+  try {
+    if (input.type === 'radio' && input.name) {
+      for (const r of qsa(`input[type="radio"][name="${cssEscape(input.name)}"]`, root)) {
+        const t = optionLabelText(r).toLowerCase();
+        if (t) set.add(t);
+      }
+    }
+  } catch {}
+  return set;
+}
+
+// Generic question-prompt finder for a group whose prompt is NOT aria-wired (Indeed smartapply
+// & many React ATS: no <fieldset>, no [role=radiogroup], no aria-labelledby — the question is a
+// plain heading/label sitting ABOVE the option row). Find the smallest ancestor that holds the
+// whole group, then climb a few levels; at each level take the prompt-shaped element CLOSEST
+// BEFORE the first control in document order whose text is clean (not an option/id). Pure DOM;
+// returns '' when nothing clean is found (the caller then never falls back to the dirty
+// fieldLabel for radios — better a clean skip than asking the AI a non-question).
+const PROMPT_SEL = 'legend, [role="heading"], h1, h2, h3, h4, h5, h6, label, [class*="label" i], [class*="question" i], [class*="prompt" i], [class*="title" i], [class*="legend" i], p';
+function promptWalkUp(input, optionTexts) {
+  try {
+    const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const root = input.getRootNode?.() || document;
+    const opts = optionTexts || optionTextsForGroup(input, root);
+    const members = (input.type === 'radio' && input.name)
+      ? qsa(`input[type="radio"][name="${cssEscape(input.name)}"]`, root)
+      : [input];
+    const first = members[0] || input;
+    let container = input.parentElement, g = 0;
+    while (container && g++ < 10 && !members.every((m) => container.contains?.(m))) container = container.parentElement;
+    container = container || input.parentElement || input;
+    let node = container, climbs = 0;
+    while (node && climbs++ < 6) {
+      let best = '';
+      for (const el of qsa(PROMPT_SEL, node)) {
+        if (el.querySelector?.('input, select, textarea')) continue;          // a wrapper / option label, not the prompt
+        const pos = el.compareDocumentPosition?.(first) || 0;
+        if (!(pos & 4 /* first FOLLOWS el → el is before the control */)) continue;
+        const t = norm(el.textContent);
+        if (t.length < 4 || isLikelyOptionOrId(t, opts)) continue;
+        best = t;                                                              // doc order → keep the LAST (closest preceding)
+      }
+      if (best) return best.slice(0, 250);
+      if (node.tagName === 'FORM' || node.tagName === 'BODY') break;
+      node = node.parentElement;
+    }
+  } catch {}
+  return '';
+}
+
 // The QUESTION for a radio group — NOT the per-option "Yes"/"No" label. LinkedIn/
 // Greenhouse render Yes/No screening questions as a <fieldset><legend>question</legend>
 // (or a [role="radiogroup"]/[role="group"] with aria-label/labelledby), and each radio's
 // own <label> is just "Yes"/"No". Using fieldLabel(input) there returns "yes" (3 chars),
 // which scanUnknown drops (length<4) → the question is never asked → stuck on Review.
-// Walk up to the group to recover the real question text.
+// Walk up to the group to recover the real question text. The structured branches below run
+// FIRST (LinkedIn/Greenhouse path, unchanged); only when they yield nothing do the generic
+// smartapply/React paths run — so LinkedIn never reaches the new code.
 export function radioGroupLabel(input) {
   const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
   const fs = input.closest?.('fieldset');
@@ -94,7 +189,23 @@ export function radioGroupLabel(input) {
     const lab = norm(grp.querySelector?.('legend, [class*="fb-dash-form-element__label"], label, [class*="label"], [class*="Label"]')?.textContent);
     if (lab.length >= 4) return lab;
   }
-  return '';
+  // ── smartapply / React (no fieldset/role/aria-wiring) ──
+  const root = input.getRootNode?.() || document;
+  const opts = optionTextsForGroup(input, root);
+  const ilb = input.getAttribute?.('aria-labelledby');
+  if (ilb) { const t = norm(idRefText(root, ilb)); if (t.length >= 4 && !isLikelyOptionOrId(t, opts)) return t.slice(0, 250); }
+  return promptWalkUp(input, opts);
+}
+
+// The QUESTION for a <select> whose label isn't formally associated (smartapply's
+// "languages * <uuid>_1_language" / "fluency_english" — the field-id leaks through as the
+// label). A clean direct label wins (covers labelled selects everywhere incl. LinkedIn);
+// only an id-shaped direct label triggers the generic prompt walk-up.
+export function selectGroupLabel(input) {
+  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const direct = norm(fieldLabel(input));
+  if (direct.length >= 4 && !isLikelyOptionOrId(direct, null) && !/_\d+_[a-z]+$|q_[0-9a-f]{12,}|[0-9a-f]{8}-[0-9a-f]{4}/.test(direct)) return direct.slice(0, 250);
+  return promptWalkUp(input, null) || direct.slice(0, 250);
 }
 
 function cssEscape(s) {
@@ -509,8 +620,15 @@ export class AutofillEngine {
         continue;
       }
       // For radios, the per-option <label> is just "Yes"/"No" — use the group's
-      // legend/question instead so the screening question is actually surfaced.
-      const label = (input.type === 'radio' ? radioGroupLabel(input) : '') || fieldLabel(input);
+      // legend/question instead so the screening question is actually surfaced. Radios NEVER
+      // fall back to fieldLabel (that produced the "yes yes q_<id>" garbage on smartapply →
+      // the AI got a non-question → parked every Indeed job). SELECTs use the prompt-recovering
+      // resolver (id-shaped names → heading walk-up). A radio with no recoverable prompt is
+      // skipped (length<4 below) rather than asked with garbage.
+      let label;
+      if (input.type === 'radio') label = radioGroupLabel(input);
+      else if (input.tagName === 'SELECT') label = selectGroupLabel(input);
+      else label = fieldLabel(input);
       if (!label || label.length < 4) continue;
       if (NEVER_AUTOFILL_RX.test(label)) continue;
       // (Generic site-search / global-search typeahead inputs are already skipped above
@@ -524,13 +642,19 @@ export class AutofillEngine {
       // (which blocked "Review"/"Next" → the "stuck on a step" failure).
       if (input.type !== 'radio' && profileFieldFor(label, profile || {})) continue;
       if (await this.lookupAnswer(label)) continue;
-      const required = input.required || input.getAttribute('aria-required') === 'true';
+      // Required-detection: smartapply's loose Yes/No radios carry NO input.required/aria-required
+      // (the marker lives on the prompt container), so they read as "optional" and the recover
+      // path — which only grounds REQUIRED fields — skipped them → eligibility never answered.
+      // ADDITIVE-OR with the prompt-container / prompt-text marker so they're treated as blocking.
+      const required = input.required || input.getAttribute('aria-required') === 'true'
+        || !!input.closest?.('[aria-required="true"], [class*="required" i], [data-required]')
+        || /[*]|\brequired\b|\brequis\b|\bobligatoire\b/i.test(label);
       let options = null;
       if (input.tagName === 'SELECT') {
         options = Array.from(input.options).map((o) => (o.textContent || '').trim()).filter((t) => t && !/^select|^choose|^--/i.test(t)).slice(0, 30);
       } else if (input.type === 'radio' && input.name) {
         options = qsa(`input[type="radio"][name="${cssEscape(input.name)}"]`, rootEl || document)
-          .map((r) => fieldLabel(r).split(' ').slice(0, 8).join(' ')).filter(Boolean).slice(0, 12);
+          .map((r) => optionLabelText(r)).filter(Boolean).slice(0, 12);
       }
       out.push({ input, label: label.slice(0, 250), required, fieldType: input.type || input.tagName.toLowerCase(), options });
     }
@@ -602,7 +726,12 @@ export class AutofillEngine {
     for (const input of this.fields(rootEl)) {
       if (!isFillable(input)) continue;
       if (input.type === 'radio' && !input.checked) continue;   // only the chosen option
-      const label = (input.type === 'radio' ? radioGroupLabel(input) : '') || fieldLabel(input);
+      // Use the prompt-recovering resolver so the qa key is the real question (not "yes yes
+      // q_<id>") — that's what makes a smartapply screening answer REUSABLE across jobs.
+      let label;
+      if (input.type === 'radio') label = radioGroupLabel(input);
+      else if (input.tagName === 'SELECT') label = selectGroupLabel(input);
+      else label = fieldLabel(input);
       if (!label || label.length < 3) continue;
       if (NEVER_AUTOFILL_RX.test(label)) continue;
       let value = '';

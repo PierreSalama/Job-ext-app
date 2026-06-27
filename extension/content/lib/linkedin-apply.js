@@ -254,8 +254,11 @@ export function pageRequiresResume(text) {
 // whose truthful answer is fully determined by the user's stated work authorization — so
 // when the profile/qa store DIDN'T already answer them we may apply a GROUNDED default
 // (never a fabrication). Anything outside this set is left to profile/qa/AI or parked.
-const ELIGIBILITY_AUTHORIZED_RX = /(legally\s+)?authori[sz]ed\s+to\s+work|eligible\s+to\s+work|right\s+to\s+work|work\s+(?:permit|authori[sz]ation)\b|are\s+you\s+(?:legally\s+)?(?:authori[sz]ed|eligible|permitted)\s+to\s+work/i;
-const ELIGIBILITY_SPONSOR_RX = /(require|need|seek).{0,30}(sponsor|visa)|sponsor(ship)?\b.{0,30}(require|need|now or in the future)|(now or in the future).{0,30}sponsor/i;
+// EN + FR + ES. Indeed smartapply screening questions are often French ("Êtes-vous autorisé à
+// travailler au Canada?") or Spanish; once the prompt is recovered the grounded default must
+// still match across language so the eligibility radio is answered, not parked.
+const ELIGIBILITY_AUTHORIZED_RX = /(legally\s+)?authori[sz]ed\s+to\s+work|eligible\s+to\s+work|right\s+to\s+work|work\s+(?:permit|authori[sz]ation)\b|are\s+you\s+(?:legally\s+)?(?:authori[sz]ed|eligible|permitted)\s+to\s+work|autoris[ée]{0,2}\s+(?:à|a|de|pour)\s+travailler|admissible\s+(?:à|a)\s+travailler|droit\s+de\s+travailler|permis\s+de\s+travail|habilit[ée]{0,2}\s+(?:à|a)\s+travailler|autorizad[oa]\s+(?:a|para)\s+trabajar|derecho\s+a\s+trabajar|elegible\s+para\s+trabajar/i;
+const ELIGIBILITY_SPONSOR_RX = /(require|need|seek).{0,30}(sponsor|visa)|sponsor(ship)?\b.{0,30}(require|need|now or in the future)|(now or in the future).{0,30}sponsor|(?:besoin|exiger|exigez|requ[ié]|requerr|n[ée]cessit|aurez|avez)\b.{0,30}(?:parrainage|visa)|(?:parrainage|visa)\b.{0,30}(?:maintenant|futur|avenir|pr[ée]sent)|\bparrainage\b|\bpatrocinio\b/i;
 
 // Decide a GROUNDED answer for a well-known work-eligibility screening question, given
 // what the profile already tells us. Returns a string answer (e.g. 'Yes'/'No') or null
