@@ -51,11 +51,25 @@ test('LinkedIn: a full combo (remote + fresh + easy-apply + geo)', () => {
   assert.match(url, /f_TPR=r7200/);
 });
 
-test('Indeed: keeps &l=<geo> (empty → country) and coarse fromage in DAYS', () => {
+test('Indeed: uses the COUNTRY Indeed host so cities resolve in the right country (Canada → ca.indeed.com)', () => {
   const url = buildSearchUrl('indeed', 'dev', '', { country: 'Canada', freshnessSeconds: 3600 });
-  assert.match(url, /^https:\/\/www\.indeed\.com\/jobs/);
+  // Was www.indeed.com (US) → "north york" geocoded to North York, PA → zero results. Must be ca.indeed.com.
+  assert.match(url, /^https:\/\/ca\.indeed\.com\/jobs/);
   assert.match(url, /[?&]l=Canada(?:&|$)/, 'empty location clamped to country');
   assert.match(url, /[?&]fromage=1(?:&|$)/, 'sub-day tier clamps to 1 day');
+});
+
+test('Indeed: a Canadian CITY resolves on the Canadian site (north york → ca.indeed.com, not US)', () => {
+  const url = buildSearchUrl('indeed', 'application developer', 'north york', { country: 'Canada' });
+  assert.match(url, /^https:\/\/ca\.indeed\.com\/jobs/);
+  assert.match(url, /[?&]l=north%20york(?:&|$)/);
+  assert.doesNotMatch(url, /www\.indeed\.com/, 'never the US host for a Canadian search');
+});
+
+test('Indeed: country host map (US → www, UK → uk, unknown → ca default)', () => {
+  assert.match(buildSearchUrl('indeed', 'dev', 'Austin', { country: 'United States' }), /^https:\/\/www\.indeed\.com\//);
+  assert.match(buildSearchUrl('indeed', 'dev', 'London', { country: 'UK' }), /^https:\/\/uk\.indeed\.com\//);
+  assert.match(buildSearchUrl('indeed', 'dev', 'Toronto', {}), /^https:\/\/ca\.indeed\.com\//);   // default country = Canada
 });
 
 test('Indeed: remote folds into the single 0kf attribute group with easy-apply (no duplicate &sc)', () => {

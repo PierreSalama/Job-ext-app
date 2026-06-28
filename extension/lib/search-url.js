@@ -15,6 +15,20 @@ import { tierToIndeedDays } from './freshness.js';
 
 const LINKEDIN_WT = { onsite: '1', remote: '2', hybrid: '3' };
 
+// Indeed runs a separate site per COUNTRY, and the `l=` location text geocodes WITHIN that site.
+// Using www.indeed.com (US) for a Canadian search resolved "North York" to North York, PA → zero
+// results (confirmed live). Pick the country's Indeed host so cities resolve in the right country.
+const INDEED_HOSTS = {
+  canada: 'ca.indeed.com', ca: 'ca.indeed.com',
+  'united states': 'www.indeed.com', usa: 'www.indeed.com', us: 'www.indeed.com', america: 'www.indeed.com',
+  'united kingdom': 'uk.indeed.com', uk: 'uk.indeed.com', 'great britain': 'uk.indeed.com',
+  australia: 'au.indeed.com', india: 'in.indeed.com', ireland: 'ie.indeed.com', germany: 'de.indeed.com', france: 'fr.indeed.com',
+};
+function indeedHost(country) {
+  const c = String(country || '').trim().toLowerCase();
+  return INDEED_HOSTS[c] || 'ca.indeed.com';   // default to Canada (the user's market)
+}
+
 function normModes(workModes) {
   const order = ['remote', 'hybrid', 'onsite'];
   const set = new Set((Array.isArray(workModes) ? workModes : []).map((m) => String(m).trim().toLowerCase()));
@@ -42,7 +56,7 @@ function buildSearchUrl(board, keyword, location, opts = {}) {
     const sc = attrs.length ? `&sc=0kf%3A${attrs.join('')}%3B` : '';
     // Coarse freshness: Indeed only does whole days. Default to 7 when no ramp tier given.
     const fromage = freshnessSeconds != null ? tierToIndeedDays(freshnessSeconds) : 7;
-    return `https://www.indeed.com/jobs?q=${kw}&sort=date&fromage=${fromage}${sc}&l=${loc}`;
+    return `https://${indeedHost(country)}/jobs?q=${kw}&sort=date&fromage=${fromage}${sc}&l=${loc}`;
   }
   if (board === 'glassdoor') {
     // Glassdoor has no public easy-apply-only URL filter (drivability sorted post-scrape).
