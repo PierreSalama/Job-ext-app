@@ -20,10 +20,24 @@ const FALLBACK_STATUSES = new Set(['blocked', 'rate_limited', 'parser_drift', 't
 // but a saturated niche keeps refilling from older not-yet-seen postings instead of grinding to zero.
 const FRESH_BASE_SEC = 259200;                                 // 72h floor (the prior static behavior)
 const FRESH_WIDE_TIERS = [259200, 604800, 1209600, 2592000];  // 72h → 7d → 14d → 30d
+const FRESH_WIDEST_SEC = FRESH_WIDE_TIERS[FRESH_WIDE_TIERS.length - 1];   // 30d
+const SATURATION_WINDOW_MS = 6 * 3600 * 1000;                 // no NEW accept in 6h ⇒ saturated
 function widerFreshTier(sec) {
   const i = FRESH_WIDE_TIERS.indexOf(Number(sec));
   if (i === -1) return FRESH_BASE_SEC;
   return FRESH_WIDE_TIERS[Math.min(i + 1, FRESH_WIDE_TIERS.length - 1)];
+}
+// The EFFECTIVE scan window for a combo this tick. The stored tier still climbs one step per dry
+// scan, but climbing 72h→30d takes 4 dry visits and — with one combo scanned per tick across
+// hundreds of combos — that's ~16h of wall-clock before a saturated combo ever scans the 30d
+// window where aged-but-unseen jobs live (the live "accepted:0 forever" symptom). So: a BRAND-NEW
+// combo (no stored tier) starts at the 72h floor (newest-first); a SATURATED combo (scanned before
+// but no NEW accept in >6h) jumps STRAIGHT to the 30d window on its NEXT visit; a recently-
+// productive combo keeps its climbed tier. `nowMs` is injectable for tests.
+function effectiveFreshTier(storedSec, lastNewAtMs, nowMs = Date.now()) {
+  if (storedSec == null || storedSec === '') return FRESH_BASE_SEC;            // never scanned → newest-first
+  if (!lastNewAtMs || (nowMs - Number(lastNewAtMs)) > SATURATION_WINDOW_MS) return FRESH_WIDEST_SEC; // saturated → widest
+  return Number(storedSec) || FRESH_BASE_SEC;                                  // recently productive → keep climbing
 }
 const activeChildren = new Set();
 
@@ -246,18 +260,25 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
         // Per-combo freshness tier: a saturated combo widens its window so it keeps surfacing
         // older, not-yet-seen postings instead of re-finding the same duplicates at a fixed 72h.
         const tierKey = `freshTier:${source}|${query.keyword}|${query.location}`;
-        const tierSec = Number(db.kvGet(tierKey)) || FRESH_BASE_SEC;
+        const lastNewKey = `freshLastNew:${source}|${query.keyword}|${query.location}`;
+        const stored = db.kvGet(tierKey);                       // null = never scanned
+        const lastNew = Number(db.kvGet(lastNewKey)) || 0;      // ms of the last NEW-accept
+        const tierSec = effectiveFreshTier(stored, lastNew);   // jump saturated combos straight to 30d
         const done = await searchBoard({
           source, keyword: query.keyword, location: query.location, country, remote,
           limit: Math.max(10, Math.min(50, Number(aa.discovery?.perRunLimit) || 25)), force,
           hoursOld: Math.round(tierSec / 3600),
         });
-        // Ramp AFTER the scan: found NEW (accepted>0) → reset to the 72h floor (re-hammer fresh);
-        // a DRY scan (0 new on an ok/empty result — NOT a provider error) → widen one tier (cap 30d).
+        // Ramp AFTER the scan: found NEW (accepted>0) → reset to the 72h floor (re-hammer fresh) AND
+        // stamp freshLastNew=now so saturation is measured from real yield; a DRY scan (0 new on an
+        // ok/empty result — NOT a provider error) → widen the STORED tier one step (cap 30d).
         try {
           const acc = Number(done?.accepted) || 0;   // discoveryBatchGet maps accepted_count → accepted
           const errored = done?.status && !['ok', 'empty'].includes(done.status);
-          if (!errored) db.kvSet(tierKey, acc > 0 ? FRESH_BASE_SEC : widerFreshTier(tierSec));
+          if (!errored) {
+            db.kvSet(tierKey, acc > 0 ? FRESH_BASE_SEC : widerFreshTier(Number(stored) || FRESH_BASE_SEC));
+            if (acc > 0) db.kvSet(lastNewKey, Date.now());
+          }
         } catch {}
         return done;
       }));
@@ -282,4 +303,4 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
   return { runTick, searchBoard, start, stop, isRunning: () => running };
 }
 
-module.exports = { normalizeJobSpyRecord, classifyProviderError, planner, selectBoards, defaultRunner, runWithCandidates, workerCandidates, createDiscoveryService };
+module.exports = { normalizeJobSpyRecord, classifyProviderError, planner, selectBoards, defaultRunner, runWithCandidates, workerCandidates, createDiscoveryService, effectiveFreshTier, widerFreshTier, FRESH_BASE_SEC, FRESH_WIDEST_SEC };

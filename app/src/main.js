@@ -117,6 +117,20 @@ function createWindow() {
     log.error('renderer gone:', (details && details.reason) || '?', '— reloading the dashboard');
     try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.reload(); } catch {}
   });
+  // HEAP OBSERVABILITY — the dashboard renderer OOM-crashes over hours; we can't profile it
+  // remotely, so sample the renderer's JS heap + DOM size + current route every 60s. A climbing
+  // usedJSHeapSize toward jsHeapSizeLimit (and which route it grows on) pinpoints the leak for the
+  // next fix instead of guessing. Cheap, read-only, and torn down with the window.
+  const heapTimer = setInterval(async () => {
+    try {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      const m = await mainWindow.webContents.executeJavaScript(
+        '({h:(performance.memory&&performance.memory.usedJSHeapSize)||0,lim:(performance.memory&&performance.memory.jsHeapSizeLimit)||0,route:location.hash||"#/",nodes:document.getElementsByTagName("*").length})',
+        true);
+      if (m && m.h) log.info(`[heap] used=${Math.round(m.h / 1048576)}MB/${Math.round(m.lim / 1048576)}MB nodes=${m.nodes} route=${m.route}`);
+    } catch {}
+  }, 60000);
+  mainWindow.on('closed', () => { try { clearInterval(heapTimer); } catch {} });
   mainWindow.on('unresponsive', () => {
     log.warn('window unresponsive — reloading the dashboard');
     try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.reload(); } catch {}

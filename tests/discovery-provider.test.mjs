@@ -38,6 +38,28 @@ test('query planner rotates keyword and location profiles deterministically', ()
   assert.deepEqual(discovery.planner(settings, 3), { keyword: 'analyst', location: 'Remote', nextIndex: 0 });
 });
 
+test('effectiveFreshTier: brand-new combo starts at the 72h floor (newest-first)', () => {
+  // No stored tier yet (never scanned) → 72h regardless of lastNew.
+  assert.equal(discovery.effectiveFreshTier(null, 0), discovery.FRESH_BASE_SEC);
+  assert.equal(discovery.effectiveFreshTier('', 0), discovery.FRESH_BASE_SEC);
+  assert.equal(discovery.effectiveFreshTier(undefined, Date.now()), discovery.FRESH_BASE_SEC);
+});
+
+test('effectiveFreshTier: a SATURATED combo (no NEW accept in >6h) jumps straight to the 30d window', () => {
+  const now = 1_000_000_000_000;
+  // stored at 7d but last new accept was 7h ago → saturated → widest (30d), not a slow climb.
+  assert.equal(discovery.effectiveFreshTier(604800, now - 7 * 3600 * 1000, now), discovery.FRESH_WIDEST_SEC);
+  // scanned before but NEVER produced a new accept (lastNew=0) → saturated → widest.
+  assert.equal(discovery.effectiveFreshTier(259200, 0, now), discovery.FRESH_WIDEST_SEC);
+});
+
+test('effectiveFreshTier: a recently-productive combo keeps its climbed tier (climb preserved)', () => {
+  const now = 1_000_000_000_000;
+  // last new accept 1h ago → not saturated → use the stored tier as-is.
+  assert.equal(discovery.effectiveFreshTier(604800, now - 1 * 3600 * 1000, now), 604800);
+  assert.equal(discovery.effectiveFreshTier(259200, now - 60 * 1000, now), 259200);
+});
+
 test('selectBoards keeps LinkedIn + Indeed when easyApplyOnly is ON, drops pure aggregators', () => {
   const all = ['linkedin', 'indeed', 'glassdoor', 'zip_recruiter', 'google'];
   // easyApplyOnly ON → LinkedIn (Easy Apply) + Indeed (Indeed-Apply → smartapply); aggregators dropped.
@@ -143,7 +165,10 @@ test('freshness ramp: a SATURATED combo widens 72h→7d→14d→30d, then resets
     discovery: { enabled: true, intervalMinutes: 5, refillBelow: 9999, perRunLimit: 10 },
   } });
   db.kvSet('discoveryPlannerIndex', 0); db.kvSet('discoveryBoardIndex', 0);
-  db.kvSet('freshTier:linkedin|frontend developer|toronto', 259200);  // start at the 72h floor
+  const TK = 'freshTier:linkedin|frontend developer|toronto';
+  const LK = 'freshLastNew:linkedin|frontend developer|toronto';
+  db.kvSet(TK, 259200);            // start at the 72h floor
+  db.kvSet(LK, Date.now());        // RECENTLY productive → climb step-by-step (not the saturation jump)
   const hoursSeen = [];
   let dry = true;   // simulate a saturated combo: 0 new ingested
   const svc = discovery.createDiscoveryService({
@@ -151,14 +176,21 @@ test('freshness ramp: a SATURATED combo widens 72h→7d→14d→30d, then resets
     ingestJobs: async () => ({ enqueued: dry ? 0 : 1, duplicates: dry ? 1 : 0, rejected: 0 }),
   });
   const tick = () => svc.runTick({ force: true });   // force bypasses the interval throttle
+  // While the combo was recently productive (freshLastNew < 6h), a dry scan climbs ONE tier per tick.
   await tick(); assert.equal(hoursSeen.at(-1), 72, 'starts at the 72h floor');
   await tick(); assert.equal(hoursSeen.at(-1), 168, 'dry → widens to 7d');
   await tick(); assert.equal(hoursSeen.at(-1), 336, 'dry → widens to 14d');
   await tick(); assert.equal(hoursSeen.at(-1), 720, 'dry → widens to 30d');
   await tick(); assert.equal(hoursSeen.at(-1), 720, 'capped at 30d');
   dry = false;                 // the combo now surfaces fresh jobs
-  await tick();                // this scan ingests new → resets the tier to the floor
+  await tick();                // this scan ingests new → resets the tier to the floor + stamps freshLastNew
   await tick(); assert.equal(hoursSeen.at(-1), 72, 'resets to 72h after finding fresh jobs');
+  // SATURATED (no NEW accept in > 6h): even sitting at the 72h floor, the combo jumps STRAIGHT to the
+  // 30d window on its next visit — it no longer takes ~4 dry visits / ~16h to reach the aged inventory.
+  dry = true;
+  db.kvSet(TK, 259200);
+  db.kvSet(LK, Date.now() - 7 * 3600 * 1000);
+  await tick(); assert.equal(hoursSeen.at(-1), 720, 'saturated (>6h since a new accept) → jumps straight to 30d');
 });
 
 test('runTick self-throttles to the configured interval (anti subprocess-storm)', async () => {
