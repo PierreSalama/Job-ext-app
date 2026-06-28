@@ -1,6 +1,6 @@
 {
   "name": "jat11",
-  "version": "11.67.0",
+  "version": "11.68.0",
   "private": true,
   "type": "module",
   "description": "Job Application Tracker v11 â€” workspace root (extension + Electron app + tooling). See README.md.",

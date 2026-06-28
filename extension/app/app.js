@@ -1944,10 +1944,20 @@ route('/queue', async () => {
         ${t.job?.jobUrl ? `<a class="btn small" href="${esc(t.job.jobUrl)}" target="_blank" rel="noopener">Open job</a>` : ''}
         <button class="btn small" data-act="delete">Remove</button>
       </div>
-      <div class="transcript" hidden><div class="transcript-entries">
-        ${(t.transcript || []).map((e2) => `<div class="tr-line"><span class="tr-ts">${esc((e2.ts || '').slice(11, 19))}</span><span class="tr-body ${esc(e2.level || '')}">${esc(e2.text || e2.note || JSON.stringify(e2))}</span></div>`).join('')}
-      </div></div>
+      <div class="transcript" hidden><div class="transcript-entries"></div></div>
     </div>`;
+
+  // OOM FIX: render a task's transcript lines LAZILY (only when its panel is first opened). Rendering
+  // every task's full transcript into hidden DOM up front built ~233k nodes on the queue page (live
+  // [heap] log: 82 → 233,551 nodes in 60s on #/queue) → the renderer OOM-crashed. Cap at the last 200
+  // lines so one huge transcript can't bloat the DOM either.
+  const fillTranscript = (card, t) => {
+    const box = card.querySelector('.transcript-entries');
+    if (!box || box.dataset.filled === '1') return;
+    const lines = (t?.transcript || []).filter((e2) => e2 && (e2.text || e2.note)).slice(-200);
+    box.innerHTML = lines.map((e2) => `<div class="tr-line"><span class="tr-ts">${esc((e2.ts || '').slice(11, 19))}</span><span class="tr-body ${esc(e2.level || '')}">${esc(e2.text || e2.note || JSON.stringify(e2))}</span></div>`).join('');
+    box.dataset.filled = '1';
+  };
 
   const groupsHtml = [...groups.entries()]
     .filter(([, list]) => list.length)
@@ -2439,7 +2449,7 @@ route('/queue', async () => {
     card.addEventListener('contextmenu', (e) => contextMenu(e, [
       t && ['failed', 'skipped', 'awaiting_input'].includes(t.state) && { label: 'Retry', run: async () => { await api('/queue/' + encodeURIComponent(taskId), { method: 'PATCH', body: { state: 'queued', lastError: null } }); navigate(); } },
       t && ['queued', 'scheduled', 'running'].includes(t.state) && { label: 'Cancel', run: async () => { await api('/queue/' + encodeURIComponent(taskId), { method: 'PATCH', body: { state: 'skipped' } }); navigate(); } },
-      t?.transcript?.length && { label: 'Show transcript', run: () => { const tr = card.querySelector('.transcript'); tr.hidden = !tr.hidden; } },
+      t?.transcript?.length && { label: 'Show transcript', run: () => { const tr = card.querySelector('.transcript'); if (tr.hidden) fillTranscript(card, t); tr.hidden = !tr.hidden; } },
       t?.job?.jobUrl && { label: 'Open job posting', run: () => window.open(t.job.jobUrl, '_blank', 'noopener') },
       { sep: true },
       { label: 'Remove', danger: true, run: async () => { await api('/queue/' + encodeURIComponent(taskId), { method: 'DELETE' }); navigate(); } },
@@ -2449,6 +2459,7 @@ route('/queue', async () => {
       try {
         if (act === 'transcript') {
           const t2 = card.querySelector('.transcript');
+          if (t2.hidden) fillTranscript(card, t);   // lazy: build transcript DOM only when first opened
           t2.hidden = !t2.hidden;
           return;
         }
