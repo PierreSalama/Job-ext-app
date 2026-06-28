@@ -1978,20 +1978,28 @@ export async function run(task, context, helpers) {
       logLine('info', 'Cloudflare interstitial — waiting for it to clear itself (no interaction)…');
       setStatus('Cloudflare check — waiting for it to clear…');
       const cf0 = Date.now();
-      let cfCleared = false;
-      while (Date.now() - cf0 < 15000 && !S.cancelled) {
+      // A no-widget "checking your browser" JS challenge resolves ITSELF given time — but the apply
+      // tab runs in the BACKGROUND, so Chrome throttles its timers/JS and the challenge can take far
+      // longer than the old 15s. Wait up to 45s (still no interaction, no fronting, no widget-solve).
+      // Re-probe each tick: clear the instant it passes; bail the instant a REAL interactive widget
+      // appears (a managed/Turnstile challenge we will NOT solve). Log WHY the wait ended so we learn
+      // whether Indeed's wall ever self-clears or always needs a click (→ then Indeed is unwinnable).
+      const CF_WAIT_MS = 45000;
+      let cfCleared = false, cfExit = 'timeout';
+      while (Date.now() - cf0 < CF_WAIT_MS && !S.cancelled) {
         await sleep(2000);
         const c2 = detectBotChallengeOnPage();
-        if (!c2.blocked) { cfCleared = true; break; }
-        if (!c2.selfClearing) break;   // a real interactive widget rendered → stop; park below
+        if (!c2.blocked) { cfCleared = true; cfExit = 'cleared'; break; }
+        if (!c2.selfClearing) { cfExit = 'interactive-widget-appeared'; break; }   // managed/Turnstile widget → can't pass without solving
       }
+      vlog('challenge', `cloudflare self-clear wait ended: ${cfExit} after ${Math.round((Date.now() - cf0) / 1000)}s`);
       if (cfCleared) {
         logLine('ok', 'Cloudflare interstitial cleared on its own — continuing the application');
-        report({ transcriptAppend: { kind: 'recovery', note: 'self-clearing Cloudflare interstitial cleared on a no-touch wait — resuming' } });
+        report({ transcriptAppend: { kind: 'recovery', note: `self-clearing Cloudflare interstitial cleared on a no-touch wait (${Math.round((Date.now() - cf0) / 1000)}s) — resuming` } });
         noChange = 0;
         continue;
       }
-      logLine('warn', 'Cloudflare interstitial did not clear on its own — parking for you');
+      logLine('warn', `Cloudflare interstitial did not clear on its own (${cfExit}) — parking for you`);
     }
     if (challenge.blocked) {
       const why = botChallengeLastError(challenge.kind);
