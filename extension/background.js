@@ -219,6 +219,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // render pass, then hand focus straight back to the user. Fire-and-forget.
       respond(nudgeApplyWindows().then(() => ({ ok: true })).catch(() => ({ ok: true })));
       return true;
+    case 'jat11.human-challenge':
+      // An apply tab hit a Cloudflare check it can't pass without a HUMAN (Option 2 — we never
+      // auto-solve). Fire an OS notification + make that tab the visible one so the user can
+      // complete it; the executor keeps polling and resumes on its own once they verify.
+      respond(notifyHumanChallenge(sender, msg).then(() => ({ ok: true })).catch(() => ({ ok: true })));
+      return true;
+    case 'jat11.human-challenge-resolved':
+      // The check cleared (or timed out) — clear the notification.
+      respond(clearHumanChallengeNotice().then(() => ({ ok: true })).catch(() => ({ ok: true })));
+      return true;
     case 'jat11.front-until-hydrated':
       // An apply tab reported itself occluded AND not yet hydrated. Bring ITS window to the
       // front and KEEP it there (sustained visible time so a heavy SPA can hydrate), then
@@ -683,6 +693,50 @@ async function restoreUserFocus() {
   if (isOurApplyWindow(id)) return;          // never restore "back" to one of our windows
   try { await chrome.windows.update(id, { focused: true }); } catch {}
 }
+
+// ── Option 2: human-in-the-loop Cloudflare check ──────────────────────────────────────────────
+// When an apply tab hits a Cloudflare wall it can't pass without a person, we DON'T auto-solve.
+// We raise an OS notification (chrome.notifications) and surface that tab so the user does the one
+// click; the content-script executor keeps polling and resumes itself once cf_clearance is set
+// (that cookie is shared across the normal Chrome profile, so one solve covers many later jobs).
+const HUMAN_CHALLENGE_NOTE_ID = 'jat11-human-challenge';
+let humanChallengeTabId = null;
+let humanChallengeWinId = null;
+async function notifyHumanChallenge(sender, msg) {
+  const tabId = sender?.tab?.id;
+  if (tabId == null) return;
+  humanChallengeTabId = tabId;
+  humanChallengeWinId = sender?.tab?.windowId ?? null;
+  // Make it the visible tab in its window (no window-focus steal — clicking the notification fronts it).
+  try { await chrome.tabs.update(tabId, { active: true }); } catch {}
+  if (!chrome.notifications?.create) return;
+  const host = String(msg?.host || 'the job site').replace(/^www\./, '');
+  try {
+    await chrome.notifications.create(HUMAN_CHALLENGE_NOTE_ID, {
+      type: 'basic',
+      iconUrl: chrome.runtime.getURL('icons/icon128.png'),
+      title: 'Quick check needed to keep applying',
+      message: `${host} wants you to confirm you're human. Click here to open the tab and check the box — auto-apply will continue on its own.`,
+      priority: 2,
+      requireInteraction: true,
+    });
+  } catch {}
+}
+async function clearHumanChallengeNotice() {
+  humanChallengeTabId = null;
+  humanChallengeWinId = null;
+  try { await chrome.notifications?.clear?.(HUMAN_CHALLENGE_NOTE_ID); } catch {}
+}
+// Clicking the notification brings the apply window forward (user gesture → safe) + focuses the tab
+// so the user lands right on the check. focusApplyWindow captures/restores the prior focus.
+chrome.notifications?.onClicked?.addListener((id) => {
+  if (id !== HUMAN_CHALLENGE_NOTE_ID) return;
+  (async () => {
+    try { if (humanChallengeWinId != null) await focusApplyWindow(humanChallengeWinId); } catch {}
+    try { if (humanChallengeTabId != null) await chrome.tabs.update(humanChallengeTabId, { active: true }); } catch {}
+    try { await chrome.notifications.clear(HUMAN_CHALLENGE_NOTE_ID); } catch {}
+  })();
+});
 
 // source tab id -> { token, childTabId, createdAt }. This intentionally stays in memory:
 // the arm→click→claim transaction lasts seconds and the open message port keeps MV3 alive.

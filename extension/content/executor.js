@@ -1974,32 +1974,51 @@ export async function run(task, context, helpers) {
     // injection → selfClearing flips false) or the budget elapses, we fall through to the honest
     // terminal park below. This is the legitimate "try it" — waiting out the page's own JS — and
     // it NEVER crosses the never-auto-solve line. Interactive captcha/verify gates skip this entirely.
-    if (challenge.blocked && challenge.kind === 'cloudflare' && challenge.selfClearing) {
-      logLine('info', 'Cloudflare interstitial — waiting for it to clear itself (no interaction)…');
-      setStatus('Cloudflare check — waiting for it to clear…');
-      const cf0 = Date.now();
-      // A no-widget "checking your browser" JS challenge resolves ITSELF given time — but the apply
-      // tab runs in the BACKGROUND, so Chrome throttles its timers/JS and the challenge can take far
-      // longer than the old 15s. Wait up to 45s (still no interaction, no fronting, no widget-solve).
-      // Re-probe each tick: clear the instant it passes; bail the instant a REAL interactive widget
-      // appears (a managed/Turnstile challenge we will NOT solve). Log WHY the wait ended so we learn
-      // whether Indeed's wall ever self-clears or always needs a click (→ then Indeed is unwinnable).
-      const CF_WAIT_MS = 45000;
-      let cfCleared = false, cfExit = 'timeout';
-      while (Date.now() - cf0 < CF_WAIT_MS && !S.cancelled) {
-        await sleep(2000);
-        const c2 = detectBotChallengeOnPage();
-        if (!c2.blocked) { cfCleared = true; cfExit = 'cleared'; break; }
-        if (!c2.selfClearing) { cfExit = 'interactive-widget-appeared'; break; }   // managed/Turnstile widget → can't pass without solving
+    if (challenge.blocked && challenge.kind === 'cloudflare') {
+      // (a) BRIEF no-touch self-clear wait first: a no-widget "checking your browser" JS challenge
+      //     often passes on its own in a few seconds — don't bother the user for those.
+      if (challenge.selfClearing) {
+        logLine('info', 'Cloudflare check — waiting a moment to see if it clears itself…');
+        setStatus('Cloudflare check — waiting…');
+        const t0 = Date.now();
+        let selfCleared = false;
+        while (Date.now() - t0 < 12000 && !S.cancelled) {
+          await sleep(2000);
+          const c2 = detectBotChallengeOnPage();
+          if (!c2.blocked) { selfCleared = true; break; }
+          if (!c2.selfClearing) break;   // a real interactive widget rendered → hand to the human below
+        }
+        if (selfCleared) {
+          logLine('ok', 'Cloudflare check cleared on its own — continuing the application');
+          report({ transcriptAppend: { kind: 'recovery', note: 'self-clearing Cloudflare check cleared on a no-touch wait — resuming' } });
+          noChange = 0;
+          continue;
+        }
       }
-      vlog('challenge', `cloudflare self-clear wait ended: ${cfExit} after ${Math.round((Date.now() - cf0) / 1000)}s`);
+      // (b) HUMAN HANDOFF (Option 2): we NEVER auto-solve/bypass. Fire an OS notification + surface the
+      //     apply tab, then WAIT (no interaction from us) while the USER completes the check. Cloudflare
+      //     then sets cf_clearance in the shared Chrome profile, so one solve covers many later jobs until
+      //     it expires — minimizing how often the user is asked. Bounded (~4 min); cancel-aware.
+      logLine('warn', 'Cloudflare needs a human check — notifying you; auto-apply will continue once you verify');
+      setStatus('Verify you’re human in the apply tab — auto-apply will resume');
+      try { chrome.runtime?.sendMessage?.({ type: 'jat11.human-challenge', host: location.hostname }); } catch {}
+      report({ transcriptAppend: { kind: 'recovery', note: 'cloudflare human-check — notified the user (OS notification); waiting for them to verify' } });
+      const cf0 = Date.now();
+      const HUMAN_WAIT_MS = 240000;
+      let cfCleared = false;
+      while (Date.now() - cf0 < HUMAN_WAIT_MS && !S.cancelled) {
+        await sleep(2500);
+        if (!detectBotChallengeOnPage().blocked) { cfCleared = true; break; }
+      }
+      try { chrome.runtime?.sendMessage?.({ type: 'jat11.human-challenge-resolved', cleared: cfCleared }); } catch {}
+      vlog('challenge', `cloudflare human-handoff: ${cfCleared ? 'cleared by user' : 'not solved in time'} after ${Math.round((Date.now() - cf0) / 1000)}s`);
       if (cfCleared) {
-        logLine('ok', 'Cloudflare interstitial cleared on its own — continuing the application');
-        report({ transcriptAppend: { kind: 'recovery', note: `self-clearing Cloudflare interstitial cleared on a no-touch wait (${Math.round((Date.now() - cf0) / 1000)}s) — resuming` } });
+        logLine('ok', 'Cloudflare check passed (you verified) — continuing the application');
+        report({ transcriptAppend: { kind: 'recovery', note: 'cloudflare cleared after human verification — resuming; cf_clearance now covers later jobs' } });
         noChange = 0;
         continue;
       }
-      logLine('warn', `Cloudflare interstitial did not clear on its own (${cfExit}) — parking for you`);
+      logLine('warn', 'Cloudflare check not completed in time — parking for you');
     }
     if (challenge.blocked) {
       const why = botChallengeLastError(challenge.kind);
