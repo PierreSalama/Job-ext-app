@@ -702,13 +702,26 @@ async function restoreUserFocus() {
 const HUMAN_CHALLENGE_NOTE_ID = 'jat11-human-challenge';
 let humanChallengeTabId = null;
 let humanChallengeWinId = null;
+// Persist the challenge target so the notification CLICK still works after the MV3 service worker
+// sleeps during the multi-minute wait (in-memory vars are lost when the SW is killed).
+async function rememberChallengeTarget(tabId, winId) {
+  humanChallengeTabId = tabId; humanChallengeWinId = winId;
+  try { await chrome.storage?.session?.set?.({ jatHumanChallenge: { tabId, winId } }); } catch {}
+}
+async function recallChallengeTarget() {
+  if (humanChallengeTabId != null) return { tabId: humanChallengeTabId, winId: humanChallengeWinId };
+  try { const s = await chrome.storage?.session?.get?.('jatHumanChallenge'); return s?.jatHumanChallenge || { tabId: null, winId: null }; } catch { return { tabId: null, winId: null }; }
+}
 async function notifyHumanChallenge(sender, msg) {
   const tabId = sender?.tab?.id;
   if (tabId == null) return;
-  humanChallengeTabId = tabId;
-  humanChallengeWinId = sender?.tab?.windowId ?? null;
-  // Make it the visible tab in its window (no window-focus steal — clicking the notification fronts it).
-  try { await chrome.tabs.update(tabId, { active: true }); } catch {}
+  const winId = sender?.tab?.windowId ?? null;
+  await rememberChallengeTarget(tabId, winId);
+  try { await chrome.tabs.update(tabId, { active: true }); } catch {}        // make it the visible tab
+  // FRONT the apply window so the user SEES the check even if the OS notification is suppressed
+  // (Windows Focus Assist) or missed — the most reliable signal. focusApplyWindow captures/restores
+  // the user's prior focus. Skip on a `repeat` re-ping so we don't yank focus while they're solving.
+  if (!msg?.repeat) { try { if (winId != null) await focusApplyWindow(winId); } catch {} }
   if (!chrome.notifications?.create) return;
   const host = String(msg?.host || 'the job site').replace(/^www\./, '');
   try {
@@ -716,7 +729,7 @@ async function notifyHumanChallenge(sender, msg) {
       type: 'basic',
       iconUrl: chrome.runtime.getURL('icons/icon128.png'),
       title: 'Quick check needed to keep applying',
-      message: `${host} wants you to confirm you're human. Click here to open the tab and check the box — auto-apply will continue on its own.`,
+      message: `${host} wants you to confirm you're human. Click here (or the raised tab) and check the box — auto-apply will continue on its own.`,
       priority: 2,
       requireInteraction: true,
     });
@@ -725,15 +738,17 @@ async function notifyHumanChallenge(sender, msg) {
 async function clearHumanChallengeNotice() {
   humanChallengeTabId = null;
   humanChallengeWinId = null;
+  try { await chrome.storage?.session?.remove?.('jatHumanChallenge'); } catch {}
   try { await chrome.notifications?.clear?.(HUMAN_CHALLENGE_NOTE_ID); } catch {}
 }
 // Clicking the notification brings the apply window forward (user gesture → safe) + focuses the tab
-// so the user lands right on the check. focusApplyWindow captures/restores the prior focus.
+// so the user lands right on the check. Recalls the target from storage if the SW was recycled.
 chrome.notifications?.onClicked?.addListener((id) => {
   if (id !== HUMAN_CHALLENGE_NOTE_ID) return;
   (async () => {
-    try { if (humanChallengeWinId != null) await focusApplyWindow(humanChallengeWinId); } catch {}
-    try { if (humanChallengeTabId != null) await chrome.tabs.update(humanChallengeTabId, { active: true }); } catch {}
+    const { tabId, winId } = await recallChallengeTarget();
+    try { if (winId != null) await focusApplyWindow(winId); } catch {}
+    try { if (tabId != null) await chrome.tabs.update(tabId, { active: true }); } catch {}
     try { await chrome.notifications.clear(HUMAN_CHALLENGE_NOTE_ID); } catch {}
   })();
 });

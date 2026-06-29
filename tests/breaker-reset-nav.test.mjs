@@ -164,16 +164,24 @@ test('CAPTCHA human-assist: executor fronts the window and waits for the user, n
 
 // ---- "Have a go": self-clearing Cloudflare interstitials are waited out (no touch), only for
 // the cloudflare+selfClearing case, and the wait re-probes each tick. NEVER touches the widget. ----
-test('self-clearing Cloudflare: executor waits it out (no interaction), gated + re-probed', () => {
-  assert.match(SRC, /challenge\.kind === 'cloudflare' && challenge\.selfClearing/, 'auto-wait gated on cloudflare+selfClearing only (interactive captcha/verify never enter)');
-  const i = SRC.indexOf('waiting for it to clear itself');
-  assert.ok(i > 0, 'logs the no-touch wait');
+test('Cloudflare: brief no-touch self-clear, then HUMAN HANDOFF (notify + wait), never auto-solves', () => {
+  assert.match(SRC, /challenge\.blocked && challenge\.kind === 'cloudflare'/, 'CF handling gated on a cloudflare block');
+  // (a) brief no-touch self-clear wait — a JS interstitial often passes itself; don't bug the user.
+  const i = SRC.indexOf('waiting a moment to see if it clears itself');
+  assert.ok(i > 0, 'logs the brief no-touch self-clear wait');
   const w = SRC.slice(i, i + 700);
   assert.match(w, /detectBotChallengeOnPage\(\)/, 're-probes the live page each tick');
-  assert.match(w, /if \(!c2\.selfClearing\) break/, 'bails to park the instant a real interactive widget renders');
-  assert.match(w, /cleared on its own — continuing/, 'resumes only when the interstitial actually clears');
-  // hard line: the self-clearing path adds NO widget interaction (presence-only detection).
-  assert.ok(!/solveCaptcha|bypassCaptcha|clickCaptcha/i.test(SRC), 'self-clearing wait never touches a widget');
+  assert.match(w, /if \(!c2\.selfClearing\) break/, 'hands to the human the instant a real interactive widget renders');
+  assert.match(w, /cleared on its own — continuing/, 'resumes if it self-clears');
+  // (b) HUMAN HANDOFF — notify the user + wait while THEY verify (Option 2; never auto-solve).
+  assert.match(SRC, /needs a human check — notifying you/, 'notifies the user to verify');
+  // CRASH-FIX GUARD: the human-challenge ping MUST use send() (callback form), NOT raw
+  // chrome.runtime.sendMessage — the raw promise rejects when the MV3 SW sleeps during the multi-
+  // minute wait, an unhandled rejection that killed the task before the user could solve (0 applies/7h).
+  assert.match(SRC, /send\(\{ type: 'jat11\.human-challenge'/, 'pings via send() (never rejects), not raw sendMessage');
+  assert.match(SRC, /cleared after human verification — resuming/, 'resumes the apply once the user verifies');
+  // hard line: NO widget interaction anywhere (presence-only detection — we never solve/bypass).
+  assert.ok(!/solveCaptcha|bypassCaptcha|clickCaptcha/i.test(SRC), 'never touches/solves a widget');
 });
 
 // ---- EXT-4: the AI rescue must DEDUP on an unchanged page within a window (token moderation). ----

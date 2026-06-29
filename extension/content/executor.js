@@ -2001,16 +2001,23 @@ export async function run(task, context, helpers) {
       //     it expires — minimizing how often the user is asked. Bounded (~4 min); cancel-aware.
       logLine('warn', 'Cloudflare needs a human check — notifying you; auto-apply will continue once you verify');
       setStatus('Verify you’re human in the apply tab — auto-apply will resume');
-      try { chrome.runtime?.sendMessage?.({ type: 'jat11.human-challenge', host: location.hostname }); } catch {}
-      report({ transcriptAppend: { kind: 'recovery', note: 'cloudflare human-check — notified the user (OS notification); waiting for them to verify' } });
+      // Use send() (callback form) — NOT raw sendMessage. Raw sendMessage with no callback returns a
+      // PROMISE that REJECTS when the background's message channel closes (the MV3 service worker
+      // sleeps during the multi-minute wait), surfacing as an unhandled rejection that KILLED the task
+      // before the user could solve anything (the live "message channel closed" crash — 0 applies/7h).
+      // send() swallows lastError and never rejects. Re-ping every ~25s so the user is reminded and
+      // the apply window is re-surfaced if they navigated away (the background no-ops a duplicate).
+      send({ type: 'jat11.human-challenge', host: location.hostname });
+      report({ transcriptAppend: { kind: 'recovery', note: 'cloudflare human-check — notified the user (OS notification + raised the tab); waiting for them to verify' } });
       const cf0 = Date.now();
       const HUMAN_WAIT_MS = 240000;
-      let cfCleared = false;
+      let cfCleared = false, lastPing = Date.now();
       while (Date.now() - cf0 < HUMAN_WAIT_MS && !S.cancelled) {
         await sleep(2500);
         if (!detectBotChallengeOnPage().blocked) { cfCleared = true; break; }
+        if (Date.now() - lastPing > 25000) { lastPing = Date.now(); send({ type: 'jat11.human-challenge', host: location.hostname, repeat: true }); }
       }
-      try { chrome.runtime?.sendMessage?.({ type: 'jat11.human-challenge-resolved', cleared: cfCleared }); } catch {}
+      send({ type: 'jat11.human-challenge-resolved', cleared: cfCleared });
       vlog('challenge', `cloudflare human-handoff: ${cfCleared ? 'cleared by user' : 'not solved in time'} after ${Math.round((Date.now() - cf0) / 1000)}s`);
       if (cfCleared) {
         logLine('ok', 'Cloudflare check passed (you verified) — continuing the application');
