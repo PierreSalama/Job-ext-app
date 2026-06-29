@@ -11,11 +11,16 @@
 
 export const APPLY_HARD_CAP_MS = 330000;          // 5.5 min — generous cap for a visible-but-slow tab
 export const APPLY_HIDDEN_STALL_CAP_MS = 90000;   // ~90s — hidden tab that asked to be fronted and still hasn't hydrated
+export const APPLY_HUMAN_CHECK_CAP_MS = 720000;   // 12 min — the USER is solving a Cloudflare check; never time them out
 
 // Pick the hard cap (ms) for an apply run from the live hidden/hydration signals.
 //   frontRequested — the tab sent jat11.front-until-hydrated (occluded + not yet hydrated)
 //   hydrated       — the tab later sent jat11.apply-hydrated (the form mounted)
-// Short cap ONLY when the tab asked to be fronted AND has not hydrated; full cap otherwise.
-export function applyHardCapMs({ frontRequested = false, hydrated = false } = {}) {
+//   awaitingHuman  — the tab is on a Cloudflare wall WAITING FOR THE USER to verify (jat11.human-
+//                    challenge). This is a deliberate human pause, NOT a stall — give it a long cap
+//                    so the 90s hidden-stall / 5.5-min caps don't kill the captcha tab mid-solve.
+// awaitingHuman wins; else short cap when fronted-but-unhydrated; else the full cap.
+export function applyHardCapMs({ frontRequested = false, hydrated = false, awaitingHuman = false } = {}) {
+  if (awaitingHuman) return APPLY_HUMAN_CHECK_CAP_MS;
   return (frontRequested && !hydrated) ? APPLY_HIDDEN_STALL_CAP_MS : APPLY_HARD_CAP_MS;
 }

@@ -9,7 +9,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {
-  applyHardCapMs, APPLY_HARD_CAP_MS, APPLY_HIDDEN_STALL_CAP_MS,
+  applyHardCapMs, APPLY_HARD_CAP_MS, APPLY_HIDDEN_STALL_CAP_MS, APPLY_HUMAN_CHECK_CAP_MS,
 } from '../extension/lib/apply-cap.js';
 
 test('hidden + front-requested + NOT hydrated → SHORT cap (~90s, fast-fail)', () => {
@@ -23,6 +23,15 @@ test('front-requested but THEN hydrated → full cap (it is making progress)', (
 test('visible-but-slow tab (never front-requested) → full cap', () => {
   assert.equal(applyHardCapMs({ frontRequested: false, hydrated: false }), APPLY_HARD_CAP_MS);
   assert.equal(applyHardCapMs({}), APPLY_HARD_CAP_MS);   // missing args default to the full cap
+});
+
+test('awaitingHuman (Cloudflare check) → LONG cap, overriding the hidden-stall cap (never kill a tab mid-solve)', () => {
+  // The captcha tab is backgrounded (frontRequested, not hydrated) → would otherwise get the 90s cap
+  // → the run is killed + the tab closed while the user is still solving. awaitingHuman must WIN.
+  assert.equal(applyHardCapMs({ frontRequested: true, hydrated: false, awaitingHuman: true }), APPLY_HUMAN_CHECK_CAP_MS);
+  assert.equal(applyHardCapMs({ awaitingHuman: true }), APPLY_HUMAN_CHECK_CAP_MS);
+  assert.ok(APPLY_HUMAN_CHECK_CAP_MS > APPLY_HARD_CAP_MS, 'human-check cap exceeds even the full cap');
+  assert.ok(APPLY_HUMAN_CHECK_CAP_MS >= 600000, 'at least 10 min for the user to notice + solve');
 });
 
 test('the caps changed: hidden-stall is much shorter than the full cap (75–90s range)', () => {

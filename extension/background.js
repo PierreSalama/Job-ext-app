@@ -226,8 +226,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       respond(notifyHumanChallenge(sender, msg).then(() => ({ ok: true })).catch(() => ({ ok: true })));
       return true;
     case 'jat11.human-challenge-resolved':
-      // The check cleared (or timed out) — clear the notification.
-      respond(clearHumanChallengeNotice().then(() => ({ ok: true })).catch(() => ({ ok: true })));
+      // The check cleared (or timed out) — clear the notification, badge, and awaiting-human flag.
+      respond(clearHumanChallengeNotice(sender?.tab?.id ?? null).then(() => ({ ok: true })).catch(() => ({ ok: true })));
       return true;
     case 'jat11.front-until-hydrated':
       // An apply tab reported itself occluded AND not yet hydrated. Bring ITS window to the
@@ -702,6 +702,21 @@ async function restoreUserFocus() {
 const HUMAN_CHALLENGE_NOTE_ID = 'jat11-human-challenge';
 let humanChallengeTabId = null;
 let humanChallengeWinId = null;
+// tab.id → ts while that apply tab is WAITING FOR THE USER on a Cloudflare wall. The run's hard-cap
+// timer reads this (applyHardCapMs awaitingHuman) to use a 12-min cap instead of the 90s hidden-stall
+// / 5.5-min caps — otherwise the cap fires, the channel breaks, and the background closes the very
+// tab the user is solving. Persisted to storage.session so a recycled SW can still read it.
+const aaAwaitingHuman = new Map();
+async function setAwaitingHuman(tabId, on) {
+  if (tabId == null) return;
+  if (on) aaAwaitingHuman.set(tabId, Date.now()); else aaAwaitingHuman.delete(tabId);
+  try { await chrome.storage?.session?.set?.({ jatAwaitingHuman: [...aaAwaitingHuman.keys()] }); } catch {}
+}
+(async () => { try { const s = await chrome.storage?.session?.get?.('jatAwaitingHuman'); for (const id of (s?.jatAwaitingHuman || [])) aaAwaitingHuman.set(Number(id), Date.now()); } catch {} })();
+function setChallengeBadge(on) {
+  try { chrome.action?.setBadgeText?.({ text: on ? '!' : '' }); } catch {}
+  try { if (on) chrome.action?.setBadgeBackgroundColor?.({ color: '#d4351c' }); } catch {}
+}
 // Persist the challenge target so the notification CLICK still works after the MV3 service worker
 // sleeps during the multi-minute wait (in-memory vars are lost when the SW is killed).
 async function rememberChallengeTarget(tabId, winId) {
@@ -717,10 +732,14 @@ async function notifyHumanChallenge(sender, msg) {
   if (tabId == null) return;
   const winId = sender?.tab?.windowId ?? null;
   await rememberChallengeTarget(tabId, winId);
+  await setAwaitingHuman(tabId, true);       // suspend the run's hard cap while the user solves it
+  setChallengeBadge(true);                   // toolbar badge — a persistent indicator
   try { await chrome.tabs.update(tabId, { active: true }); } catch {}        // make it the visible tab
-  // FRONT the apply window so the user SEES the check even if the OS notification is suppressed
-  // (Windows Focus Assist) or missed — the most reliable signal. focusApplyWindow captures/restores
-  // the user's prior focus. Skip on a `repeat` re-ping so we don't yank focus while they're solving.
+  // MULTI-CHANNEL alert (OS often BLOCKS programmatic focus-steal, so don't rely on one signal):
+  //   • drawAttention flashes the taskbar/title (works even when focus is denied) — every ping.
+  //   • focusApplyWindow tries to raise the window (captures/restores focus) — first time only, so
+  //     we don't yank focus back while the user is mid-solve.
+  try { if (winId != null) await chrome.windows.update(winId, { drawAttention: true }); } catch {}
   if (!msg?.repeat) { try { if (winId != null) await focusApplyWindow(winId); } catch {} }
   if (!chrome.notifications?.create) return;
   const host = String(msg?.host || 'the job site').replace(/^www\./, '');
@@ -729,13 +748,16 @@ async function notifyHumanChallenge(sender, msg) {
       type: 'basic',
       iconUrl: chrome.runtime.getURL('icons/icon128.png'),
       title: 'Quick check needed to keep applying',
-      message: `${host} wants you to confirm you're human. Click here (or the raised tab) and check the box — auto-apply will continue on its own.`,
+      message: `${host} wants you to confirm you're human. Click here (or the flashing tab) and check the box — auto-apply will continue on its own.`,
       priority: 2,
       requireInteraction: true,
     });
   } catch {}
 }
-async function clearHumanChallengeNotice() {
+async function clearHumanChallengeNotice(tabId = null) {
+  if (tabId != null) await setAwaitingHuman(tabId, false);
+  else { aaAwaitingHuman.clear(); try { await chrome.storage?.session?.remove?.('jatAwaitingHuman'); } catch {} }
+  setChallengeBadge(false);
   humanChallengeTabId = null;
   humanChallengeWinId = null;
   try { await chrome.storage?.session?.remove?.('jatHumanChallenge'); } catch {}
@@ -1516,7 +1538,7 @@ async function launchOne(task, context) {
         const timeout = new Promise((_, rej) => {
           const tick = () => {
             const tr = aaFrontRequested.get(tab.id) || {};
-            const cap = applyHardCapMs({ frontRequested: !!tr.at, hydrated: !!tr.hydrated });
+            const cap = applyHardCapMs({ frontRequested: !!tr.at, hydrated: !!tr.hydrated, awaitingHuman: aaAwaitingHuman.has(tab.id) });
             if (Date.now() - runStart >= cap) {
               rej(new Error(cap === APPLY_HIDDEN_STALL_CAP_MS
                 ? 'apply form did not hydrate on a throttled/occluded tab — will retry'
@@ -1539,18 +1561,23 @@ async function launchOne(task, context) {
       // us. That's NOT a real failure: leave the task as the dashboard set it (skipped)
       // and bow out quietly, so no "application failed" toast fires.
       if (stopping) return 'skipped';
-      // A same-tab external handoff intentionally navigates away from the source
-      // content script, so Chrome rejects the original sendMessage even though the
-      // service worker has already re-dispatched the task on the ATS page. If ownership
-      // is armed, wait for that authoritative result instead of racing it with a false
-      // failure patch.
+      const emsg = String(e?.message || e);
+      // A BENIGN channel break — NOT a real failure:
+      //   • the MV3 service worker was recycled while the executor sat in a LONG human Cloudflare wait
+      //     (the executor is still running in the tab and reports its own terminal state), or
+      //   • a same-tab external handoff navigated away from the source content script.
+      // In these cases NEVER mark 'failed' and NEVER close the tab — closing it would kill the very
+      // captcha the user is solving (the live "runs out of time, waits for nothing" bug). Poll the
+      // server for the executor's authoritative terminal state instead.
+      const channelBroke = /message channel closed|Receiving end does not exist|message port closed|back\/forward cache|No tab with id/i.test(emsg);
+      const awaitingHuman = aaAwaitingHuman.has(tab.id);
       let handedOff = null;
       try {
         const qr = await api.call('GET', '/queue', null, 8000);
         handedOff = (qr?.items || []).find((x) => x.id === task.id && x.handoffToken);
       } catch {}
-      if (handedOff) {
-        const deadline = Date.now() + 285000;
+      if (handedOff || channelBroke || awaitingHuman) {
+        const deadline = Date.now() + (awaitingHuman ? 780000 : 285000);   // ~13 min while a human is verifying
         while (Date.now() < deadline && !stopping) {
           try {
             const qr = await api.call('GET', '/queue', null, 8000);
@@ -1559,10 +1586,13 @@ async function launchOne(task, context) {
           } catch {}
           await new Promise((resolve) => setTimeout(resolve, 1500));
         }
+        // Deadline hit without a terminal state — leave the tab + run ALONE (the executor's report is
+        // authoritative; the tab-reaper cleans up a truly-abandoned tab). No clobber, no tab close.
+        return 'skipped';
       }
       await api.call('PATCH', '/queue/' + task.id, {
-        state: 'failed', attemptsDelta: 1, lastError: String(e?.message || e),
-        transcriptAppend: { note: 'executor error: ' + String(e?.message || e) },
+        state: 'failed', attemptsDelta: 1, lastError: emsg,
+        transcriptAppend: { note: 'executor error: ' + emsg },
       });
       try { await chrome.tabs.remove(tab.id); } catch {}
       untrackAaTab(tab.id);

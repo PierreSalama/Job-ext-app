@@ -109,6 +109,37 @@ const send = (msg) => new Promise((res) => {
   catch { res(null); }
 });
 
+// In-tab alert for a human Cloudflare check — the reliable fallback when the OS suppresses the
+// notification / blocks window-focus. A big fixed banner the user can't miss once on the tab, plus
+// a short beep to draw attention (best-effort: autoplay may block it).
+function showCfBanner() {
+  try {
+    if (document.getElementById('jat11-cf-banner')) return;
+    const b = document.createElement('div');
+    b.id = 'jat11-cf-banner';
+    b.setAttribute('style', 'position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#d4351c;color:#fff;font:700 16px/1.45 system-ui,Segoe UI,sans-serif;padding:14px 18px;text-align:center;box-shadow:0 2px 14px rgba(0,0,0,.45)');
+    b.textContent = '⚠ Auto-apply is waiting — please complete the “I’m human” check on this page. It will continue automatically once you do.';
+    (document.body || document.documentElement).appendChild(b);
+  } catch {}
+}
+function hideCfBanner() { try { document.getElementById('jat11-cf-banner')?.remove(); } catch {} }
+function cfBeep() {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const ctx = new AC();
+    for (let k = 0; k < 2; k++) {
+      const t = ctx.currentTime + k * 0.42;
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.frequency.value = 880; o.connect(g); g.connect(ctx.destination);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.3, t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
+      o.start(t); o.stop(t + 0.3);
+    }
+  } catch {}
+}
+
 const S = {
   running: false, paused: false, cancelled: false,
   step: 0, overlay: null, task: null, context: null, supervisor: null,
@@ -1214,12 +1245,12 @@ export async function run(task, context, helpers) {
   function requestFrontUntilHydrated() {
     if (!frontToHydrate || frontRequested) return;
     frontRequested = true;
-    try { chrome.runtime?.sendMessage?.({ type: 'jat11.front-until-hydrated' }); } catch {}
+    send({ type: 'jat11.front-until-hydrated' });
   }
   function signalHydrated() {
     if (!frontRequested) return;   // never released a front we didn't request
     frontRequested = false;
-    try { chrome.runtime?.sendMessage?.({ type: 'jat11.apply-hydrated' }); } catch {}
+    send({ type: 'jat11.apply-hydrated' });
   }
 
   // ============================================================
@@ -2007,16 +2038,23 @@ export async function run(task, context, helpers) {
       // before the user could solve anything (the live "message channel closed" crash — 0 applies/7h).
       // send() swallows lastError and never rejects. Re-ping every ~25s so the user is reminded and
       // the apply window is re-surfaced if they navigated away (the background no-ops a duplicate).
+      // Alert on EVERY channel (the OS frequently suppresses notifications + blocks window-focus):
+      // background fires the OS notification + flashes the taskbar + sets a toolbar badge; here we add
+      // an in-page banner + a beep. The background also flips this tab to "awaiting human" so the run's
+      // hard cap is suspended (12 min) — otherwise the 90s hidden-stall cap closes the captcha tab.
       send({ type: 'jat11.human-challenge', host: location.hostname });
-      report({ transcriptAppend: { kind: 'recovery', note: 'cloudflare human-check — notified the user (OS notification + raised the tab); waiting for them to verify' } });
+      showCfBanner();
+      cfBeep();
+      report({ transcriptAppend: { kind: 'recovery', note: 'cloudflare human-check — alerted you (notification + flashing tab + badge + in-page banner + beep); waiting for you to verify' } });
       const cf0 = Date.now();
-      const HUMAN_WAIT_MS = 240000;
+      const HUMAN_WAIT_MS = 360000;   // 6 min for the user to notice + solve (background cap is 12 min)
       let cfCleared = false, lastPing = Date.now();
       while (Date.now() - cf0 < HUMAN_WAIT_MS && !S.cancelled) {
         await sleep(2500);
         if (!detectBotChallengeOnPage().blocked) { cfCleared = true; break; }
-        if (Date.now() - lastPing > 25000) { lastPing = Date.now(); send({ type: 'jat11.human-challenge', host: location.hostname, repeat: true }); }
+        if (Date.now() - lastPing > 25000) { lastPing = Date.now(); send({ type: 'jat11.human-challenge', host: location.hostname, repeat: true }); cfBeep(); }
       }
+      hideCfBanner();
       send({ type: 'jat11.human-challenge-resolved', cleared: cfCleared });
       vlog('challenge', `cloudflare human-handoff: ${cfCleared ? 'cleared by user' : 'not solved in time'} after ${Math.round((Date.now() - cf0) / 1000)}s`);
       if (cfCleared) {
@@ -2613,7 +2651,7 @@ export async function run(task, context, helpers) {
             : 'apply tab still not hydrated after waiting — fronting its window as a last resort');
           requestFrontUntilHydrated();
         } else {
-          try { chrome.runtime?.sendMessage?.({ type: 'jat11.nudge-apply-window' }); } catch {}
+          send({ type: 'jat11.nudge-apply-window' });
         }
         const frontedCap = 28;   // ~14s of 500ms ticks — comfortably past the SW front hard-cap
         const frontStart = Date.now();
