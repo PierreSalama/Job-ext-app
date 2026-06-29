@@ -90,6 +90,30 @@ test('groundedEligibilityAnswer: UNKNOWN authorization never guesses (returns nu
   assert.equal(groundedEligibilityAnswer('Will you require sponsorship?', { authorizedToWork: null }), null);
 });
 
+// "Able to perform the duties of the job (with or without reasonable accommodation)?" is a standard
+// ability screen — truthful Yes for any applicant, NOT a disability disclosure. The AI refuses it
+// ("accommodation" reads disability-adjacent) → it parked + blocked the smartapply form. Ground it.
+test('groundedEligibilityAnswer: ability-to-perform-the-duties → Yes (independent of work auth)', () => {
+  const a = 'Are you able to perform the specific duties of this position with or without reasonable accommodation?';
+  assert.equal(isEligibilityScreeningQuestion(a), true, 'recognised as groundable');
+  assert.equal(groundedEligibilityAnswer(a, { authorizedToWork: true }), 'Yes');
+  assert.equal(groundedEligibilityAnswer(a, { authorizedToWork: null }), 'Yes', 'always Yes — not auth-gated');
+  assert.equal(groundedEligibilityAnswer('Can you perform the essential functions of the role?', {}), 'Yes');
+  assert.equal(groundedEligibilityAnswer('Are you able to perform the job?', { authorizedToWork: true, yesText: 'Yes, I can' }), 'Yes, I can');
+});
+
+test('the ability RX must NOT fire on disability/accommodation-NEED or experience questions (those are NOT auto-Yes)', () => {
+  for (const qq of [
+    'Do you have a disability?',
+    'Do you require a reasonable accommodation?',
+    'Will you need any accommodations during the hiring process?',
+    'How many years have you performed these duties?',
+    'Are you willing to work weekends?',
+  ]) {
+    assert.notEqual(groundedEligibilityAnswer(qq, { authorizedToWork: true }), 'Yes', `must NOT auto-Yes: "${qq}"`);
+  }
+});
+
 test('groundedEligibilityAnswer: NEVER answers a non-eligibility question (no fabrication)', () => {
   assert.equal(groundedEligibilityAnswer('Are you comfortable commuting to this location?', { authorizedToWork: true }), null);
   assert.equal(groundedEligibilityAnswer('How many years of Python experience?', { authorizedToWork: true }), null);

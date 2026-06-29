@@ -259,6 +259,15 @@ export function pageRequiresResume(text) {
 // still match across language so the eligibility radio is answered, not parked.
 const ELIGIBILITY_AUTHORIZED_RX = /(legally\s+)?authori[sz]ed\s+to\s+work|eligible\s+to\s+work|right\s+to\s+work|work\s+(?:permit|authori[sz]ation)\b|are\s+you\s+(?:legally\s+)?(?:authori[sz]ed|eligible|permitted)\s+to\s+work|autoris[ée]{0,2}\s+(?:à|a|de|pour)\s+travailler|admissible\s+(?:à|a)\s+travailler|droit\s+de\s+travailler|permis\s+de\s+travail|habilit[ée]{0,2}\s+(?:à|a)\s+travailler|autorizad[oa]\s+(?:a|para)\s+trabajar|derecho\s+a\s+trabajar|elegible\s+para\s+trabajar/i;
 const ELIGIBILITY_SPONSOR_RX = /(require|need|seek).{0,30}(sponsor|visa)|sponsor(ship)?\b.{0,30}(require|need|now or in the future)|(now or in the future).{0,30}sponsor|(?:besoin|exiger|exigez|requ[ié]|requerr|n[ée]cessit|aurez|avez)\b.{0,30}(?:parrainage|visa)|(?:parrainage|visa)\b.{0,30}(?:maintenant|futur|avenir|pr[ée]sent)|\bparrainage\b|\bpatrocinio\b/i;
+// "Are you able to perform the [essential] duties/functions of this position, with or without
+// reasonable accommodation?" — a standard ABILITY-to-do-the-job screen (very common on Indeed
+// smartapply; the AI refuses it because "accommodation" reads as disability-adjacent, so it parks +
+// blocks the form). The truthful answer for an APPLICANT is YES — you're applying to do the job, and
+// the phrasing is INCLUSIVE (with or without accommodation). It is NOT a disability disclosure: it
+// never asks whether you HAVE a disability or NEED an accommodation, only whether you can do the job.
+// Anchored on "able to perform … <duties/functions/job>" so it never matches "do you require an
+// accommodation" / "do you have a disability" (those stay parked via NEVER_AUTOFILL_RX).
+const ABILITY_TO_PERFORM_RX = /\b(?:are you able to|able to|can you)\b[^?]{0,70}\bperform\b[^?]{0,70}\b(?:duties|functions|tasks|requirements|responsibilities|role|position|job)\b/i;
 
 // Decide a GROUNDED answer for a well-known work-eligibility screening question, given
 // what the profile already tells us. Returns a string answer (e.g. 'Yes'/'No') or null
@@ -273,6 +282,8 @@ const ELIGIBILITY_SPONSOR_RX = /(require|need|seek).{0,30}(sponsor|visa)|sponsor
 export function groundedEligibilityAnswer(label, { authorizedToWork = null, yesText = 'Yes', noText = 'No' } = {}) {
   const t = String(label || '');
   if (!t.trim()) return null;
+  // Ability-to-perform-the-job → always Yes (truthful for an applicant; independent of work auth).
+  if (ABILITY_TO_PERFORM_RX.test(t)) return yesText;
   if (authorizedToWork == null) return null;        // unknown authorization → never guess
   // "Are you authorized / eligible / permitted to work…?" → Yes iff authorized.
   if (ELIGIBILITY_AUTHORIZED_RX.test(t)) return authorizedToWork ? yesText : noText;
@@ -288,7 +299,7 @@ export function groundedEligibilityAnswer(label, { authorizedToWork = null, yesT
 // readable and node-testable.
 export function isEligibilityScreeningQuestion(label) {
   const t = String(label || '');
-  return ELIGIBILITY_AUTHORIZED_RX.test(t) || ELIGIBILITY_SPONSOR_RX.test(t);
+  return ELIGIBILITY_AUTHORIZED_RX.test(t) || ELIGIBILITY_SPONSOR_RX.test(t) || ABILITY_TO_PERFORM_RX.test(t);
 }
 
 // Partition the unanswered REQUIRED fields blocking an advance into the ones we can
