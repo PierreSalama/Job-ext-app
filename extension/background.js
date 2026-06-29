@@ -642,6 +642,8 @@ let stopping = false;             // true briefly while tearing a run down, so i
 const AA_TABS_KEY = 'jat11.aaTabs';
 const AA_PRIMARY_WINDOW_KEY = 'jat11.aaWindowId';
 const AA_WINDOW_POOL_KEY = 'jat11.aaWindowPool';
+const AA_REUSE_TAB_KEY = 'jat11.aaReuseTab';   // the ONE warm serial apply tab we navigate per job (Cloudflare session continuity)
+let aaReuseTabId = null;
 const AA_TAB_MAX_AGE_MS = 8 * 60 * 1000;   // a single apply should never need >8 min
 const AA_TAB_CAP = 10;                       // hard ceiling on simultaneously-open AA tabs
 const AA_WINDOW_CAP = 5;                     // hard ceiling on owned AA windows (primary + workers); matches server concurrency clamp
@@ -733,6 +735,7 @@ async function notifyHumanChallenge(sender, msg) {
   const winId = sender?.tab?.windowId ?? null;
   await rememberChallengeTarget(tabId, winId);
   await setAwaitingHuman(tabId, true);       // suspend the run's hard cap while the user solves it
+  trackAaTab(tabId);                         // refresh the tab's age so the reaper never closes it mid-solve
   setChallengeBadge(true);                   // toolbar badge — a persistent indicator
   try { await chrome.tabs.update(tabId, { active: true }); } catch {}        // make it the visible tab
   // MULTI-CHANNEL alert (OS often BLOCKS programmatic focus-steal, so don't rely on one signal):
@@ -788,10 +791,11 @@ function normalizeWindowIds(ids) {
 
 const aaRuntimeLoad = (async () => {
   try {
-    const o = await chrome.storage.local.get([AA_TABS_KEY, AA_PRIMARY_WINDOW_KEY, AA_WINDOW_POOL_KEY]);
+    const o = await chrome.storage.local.get([AA_TABS_KEY, AA_PRIMARY_WINDOW_KEY, AA_WINDOW_POOL_KEY, AA_REUSE_TAB_KEY]);
     aaTabs = (o && o[AA_TABS_KEY]) || {};
     aaWindowId = o && o[AA_PRIMARY_WINDOW_KEY] ? Number(o[AA_PRIMARY_WINDOW_KEY]) : null;
     aaWindowPool = normalizeWindowIds(o && o[AA_WINDOW_POOL_KEY]);
+    aaReuseTabId = o && o[AA_REUSE_TAB_KEY] ? Number(o[AA_REUSE_TAB_KEY]) : null;
   } catch {}
   aaRuntimeHydrated = true;
 })();
@@ -1402,6 +1406,8 @@ async function closeAutoApplyTabs() {
   // "a queued application failed" toasts on Stop).
   stopping = true;
   if (stopWatchdog) { clearInterval(stopWatchdog); stopWatchdog = null; }
+  aaReuseTabId = null;   // the warm reuse tab is among the tabs being closed below; forget it
+  try { await chrome.storage?.local?.remove?.(AA_REUSE_TAB_KEY); } catch {}
   try {
     const ids = new Set();
     // Close EVERY "JAT Auto-apply" group's tabs — not just the cached one. An SW
@@ -1479,14 +1485,36 @@ async function launchOne(task, context) {
   let tab = null;
   const bringFront = !!(context && context.bringToFront);
   const parallel = currentConcurrency > 1;
+  // TAB REUSE (serial only): keep ONE warm apply tab and NAVIGATE it to each job rather than
+  // open+close a fresh tab every time. A reused tab preserves the site's session — the Cloudflare
+  // cf_clearance cookie, the navigation/referrer continuity, and the per-session bot-score trust —
+  // so once the user passes a check it stays cleared far longer (fewer re-verifications). A parallel
+  // pool still needs its own tab per worker, so reuse is off when concurrency > 1.
+  const reuse = !parallel;
+  const keepTab = (t) => { if (reuse && t) { aaReuseTabId = t.id; try { chrome.storage?.local?.set?.({ [AA_REUSE_TAB_KEY]: aaReuseTabId }); } catch {} } };
   // The apply tab is the ACTIVE tab in a window that is NEVER the one you're working in
   // (a persistent dedicated window — or a per-worker one when parallel). Being the active
   // tab in an on-display window means the page loads un-throttled, and since it's not your
   // window it never interrupts you. focusWindow (opt-in) additionally brings it to front.
   const winId = parallel ? await acquireApplyWindow(bringFront) : await autoApplyTargetWindow();
   try {
-    tab = await createAaTab(url, { active: true, focusWindow: bringFront, winId, isApply: true });
-    try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch {}   // don't let Chrome discard it mid-apply
+    // Reuse the warm serial tab if it's still alive — navigate it to this job (keeps the session).
+    if (reuse && aaReuseTabId != null) {
+      try {
+        const warm = await chrome.tabs.get(aaReuseTabId);
+        if (warm && !warm.discarded) {
+          tab = warm;
+          await chrome.tabs.update(tab.id, { url, active: true, autoDiscardable: false });
+          trackAaTab(tab.id);                 // refresh its age so the reaper won't close it mid-run
+          try { await groupTab(tab.id); } catch {}
+        }
+      } catch { aaReuseTabId = null; }
+    }
+    if (!tab) {
+      tab = await createAaTab(url, { active: true, focusWindow: bringFront, winId, isApply: true });
+      try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch {}   // don't let Chrome discard it mid-apply
+    }
+    keepTab(tab);
 
     // Wait for the page (and content script) to settle, then hand over the task.
     await new Promise((resolve) => {
@@ -1594,8 +1622,7 @@ async function launchOne(task, context) {
         state: 'failed', attemptsDelta: 1, lastError: emsg,
         transcriptAppend: { note: 'executor error: ' + emsg },
       });
-      try { await chrome.tabs.remove(tab.id); } catch {}
-      untrackAaTab(tab.id);
+      if (!reuse) { try { await chrome.tabs.remove(tab.id); } catch {} untrackAaTab(tab.id); }   // reuse: keep the warm tab; the next job navigates it
       return 'failed';
     }
     const finalState = (result && typeof result.state === 'string') ? result.state : null;
@@ -1605,8 +1632,7 @@ async function launchOne(task, context) {
         state: 'failed', attemptsDelta: 1, lastError: String(result?.error || 'executor returned no state'),
         transcriptAppend: { note: 'executor failed: ' + String(result?.error || 'no state') },
       });
-      try { await chrome.tabs.remove(tab.id); } catch {}
-      untrackAaTab(tab.id);
+      if (!reuse) { try { await chrome.tabs.remove(tab.id); } catch {} untrackAaTab(tab.id); }
       return 'failed';
     }
     if (finalState !== 'running') {
@@ -1635,12 +1661,14 @@ async function launchOne(task, context) {
     // awaiting_review (review-mode: the user manually clicks submit in that tab) stays
     // open — and the reaper still closes it after the max age as a backstop.
     if (['done', 'skipped', 'failed', 'parked', 'awaiting_input'].includes(finalState)) {
-      try { await chrome.tabs.remove(tab.id); } catch {}
-      untrackAaTab(tab.id);
+      // reuse (serial): KEEP the warm tab — the next job navigates it, preserving the Cloudflare
+      // session so a passed check stays cleared. Only close it on Stop (closeAutoApplyTabs) or when
+      // the reaper ages it out. Parallel: close per-job as before.
+      if (!reuse) { try { await chrome.tabs.remove(tab.id); } catch {} untrackAaTab(tab.id); }
     }
     return finalState;
   } catch (e) {
-    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} untrackAaTab(tab.id); }
+    if (tab && !reuse) { try { await chrome.tabs.remove(tab.id); } catch {} untrackAaTab(tab.id); }
     return stopping ? 'skipped' : 'failed';
   } finally {
     if (parallel && winId != null) releaseApplyWindow(winId);   // free this worker's pool window (parallel only)

@@ -49,4 +49,17 @@ test('background.js fails the hidden-stall case RETRIABLY (transient phrasing)',
   assert.match(bg, /applyHardCapMs\(/, 'dispatch race uses the adaptive cap selector');
   assert.match(bg, /APPLY_HIDDEN_STALL_CAP_MS/, 'dispatch race distinguishes the hidden-stall cap');
   assert.match(bg, /apply form did not hydrate on a throttled\/occluded tab — will retry/, 'retriable phrasing on the short cap');
+  assert.match(bg, /awaitingHuman: aaAwaitingHuman\.has\(tab\.id\)/, 'cap is suspended while the user solves a Cloudflare check');
+});
+
+// TAB REUSE: a serial run keeps ONE warm apply tab and navigates it per job (Cloudflare session
+// continuity → a passed check stays cleared longer). It must NOT be closed on terminal when reusing,
+// and must be cleared on Stop.
+test('serial apply tab is REUSED (navigated, not closed) to keep the Cloudflare session warm', () => {
+  const bg = fs.readFileSync(new URL('../extension/background.js', import.meta.url), 'utf8');
+  assert.match(bg, /const reuse = !parallel/, 'reuse is on for serial (concurrency=1), off for a parallel pool');
+  assert.match(bg, /chrome\.tabs\.get\(aaReuseTabId\)/, 'reuses the warm tab when it is still alive');
+  assert.match(bg, /chrome\.tabs\.update\(tab\.id, \{ url, active: true/, 'navigates the warm tab to the next job');
+  assert.match(bg, /if \(!reuse\) \{ try \{ await chrome\.tabs\.remove\(tab\.id\)/, 'keeps the tab open on terminal when reusing');
+  assert.match(bg, /aaReuseTabId = null;/, 'clears the reuse tab on Stop (closeAutoApplyTabs)');
 });
