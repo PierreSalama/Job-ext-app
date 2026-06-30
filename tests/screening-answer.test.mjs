@@ -15,8 +15,23 @@ import assert from 'node:assert/strict';
 import {
   groundedEligibilityAnswer,
   isEligibilityScreeningQuestion,
+  isReferralQuestion,
+  referralDefaultAnswer,
   decideAnswerOrPark,
 } from '../extension/content/lib/linkedin-apply.js';
+
+// Referral fields stall the form (AI refuses with no info). When not referred we answer the neutral
+// truthful default: text → "N/A", Yes/No → No. Must NOT fire on "how did you hear about us".
+test('referral fields get a neutral default (text → N/A, choice → No); source questions do not', () => {
+  for (const qq of ['Referred by (name)', 'If you were referred to BeyondTrust please enter their name below', 'Who referred you?', 'Employee referral name']) {
+    assert.equal(isReferralQuestion(qq), true, `referral: "${qq}"`);
+    assert.equal(referralDefaultAnswer(qq, { fieldType: 'text' }), 'N/A');
+  }
+  assert.equal(referralDefaultAnswer('Were you referred by a current employee?', { fieldType: 'radio', options: ['Yes', 'No'] }), 'No');
+  // NOT a referral question — left to the AI (null).
+  assert.equal(isReferralQuestion('How did you hear about us?'), false);
+  assert.equal(referralDefaultAnswer('How did you hear about us?', { fieldType: 'text' }), null);
+});
 
 // ---- isEligibilityScreeningQuestion: recognises the determinable work-auth/sponsorship Qs ----
 test('isEligibilityScreeningQuestion: matches the well-known work-eligibility screening questions', () => {

@@ -302,6 +302,22 @@ export function isEligibilityScreeningQuestion(label) {
   return ELIGIBILITY_AUTHORIZED_RX.test(t) || ELIGIBILITY_SPONSOR_RX.test(t) || ABILITY_TO_PERFORM_RX.test(t);
 }
 
+// Referral fields — "referred by (name)", "if you were referred, enter their name", "Were you
+// referred? Yes/No", "employee referral". When the user WASN'T referred (the common case), the AI
+// refuses (no info) → the form parks and stalls. The truthful neutral answer: a free-text field →
+// "N/A"; a Yes/No choice → No. Deliberately NARROW — does NOT match "how did you hear about us"
+// (a source question, left to the AI).
+const REFERRAL_RX = /\breferred by\b|were you referred|who referred you|employee referral|referral (?:name|source|code)\b|if you (?:were|are|have been) referred|name of (?:the )?(?:person|employee|individual) who referred/i;
+export function isReferralQuestion(label) { return REFERRAL_RX.test(String(label || '')); }
+// The neutral "not referred" answer for a referral field. Returns null when it isn't a referral
+// question. A radio/select → its own "No" option (or 'No'); a text/textarea → 'N/A'.
+export function referralDefaultAnswer(label, { fieldType = 'text', options = [] } = {}) {
+  if (!REFERRAL_RX.test(String(label || ''))) return null;
+  const choice = fieldType === 'radio' || /select/.test(String(fieldType || ''));
+  if (choice) return (Array.isArray(options) ? options : []).find((o) => /^\s*no\b/i.test(o)) || 'No';
+  return 'N/A';
+}
+
 // Partition the unanswered REQUIRED fields blocking an advance into the ones we can
 // answer this pass vs the ones we must PARK. PURE: the caller resolves `answerable`
 // (did profile/qa/AI/grounded-default produce a confident value?) and `parkable`

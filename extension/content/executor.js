@@ -25,7 +25,7 @@ import { classifyInterstitial } from './lib/interstitial.js';
 import { shouldFrontOnOpenerStall, classifyNoChangeRoute } from './lib/opener-stall.js';
 import { detectBotChallenge, botChallengeLastError } from './lib/challenge.js';
 import { ADVANCE_KEYWORDS, isAdvanceLabel } from './lib/advance.js';
-import { isLinkedInEasyApplyApplyUrl, isLinkedInApplyAdvanceLabel, deriveApplyRootFromAdvanceButton, shouldUseGenericOpenFallback, detectLinkedInExternalPosting, decideResumePage, isUploadResumeAffordanceLabel, pageRequiresResume, groundedEligibilityAnswer, isEligibilityScreeningQuestion, decideAnswerOrPark } from './lib/linkedin-apply.js';
+import { isLinkedInEasyApplyApplyUrl, isLinkedInApplyAdvanceLabel, deriveApplyRootFromAdvanceButton, shouldUseGenericOpenFallback, detectLinkedInExternalPosting, decideResumePage, isUploadResumeAffordanceLabel, pageRequiresResume, groundedEligibilityAnswer, isEligibilityScreeningQuestion, isReferralQuestion, referralDefaultAnswer, decideAnswerOrPark } from './lib/linkedin-apply.js';
 import { sitePack } from './sites/index.js';
 import { confirmSignalsMatched, findPackSubmitBroadened } from './lib/ats-drive.js';
 
@@ -2457,6 +2457,21 @@ export async function run(task, context, helpers) {
         vlog('field', `"${redactLabel(u.label)}" → left-empty (optional photo/headshot — not auto-answerable)`);
         logLine('warn', `left optional field blank: "${u.label.slice(0, 40)}" (photo/headshot — not auto-answerable)`);
         continue;
+      }
+      // Referral fields ("referred by (name)" / "if you were referred…" / "Were you referred?"): when
+      // not referred (the common case) the AI refuses (no info) → parks → stalls the form. Answer the
+      // truthful neutral default (text → "N/A"; Yes/No → No) so it advances.
+      if (isReferralQuestion(u.label)) {
+        const rv = referralDefaultAnswer(u.label, { fieldType: u.fieldType, options: u.options });
+        if (rv != null) {
+          const ok = await engine.fill([{ input: u.input, value: rv }]);
+          vlog('screen', `referral "${redactLabel(u.label)}" → ${rv} (not referred) ${ok ? 'filled' : 'fill-failed'}`);
+          if (ok) {
+            logLine('ok', `answered referral "${u.label.slice(0, 40)}" → ${rv} (not referred)`);
+            try { await engine.recordAnswer({ question: u.label, answer: rv, fieldType: u.fieldType, source: 'profile', jobId: job?.id }); } catch {}
+            continue;
+          }
+        }
       }
       setStatus(`Step ${S.step}: thinking about "${u.label.slice(0, 40)}…"`);
       // [TRACE 5] AI LADDER — the question going to /ai/answer-question.
