@@ -38,6 +38,75 @@ test('query planner rotates keyword and location profiles deterministically', ()
   assert.deepEqual(discovery.planner(settings, 3), { keyword: 'analyst', location: 'Remote', nextIndex: 0 });
 });
 
+test('easyApplyOnly: Indeed discovery asks JobSpy for easy_apply=true (applyable-only, no external bounces)', async () => {
+  db.patchSettings({ autoApply: {
+    enabled: true, easyApplyOnly: true, keywords: ['developer'], boards: ['indeed'],
+    locations: ['Toronto'], country: 'Canada',
+    discovery: { enabled: true, intervalMinutes: 5, refillBelow: 9999, perRunLimit: 10 },
+  } });
+  db.kvSet('discoveryPlannerIndex', 0); db.kvSet('discoveryBoardIndex', 0);
+  let captured = null;
+  const svc = discovery.createDiscoveryService({
+    runner: async (args) => { captured = args; return { ok: true, jobs: [] }; },
+    ingestJobs: async () => ({ enqueued: 0, duplicates: 0, rejected: 0 }),
+  });
+  await svc.runTick({ force: true });
+  assert.equal(captured?.source, 'indeed');
+  assert.equal(captured?.easy_apply, true, 'Indeed under easyApplyOnly requests only board-hosted jobs');
+});
+
+test('easyApplyOnly OFF: Indeed discovery does NOT set easy_apply (keeps the freshness window)', async () => {
+  db.patchSettings({ autoApply: {
+    enabled: true, easyApplyOnly: false, keywords: ['developer'], boards: ['indeed'],
+    locations: ['Toronto'], country: 'Canada',
+    discovery: { enabled: true, intervalMinutes: 5, refillBelow: 9999, perRunLimit: 10 },
+  } });
+  db.kvSet('discoveryPlannerIndex', 0); db.kvSet('discoveryBoardIndex', 0);
+  let captured = null;
+  const svc = discovery.createDiscoveryService({
+    runner: async (args) => { captured = args; return { ok: true, jobs: [] }; },
+    ingestJobs: async () => ({ enqueued: 0, duplicates: 0, rejected: 0 }),
+  });
+  await svc.runTick({ force: true });
+  assert.equal(captured?.easy_apply, false, 'off → falls back to the freshness window');
+});
+
+test('combosPerTick: one tick sweeps a BATCH of distinct combos (widen breadth)', async () => {
+  db.patchSettings({ autoApply: {
+    enabled: true, easyApplyOnly: false, keywords: ['a dev', 'b dev'], boards: ['indeed'],
+    locations: ['toronto', 'ottawa'], country: 'Canada',
+    discovery: { enabled: true, intervalMinutes: 5, refillBelow: 9999, perRunLimit: 10, combosPerTick: 3 },
+  } });
+  db.kvSet('discoveryPlannerIndex', 0); db.kvSet('discoveryBoardIndex', 0);
+  const seen = [];
+  const svc = discovery.createDiscoveryService({
+    runner: async (args) => { seen.push(`${args.keyword}|${args.location}`); return { ok: true, jobs: [] }; },
+    ingestJobs: async () => ({ enqueued: 0, duplicates: 0, rejected: 0 }),
+  });
+  const res = await svc.runTick({ force: true });
+  assert.equal(res.combosScanned, 3, 'scanned 3 combos in one tick');
+  assert.equal(seen.length, 3, '3 runner calls (1 board × 3 combos)');
+  assert.equal(new Set(seen).size, 3, 'all 3 combos distinct');
+  assert.equal(Number(db.kvGet('discoveryPlannerIndex')), 3, 'planner advanced by the batch size');
+});
+
+test('combosPerTick: stops at a full cycle instead of rescanning the same combos', async () => {
+  db.patchSettings({ autoApply: {
+    enabled: true, easyApplyOnly: false, keywords: ['solo dev'], boards: ['indeed'],
+    locations: ['toronto', 'ottawa'], country: 'Canada',
+    discovery: { enabled: true, intervalMinutes: 5, refillBelow: 9999, perRunLimit: 10, combosPerTick: 5 },
+  } });
+  db.kvSet('discoveryPlannerIndex', 0); db.kvSet('discoveryBoardIndex', 0);
+  const seen = [];
+  const svc = discovery.createDiscoveryService({
+    runner: async (args) => { seen.push(`${args.keyword}|${args.location}`); return { ok: true, jobs: [] }; },
+    ingestJobs: async () => ({ enqueued: 0, duplicates: 0, rejected: 0 }),
+  });
+  const res = await svc.runTick({ force: true });
+  assert.equal(res.combosScanned, 2, 'only 2 distinct combos exist → no rescans');
+  assert.equal(new Set(seen).size, 2, 'each combo scanned at most once');
+});
+
 test('effectiveFreshTier: brand-new combo starts at the 72h floor (newest-first)', () => {
   // No stored tier yet (never scanned) → 72h regardless of lastNew.
   assert.equal(discovery.effectiveFreshTier(null, 0), discovery.FRESH_BASE_SEC);

@@ -188,7 +188,7 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
   let timer = null, warmup = null, running = false, stopped = false;
   let lastTickAt = 0;   // self-throttle gate (see runTick) — prevents the idle-watchdog storm
 
-  async function searchBoard({ source, keyword, location, limit, hoursOld = 72, force = false, country = 'Canada', remote = false }) {
+  async function searchBoard({ source, keyword, location, limit, hoursOld = 72, force = false, country = 'Canada', remote = false, easyApply = false, distance = 0 }) {
     // location is ALWAYS a geography. Never let it be empty — fall back to the country so
     // a LinkedIn scrape (which has no country param) is still geo-clamped. Work-mode is a
     // separate boolean (`remote`), never smuggled in as the location string.
@@ -196,7 +196,7 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     const batch = db.discoveryBatchStart({ provider: 'jobspy', source, keyword, location: geo });
     broadcast('discovery.updated', { batch });
     try {
-      const result = await runner({ source, keyword, location: geo, limit, hours_old: hoursOld, country: text(country) || 'Canada', remote: !!remote }, 90000);
+      const result = await runner({ source, keyword, location: geo, limit, hours_old: hoursOld, country: text(country) || 'Canada', remote: !!remote, easy_apply: !!easyApply, distance: Number(distance) || 0 }, 90000);
       if (stopped) return batch;
       const jobs = (result.jobs || []).map((j) => normalizeJobSpyRecord(j, source)).filter(Boolean);
       const intake = await ingestJobs(source, jobs, { provider: 'jobspy', batchId: batch.id, force });
@@ -232,10 +232,26 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     const ivMs = Math.max(1, Number(aa.discovery?.intervalMinutes) || 1) * 60000;
     if (!force && (Date.now() - lastTickAt) < ivMs) return { ok: false, reason: 'throttled' };
     if (!force && db.queueList({ state: 'queued' }).length >= (aa.discovery?.refillBelow || 3)) return { ok: false, reason: 'queue-full' };
-    const idx = Number(db.kvGet('discoveryPlannerIndex')) || 0;
-    const query = planner(settings, idx);
-    if (!query) return { ok: false, reason: 'no-keywords' };
-    db.kvSet('discoveryPlannerIndex', query.nextIndex);
+    // WIDEN: scan a BATCH of consecutive planner combos per tick (default 1, cap 5) so the full
+    // keyword×location space (hundreds of combos) is swept in a fraction of the wall-clock instead
+    // of one combo per interval. Combos run SEQUENTIALLY below, so at most selectedBoards.length
+    // subprocesses are ever live at once — the anti-subprocess-storm invariant is preserved.
+    const combosPerTick = Math.max(1, Math.min(5, Number(aa.discovery?.combosPerTick) || 1));
+    let plannerIdx = Number(db.kvGet('discoveryPlannerIndex')) || 0;
+    const combos = [];
+    const seenCombo = new Set();
+    for (let c = 0; c < combosPerTick; c++) {
+      const q = planner(settings, plannerIdx);
+      if (!q) break;
+      const key = `${q.keyword}|${q.location}`;
+      if (seenCombo.has(key)) break;   // wrapped a full cycle of the combo space — don't rescan
+      seenCombo.add(key);
+      combos.push(q);
+      plannerIdx = q.nextIndex;
+    }
+    if (!combos.length) return { ok: false, reason: 'no-keywords' };
+    db.kvSet('discoveryPlannerIndex', plannerIdx);
+    const query = combos[0];
     let boards = (aa.boards || ['linkedin', 'indeed']).map((b) => text(b).toLowerCase().replace(/\s+/g, '_')).filter((b) => SUPPORTED.has(b));
     if (!boards.length) return { ok: false, reason: 'no-supported-boards' };
     // Fix 5(a): in Easy-Apply-only mode, only LinkedIn can yield real Easy-Apply jobs
@@ -256,7 +272,7 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     lastTickAt = Date.now();   // stamp only once we actually proceed to scrape (gates the next call)
     running = true;
     try {
-      const results = await Promise.all(selectedBoards.map(async (source) => {
+      const scanCombo = async (query) => Promise.all(selectedBoards.map(async (source) => {
         // Per-combo freshness tier: a saturated combo widens its window so it keeps surfacing
         // older, not-yet-seen postings instead of re-finding the same duplicates at a fixed 72h.
         const tierKey = `freshTier:${source}|${query.keyword}|${query.location}`;
@@ -264,10 +280,15 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
         const stored = db.kvGet(tierKey);                       // null = never scanned
         const lastNew = Number(db.kvGet(lastNewKey)) || 0;      // ms of the last NEW-accept
         const tierSec = effectiveFreshTier(stored, lastNew);   // jump saturated combos straight to 30d
+        // Under easyApplyOnly, ask JobSpy for ONLY board-hosted (Indeed-Apply / LinkedIn Easy-Apply)
+        // jobs — the ones we can actually auto-submit — instead of the freshness window. This drops
+        // the ~30% external company-site bounces that were the biggest source of wasted attempts.
+        const easyApply = aa.easyApplyOnly !== false && (source === 'indeed' || source === 'linkedin');
         const done = await searchBoard({
           source, keyword: query.keyword, location: query.location, country, remote,
           limit: Math.max(10, Math.min(50, Number(aa.discovery?.perRunLimit) || 25)), force,
-          hoursOld: Math.round(tierSec / 3600),
+          hoursOld: Math.round(tierSec / 3600), easyApply,
+          distance: Math.max(0, Math.min(100, Number(aa.discovery?.distanceMiles) || 0)),
         });
         // Ramp AFTER the scan: found NEW (accepted>0) → reset to the 72h floor (re-hammer fresh) AND
         // stamp freshLastNew=now so saturation is measured from real yield; a DRY scan (0 new on an
@@ -282,8 +303,13 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
         } catch {}
         return done;
       }));
-      db.kvSet('discoveryStatus', { provider: 'jobspy', query, results, at: new Date().toISOString() });
-      return { ok: true, query, results };
+      // Sequential over combos: bounds live subprocesses to selectedBoards.length (anti-storm),
+      // and each combo's per-board freshness ramp still runs inside scanCombo.
+      const batch = [];
+      for (const q of combos) batch.push({ query: q, results: await scanCombo(q) });
+      const first = batch[0] || { query, results: [] };
+      db.kvSet('discoveryStatus', { provider: 'jobspy', query: first.query, results: first.results, combos: batch.map((b) => b.query), at: new Date().toISOString() });
+      return { ok: true, query: first.query, results: first.results, combos: batch, combosScanned: batch.length };
     } finally { running = false; }
   }
 

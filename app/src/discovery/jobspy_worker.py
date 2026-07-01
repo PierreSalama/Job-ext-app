@@ -37,31 +37,39 @@ def main():
     # so a search is never borderless. Work-mode ("remote") is a SEPARATE boolean below,
     # never folded into the location string.
     location = str(request.get("location") or "").strip() or country
+    hours_old = max(1, min(720, int(request.get("hours_old") or 72)))
+    easy_apply = bool(request.get("easy_apply"))
     kwargs = {
         "site_name": [source],
         "search_term": str(request.get("keyword") or ""),
         "location": location,
         "results_wanted": wanted,
-        "hours_old": max(1, min(720, int(request.get("hours_old") or 72))),
         "verbose": 0,
     }
+    # Optional search radius in miles (JobSpy defaults to 50; a wider radius pulls more of the metro).
+    if request.get("distance"):
+        kwargs["distance"] = max(1, min(100, int(request["distance"])))
     if source in ("indeed", "glassdoor"):
         kwargs["country_indeed"] = country
-    # Google Jobs is driven by ONE natural-language query string (google_search_term);
-    # JobSpy IGNORES the plain `search_term` for the google site, so without this the Google
-    # scraper returns an empty frame. Compose the term + geography + a freshness hint into the
-    # kind of phrase a person would type into Google ("software engineer jobs near Toronto, ON
-    # since yesterday"). hours_old above already clamps the freshness window.
-    if source == "google":
+    # INDEED CONSTRAINT: JobSpy allows only ONE of {hours_old, is_remote/job_type, easy_apply} per
+    # Indeed search. easy_apply=True filters to jobs HOSTED ON the board (Indeed-Apply / "Easily
+    # apply") — the ones we can actually auto-submit — dropping the ~30% external company-site bounces
+    # that were the single biggest waste. When asked for it (Indeed/LinkedIn) use it and skip the
+    # mutually-exclusive freshness/remote filters; otherwise use the freshness window (+ optional
+    # remote). Google is a separate natural-language path and always uses the freshness hint.
+    if easy_apply and source in ("indeed", "linkedin"):
+        kwargs["easy_apply"] = True
+    elif source == "google":
+        # JobSpy IGNORES the plain `search_term` for Google; it needs ONE natural-language phrase.
         term = str(request.get("keyword") or "").strip()
-        hrs = max(1, min(720, int(request.get("hours_old") or 72)))
-        since = "since yesterday" if hrs <= 24 else ("in the last week" if hrs <= 168 else "in the last month")
+        since = "since yesterday" if hours_old <= 24 else ("in the last week" if hours_old <= 168 else "in the last month")
         parts = [p for p in [term, "jobs", ("near " + location) if location else "", since] if p]
         kwargs["google_search_term"] = " ".join(parts)
-    # Work-mode filter: jobspy exposes is_remote across its supported boards. Only set it
-    # when the request explicitly asks for remote — otherwise leave results unfiltered.
-    if request.get("remote"):
-        kwargs["is_remote"] = True
+        kwargs["hours_old"] = hours_old
+    else:
+        kwargs["hours_old"] = hours_old
+        if request.get("remote"):
+            kwargs["is_remote"] = True
     if request.get("proxies"):
         kwargs["proxies"] = request["proxies"]
 
