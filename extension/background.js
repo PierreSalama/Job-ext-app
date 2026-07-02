@@ -20,6 +20,7 @@
 import * as api from './lib/api.js';
 import { isJobPageUrl } from './lib/jobpage.js';
 import { HOST_BREAKER_COOLDOWN_MS, hostOfUrl, shouldDispatchHost, trippedEntry } from './lib/host-breaker.js';
+import { focusArbiterDecision } from './lib/focus-arbiter.js';
 import { pickApplyWindowBounds } from './lib/window-place.js';
 import { buildSearchUrl } from './lib/search-url.js';
 import { NARROWEST_TIER, nextFreshnessTier } from './lib/freshness.js';
@@ -677,12 +678,28 @@ async function captureUserFocusOnce() {
   } catch {}
 }
 
+// ── the single-focus arbiter's runtime state + gate ──
+// EVERY window-front in the pool routes through grantWindowFront so parallel apply
+// windows can never fight for the foreground (the freeze). At most one window is
+// granted focus per interval; competing requests are dropped (harmless — the worker
+// windows are already visible-but-unfocused tiles where the SPA hydrates fine).
+let _focusArb = { heldWin: null, heldAt: 0 };
+async function grantWindowFront(winId, { force = false } = {}) {
+  if (winId == null || !chrome.windows?.update) return false;
+  const d = focusArbiterDecision(_focusArb, winId, Date.now(), { force });
+  _focusArb = d.state;
+  if (d.alreadyFront) return true;   // already the held foreground — no yank
+  if (!d.grant) return false;        // REFUSED — this is what prevents the focus war
+  try { await chrome.windows.update(winId, { focused: true, state: 'normal' }); } catch {}
+  return true;
+}
+
 // Bring an apply window to the foreground and KEEP it there (no yank). Un-throttles the tab
 // so the SPA hydrates. Captures the user's focus first so we can restore it later.
 async function focusApplyWindow(winId) {
   if (winId == null || !chrome.windows?.update) return;
   await captureUserFocusOnce();
-  try { await chrome.windows.update(winId, { focused: true, state: 'normal' }); } catch {}
+  await grantWindowFront(winId);     // arbiter-gated: never wars with a sibling window
 }
 
 // Restore focus to the user's previously-focused window — called when the run goes idle /
@@ -691,6 +708,7 @@ async function restoreUserFocus() {
   const id = userFocusedWindowId;
   userFocusedWindowId = null;
   userFocusCaptured = false;
+  _focusArb = { heldWin: null, heldAt: 0 };   // run over → clear the arbiter for the next run
   if (id == null || !chrome.windows?.update) return;
   if (isOurApplyWindow(id)) return;          // never restore "back" to one of our windows
   try { await chrome.windows.update(id, { focused: true }); } catch {}
@@ -1235,8 +1253,10 @@ async function nudgeApplyWindows() {
   if (!chrome.windows?.update) return;
   await captureUserFocusOnce();
   const ids = [aaWindowId, ...aaWindowPool].filter((x) => x != null);
+  // Arbiter-gated: fronting EVERY owned window in a loop was itself a focus war. The
+  // arbiter grants at most one per interval, so at most one nudge lands per cycle.
   for (const id of ids) {
-    try { await chrome.windows.update(id, { focused: true, state: 'normal' }); } catch {}
+    if (await grantWindowFront(id)) break;   // one nudge is enough; the rest wait their turn
   }
 }
 
@@ -1277,7 +1297,8 @@ async function frontUntilHydrated(applyWinId) {
   if (frontHeld.has(applyWinId)) return;       // already holding this one
   await captureUserFocusOnce();
   // Bring the apply window to the front and keep it there (stable; no 700ms yank).
-  try { await chrome.windows.update(applyWinId, { focused: true, state: 'normal' }); } catch {}
+  // Arbiter-gated so N parallel windows requesting front-until-hydrate can't thrash focus.
+  if (!(await grantWindowFront(applyWinId))) return;   // refused this cycle → stay a visible tile
   // Short safety cap — just clears the hold marker; focus restore is run-level.
   const timer = setTimeout(() => { try { releaseFrontUntilHydrated(applyWinId); } catch {} }, FRONT_HARD_CAP_MS);
   frontHeld.set(applyWinId, { timer });
@@ -1327,7 +1348,7 @@ async function acquireApplyWindow(focus = false) {
         win = w.id;
         aaWindowPool = normalizeWindowIds([...aaWindowPool, win]);
         persistAaWindowPool();
-        if (focus) { try { await chrome.windows.update(win, { focused: true, state: 'normal' }); } catch {} }
+        if (focus) { await grantWindowFront(win); }   // arbiter-gated (opt-in bring-to-front mode)
       }
     } catch {}
   }
