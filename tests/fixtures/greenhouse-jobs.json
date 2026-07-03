@@ -1,0 +1,28 @@
+{
+  "jobs": [
+    {
+      "id": 4123456001,
+      "title": "Senior Software Engineer, Backend",
+      "absolute_url": "https://boards.greenhouse.io/exampleco/jobs/4123456001",
+      "location": { "name": "Toronto, ON, Canada" },
+      "updated_at": "2026-06-28T14:32:00-04:00",
+      "content": "<p>ExampleCo is looking for a Senior Software Engineer to join our Backend team. You will design and build scalable services powering our core platform.</p><p>Requirements: 5+ years experience, strong knowledge of distributed systems, Go or Java.</p>"
+    },
+    {
+      "id": 4123456002,
+      "title": "Product Manager, Growth",
+      "absolute_url": "https://boards.greenhouse.io/exampleco/jobs/4123456002",
+      "location": { "name": "Remote - Canada" },
+      "updated_at": "2026-06-29T09:10:00-04:00",
+      "content": "<p>We're hiring a Product Manager to lead our Growth pod. You'll partner with engineering, design, and marketing to drive activation and retention.</p><p>Requirements: 3+ years PM experience, data-driven mindset.</p>"
+    },
+    {
+      "id": 4123456003,
+      "title": "Data Analyst",
+      "absolute_url": "https://boards.greenhouse.io/exampleco/jobs/4123456003",
+      "location": { "name": "Ottawa, ON, Canada" },
+      "updated_at": "2026-06-30T11:00:00-04:00",
+      "content": "<p>Join our Analytics team as a Data Analyst. You will build dashboards and drive insights for cross-functional stakeholders.</p><p>Requirements: SQL, Python, experience with BI tools.</p>"
+    }
+  ]
+}

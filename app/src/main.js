@@ -12,6 +12,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { startServer, stopServer, getToken, broadcast, rescanAllFolders, startFolderWatchers, ingestDiscoveredJobs } = require('./server');
 const { createDiscoveryService } = require('./discovery');
+const { createAtsBoardsService } = require('./discovery/ats-boards');
 const db = require('./db');
 const { autoUpdater } = require('electron-updater');
 const { scope, log: rootLog } = require('./logger');
@@ -37,6 +38,7 @@ let suspended = false;       // machine asleep → pause all background work
 let maintenanceInterval = null;
 let ghostSweepInterval = null;
 let discoveryService = null;
+let atsBoardsService = null;
 let keepAwakeId = null;
 let pipelineWatchdogInterval = null;
 
@@ -538,7 +540,7 @@ async function pipelineWatchdogTick() {
   }
   if (aa.enabled) {
     const live = db.queueLive({ startedAt: aa.startedAt || '' });
-    if (!live.active && !live.queuedDepth && !live.scheduled) discoveryService?.runTick().catch(() => {});
+    if (!live.active && !live.queuedDepth && !live.scheduled) { discoveryService?.runTick().catch(() => {}); atsBoardsService?.runTick().catch(() => {}); }
   }
   broadcast('autoApply.health', health);
 }
@@ -624,6 +626,14 @@ app.whenReady().then(async () => {
     }),
     broadcast,
   });
+  // Direct-ATS JSON board discovery (Greenhouse/Lever/Ashby) — feeds the harness-proven
+  // apply adapters that JobSpy's board list never discovers postings for. See ats-boards.js.
+  atsBoardsService = createAtsBoardsService({
+    ingestJobs: (source, jobs, meta) => ingestDiscoveredJobs(source, jobs, {
+      providerName: meta && meta.provider, batchId: meta && meta.batchId,
+    }),
+    broadcast, db, logger: scope('ats-boards'),
+  });
   const serverOpts = {
     getVersion: () => app.getVersion(),
     userDataDir: app.getPath('userData'),
@@ -663,6 +673,12 @@ app.whenReady().then(async () => {
     intervalMs: Math.max(1, Number(db.getSettings().autoApply?.discovery?.intervalMinutes) || 1) * 60000,
     warmupMs: 12000,
   });
+  {
+    const aaStart = db.getSettings().autoApply || {};
+    if (aaStart.enabled && aaStart.discovery?.enabled && aaStart.discovery?.atsBoardsEnabled !== false) {
+      atsBoardsService.start({ intervalMs: 60000 });
+    }
+  }
   pipelineWatchdogInterval = setInterval(() => pipelineWatchdogTick().catch((e) => log.warn('pipeline watchdog failed', e.message)), 60000);
   setTimeout(() => pipelineWatchdogTick().catch(() => {}), 18000);
 
@@ -722,7 +738,7 @@ app.whenReady().then(async () => {
   // wake (each sync resumes from its own cursor, so nothing is lost or doubled).
   try {
     powerMonitor.on('suspend', () => { suspended = true; log.info('system suspend — pausing background work'); });
-    powerMonitor.on('resume', () => { suspended = false; log.info('system resume — background work re-enabled'); scheduleEmailSync(); maybeCheck(); discoveryService?.runTick().catch(() => {}); });
+    powerMonitor.on('resume', () => { suspended = false; log.info('system resume — background work re-enabled'); scheduleEmailSync(); maybeCheck(); discoveryService?.runTick().catch(() => {}); atsBoardsService?.runTick().catch(() => {}); });
   } catch (e) { log.warn('powerMonitor unavailable', e.message); }
 
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
@@ -753,6 +769,7 @@ app.on('will-quit', () => {
   if (maintenanceInterval) clearInterval(maintenanceInterval);
   if (pipelineWatchdogInterval) clearInterval(pipelineWatchdogInterval);
   if (discoveryService) discoveryService.stop();
+  if (atsBoardsService) atsBoardsService.stop();
   if (keepAwakeId != null) { try { powerSaveBlocker.stop(keepAwakeId); } catch {} keepAwakeId = null; }
   globalShortcut.unregisterAll();
   if (tray) { try { tray.destroy(); } catch {} tray = null; }

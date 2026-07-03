@@ -1,6 +1,6 @@
 {
   "name": "jat11",
-  "version": "11.79.0",
+  "version": "11.80.0",
   "private": true,
   "type": "module",
   "description": "Job Application Tracker v11 â€” workspace root (extension + Electron app + tooling). See README.md.",
@@ -11,8 +11,8 @@
     "validate:ext": "node tools/validate-extension.mjs",
     "harness": "node harness/run.mjs",
     "harness:linkedin": "node harness/run.mjs linkedin",
-    "test": "node --test tests/status.test.mjs tests/fit.test.mjs tests/prompts.test.mjs tests/secrets.test.mjs tests/profile-memory.test.mjs tests/resume.test.mjs tests/autoapply-breakdown.test.mjs tests/autoapply-policy.test.mjs tests/data-safety.test.mjs tests/teach-bugfix.test.mjs tests/control-studio.test.mjs tests/discovery-provider.test.mjs tests/email-match.test.mjs tests/route-state.test.mjs tests/terminal-integrity.test.mjs tests/challenge.test.mjs tests/focus-arbiter.test.mjs tests/idle-gate.test.mjs",
-    "test:all": "node --test --test-force-exit tests/status.test.mjs tests/fit.test.mjs tests/prompts.test.mjs tests/secrets.test.mjs tests/profile-memory.test.mjs tests/resume.test.mjs tests/autoapply-breakdown.test.mjs tests/data-safety.test.mjs tests/detection.test.mjs tests/detector-flow.test.mjs tests/ai-provider.test.mjs tests/autoapply.test.mjs tests/teach-bugfix.test.mjs tests/control-studio.test.mjs tests/discovery-provider.test.mjs tests/email-match.test.mjs tests/route-state.test.mjs tests/terminal-integrity.test.mjs"
+    "test": "node --test tests/status.test.mjs tests/fit.test.mjs tests/prompts.test.mjs tests/secrets.test.mjs tests/profile-memory.test.mjs tests/resume.test.mjs tests/autoapply-breakdown.test.mjs tests/autoapply-policy.test.mjs tests/data-safety.test.mjs tests/teach-bugfix.test.mjs tests/control-studio.test.mjs tests/discovery-provider.test.mjs tests/ats-boards-provider.test.mjs tests/email-match.test.mjs tests/route-state.test.mjs tests/terminal-integrity.test.mjs tests/challenge.test.mjs tests/focus-arbiter.test.mjs tests/idle-gate.test.mjs",
+    "test:all": "node --test --test-force-exit tests/status.test.mjs tests/fit.test.mjs tests/prompts.test.mjs tests/secrets.test.mjs tests/profile-memory.test.mjs tests/resume.test.mjs tests/autoapply-breakdown.test.mjs tests/data-safety.test.mjs tests/detection.test.mjs tests/detector-flow.test.mjs tests/ai-provider.test.mjs tests/autoapply.test.mjs tests/teach-bugfix.test.mjs tests/control-studio.test.mjs tests/discovery-provider.test.mjs tests/ats-boards-provider.test.mjs tests/email-match.test.mjs tests/route-state.test.mjs tests/terminal-integrity.test.mjs"
   },
   "devDependencies": {
     "jsdom": "^29.1.1",

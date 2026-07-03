@@ -168,6 +168,12 @@ const DEFAULTS = {
       refillBelow: 3,             // top up the queue when it drops below this
       intervalMinutes: 1,
       hoursOld: 72,
+      // Direct-ATS JSON board discovery (Greenhouse/Lever/Ashby — app/src/discovery/ats-boards.js).
+      // ON by default: it's what feeds the harness-proven Lever/Greenhouse/Ashby apply
+      // adapters, which JobSpy's board list (linkedin/indeed/glassdoor/google/zip_recruiter)
+      // never discovers postings for. Set false to disable just this discovery lane while
+      // keeping JobSpy running.
+      atsBoardsEnabled: true,
     },
     sites: {},               // per-host overrides: { 'linkedin.com': { mode: 'auto' } }
   },

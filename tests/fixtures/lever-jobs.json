@@ -1,0 +1,41 @@
+[
+  {
+    "id": "a1b2c3d4-0001-4e5f-8a9b-000000000001",
+    "text": "Frontend Engineer",
+    "hostedUrl": "https://jobs.lever.co/exampleco/a1b2c3d4-0001-4e5f-8a9b-000000000001",
+    "applyUrl": "https://jobs.lever.co/exampleco/a1b2c3d4-0001-4e5f-8a9b-000000000001/apply",
+    "categories": {
+      "location": "Toronto, Ontario, Canada",
+      "team": "Engineering",
+      "commitment": "Full-time"
+    },
+    "createdAt": 1751000000000,
+    "descriptionPlain": "We are looking for a Frontend Engineer to build delightful, performant user interfaces using React and TypeScript. You'll work closely with design and product to ship features end to end."
+  },
+  {
+    "id": "a1b2c3d4-0002-4e5f-8a9b-000000000002",
+    "text": "Customer Success Manager",
+    "hostedUrl": "https://jobs.lever.co/exampleco/a1b2c3d4-0002-4e5f-8a9b-000000000002",
+    "applyUrl": "https://jobs.lever.co/exampleco/a1b2c3d4-0002-4e5f-8a9b-000000000002/apply",
+    "categories": {
+      "location": "Remote - Canada",
+      "team": "Customer Success",
+      "commitment": "Full-time"
+    },
+    "createdAt": 1751100000000,
+    "descriptionPlain": "As a Customer Success Manager you will own the post-sale relationship for a portfolio of enterprise accounts, driving adoption and renewal."
+  },
+  {
+    "id": "a1b2c3d4-0003-4e5f-8a9b-000000000003",
+    "text": "Site Reliability Engineer",
+    "hostedUrl": "https://jobs.lever.co/exampleco/a1b2c3d4-0003-4e5f-8a9b-000000000003",
+    "applyUrl": "https://jobs.lever.co/exampleco/a1b2c3d4-0003-4e5f-8a9b-000000000003/apply",
+    "categories": {
+      "location": "Vancouver, British Columbia, Canada",
+      "team": "Infrastructure",
+      "commitment": "Full-time"
+    },
+    "createdAt": 1751200000000,
+    "descriptionPlain": "We're hiring an SRE to help scale our infrastructure, improve observability, and reduce toil across our production systems."
+  }
+]

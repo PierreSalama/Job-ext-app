@@ -39,6 +39,36 @@ function effectiveFreshTier(storedSec, lastNewAtMs, nowMs = Date.now()) {
   if (!lastNewAtMs || (nowMs - Number(lastNewAtMs)) > SATURATION_WINDOW_MS) return FRESH_WIDEST_SEC; // saturated → widest
   return Number(storedSec) || FRESH_BASE_SEC;                                  // recently productive → keep climbing
 }
+
+// ---- Saturation de-prioritization (planner reordering, NOT a request-volume change). ROOT CAUSE:
+// the planner round-robins every keyword×location combo with equal weight, so a combo that's been
+// fully mined (widest 30d tier + no new accept in the saturation window — see effectiveFreshTier)
+// gets scanned on the SAME cadence as a combo that's still yielding fresh jobs. That wastes ticks
+// re-hitting dead ground instead of concentrating effort on combos still producing. A combo is
+// "fully saturated" once it has climbed to the widest freshness tier for EVERY board it would be
+// scanned on AND none of those boards found a new job within the saturation window. Once saturated,
+// only let it through the planner every SKIP_EVERY_N-th time it comes up (deterministic, per-combo
+// counter in kv) — total request volume across all combos is unchanged over a long run (it's still
+// visited, just less often), only the ORDER/FREQUENCY shifts toward productive combos.
+const SKIP_EVERY_N = 4;   // a saturated combo is scanned on 1-in-4 visits instead of every visit
+
+function isComboSaturated(getTierAndLastNew, boards, keyword, location, nowMs = Date.now()) {
+  const list = (Array.isArray(boards) ? boards : []).filter(Boolean);
+  if (!list.length) return false;
+  return list.every((source) => {
+    const { storedSec, lastNewAtMs } = getTierAndLastNew(source, keyword, location) || {};
+    return effectiveFreshTier(storedSec, lastNewAtMs, nowMs) === FRESH_WIDEST_SEC;
+  });
+}
+
+// Pure decision (exported for tests): given the combo's current visit counter, should this tick
+// SKIP a saturated combo (down-weight) or let it through? Non-saturated combos are never skipped.
+// `counter` is the number of times this combo has been offered by the planner since it last ran;
+// callers persist it in kv keyed per-combo and reset it to 0 whenever the combo is actually run.
+function shouldSkipSaturatedCombo(saturated, counter) {
+  if (!saturated) return false;
+  return ((Number(counter) || 0) + 1) < SKIP_EVERY_N;
+}
 const activeChildren = new Set();
 
 function text(v) { return v == null ? '' : String(v).trim(); }
@@ -232,26 +262,9 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     const ivMs = Math.max(1, Number(aa.discovery?.intervalMinutes) || 1) * 60000;
     if (!force && (Date.now() - lastTickAt) < ivMs) return { ok: false, reason: 'throttled' };
     if (!force && db.queueList({ state: 'queued' }).length >= (aa.discovery?.refillBelow || 3)) return { ok: false, reason: 'queue-full' };
-    // WIDEN: scan a BATCH of consecutive planner combos per tick (default 1, cap 5) so the full
-    // keyword×location space (hundreds of combos) is swept in a fraction of the wall-clock instead
-    // of one combo per interval. Combos run SEQUENTIALLY below, so at most selectedBoards.length
-    // subprocesses are ever live at once — the anti-subprocess-storm invariant is preserved.
-    const combosPerTick = Math.max(1, Math.min(5, Number(aa.discovery?.combosPerTick) || 1));
-    let plannerIdx = Number(db.kvGet('discoveryPlannerIndex')) || 0;
-    const combos = [];
-    const seenCombo = new Set();
-    for (let c = 0; c < combosPerTick; c++) {
-      const q = planner(settings, plannerIdx);
-      if (!q) break;
-      const key = `${q.keyword}|${q.location}`;
-      if (seenCombo.has(key)) break;   // wrapped a full cycle of the combo space — don't rescan
-      seenCombo.add(key);
-      combos.push(q);
-      plannerIdx = q.nextIndex;
-    }
-    if (!combos.length) return { ok: false, reason: 'no-keywords' };
-    db.kvSet('discoveryPlannerIndex', plannerIdx);
-    const query = combos[0];
+    // Board selection happens BEFORE combo selection: which boards a combo would scan on is needed
+    // to test that combo for saturation (see isComboSaturated below), and board choice never depends
+    // on which combo is picked.
     let boards = (aa.boards || ['linkedin', 'indeed']).map((b) => text(b).toLowerCase().replace(/\s+/g, '_')).filter((b) => SUPPORTED.has(b));
     if (!boards.length) return { ok: false, reason: 'no-supported-boards' };
     // Fix 5(a): in Easy-Apply-only mode, only LinkedIn can yield real Easy-Apply jobs
@@ -266,6 +279,58 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     const selectedBoards = [];
     for (let i = 0; i < Math.min(3, boards.length); i++) selectedBoards.push(boards[(boardIndex + i) % boards.length]);
     db.kvSet('discoveryBoardIndex', (boardIndex + selectedBoards.length) % boards.length);
+    // WIDEN: scan a BATCH of consecutive planner combos per tick (default 1, cap 5) so the full
+    // keyword×location space (hundreds of combos) is swept in a fraction of the wall-clock instead
+    // of one combo per interval. Combos run SEQUENTIALLY below, so at most selectedBoards.length
+    // subprocesses are ever live at once — the anti-subprocess-storm invariant is preserved.
+    //
+    // SATURATION SKIP: while walking the planner, a combo that's fully saturated on every board in
+    // selectedBoards (see isComboSaturated) is offered but usually DOWN-WEIGHTED — its per-combo
+    // visit counter (kv) increments and the planner moves on to the next combo instead, UNLESS the
+    // counter says this is its 1-in-SKIP_EVERY_N turn, in which case it's let through like normal
+    // and its counter resets. This is pure reordering: a skipped combo's planner index still
+    // advances (so it isn't stuck), and it still gets scanned eventually — just less often — so
+    // total request volume over a long run is unchanged while effort concentrates on combos still
+    // yielding new jobs. Bounded by a generous walk cap so an all-saturated combo space can't spin.
+    const combosPerTick = Math.max(1, Math.min(5, Number(aa.discovery?.combosPerTick) || 1));
+    const getTierAndLastNew = (source, keyword, location) => ({
+      storedSec: db.kvGet(`freshTier:${source}|${keyword}|${location}`),
+      lastNewAtMs: Number(db.kvGet(`freshLastNew:${source}|${keyword}|${location}`)) || 0,
+    });
+    let plannerIdx = Number(db.kvGet('discoveryPlannerIndex')) || 0;
+    const combos = [];
+    const seenCombo = new Set();
+    const maxWalk = Math.max(combosPerTick, Math.min(200, combosPerTick * SKIP_EVERY_N * 2));
+    // Fallback if EVERY combo in the space is saturated and none is on its Nth turn this cycle
+    // (rare — normally at least one combo hits its turn well before a full wrap): rather than
+    // starving discovery entirely, fall back to the single most-skipped (longest overdue) combo
+    // seen during the walk so a full cycle of down-weighting still guarantees forward progress.
+    let staleFallback = null, staleFallbackCounter = -1;
+    for (let walk = 0; walk < maxWalk && combos.length < combosPerTick; walk++) {
+      const q = planner(settings, plannerIdx);
+      if (!q) break;
+      const key = `${q.keyword}|${q.location}`;
+      if (seenCombo.has(key)) break;   // wrapped a full cycle of the combo space — don't rescan
+      seenCombo.add(key);
+      plannerIdx = q.nextIndex;
+      const skipKey = `discoverySkipCount:${key}`;
+      const saturated = isComboSaturated(getTierAndLastNew, selectedBoards, q.keyword, q.location);
+      const counter = Number(db.kvGet(skipKey)) || 0;
+      if (shouldSkipSaturatedCombo(saturated, counter)) {
+        db.kvSet(skipKey, counter + 1);
+        if (counter > staleFallbackCounter) { staleFallback = q; staleFallbackCounter = counter; }
+        continue;   // down-weighted this cycle — planner index already advanced past it
+      }
+      if (saturated) db.kvSet(skipKey, 0);   // let through on its 1-in-N turn — reset the counter
+      combos.push(q);
+    }
+    if (!combos.length && staleFallback) {
+      db.kvSet(`discoverySkipCount:${staleFallback.keyword}|${staleFallback.location}`, 0);
+      combos.push(staleFallback);
+    }
+    if (!combos.length) return { ok: false, reason: 'no-keywords' };
+    db.kvSet('discoveryPlannerIndex', plannerIdx);
+    const query = combos[0];
     // Country-clamp every source; pass work-mode through as a boolean (never as location).
     const country = text(aa.country) || 'Canada';
     const remote = Array.isArray(aa.workModes) && aa.workModes.includes('remote');
@@ -329,4 +394,8 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
   return { runTick, searchBoard, start, stop, isRunning: () => running };
 }
 
-module.exports = { normalizeJobSpyRecord, classifyProviderError, planner, selectBoards, defaultRunner, runWithCandidates, workerCandidates, createDiscoveryService, effectiveFreshTier, widerFreshTier, FRESH_BASE_SEC, FRESH_WIDEST_SEC };
+module.exports = {
+  normalizeJobSpyRecord, classifyProviderError, planner, selectBoards, defaultRunner, runWithCandidates,
+  workerCandidates, createDiscoveryService, effectiveFreshTier, widerFreshTier, FRESH_BASE_SEC, FRESH_WIDEST_SEC,
+  isComboSaturated, shouldSkipSaturatedCombo, SKIP_EVERY_N,
+};

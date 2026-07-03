@@ -194,6 +194,10 @@ function jobFit(jobOrTitle, aa) {
 // with easyApplyOnly ON is now (correctly) rejected unless the record proves Easy Apply.
 // `source` falls back to the record's own source so the browser-fallback / ingest-endpoint
 // path is covered too.
+// ANY new discovery source must be added to this allowlist or it is SILENTLY DROPPED
+// under easyApplyOnly (rejected++ in ingestDiscoveredJobs, no error, no log) — this bit
+// us once already with Lever/Greenhouse/Ashby (0 done / ~4 jobs each all-time) before
+// they were added below.
 function easyApplyIngestEligible(source, easyApplyOnly, job = null) {
   if (!easyApplyOnly) return true;
   const src = String(source || (job && job.source) || '').toLowerCase();
@@ -204,7 +208,11 @@ function easyApplyIngestEligible(source, easyApplyOnly, job = null) {
   // EXECUTOR fast-skips a posting that's external/off-board in ~35ms (detectLinkedInExternalPosting
   // for LinkedIn; the Indeed-host external fast-skip for Indeed) and terminal-skips it (non-retriable),
   // so the queue stays fed and the run blazes past externals to the real Easy-Apply/Indeed-Apply jobs.
-  return src === 'linkedin' || src === 'indeed';
+  //
+  // Greenhouse/Lever/Ashby (ats-boards.js) are ALSO genuinely in-board drivable — their postings
+  // are fetched directly from the ATS's own JSON API and every result IS the company's own native
+  // apply form (no board/aggregator layer to bounce off of), so they belong in the same allowlist.
+  return src === 'linkedin' || src === 'indeed' || src === 'greenhouse' || src === 'lever' || src === 'ashby';
 }
 
 // One intake path for every discovery provider. JobSpy and the browser fallback

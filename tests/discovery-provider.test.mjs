@@ -262,6 +262,75 @@ test('freshness ramp: a SATURATED combo widens 72h→7d→14d→30d, then resets
   await tick(); assert.equal(hoursSeen.at(-1), 720, 'saturated (>6h since a new accept) → jumps straight to 30d');
 });
 
+test('isComboSaturated: true only when EVERY board is at the widest tier and stale', () => {
+  const now = 1_000_000_000_000;
+  const wide = { storedSec: discovery.FRESH_WIDEST_SEC, lastNewAtMs: now - 7 * 3600 * 1000 };   // saturated
+  const fresh = { storedSec: discovery.FRESH_BASE_SEC, lastNewAtMs: now - 60 * 1000 };            // productive
+  assert.equal(discovery.isComboSaturated(() => wide, ['linkedin', 'indeed'], 'dev', 'toronto', now), true);
+  // One board still productive → combo NOT saturated (any fresh board is reason enough to visit).
+  assert.equal(discovery.isComboSaturated((source) => (source === 'indeed' ? fresh : wide), ['linkedin', 'indeed'], 'dev', 'toronto', now), false);
+  // No boards → never saturated (defensive; caller always passes selectedBoards).
+  assert.equal(discovery.isComboSaturated(() => wide, [], 'dev', 'toronto', now), false);
+});
+
+test('shouldSkipSaturatedCombo: never skips a non-saturated combo; skips a saturated one until its 1-in-N turn', () => {
+  assert.equal(discovery.shouldSkipSaturatedCombo(false, 0), false);
+  assert.equal(discovery.shouldSkipSaturatedCombo(false, 99), false);
+  const seen = [];
+  for (let counter = 0; counter < discovery.SKIP_EVERY_N + 2; counter++) {
+    seen.push(discovery.shouldSkipSaturatedCombo(true, counter));
+  }
+  // Skipped for the first SKIP_EVERY_N-1 counters, then let through on the Nth (counter+1 === N).
+  assert.deepEqual(seen.slice(0, discovery.SKIP_EVERY_N - 1), Array(discovery.SKIP_EVERY_N - 1).fill(true));
+  assert.equal(seen[discovery.SKIP_EVERY_N - 1], false, 'lets through on the 1-in-N turn');
+});
+
+test('saturation de-prioritization: a fully-saturated (30d + stale) combo is visited far less often than a fresh one over many ticks, with unchanged total request volume', async () => {
+  // Two combos, both on the single selected board (indeed). "stale dev|toronto" is seeded already
+  // saturated (widest tier, no new accept in >6h) on indeed; "fresh dev|ottawa" is seeded productive
+  // (base tier, accepted recently). Run enough ticks to sweep a few full cycles of the 2-combo space
+  // and assert the saturated combo is scanned roughly 1-in-N times while the fresh one is scanned
+  // essentially every cycle — pure reordering, not a volume cut (every combo is still visited).
+  db.patchSettings({ autoApply: {
+    enabled: true, easyApplyOnly: false, keywords: ['stale dev', 'fresh dev'], boards: ['indeed'],
+    locations: ['toronto', 'ottawa'], country: 'Canada',
+    discovery: { enabled: true, intervalMinutes: 5, refillBelow: 9999, perRunLimit: 10, combosPerTick: 1 },
+  } });
+  db.kvSet('discoveryPlannerIndex', 0);
+  db.kvSet('discoveryBoardIndex', 0);
+  // planner() pairs keywords[i] with locations[i] in this settings shape (2x2 grid, but we only
+  // seed the diagonal combos this test cares about): stale dev|toronto and fresh dev|ottawa.
+  db.kvSet('freshTier:indeed|stale dev|toronto', discovery.FRESH_WIDEST_SEC);
+  db.kvSet('freshLastNew:indeed|stale dev|toronto', Date.now() - 7 * 3600 * 1000);   // >6h stale → saturated
+  db.kvSet('freshTier:indeed|fresh dev|ottawa', discovery.FRESH_BASE_SEC);
+  db.kvSet('freshLastNew:indeed|fresh dev|ottawa', Date.now());                        // recent → productive
+  // Also seed the off-diagonal combos as saturated so they don't dilute the count (planner rotates
+  // over the full keyword×location cross product: stale dev|ottawa and fresh dev|toronto too).
+  db.kvSet('freshTier:indeed|stale dev|ottawa', discovery.FRESH_WIDEST_SEC);
+  db.kvSet('freshLastNew:indeed|stale dev|ottawa', Date.now() - 7 * 3600 * 1000);
+  db.kvSet('freshTier:indeed|fresh dev|toronto', discovery.FRESH_WIDEST_SEC);
+  db.kvSet('freshLastNew:indeed|fresh dev|toronto', Date.now() - 7 * 3600 * 1000);
+  const scans = { 'stale dev|toronto': 0, 'fresh dev|ottawa': 0 };
+  const svc = discovery.createDiscoveryService({
+    runner: async (args) => {
+      const key = `${args.keyword}|${args.location}`;
+      if (key in scans) scans[key]++;
+      return { ok: true, jobs: [] };
+    },
+    ingestJobs: async () => ({ enqueued: 0, duplicates: 0, rejected: 0 }),
+  });
+  const N_TICKS = discovery.SKIP_EVERY_N * 4;   // several full 1-in-N cycles
+  for (let i = 0; i < N_TICKS; i++) {
+    const res = await svc.runTick({ force: true });
+    assert.equal(res.ok, true, `tick ${i} should find a combo to scan`);
+  }
+  // The saturated combo must be visited (forward progress guaranteed), but strictly less often
+  // than the fresh one, which is offered on every cycle it's the planner's turn.
+  assert.ok(scans['stale dev|toronto'] >= 1, 'saturated combo is still eventually visited (not starved)');
+  assert.ok(scans['fresh dev|ottawa'] > scans['stale dev|toronto'],
+    `fresh combo (${scans['fresh dev|ottawa']}) should be scanned more often than the saturated one (${scans['stale dev|toronto']})`);
+});
+
 test('runTick self-throttles to the configured interval (anti subprocess-storm)', async () => {
   // The idle-watchdog pokes runTick every few seconds whenever the queue is drained; without a
   // time gate that spawns a JobSpy subprocess each time and pins the CPU (the live freeze: 791

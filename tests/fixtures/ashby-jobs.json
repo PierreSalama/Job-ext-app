@@ -1,0 +1,37 @@
+{
+  "jobs": [
+    {
+      "id": "9f8e7d6c-0001-4b3a-9c1d-000000000001",
+      "title": "Full Stack Engineer",
+      "location": "Toronto, Canada",
+      "employmentType": "FullTime",
+      "isRemote": false,
+      "jobUrl": "https://jobs.ashbyhq.com/exampleco/9f8e7d6c-0001-4b3a-9c1d-000000000001",
+      "applyUrl": "https://jobs.ashbyhq.com/exampleco/9f8e7d6c-0001-4b3a-9c1d-000000000001/application",
+      "publishedAt": "2026-06-27T08:00:00.000Z",
+      "descriptionPlain": "We are seeking a Full Stack Engineer to help build our core product across the stack, from our Postgres-backed API to our React frontend."
+    },
+    {
+      "id": "9f8e7d6c-0002-4b3a-9c1d-000000000002",
+      "title": "Technical Recruiter",
+      "location": "Remote - Canada",
+      "employmentType": "FullTime",
+      "isRemote": true,
+      "jobUrl": "https://jobs.ashbyhq.com/exampleco/9f8e7d6c-0002-4b3a-9c1d-000000000002",
+      "applyUrl": "https://jobs.ashbyhq.com/exampleco/9f8e7d6c-0002-4b3a-9c1d-000000000002/application",
+      "publishedAt": "2026-06-28T08:00:00.000Z",
+      "descriptionPlain": "Join our People team as a Technical Recruiter, partnering with hiring managers to build a world-class engineering org."
+    },
+    {
+      "id": "9f8e7d6c-0003-4b3a-9c1d-000000000003",
+      "title": "Engineering Manager, Platform",
+      "location": "Toronto, Canada",
+      "employmentType": "FullTime",
+      "isRemote": false,
+      "jobUrl": "https://jobs.ashbyhq.com/exampleco/9f8e7d6c-0003-4b3a-9c1d-000000000003",
+      "applyUrl": "https://jobs.ashbyhq.com/exampleco/9f8e7d6c-0003-4b3a-9c1d-000000000003/application",
+      "publishedAt": "2026-06-29T08:00:00.000Z",
+      "descriptionPlain": "We're looking for an Engineering Manager to lead our Platform team, responsible for developer experience and core infrastructure."
+    }
+  ]
+}
