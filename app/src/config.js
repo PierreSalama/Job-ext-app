@@ -130,6 +130,13 @@ const DEFAULTS = {
     runAnytime: true,        // ON by default — run 24/7. Turn OFF to use the window below.
     windowStart: '',         // only used when runAnytime is false
     windowEnd: '',
+    // ---- "only auto-apply while I'm idle/away" (opt-in) ----
+    idleOnly: false,              // OFF by default. ON = pause dispatch + discovery the instant you use
+                                  // the mouse/keyboard OR any browser tab plays audio/video (YouTube, music,
+                                  // a call); resume automatically only when you're completely idle AND silent.
+                                  // Uses chrome.idle (system input) + audible-tab detection. Native-app audio
+                                  // (a desktop video player outside the browser) is NOT detectable.
+    idleThresholdSeconds: 60,     // seconds of no mouse/keyboard input before you count as "idle" (min 15 — the chrome.idle floor)
     aiAnswerConfidenceMin: 0.7,   // AI answers a screening question when reasonably confident (lower = fewer parks, more autonomy)
     easyApplyOnly: false,         // OFF = include normal/external postings and let the runner hand off to company/ATS forms when possible
     keywords: [],                 // e.g. ['software engineer', 'data analyst']
@@ -213,6 +220,9 @@ const DEFAULTS = {
   notifications: {
     statusChanges: false,
     autoApply: true,
+    autoApplyDesktop: true,   // ALSO raise a NATIVE OS notification (Windows Action Center) on every
+                              // auto-apply outcome — submitted, failed, or needs-you — so a result is
+                              // visible even when the dashboard isn't in front (not just the in-app toast).
     updates: true,
     followUps: false,
   },

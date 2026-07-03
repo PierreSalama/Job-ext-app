@@ -1993,6 +1993,7 @@ route('/queue', async () => {
     </header>
 
     ${working ? '<div class="aa-running"><span class="aa-pulse"></span> Auto-apply is working in a background tab — <strong>don\'t touch that window</strong>. It\'s paced and you can Stop any time.</div>' : ''}
+    ${(aa.enabled && aa.idleOnly === true && disc && disc.paused) ? `<div class="aa-running" style="background:rgba(120,124,160,.14);border-color:rgba(120,124,160,.35)">🌙 <strong>Idle-pause</strong> — ${esc(disc.pauseReason || 'you\'re using the computer')}. Auto-apply resumes automatically the moment you\'re idle and nothing is playing.</div>` : ''}
 
     <div id="aa-live" data-keep></div>
 
@@ -2039,10 +2040,12 @@ route('/queue', async () => {
       </div>
     </section>
 
-    <details class="section aa-advanced" ${(aa.runAnytime === false || aa.maxPerDay < 50 || (Number(aa.concurrency) || 1) > 1) ? 'open' : ''}>
+    <details class="section aa-advanced" ${(aa.runAnytime === false || aa.idleOnly === true || aa.maxPerDay < 50 || (Number(aa.concurrency) || 1) > 1) ? 'open' : ''}>
       <summary><span class="section-eyebrow">Advanced</span> Pacing &amp; limits</summary>
       <div class="queue-controls section-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px">
         ${qc('Run anytime (24/7)', `<label class="toggle"><input type="checkbox" id="aa-anytime" ${aa.runAnytime !== false ? 'checked' : ''} /><span class="knob"></span></label>`)}
+        ${qc('Only when I\'m idle', `<label class="toggle"><input type="checkbox" id="aa-idleonly" ${aa.idleOnly === true ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">Pauses the moment you touch the mouse/keyboard <em>or</em> any tab plays audio/video (YouTube, music, a call), and resumes automatically only when you're completely idle with nothing playing — ideal for applying while you're away. Uses your browser's idle + audible-tab detection; audio from apps outside the browser isn't detected.</div>`)}
+        ${qc('Count me idle after (sec)', `<input class="input" id="aa-idlesecs" type="number" min="15" max="1800" step="5" value="${Math.max(15, Number(aa.idleThresholdSeconds) || 60)}" /><div class="form-hint">Seconds of no mouse/keyboard before you count as idle (minimum 15).</div>`)}
         ${qc('Max / day', `<input class="input" id="aa-day" type="number" min="1" max="500" value="${aa.maxPerDay}" />`)}
         ${qc('Max / hour', `<input class="input" id="aa-hour" type="number" min="1" max="100" value="${aa.maxPerHour}" />`)}
         ${qc('Gap min (min)', `<input class="input" id="aa-gmin" type="number" min="0" max="180" step="0.25" value="${aa.minGapMinutes}" />`)}
@@ -2145,6 +2148,8 @@ route('/queue', async () => {
           runAnytime: v.querySelector('#aa-anytime').checked,
           windowStart: v.querySelector('#aa-ws')?.value || '',
           windowEnd: v.querySelector('#aa-we')?.value || '',
+          idleOnly: v.querySelector('#aa-idleonly')?.checked || false,
+          idleThresholdSeconds: Math.max(15, Math.min(1800, Number(v.querySelector('#aa-idlesecs')?.value) || 60)),
         } },
       });
       state.settings = null;

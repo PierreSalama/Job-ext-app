@@ -6,7 +6,7 @@
 
 const {
   app, BrowserWindow, Tray, Menu, dialog, globalShortcut,
-  ipcMain, nativeImage, shell, powerMonitor, powerSaveBlocker,
+  ipcMain, nativeImage, shell, powerMonitor, powerSaveBlocker, Notification,
 } = require('electron');
 const path = require('path');
 const crypto = require('crypto');
@@ -231,6 +231,23 @@ function notify(kind, title, body, toastKind = 'info') {
   } catch {}
 }
 
+// A NATIVE OS notification (Windows Action Center / macOS Notification Center) — used for
+// auto-apply OUTCOMES so a submitted/failed/needs-you application is visible even when the
+// dashboard window isn't in front. Silently no-ops where the platform can't show one.
+// Clicking it brings the app window forward.
+function nativeNotify(title, body) {
+  try {
+    if (!Notification || !Notification.isSupported || !Notification.isSupported()) return;
+    const n = new Notification({ title: String(title || 'Auto-apply'), body: String(body || '').slice(0, 240), silent: false });
+    n.on('click', () => {
+      try {
+        if (mainWindow && !mainWindow.isDestroyed()) { mainWindow.show(); mainWindow.focus(); }
+      } catch {}
+    });
+    n.show();
+  } catch {}
+}
+
 function notifyEvent(type, payload) {
   if (type === 'status' && payload?.job) {
     if (payload.action === 'created') {
@@ -240,6 +257,12 @@ function notifyEvent(type, payload) {
     }
   }
   if (type === 'autoApply' && payload) {
+    // Name the actual application in every notification (the task row only carries jobId).
+    let jobLabel = '';
+    try {
+      const j = payload.jobId ? db.getJob(payload.jobId) : null;
+      if (j) jobLabel = [j.title, j.company].filter(Boolean).join(' — ');
+    } catch {}
     const msgs = {
       awaiting_review: 'An application is filled and waiting for your review.',
       awaiting_input: 'Auto-apply needs your input on a question it could not answer.',
@@ -247,7 +270,25 @@ function notifyEvent(type, payload) {
       failed: `A queued application failed: ${payload.lastError || 'see transcript'}`,
     };
     const kinds = { awaiting_review: 'info', awaiting_input: 'warn', done: 'success', failed: 'danger' };
-    if (msgs[payload.state]) notify('autoApply', 'Auto-apply', msgs[payload.state], kinds[payload.state] || 'info');
+    if (msgs[payload.state]) {
+      notify('autoApply', 'Auto-apply', jobLabel ? `${jobLabel} — ${msgs[payload.state]}` : msgs[payload.state], kinds[payload.state] || 'info');
+    }
+    // The second, always-visible notification (Pierre's ask): a NATIVE OS popup on EVERY
+    // outcome — success or not — gated by notifications.autoApplyDesktop (default on).
+    try {
+      const s = db.getSettings().notifications;
+      if (s.autoApply !== false && s.autoApplyDesktop !== false) {
+        const native = {
+          done:            { t: '✅ Application submitted',        b: jobLabel || 'An application was submitted.' },
+          awaiting_review: { t: '📝 Filled — needs your review',    b: jobLabel || 'An application is waiting for your review.' },
+          awaiting_input:  { t: '❓ Auto-apply needs your answer',   b: jobLabel || 'A question could not be answered automatically.' },
+          parked:          { t: '⏸ Application parked',             b: (jobLabel ? jobLabel + ' — ' : '') + (payload.parkReason || payload.lastError || 'needs your input') },
+          failed:          { t: '⚠ Application failed',             b: (jobLabel ? jobLabel + ' — ' : '') + (payload.lastError || 'see transcript') },
+        };
+        const nd = native[payload.state];
+        if (nd) nativeNotify(nd.t, nd.b);
+      }
+    } catch {}
   }
 }
 
@@ -541,6 +582,10 @@ ipcMain.handle('jat:pair-respond', (_e, id, allow) => { if (pendingPair && pendi
 
 // ---------- lifecycle ----------
 app.whenReady().then(async () => {
+  // Windows attributes native notifications to this AppUserModelID; setting it explicitly
+  // makes auto-apply outcome notifications show correctly in dev too (the installer sets it
+  // for the packaged app). Harmless on macOS/Linux.
+  try { app.setAppUserModelId('com.pierre.jat11'); } catch {}
   try {
     db.open(app.getPath('userData'));
   } catch (e) {

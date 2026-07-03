@@ -18,6 +18,7 @@
 // (1m, ask app /queue/next and dispatch to a tab), jat11-extupdate (6h).
 
 import * as api from './lib/api.js';
+import { computeIdleGate, clampIdleThreshold } from './lib/idle-gate.js';
 import { isJobPageUrl } from './lib/jobpage.js';
 import { HOST_BREAKER_COOLDOWN_MS, hostOfUrl, shouldDispatchHost, trippedEntry } from './lib/host-breaker.js';
 import { focusArbiterDecision } from './lib/focus-arbiter.js';
@@ -156,6 +157,27 @@ chrome.alarms.onAlarm.addListener(async (a) => {
   if (a.name === 'jat11-aa-reaper') {
     await reapAaTabs().catch(() => {});
   }
+});
+
+// ---------- idle-gate reactivity ----------
+// When "only when idle" is on, react to the user going away / audio stopping so auto-apply
+// resumes within a second instead of waiting for the 1-min alarm — and pauses promptly when
+// they come back. Guarded by _idleOnlyHint so there is ZERO extra work when the toggle is off.
+// (schedulePump / discoverTick are function declarations → hoisted; _idleOnlyHint is read only
+// at event time, after the module has fully evaluated.)
+try {
+  chrome.idle.onStateChanged.addListener((newState) => {
+    if (!_idleOnlyHint) return;
+    // 'idle'/'locked' may OPEN the gate → try to resume applies + top up discovery.
+    // 'active' will re-gate on the next pump; nudging is harmless (pump self-gates).
+    schedulePump();
+    if (newState === 'idle' || newState === 'locked') discoverTick().catch(() => {});
+  });
+} catch { /* 'idle' permission missing — feature simply won't react in real time */ }
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
+  if (changeInfo.audible === undefined || !_idleOnlyHint) return;
+  // Audio started (pump will re-gate) or stopped (may open the gate) → re-evaluate.
+  schedulePump();
 });
 
 // ---------- badge ----------
@@ -1718,6 +1740,17 @@ async function pump(force = false) {
   if (!(await api.isPaired())) return { dispatched: false, reason: 'not paired' };
   const h = await api.health();
   if (!h?.ok) return { dispatched: false, reason: 'app offline' };
+  // IDLE GATE: when "only when idle" is on and the user is active (input) or media is
+  // playing, don't START new applies. A manual "Apply next now" (force) always bypasses.
+  // In-flight tasks keep running; the idle/audible listeners re-pump when the user goes away.
+  if (!force) {
+    const g = await evalIdleGate(await getAaCached());
+    if (g.gated) {
+      await postIdlePauseStatus(g);
+      return { dispatched: false, reason: 'idle-gate:' + (g.activeInput ? 'user-active' : 'media-playing') };
+    }
+    if (g.idleOnly) await clearIdlePauseStatus();
+  }
   if (gapTimer) { clearTimeout(gapTimer); gapTimer = null; }
   pumping = true;
   let dispatched = 0;
@@ -1896,6 +1929,61 @@ function withinWindow(aa) {
   return mins >= sh * 60 + (sm || 0) && mins <= eh * 60 + (em || 0);
 }
 
+// ── IDLE GATE ("only auto-apply while I'm idle/away") ────────────────────────────
+// When autoApply.idleOnly is ON, pause NEW dispatch + discovery the instant the user is
+// active (mouse/keyboard input) or any tab is playing audio/video, and resume only when
+// they're idle AND silent. The pure rule lives in ./lib/idle-gate.js (node-tested); here
+// we feed it the live chrome.idle state + audible-tab count. In-flight applies are left to
+// finish — we only stop STARTING new work — so a half-filled form isn't abandoned mid-run.
+let _aaCache = null, _aaCacheAt = 0;
+let _idleOnlyHint = false;         // cheap flag so event listeners can skip work when the feature is off
+let _idlePausePosted = false;      // whether we've surfaced a pause marker that later needs clearing
+
+// Lightweight settings cache so a hot pump loop doesn't hit /settings on every slot.
+async function getAaCached(maxAgeMs = 3000) {
+  const now = Date.now();
+  if (_aaCache && now - _aaCacheAt < maxAgeMs) return _aaCache;
+  try {
+    const s = await api.call('GET', '/settings', null, 5000);
+    if (s?.ok) { _aaCache = s.settings?.autoApply || {}; _aaCacheAt = now; _idleOnlyHint = _aaCache.idleOnly === true; }
+  } catch { /* keep last cache on a blip */ }
+  return _aaCache;
+}
+
+// Live idle-gate decision for the given autoApply settings. Returns { gated:false } when
+// the feature is off. When on, queries chrome.idle + audible tabs and applies the pure rule.
+async function evalIdleGate(aa) {
+  if (!aa || aa.idleOnly !== true) { _idleOnlyHint = false; return { gated: false, idleOnly: false }; }
+  _idleOnlyHint = true;
+  const threshold = clampIdleThreshold(aa.idleThresholdSeconds);
+  try { chrome.idle.setDetectionInterval(threshold); } catch {}
+  let idleState = 'active';
+  try { idleState = await chrome.idle.queryState(threshold); } catch { idleState = 'active'; }
+  let audible = 0;
+  try { audible = (await chrome.tabs.query({ audible: true })).length; } catch {}
+  const d = computeIdleGate(idleState, audible);
+  return { gated: d.busy, idleOnly: true, threshold, ...d };
+}
+
+// Surface WHY the engine is paused so an idle-pause never reads as "broken" (reuses the
+// discovery-status kv the Auto-apply page already renders — no server change needed).
+async function postIdlePauseStatus(g) {
+  _idlePausePosted = true;
+  await api.call('POST', '/auto-apply/discovery-status', {
+    ok: true, paused: true, pauseReason: g.reason,
+    note: `Paused — ${g.reason}. Auto-apply resumes automatically when you're idle and nothing is playing.`,
+    board: '', keyword: '', found: 0, enqueued: 0,
+  }, 5000).catch(() => {});
+}
+
+// Clear a previously-posted pause marker the moment the gate opens (so the banner drops
+// even before the next discovery scan overwrites the status).
+async function clearIdlePauseStatus() {
+  if (!_idlePausePosted) return;
+  _idlePausePosted = false;
+  await api.call('POST', '/auto-apply/discovery-status', { ok: true, paused: false, note: '' }, 5000).catch(() => {});
+}
+
 // buildSearchUrl now lives in ./lib/search-url.js (pure + node-testable): geography is
 // mandatory (empty location → country), work-mode → LinkedIn f_WT / Indeed remote attr,
 // and freshnessSeconds → LinkedIn f_TPR / Indeed fromage. The freshness tier per combo is
@@ -1954,6 +2042,15 @@ async function discoverTick(force = false) {
   const sres = await api.call('GET', '/settings', null, 6000);
   const aa = sres?.ok ? sres.settings?.autoApply : null;
   if (!aa || !aa.enabled || !aa.discovery?.enabled) return { ok: false, note: 'auto-apply is off' };
+  // Refresh the cache the pump reads, so pump + discovery agree on the idle-gate state.
+  if (aa) { _aaCache = aa; _aaCacheAt = Date.now(); _idleOnlyHint = aa.idleOnly === true; }
+  // IDLE GATE: don't open a discovery/search tab while the user is active or media is playing
+  // (a background tab popping up is itself intrusive). Manual "Search now" (force) bypasses.
+  if (!force) {
+    const g = await evalIdleGate(aa);
+    if (g.gated) { await postIdlePauseStatus(g); return { ok: false, note: `paused — ${g.reason}` }; }
+    if (g.idleOnly) await clearIdlePauseStatus();
+  }
   const keywords = (aa.keywords || []).filter(Boolean);
   let boards = (aa.boards || []).filter(Boolean);
   if (aa.easyApplyOnly !== false) {
