@@ -249,10 +249,14 @@ function normalizeAtsRecord(raw = {}, ats, token) {
 const ATS_HOST_RX = /(greenhouse\.io|lever\.co|ashbyhq\.com)/i;
 
 function harvestTokensFromDb(db) {
-  if (!db || typeof db.classifyAts !== 'function' || typeof db.listJobs !== 'function') return [];
+  if (!db || typeof db.classifyAts !== 'function') return [];
   let rows = [];
   try {
-    rows = db.listJobs({}) || [];
+    // Prefer the narrow id+job_url scan (only ATS-hosted rows, no description, no annotateAutoApply);
+    // fall back to listJobs for older db shapes / test doubles.
+    rows = typeof db.jobUrlsForAtsHarvest === 'function'
+      ? (db.jobUrlsForAtsHarvest() || [])
+      : (typeof db.listJobs === 'function' ? (db.listJobs({}) || []) : []);
   } catch (e) {
     log.warn('harvestTokensFromDb query failed:', e?.message || e);
     return [];

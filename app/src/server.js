@@ -721,7 +721,11 @@ async function handle(req, res, parsed) {
         needsReview: parsed.searchParams.has('needsReview')
           ? parsed.searchParams.get('needsReview') === '1' : undefined,
         q: parsed.searchParams.get('q') || undefined,
-        limit: parsed.searchParams.get('limit') || undefined,
+        // Boundary safety cap when the caller omits a limit: keeps a stray no-limit /jobs from
+        // materializing every row. Generous (1000) — the UI's largest explicit list fetch is 500,
+        // so this never truncates a real view; internal callers (exportAll/backfill) bypass the
+        // HTTP layer entirely and stay unbounded. See perf audit (v11.82.0).
+        limit: parsed.searchParams.get('limit') || 1000,
         offset: parsed.searchParams.get('offset') || undefined,
       }),
     });
@@ -1234,6 +1238,14 @@ async function handle(req, res, parsed) {
   // The deduped list of questions parked jobs are waiting on (the intake form).
   if (req.method === 'GET' && pathname === '/queue/parked') {
     return sendJson(res, 200, { ok: true, items: db.queueParkedQuestions() });
+  }
+  // Single FULL task incl. transcript — the queue list is lean (no transcript blob), so the
+  // Transcript panel lazily fetches it here on first open. MUST come AFTER the specific
+  // /queue/next + /queue/parked GET routes above so it never shadows them.
+  if (req.method === 'GET' && (jm = m(/^\/queue\/([^/]+)$/))) {
+    const task = db.queueGet(jm[1]);
+    if (!task) return sendJson(res, 404, { ok: false, error: 'not found' });
+    return sendJson(res, 200, { ok: true, task });
   }
   // Auto-apply tasks that need the user (parked / needs-input / review) WITH their job +
   // outstanding questions — surfaced in the Applications page to finish in place.

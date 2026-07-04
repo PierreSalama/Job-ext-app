@@ -212,7 +212,9 @@ const DEFAULTS = {
   maintenance: {
     eventRetentionDays: 400,        // prune timeline events older than this
     taskRetentionDays: 60,          // prune terminal (skipped/failed) auto-apply tasks older than this
-    discoveryRetentionDays: 90,     // provider diagnostics/provenance are useful for tuning, but bounded
+    transcriptClearDays: 14,        // null out the (large) transcript blob of terminal tasks older than this — keeps the row + evidence, drops the bloat (perf audit v11.82.0)
+    aiLogRetentionDays: 30,         // prune AI-call diagnostics older than this (no FK, pure telemetry)
+    discoveryRetentionDays: 30,     // was 90 — provenance (biggest table) cascades off discovery_batches, so a tighter window is the single biggest DB-size win
     emailRetentionDays: 365,        // prune UNMATCHED emails older than this (matched/manual are always kept)
     vacuumEveryDays: 7,             // reclaim disk by compacting the DB at most this often
     pauseBackgroundOnBattery: false,// when true, defer background email/gmail sync while on battery

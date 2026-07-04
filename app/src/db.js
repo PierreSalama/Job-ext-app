@@ -803,6 +803,7 @@ function open(userDataDir) {
   migrateGmailQuery();
   migrateGmailBackfill();
   migrateMemoryPlaceholders();
+  migrateForceVacuumOnce();
   log.info('opened', file);
   return db;
 }
@@ -855,13 +856,21 @@ function maintenance() {
   if (!db) return { events: 0, tasks: 0, emails: 0, discovery: 0, vacuumed: false };
   const m = getSettings().maintenance || {};
   const cut = (days, fallback) => new Date(Date.now() - Math.max(1, days || fallback) * 86400 * 1000).toISOString();
-  let events = 0, tasks = 0, emails = 0, discovery = 0;
+  let events = 0, tasks = 0, emails = 0, discovery = 0, transcripts = 0, aiLog = 0;
   transaction(() => {
     events = run('DELETE FROM events WHERE timestamp < ?', [cut(m.eventRetentionDays, 400)])?.changes || 0;
     tasks = run("DELETE FROM auto_apply_tasks WHERE state IN ('skipped','failed') AND updated_at < ?", [cut(m.taskRetentionDays, 60)])?.changes || 0;
+    // Null the big transcript blob of TERMINAL tasks past the window — keep the row + its
+    // submission_evidence (separate column) so history/reward survive; only the ~14MB of trails go.
+    // done/skipped/failed only: recoverVerifiedEvidenceFromTranscript targets awaiting_* states, so
+    // those transcripts are never touched here.
+    transcripts = run("UPDATE auto_apply_tasks SET transcript = NULL WHERE transcript IS NOT NULL AND state IN ('skipped','failed','done') AND updated_at < ?", [cut(m.transcriptClearDays, 14)])?.changes || 0;
+    aiLog = run('DELETE FROM ai_log WHERE ts < ?', [cut(m.aiLogRetentionDays, 30)])?.changes || 0;
     // unmatched only; keep user-dismissed ones so a stale dismissal can't resurface as a suggestion.
     emails = run("DELETE FROM emails WHERE matched_job_id IS NULL AND (match_source IS NULL OR match_source NOT IN ('dismissed','manual')) AND created_at < ?", [cut(m.emailRetentionDays, 365)])?.changes || 0;
-    discovery = run('DELETE FROM discovery_batches WHERE started_at < ?', [cut(m.discoveryRetentionDays, 90)])?.changes || 0;
+    // Cascades to job_discovery_provenance + discovery_fallbacks (FK ON DELETE CASCADE) — the
+    // provenance table (biggest by row count) shrinks with this.
+    discovery = run('DELETE FROM discovery_batches WHERE started_at < ?', [cut(m.discoveryRetentionDays, 30)])?.changes || 0;
   });
   // VACUUM must run OUTSIDE a transaction; gate it so it doesn't run every call.
   let vacuumed = false;
@@ -870,8 +879,8 @@ function maintenance() {
   if (!last || (Date.now() - Date.parse(last)) > everyMs) {
     try { exec('VACUUM'); kvSet('lastVacuumAt', new Date().toISOString()); vacuumed = true; } catch (e) { log.warn('VACUUM failed', e.message); }
   }
-  if (events || tasks || emails || discovery || vacuumed) log.info(`maintenance: pruned ${events} events, ${tasks} tasks, ${emails} emails, ${discovery} discovery batches${vacuumed ? ' + vacuumed' : ''}`);
-  return { events, tasks, emails, discovery, vacuumed };
+  if (events || tasks || emails || discovery || transcripts || aiLog || vacuumed) log.info(`maintenance: pruned ${events} events, ${tasks} tasks, ${emails} emails, ${discovery} discovery batches, ${aiLog} ai-log; cleared ${transcripts} transcripts${vacuumed ? ' + vacuumed' : ''}`);
+  return { events, tasks, emails, discovery, transcripts, aiLog, vacuumed };
 }
 
 // ============================================================
@@ -1028,6 +1037,19 @@ function migrateMemoryPlaceholders() {
   } catch (e) { log.warn && log.warn('memory placeholder purge skipped:', e.message); }
 }
 
+// v11.82.0 perf release: the tightened retention (discovery 90→30, transcript-clear, ai_log prune)
+// deletes a large backlog on the first maintenance() run, but VACUUM is gated to once/7d — so clear
+// the gate ONCE here so the next maintenance tick compacts the freed pages back to the OS. Guarded by
+// a kv flag so it only happens on the upgrade, not every boot.
+function migrateForceVacuumOnce() {
+  if (!db) return;
+  try {
+    if (kvGet('forceVacuumV1182')) return;
+    kvSet('lastVacuumAt', '');   // falsy → next maintenance() VACUUMs regardless of the 7-day gate
+    kvSet('forceVacuumV1182', 1);
+  } catch (e) { log.warn && log.warn('force-vacuum migration skipped:', e.message); }
+}
+
 // ---- kv ----
 function kvGet(key) {
   if (!db) return null;
@@ -1159,8 +1181,19 @@ function annotateAutoApply(jobs) {
   return jobs;
 }
 
-function listJobs({ status, source, needsReview, q, limit, offset } = {}) {
-  let sql = 'SELECT * FROM jobs WHERE 1=1';
+// LEAN column set for list views: every field rowToJob emits EXCEPT the heavy blobs
+// (description ~5MB across the table, plus attachments/answers/fit_data). rowToJob tolerates the
+// absent columns (row.description||'' → '', safeParse(undefined,[])→[]) so the returned object shape
+// is IDENTICAL — the omitted fields just come back empty. Any consumer that needs the real
+// description/answers/attachments/fitData uses getJob()/`/jobs/:id` (the FAT single-item path).
+// This is what turns /jobs from a 16MB payload into ~1MB. Pass { full:true } for a lossless dump
+// (exportAll). See the perf audit (v11.82.0).
+const JOB_LEAN_COLS = 'id, external_id, source, status, title, company, location, job_url, '
+  + 'compensation, work_mode, employment_type, notes, next_action, due_at, needs_review, '
+  + 'fit_score, tags, created_at, updated_at, submitted_at';
+
+function listJobs({ status, source, needsReview, q, limit, offset, full } = {}) {
+  let sql = `SELECT ${full ? '*' : JOB_LEAN_COLS} FROM jobs WHERE 1=1`;
   const args = [];
   if (status) { sql += ' AND status = ?'; args.push(status); }
   if (source) { sql += ' AND source = ?'; args.push(source); }
@@ -1181,6 +1214,13 @@ function listJobs({ status, source, needsReview, q, limit, offset } = {}) {
 function getJob(id) {
   const j = rowToJob(get('SELECT * FROM jobs WHERE id = ?', [id]));
   return j ? annotateAutoApply([j])[0] : j;
+}
+
+// Narrow scan for the ATS board-API harvester (ats-boards.js): just id + job_url for postings hosted
+// on the three ATS whose company tokens we harvest. Replaces a listJobs({}) that loaded EVERY job
+// (now lean, but still all rows + an annotateAutoApply GROUP BY) once/minute during active runs.
+function jobUrlsForAtsHarvest() {
+  return all("SELECT id, job_url FROM jobs WHERE job_url LIKE '%greenhouse.io%' OR job_url LIKE '%lever.co%' OR job_url LIKE '%ashbyhq.com%'");
 }
 
 function listEvents(jobId, limit = 200) {
@@ -1588,15 +1628,20 @@ function qaRecord({ profileId, question, answer, source, fieldType, lineageSourc
   return get('SELECT * FROM qa WHERE id = ?', [row.id]);
 }
 
-function qaLookup(profileId, question) {
+// Optional `cache` (from makeMemoryCache) turns the per-question DB round-trip into an in-memory
+// lookup — critical for queueParkedQuestions/queueNeedsYou which call this once PER pending question
+// across dozens of tasks, and every unanswered question falls to the fuzzy scan below (which
+// otherwise re-reads all of a profile's qa rows from the DB each time).
+function qaLookup(profileId, question, cache) {
   const qn = normalizeQuestion(question);
   if (!qn || !profileId) return null;
-  const exact = get('SELECT * FROM qa WHERE profile_id = ? AND question_norm = ?', [profileId, qn]);
+  const c = cache ? cache.qa(profileId) : null;
+  const exact = c ? c.byNorm.get(qn) : get('SELECT * FROM qa WHERE profile_id = ? AND question_norm = ?', [profileId, qn]);
   if (exact && !isPlaceholderAnswer(exact.answer)) return { ...exact, match: 'exact', score: 1 };
   const want = new Set(qn.split(' ').filter(Boolean));
   if (!want.size) return null;
   let best = null;
-  for (const row of all('SELECT * FROM qa WHERE profile_id = ?', [profileId])) {
+  for (const row of (c ? c.rows : all('SELECT * FROM qa WHERE profile_id = ?', [profileId]))) {
     if (isPlaceholderAnswer(row.answer)) continue;   // a placeholder is not an answer — don't serve it
     const have = new Set(row.question_norm.split(' ').filter(Boolean));
     let hit = 0;
@@ -1715,15 +1760,16 @@ function profileFieldSet(id, { value, locked, label }) {
 }
 function profileFieldDelete(id) { return (run('DELETE FROM profile_fields WHERE id = ?', [id])?.changes ?? 0) > 0; }
 
-function profileFieldLookup(profileId, question) {
+function profileFieldLookup(profileId, question, cache) {
   const qn = normalizeQuestion(question);
   if (!qn || !profileId) return null;
-  const exact = get('SELECT * FROM profile_fields WHERE profile_id = ? AND key_norm = ?', [profileId, qn]);
+  const c = cache ? cache.pf(profileId) : null;
+  const exact = c ? c.byNorm.get(qn) : get('SELECT * FROM profile_fields WHERE profile_id = ? AND key_norm = ?', [profileId, qn]);
   if (exact && !isPlaceholderAnswer(exact.value)) return { ...pfRow(exact), match: 'exact', score: 1 };
   const want = new Set(qn.split(' ').filter(Boolean));
   if (!want.size) return null;
   let best = null;
-  for (const r of all('SELECT * FROM profile_fields WHERE profile_id = ?', [profileId])) {
+  for (const r of (c ? c.rows : all('SELECT * FROM profile_fields WHERE profile_id = ?', [profileId]))) {
     if (isPlaceholderAnswer(r.value)) continue;   // a placeholder is not an answer — don't serve it
     const have = new Set(String(r.key_norm).split(' ').filter(Boolean));
     let hit = 0; for (const t of want) if (have.has(t)) hit++;
@@ -2767,16 +2813,35 @@ function rowToTask(r) {
   };
 }
 
-function queueList({ state } = {}) {
+function queueList({ state, full } = {}) {
   let sql = `SELECT t.*, j.title AS _title, j.company AS _company, j.job_url AS _url, j.source AS _src
              FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id`;
   const args = [];
   if (state) { sql += ' WHERE t.state = ?'; args.push(state); }
   sql += ' ORDER BY t.created_at DESC';
-  return all(sql, args).map((r) => ({
-    ...rowToTask(r),
-    job: { title: r._title, company: r._company, jobUrl: r._url, source: r._src },
-  }));
+  return all(sql, args).map((r) => {
+    const task = rowToTask(r);   // parses transcript so classifyQueueFailure can read its trail + fingerprints
+    const job = { title: r._title, company: r._company, jobUrl: r._url, source: r._src };
+    if (full) return { ...task, job };   // FAT: lossless export needs transcript + evidence
+    // LEAN (the 17MB /queue fix): the list view never renders the transcript/evidence blobs
+    // (~13.9MB across the table) — it shows the failure label + a one-line "last step" + a
+    // Transcript button that lazily GETs /queue/:id. Derive lastLog/hasTranscript from the parsed
+    // transcript FIRST, THEN drop the heavy keys. This is derive-then-strip, NOT
+    // SELECT-except-transcript: classifyQueueFailure (inside rowToTask above) needs the transcript
+    // trail + recovery fingerprints or 'repeated_failure' collapses to 'unknown_failure'
+    // (autoapply-policy.test.mjs feeds a queueList item straight into it).
+    const tr = Array.isArray(task.transcript) ? task.transcript : [];
+    const last = tr.filter((e) => e && (e.text || e.note)).slice(-1)[0] || null;
+    const lean = { ...task, job, hasTranscript: tr.length > 0, lastLog: last ? String(last.text || last.note || '') : '' };
+    delete lean.transcript; delete lean.submissionEvidence; delete lean.routeState; delete lean.handoffToken;
+    return lean;
+  });
+}
+
+// Single FULL task (incl. transcript + evidence) for the lazy /queue/:id detail fetch — the queue
+// list is lean (no transcript), so the Transcript panel pulls the blob on demand from here.
+function queueGet(id) {
+  return rowToTask(get('SELECT * FROM auto_apply_tasks WHERE id = ?', [id]));
 }
 
 function queueActiveSiteKeys() {
@@ -3183,6 +3248,11 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
     const items = Array.isArray(transcriptAppend) ? transcriptAppend : [transcriptAppend];
     for (const it of items) transcript.push({ ts: now(), ...((typeof it === 'object') ? it : { note: String(it) }) });
   }
+  // Cap the stored transcript: last 200 entries AND ≤32KB serialized, so one pathological run can't
+  // bloat the row. Transcripts were the single biggest DB hog (perf audit v11.82.0). Keep ≥1 entry.
+  let trTrim = transcript.slice(-200);
+  let trJson = JSON.stringify(trTrim);
+  while (trJson.length > 32768 && trTrim.length > 1) { trTrim = trTrim.slice(1); trJson = JSON.stringify(trTrim); }
   run(`UPDATE auto_apply_tasks SET
        state = ?, mode = ?, scheduled_at = ?, attempts = attempts + ?, last_error = ?,
        transcript = ?, park_reason = ?, pending_questions = ?, apply_route = COALESCE(?, apply_route),
@@ -3193,7 +3263,7 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
        scheduledAt !== undefined ? scheduledAt : cur.scheduled_at,
        attemptsDelta || 0,
        nextError,
-       JSON.stringify(transcript.slice(-200)),
+       trJson,
        nextParkReason,
        JSON.stringify(nextPending),
        (applyRoute !== undefined && applyRoute !== null) ? String(applyRoute) : null,
@@ -3207,17 +3277,59 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
 // ---- self-healing intake ----
 // Distinct outstanding questions across all parked tasks, dropping any the
 // knowledge base can now answer (so the intake only asks what's truly missing).
+// Request-scoped snapshot of a profile's learned memory (qa + profile_fields) so the parked/needs-you
+// queue resolves dozens of pending questions with ONE load per table instead of a DB round-trip AND a
+// fuzzy full-scan per question. Lazily loads per profile id; a norm-keyed Map serves the exact hit,
+// the row list the fuzzy fallback. A single request's data doesn't change under it, so a snapshot is
+// safe. Pass the returned object as the `cache` arg to profileFieldLookup/qaLookup.
+function makeMemoryCache() {
+  const qaByPid = new Map();
+  const pfByPid = new Map();
+  return {
+    qa(pid) {
+      if (!qaByPid.has(pid)) {
+        const rows = all('SELECT * FROM qa WHERE profile_id = ?', [pid]);
+        qaByPid.set(pid, { rows, byNorm: new Map(rows.map((r) => [r.question_norm, r])) });
+      }
+      return qaByPid.get(pid);
+    },
+    pf(pid) {
+      if (!pfByPid.has(pid)) {
+        const rows = all('SELECT * FROM profile_fields WHERE profile_id = ?', [pid]);
+        pfByPid.set(pid, { rows, byNorm: new Map(rows.map((r) => [r.key_norm, r])) });
+      }
+      return pfByPid.get(pid);
+    },
+  };
+}
+
+// Batch job_id -> source in ONE (chunked) query, replacing the getJob()-per-parked-task N+1 — each
+// getJob() was a SELECT * (incl. the ~1.5KB description) + an annotateAutoApply query, and these queue
+// callers only ever needed the source to resolve a profile id.
+function jobSourcesFor(jobIds) {
+  const ids = [...new Set((jobIds || []).filter(Boolean))];
+  const out = {};
+  for (let i = 0; i < ids.length; i += 400) {
+    const chunk = ids.slice(i, i + 400);
+    for (const r of all(`SELECT id, source FROM jobs WHERE id IN (${chunk.map(() => '?').join(',')})`, chunk)) out[r.id] = r.source;
+  }
+  return out;
+}
+
 function queueParkedQuestions() {
   const out = [];
   const seen = new Set();
-  for (const t of all("SELECT * FROM auto_apply_tasks WHERE state = 'parked'").map(rowToTask)) {
-    const pid = resolveProfileId(getJob(t.jobId)?.source);   // check against THIS job's profile memory
+  const cache = makeMemoryCache();
+  const tasks = all("SELECT * FROM auto_apply_tasks WHERE state = 'parked'").map(rowToTask);
+  const srcByJob = jobSourcesFor(tasks.map((t) => t.jobId));
+  for (const t of tasks) {
+    const pid = resolveProfileId(srcByJob[t.jobId]);   // check against THIS job's profile memory
     for (const q of t.pendingQuestions || []) {
       if (!q || !q.question) continue;
       const key = normalizeQuestion(q.question);
       if (!key || seen.has(key)) continue;
       // already learned it (for this job's profile)? then it's not outstanding.
-      if (profileFieldLookup(pid, q.question) || qaLookup(pid, q.question)) continue;
+      if (profileFieldLookup(pid, q.question, cache) || qaLookup(pid, q.question, cache)) continue;
       seen.add(key);
       out.push({ question: q.question, fieldType: q.fieldType || 'text', options: q.options || null, reason: q.reason || 'missing answer', taskId: t.id, jobId: t.jobId });
     }
@@ -3236,11 +3348,12 @@ function queueNeedsYou() {
        FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
       WHERE t.state IN ('parked', 'awaiting_input', 'awaiting_review')
       ORDER BY t.updated_at DESC LIMIT 100`);
+  const cache = makeMemoryCache();
   return rows.map((r) => {
     const tk = rowToTask(r);
     const pid = resolveProfileId(r._src);
     const questions = (tk.pendingQuestions || []).filter((q) => q && q.question
-      && !profileFieldLookup(pid, q.question) && !qaLookup(pid, q.question));
+      && !profileFieldLookup(pid, q.question, cache) && !qaLookup(pid, q.question, cache));
     return {
       taskId: tk.id, jobId: tk.jobId, state: tk.state, route: tk.applyRoute || null,
       reason: tk.lastError || tk.parkReason || '',
@@ -3255,10 +3368,13 @@ function queueNeedsYou() {
 // questions, flip it back to 'queued' so the next paced tick retries it.
 function queueRetryParked() {
   let requeued = 0;
-  for (const t of all("SELECT * FROM auto_apply_tasks WHERE state = 'parked'").map(rowToTask)) {
-    const pid = resolveProfileId(getJob(t.jobId)?.source);
+  const cache = makeMemoryCache();
+  const tasks = all("SELECT * FROM auto_apply_tasks WHERE state = 'parked'").map(rowToTask);
+  const srcByJob = jobSourcesFor(tasks.map((t) => t.jobId));
+  for (const t of tasks) {
+    const pid = resolveProfileId(srcByJob[t.jobId]);
     const pend = t.pendingQuestions || [];
-    const stillMissing = pend.filter((q) => q && q.question && !profileFieldLookup(pid, q.question) && !qaLookup(pid, q.question));
+    const stillMissing = pend.filter((q) => q && q.question && !profileFieldLookup(pid, q.question, cache) && !qaLookup(pid, q.question, cache));
     if (pend.length && stillMissing.length === 0) {
       run("UPDATE auto_apply_tasks SET state = 'queued', park_reason = NULL, pending_questions = NULL, updated_at = ? WHERE id = ?", [now(), t.id]);
       requeued++;
@@ -3274,9 +3390,11 @@ function saveIntakeAnswer({ question, value, fieldType }) {
   if (!question || value == null || String(value).trim() === '') return 0;
   const key = normalizeQuestion(question);
   const pids = new Set();
-  for (const t of all("SELECT * FROM auto_apply_tasks WHERE state = 'parked'").map(rowToTask)) {
+  const tasks = all("SELECT * FROM auto_apply_tasks WHERE state = 'parked'").map(rowToTask);
+  const srcByJob = jobSourcesFor(tasks.map((t) => t.jobId));
+  for (const t of tasks) {
     if ((t.pendingQuestions || []).some((q) => q && q.question && normalizeQuestion(q.question) === key)) {
-      pids.add(resolveProfileId(getJob(t.jobId)?.source));
+      pids.add(resolveProfileId(srcByJob[t.jobId]));
     }
   }
   if (!pids.size) pids.add(ensureDefaultProfileId());
@@ -3426,7 +3544,7 @@ function exportAll() {
   return {
     exportedAt: now(),
     schema: userVersion(),
-    jobs: listJobs(),
+    jobs: listJobs({ full: true }),   // FAT dump: lossless backup needs description/answers/attachments/fitData
     events: all('SELECT * FROM events').map(rowToEvent),
     settings: getSettings(),
     qa: all('SELECT * FROM qa').map((r) => ({ profileId: r.profile_id, question: r.question, answer: r.answer })),
@@ -3437,7 +3555,7 @@ function exportAll() {
     })),
     profiles: listProfiles(),
     documents: listDocuments(),
-    queue: queueList(),
+    queue: queueList({ full: true }),   // FAT dump: lossless backup needs transcript + submission_evidence
     discoveryBatches: discoveryBatchList({ limit: 500 }),
   };
 }
@@ -4362,7 +4480,7 @@ module.exports = {
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
   discoveryBatchStart, discoveryBatchGet, discoveryBatchComplete, discoveryBatchList, discoveryRecordJob,
   discoveryFallbackQueue, discoveryFallbackNext, discoveryFallbackComplete, discoveryHealth, reconcileDiscovery, pipelineHealth,
-  queueList, queueHistory, queueBreakdown, summarizeRun, queueRunSummary, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, quarantineUntrustworthyDone, recoverRaceLostSubmissions, recoverVerifiedEvidenceFromTranscript, isTrustworthyEvidence, saveIntakeAnswer,
+  queueList, queueGet, queueHistory, queueBreakdown, jobUrlsForAtsHarvest, summarizeRun, queueRunSummary, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, quarantineUntrustworthyDone, recoverRaceLostSubmissions, recoverVerifiedEvidenceFromTranscript, isTrustworthyEvidence, saveIntakeAnswer,
   classifyQueueFailure, taskSiteKey, queueActiveSiteKeys, lastStartBySiteKey,
   setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
   aiLog, aiLogList, aiUsage,

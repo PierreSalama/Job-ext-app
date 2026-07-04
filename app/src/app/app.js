@@ -1924,6 +1924,9 @@ route('/queue', async () => {
   const qc = (label, html) => `<div class="qc-field"><span class="qc-label form-label">${esc(label)}</span>${html}</div>`;
 
   const lastLogOf = (t) => {
+    // The lean /queue list carries the last line as t.lastLog (no transcript blob); fall back to
+    // the full transcript when present (full-mode / already-fetched task).
+    if (typeof t.lastLog === 'string') return t.lastLog;
     const e = (t.transcript || []).filter((x) => x && (x.text || x.note)).slice(-1)[0];
     return e ? (e.text || e.note || '') : '';
   };
@@ -1940,7 +1943,7 @@ route('/queue', async () => {
       <div class="task-actions">
         ${['failed', 'skipped', 'awaiting_input'].includes(t.state) ? '<button class="btn small" data-act="retry">Retry</button>' : ''}
         ${['queued', 'scheduled', 'running'].includes(t.state) ? '<button class="btn small" data-act="cancel">Cancel</button>' : ''}
-        ${t.transcript?.length ? '<button class="btn small" data-act="transcript">Transcript</button>' : ''}
+        ${(t.hasTranscript || t.transcript?.length) ? '<button class="btn small" data-act="transcript">Transcript</button>' : ''}
         ${t.job?.jobUrl ? `<a class="btn small" href="${esc(t.job.jobUrl)}" target="_blank" rel="noopener">Open job</a>` : ''}
         <button class="btn small" data-act="delete">Remove</button>
       </div>
@@ -1951,10 +1954,18 @@ route('/queue', async () => {
   // every task's full transcript into hidden DOM up front built ~233k nodes on the queue page (live
   // [heap] log: 82 → 233,551 nodes in 60s on #/queue) → the renderer OOM-crashed. Cap at the last 200
   // lines so one huge transcript can't bloat the DOM either.
-  const fillTranscript = (card, t) => {
+  const fillTranscript = async (card, t) => {
     const box = card.querySelector('.transcript-entries');
     if (!box || box.dataset.filled === '1') return;
-    const lines = (t?.transcript || []).filter((e2) => e2 && (e2.text || e2.note)).slice(-200);
+    // The queue list is now LEAN (no transcript blob) to keep /queue small — so fetch the full
+    // task's transcript on demand the first time the panel opens. Full-mode items still carry it.
+    let tr = Array.isArray(t?.transcript) ? t.transcript : null;
+    if (!tr) {
+      box.dataset.filled = '1';   // guard against a double-click firing two fetches
+      try { const r = await api('/queue/' + encodeURIComponent(t.id)); tr = (r && r.task && r.task.transcript) || []; }
+      catch { tr = []; }
+    }
+    const lines = tr.filter((e2) => e2 && (e2.text || e2.note)).slice(-200);
     box.innerHTML = lines.map((e2) => `<div class="tr-line"><span class="tr-ts">${esc((e2.ts || '').slice(11, 19))}</span><span class="tr-body ${esc(e2.level || '')}">${esc(e2.text || e2.note || JSON.stringify(e2))}</span></div>`).join('');
     box.dataset.filled = '1';
   };
@@ -2454,7 +2465,7 @@ route('/queue', async () => {
     card.addEventListener('contextmenu', (e) => contextMenu(e, [
       t && ['failed', 'skipped', 'awaiting_input'].includes(t.state) && { label: 'Retry', run: async () => { await api('/queue/' + encodeURIComponent(taskId), { method: 'PATCH', body: { state: 'queued', lastError: null } }); navigate(); } },
       t && ['queued', 'scheduled', 'running'].includes(t.state) && { label: 'Cancel', run: async () => { await api('/queue/' + encodeURIComponent(taskId), { method: 'PATCH', body: { state: 'skipped' } }); navigate(); } },
-      t?.transcript?.length && { label: 'Show transcript', run: () => { const tr = card.querySelector('.transcript'); if (tr.hidden) fillTranscript(card, t); tr.hidden = !tr.hidden; } },
+      (t?.hasTranscript || t?.transcript?.length) && { label: 'Show transcript', run: () => { const tr = card.querySelector('.transcript'); if (tr.hidden) fillTranscript(card, t); tr.hidden = !tr.hidden; } },
       t?.job?.jobUrl && { label: 'Open job posting', run: () => window.open(t.job.jobUrl, '_blank', 'noopener') },
       { sep: true },
       { label: 'Remove', danger: true, run: async () => { await api('/queue/' + encodeURIComponent(taskId), { method: 'DELETE' }); navigate(); } },
