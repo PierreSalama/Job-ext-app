@@ -250,6 +250,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     case 'jat11.human-challenge-resolved':
       // The check cleared (or timed out) — clear the notification, badge, and awaiting-human flag.
+      // NOT cleared (unattended / not solved in time) → trip the host breaker NOW so sibling jobs
+      // for the same host skip immediately instead of each hitting (and probing) the same wall.
+      if (msg && msg.cleared === false) {
+        const chost = hostOfUrl(sender?.tab?.url) || (msg.host ? String(msg.host).replace(/^www\./, '').toLowerCase() : '');
+        if (chost) tripHostBreaker(chost, 'cloudflare');
+      }
       respond(clearHumanChallengeNotice(sender?.tab?.id ?? null).then(() => ({ ok: true })).catch(() => ({ ok: true })));
       return true;
     case 'jat11.front-until-hydrated':

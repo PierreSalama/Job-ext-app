@@ -128,6 +128,11 @@ function cfBeep() {
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
     const ctx = new AC();
+    // Chrome's autoplay policy leaves the context 'suspended' until a real user gesture;
+    // calling start() then logs "AudioContext was not allowed to start" ASYNCHRONOUSLY
+    // (not a thrown error, so try/catch can't swallow it). On an unattended run this fired
+    // hundreds of times. Bail cleanly when there's been no gesture — no sound is possible anyway.
+    if (ctx.state === 'suspended') { try { ctx.close(); } catch {} return; }
     for (let k = 0; k < 2; k++) {
       const t = ctx.currentTime + k * 0.42;
       const o = ctx.createOscillator(), g = ctx.createGain();
@@ -2047,15 +2052,33 @@ export async function run(task, context, helpers) {
       cfBeep();
       report({ transcriptAppend: { kind: 'recovery', note: 'cloudflare human-check — alerted you (notification + flashing tab + badge + in-page banner + beep); waiting for you to verify' } });
       const cf0 = Date.now();
-      const HUMAN_WAIT_MS = 360000;   // 6 min for the user to notice + solve (background cap is 12 min)
-      let cfCleared = false, lastPing = Date.now();
-      while (Date.now() - cf0 < HUMAN_WAIT_MS && !S.cancelled) {
-        await sleep(2500);
-        if (!detectBotChallengeOnPage().blocked) { cfCleared = true; break; }
-        if (Date.now() - lastPing > 25000) { lastPing = Date.now(); send({ type: 'jat11.human-challenge', host: location.hostname, repeat: true }); cfBeep(); }
+      const HUMAN_WAIT_MS = 360000;   // full wait when the user is actually present
+      const PROBE_MS = 30000;         // UNATTENDED FAST-SKIP: with no interaction in 30s, park instead
+                                      // of burning 6 min per hit — the overnight-run killer (27 hits × 6 min).
+      let cfCleared = false, lastPing = Date.now(), userSeen = false;
+      // The user is "present" only if they actually touch this machine while the check is up.
+      const onAct = () => { userSeen = true; };
+      const ACT_EVENTS = ['mousemove', 'keydown', 'pointerdown', 'wheel', 'touchstart'];
+      const onVis = () => { if (document.visibilityState === 'visible') userSeen = true; };
+      ACT_EVENTS.forEach((e) => window.addEventListener(e, onAct, { passive: true, capture: true }));
+      document.addEventListener('visibilitychange', onVis);
+      try {
+        while (Date.now() - cf0 < HUMAN_WAIT_MS && !S.cancelled) {
+          await sleep(2500);
+          if (!detectBotChallengeOnPage().blocked) { cfCleared = true; break; }
+          // Unattended: nobody interacted within the probe window → don't waste the wait.
+          if (!userSeen && Date.now() - cf0 > PROBE_MS) {
+            vlog('challenge', 'cloudflare human-check: no interaction within probe — run is unattended, parking fast (host breaker will skip further same-host jobs)');
+            break;
+          }
+          if (Date.now() - lastPing > 25000) { lastPing = Date.now(); send({ type: 'jat11.human-challenge', host: location.hostname, repeat: true }); if (userSeen) cfBeep(); }
+        }
+      } finally {
+        ACT_EVENTS.forEach((e) => window.removeEventListener(e, onAct, { capture: true }));
+        document.removeEventListener('visibilitychange', onVis);
       }
       hideCfBanner();
-      send({ type: 'jat11.human-challenge-resolved', cleared: cfCleared });
+      send({ type: 'jat11.human-challenge-resolved', cleared: cfCleared, host: location.hostname });
       vlog('challenge', `cloudflare human-handoff: ${cfCleared ? 'cleared by user' : 'not solved in time'} after ${Math.round((Date.now() - cf0) / 1000)}s`);
       if (cfCleared) {
         logLine('ok', 'Cloudflare check passed (you verified) — continuing the application');
