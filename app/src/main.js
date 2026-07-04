@@ -673,12 +673,11 @@ app.whenReady().then(async () => {
     intervalMs: Math.max(1, Number(db.getSettings().autoApply?.discovery?.intervalMinutes) || 1) * 60000,
     warmupMs: 12000,
   });
-  {
-    const aaStart = db.getSettings().autoApply || {};
-    if (aaStart.enabled && aaStart.discovery?.enabled && aaStart.discovery?.atsBoardsEnabled !== false) {
-      atsBoardsService.start({ intervalMs: 60000 });
-    }
-  }
+  // Start the ATS board-API feed UNCONDITIONALLY, exactly like discoveryService above: runTick now
+  // self-gates on auto-apply enablement, so starting it here means it's live the moment the user
+  // toggles auto-apply on in the dashboard — instead of only ever running if it happened to be
+  // enabled at launch. That boot-gate was why the feed had never run once (launch-off→toggle-on).
+  atsBoardsService.start({ intervalMs: 60000 });
   pipelineWatchdogInterval = setInterval(() => pipelineWatchdogTick().catch((e) => log.warn('pipeline watchdog failed', e.message)), 60000);
   setTimeout(() => pipelineWatchdogTick().catch(() => {}), 18000);
 

@@ -201,6 +201,9 @@ function makeFakeDb(overrides = {}) {
   return {
     classifyAts: db.classifyAts,
     listJobs: () => [],
+    // runTick self-gates on auto-apply enablement (so main.js can start it unconditionally at boot).
+    // Default the fake to enabled; the gate/throttle tests below override this.
+    getSettings: () => ({ autoApply: { enabled: true, discovery: { enabled: true, atsBoardsEnabled: true } } }),
     kvGet: (k) => (kv.has(k) ? kv.get(k) : null),
     kvSet: (k, v) => { kv.set(k, v); },
     discoveryBatchStart: ({ provider, source, keyword, location }) => {
@@ -229,13 +232,15 @@ test('createAtsBoardsService().runTick(): round-robin token rotation advances th
   const ingestJobs = async () => ({ enqueued: 0, duplicates: 0, rejected: 0 });
   const svc = atsBoards.createAtsBoardsService({ ingestJobs, db: fakeDb, fetchFn, logger: { info() {}, warn() {}, error() {} }, spacingMs: 0 });
 
-  const first = await svc.runTick();
+  // force:true bypasses the self-throttle so the two back-to-back ticks both run (this test is
+  // about rotation mechanics; the throttle has its own dedicated test below).
+  const first = await svc.runTick({ force: true });
   assert.equal(first.ok, true);
   assert.ok(first.scanned > 0, 'scanned at least one seed token');
   const cursorAfterFirst = Number(fakeDb.kvGet('atsBoardsTokenIndex'));
   assert.equal(cursorAfterFirst, first.scanned, 'KV cursor advances by exactly the number of tokens scanned');
 
-  const second = await svc.runTick();
+  const second = await svc.runTick({ force: true });
   assert.equal(second.ok, true);
   const cursorAfterSecond = Number(fakeDb.kvGet('atsBoardsTokenIndex'));
   assert.equal(cursorAfterSecond, (cursorAfterFirst + second.scanned) % (cursorAfterFirst + second.scanned > 0 ? Infinity : 1) || cursorAfterSecond, 'cursor kept advancing (rotation, not a fixed re-scan of token 0)');
@@ -350,6 +355,101 @@ test('createAtsBoardsService().runTick(): no tokens (empty seed + empty harvest)
   assert.ok([r1.ok, r2.ok].includes(true));
   const guarded = [r1, r2].find((r) => r.reason === 'already-running');
   assert.ok(guarded, 'a concurrent runTick() call is rejected instead of double-scanning');
+});
+
+// ---- locationEligible: the positive location gate (board APIs return roles worldwide) ----
+
+const CA = ['toronto', 'ontario', 'canada', 'vancouver', 'waterloo', 'kitchener'];
+
+test('locationEligible: a Canada-named location passes (city/province/country term match)', () => {
+  assert.equal(atsBoards.locationEligible({ location: 'Toronto, ON, Canada' }, CA, 'Canada'), true);
+  assert.equal(atsBoards.locationEligible({ location: 'Vancouver, BC' }, CA, 'Canada'), true);
+  assert.equal(atsBoards.locationEligible({ location: 'Remote - Ontario, Canada', remote: true }, CA, 'Canada'), true);
+  assert.equal(atsBoards.locationEligible({ location: 'Kitchener, ON, Canada' }, CA, 'Canada'), true);
+});
+
+test('locationEligible: a generic remote posting (no country lock) passes', () => {
+  assert.equal(atsBoards.locationEligible({ location: 'Remote', remote: true }, CA, 'Canada'), true);
+  assert.equal(atsBoards.locationEligible({ location: '', remote: true }, CA, 'Canada'), true);
+  assert.equal(atsBoards.locationEligible({ location: 'Anywhere', remote: true }, CA, 'Canada'), true);
+  assert.equal(atsBoards.locationEligible({ location: 'Remote - North America', remote: true }, CA, 'Canada'), true);
+  assert.equal(atsBoards.locationEligible({ location: 'Remote - USA or Canada', remote: true }, CA, 'Canada'), true, 'US-or-Canada is Canada-eligible via the canada term');
+});
+
+test('locationEligible: a foreign onsite location fails', () => {
+  assert.equal(atsBoards.locationEligible({ location: 'San Francisco, CA' }, CA, 'Canada'), false);
+  assert.equal(atsBoards.locationEligible({ location: 'Bengaluru, India' }, CA, 'Canada'), false);
+  assert.equal(atsBoards.locationEligible({ location: 'London, United Kingdom' }, CA, 'Canada'), false);
+  assert.equal(atsBoards.locationEligible({ location: 'Belgrade, Serbia' }, CA, 'Canada'), false);
+});
+
+test('locationEligible: a remote role LOCKED to a foreign country fails (residual place-name remains)', () => {
+  assert.equal(atsBoards.locationEligible({ location: 'United States - Remote', remote: true }, CA, 'Canada'), false);
+  assert.equal(atsBoards.locationEligible({ location: 'EMEA', remote: true }, CA, 'Canada'), false);
+  assert.equal(atsBoards.locationEligible({ location: 'Remote - US', remote: true }, CA, 'Canada'), false);
+});
+
+test('locationEligible: empty target list keeps everything (no location preference set)', () => {
+  assert.equal(atsBoards.locationEligible({ location: 'San Francisco, CA' }, [], ''), true);
+  assert.equal(atsBoards.locationEligible({ location: 'Bengaluru, India' }, [], ''), true);
+});
+
+// ---- self-gate + self-throttle (the fix that made the feed actually run) ----
+
+test('createAtsBoardsService().runTick(): self-gates while auto-apply is OFF (no fetch, reason=disabled)', async () => {
+  // This is the whole reason the feed had never run: main.js now start()s the service at boot
+  // UNCONDITIONALLY, so runTick must no-op while auto-apply is disabled instead of scanning.
+  let fetched = 0;
+  const fakeDb = makeFakeDb({
+    getSettings: () => ({ autoApply: { enabled: false, discovery: { enabled: true, atsBoardsEnabled: true } } }),
+  });
+  const svc = atsBoards.createAtsBoardsService({
+    ingestJobs: async () => ({ enqueued: 0, duplicates: 0, rejected: 0 }),
+    db: fakeDb, fetchFn: async () => { fetched++; return { ok: true, status: 200, json: async () => ({ jobs: [] }) }; },
+    logger: { info() {}, warn() {}, error() {} }, spacingMs: 0,
+  });
+  const r = await svc.runTick();
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'disabled');
+  assert.equal(fetched, 0, 'no ATS endpoint was hit while disabled');
+
+  // ...but a forced/manual run bypasses the gate.
+  const forced = await svc.runTick({ force: true });
+  assert.equal(forced.ok, true);
+  assert.ok(fetched > 0, 'forced run scans despite the disabled setting');
+});
+
+test('createAtsBoardsService().runTick(): self-gates when discovery.atsBoardsEnabled is false', async () => {
+  let fetched = 0;
+  const fakeDb = makeFakeDb({
+    getSettings: () => ({ autoApply: { enabled: true, discovery: { enabled: true, atsBoardsEnabled: false } } }),
+  });
+  const svc = atsBoards.createAtsBoardsService({
+    ingestJobs: async () => ({ enqueued: 0, duplicates: 0, rejected: 0 }),
+    db: fakeDb, fetchFn: async () => { fetched++; return { ok: true, status: 200, json: async () => ({ jobs: [] }) }; },
+    logger: { info() {}, warn() {}, error() {} }, spacingMs: 0,
+  });
+  const r = await svc.runTick();
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'disabled');
+  assert.equal(fetched, 0);
+});
+
+test('createAtsBoardsService().runTick(): self-throttles a rapid second (non-forced) call', async () => {
+  let fetched = 0;
+  const fakeDb = makeFakeDb();
+  const svc = atsBoards.createAtsBoardsService({
+    ingestJobs: async () => ({ enqueued: 0, duplicates: 0, rejected: 0 }),
+    db: fakeDb, fetchFn: async () => { fetched++; return { ok: true, status: 200, json: async () => ({ jobs: [] }) }; },
+    logger: { info() {}, warn() {}, error() {} }, spacingMs: 0,
+  });
+  const first = await svc.runTick();
+  assert.equal(first.ok, true);
+  const fetchedAfterFirst = fetched;
+  const second = await svc.runTick();          // immediate → within MIN_TICK_INTERVAL_MS
+  assert.equal(second.ok, false);
+  assert.equal(second.reason, 'throttled');
+  assert.equal(fetched, fetchedAfterFirst, 'the throttled call did not hit any endpoint');
 });
 
 // ---- mergeTokenLists (helper exercised indirectly above; direct unit coverage) ----

@@ -27,6 +27,7 @@ const ROTATION_KV_KEY = 'atsBoardsTokenIndex';
 const COOLDOWN_MS = 30 * 60 * 1000;      // 30 min cooldown for a token that 429/403'd
 const SPACING_MS = 2000;                  // ~2s between sequential fetches (be a good citizen)
 const TOKENS_PER_TICK = 10;               // round-robin N tokens per tick
+const MIN_TICK_INTERVAL_MS = 55000;       // self-throttle: never scan more than ~once/min no matter how often poked
 
 function text(v) { return v == null ? '' : String(v).trim(); }
 
@@ -125,6 +126,38 @@ function titleMatchesKeywords(title, keywords) {
   if (!list.length) return true;
   const t = text(title).toLowerCase();
   return list.some((k) => t.includes(k));
+}
+
+// Positive LOCATION gate for board-API supply. This is the location-analogue of
+// titleMatchesKeywords and exists for the SAME reason: JobSpy's LinkedIn/Indeed search is already
+// location-scoped by the user's query, but a direct-ATS board returns EVERY role at the company —
+// worldwide. Without this, a Canada-based user's queue floods with San Francisco / Bengaluru /
+// London / EMEA postings they can't take (confirmed via a live yield probe: ~400 "applyable" jobs
+// from the first 2 ticks, nearly all overseas). jobFit only EXCLUDES locations, never REQUIRES one,
+// so the positive match has to live here.
+//
+// A job is eligible if EITHER:
+//   • its location text contains one of the user's target terms (their `locations` list + `country`,
+//     e.g. "toronto"/"ontario"/"canada" matches "Toronto, ON, Canada" or "Remote - Canada"); OR
+//   • it's a remote role with NO country lock — strip the remote/hybrid words and generic
+//     region words (north america / americas) and if nothing meaningful remains it's a plainly
+//     generic remote posting (plausibly Canada-eligible). A remote role whose location still names
+//     a foreign place ("United States - Remote", "EMEA") leaves a residual → NOT eligible.
+// Empty target list = keep all (never surprises a user who set no location preference).
+function locationEligible(job, locations, country) {
+  const terms = [...(locations || []), country].map((x) => text(x).trim().toLowerCase()).filter(Boolean);
+  if (!terms.length) return true;
+  const loc = text(job && job.location).toLowerCase();
+  if (terms.some((t) => loc.includes(t))) return true;
+  if (job && job.remote) {
+    const residual = loc
+      .replace(/\b(remote|work from home|wfh|anywhere|worldwide|global|distributed|hybrid|on-?site|in office)\b/g, ' ')
+      .replace(/\b(north america|americas|n\.?a\.?)\b/g, ' ')
+      .replace(/[^a-z]+/g, ' ')
+      .trim();
+    if (!residual) return true;   // generic remote, no foreign country named
+  }
+  return false;
 }
 
 function normalizeAtsRecord(raw = {}, ats, token) {
@@ -270,7 +303,7 @@ function mergeTokenLists(seed, harvested) {
 }
 
 function createAtsBoardsService({ ingestJobs, broadcast = () => {}, db, fetchFn = fetch, logger = log, spacingMs = SPACING_MS } = {}) {
-  let timer = null, warmup = null, running = false, stopped = false;
+  let timer = null, warmup = null, running = false, stopped = false, lastTickAt = 0;
 
   async function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
@@ -342,12 +375,21 @@ function createAtsBoardsService({ ingestJobs, broadcast = () => {}, db, fetchFn 
       // this, Stripe's ~490 postings (sales/marketing/finance/…) would all flood the queue. Keep
       // only titles matching a target keyword. jobFit() downstream still applies seniority/exclude
       // rules; this adds the positive role match that the board APIs lack. Empty list = keep all.
-      let targetKeywords = [];
-      try { targetKeywords = (db.getSettings().autoApply || {}).keywords || []; } catch { /* keep all */ }
+      // POSITIVE location gate (same rationale as the keyword gate: board APIs return roles
+      // worldwide with no location scoping). Keep only Canada-local or generic-remote postings so
+      // the queue isn't flooded with un-actionable overseas jobs. Empty targets = keep all.
+      let targetKeywords = [], targetLocations = [], targetCountry = '';
+      try {
+        const aa = db.getSettings().autoApply || {};
+        targetKeywords = aa.keywords || [];
+        targetLocations = aa.locations || [];
+        targetCountry = aa.country || '';
+      } catch { /* keep all */ }
       const jobs = (Array.isArray(raw) ? raw : [])
         .map((r) => normalizeAtsRecord(r, ats, token))
         .filter(Boolean)
-        .filter((j) => titleMatchesKeywords(j.title, targetKeywords));
+        .filter((j) => titleMatchesKeywords(j.title, targetKeywords))
+        .filter((j) => locationEligible(j, targetLocations, targetCountry));
 
       let intake = { enqueued: 0, duplicates: 0, rejected: 0 };
       if (jobs.length && typeof ingestJobs === 'function') {
@@ -383,8 +425,23 @@ function createAtsBoardsService({ ingestJobs, broadcast = () => {}, db, fetchFn 
     }
   }
 
-  async function runTick() {
+  async function runTick({ force = false } = {}) {
     if (running) return { ok: false, reason: 'already-running' };
+    // SELF-GATE on enablement (mirrors discovery/index.js runTick). This is what lets main.js
+    // start() us UNCONDITIONALLY at boot: while auto-apply is off we just no-op. Without it, the
+    // periodic timer only ever started if auto-apply was ALREADY enabled at launch — but the real
+    // usage is launch-with-it-off then toggle-on in the dashboard, so this feed NEVER ran once
+    // (0 '%-api' batches / 0 atsBoards rotation-kv all-time) and Greenhouse/Lever/Ashby stayed
+    // starved. A forced/manual run bypasses the gate.
+    let aa = {};
+    try { aa = db.getSettings().autoApply || {}; } catch {}
+    if (!force && (!aa.enabled || aa.discovery?.enabled === false || aa.discovery?.atsBoardsEnabled === false)) {
+      return { ok: false, reason: 'disabled' };
+    }
+    // SELF-THROTTLE: the idle-watchdog (main.js) and the 60s timer can both poke us within the same
+    // minute — never scan more than ~once/interval no matter how often called. Forced runs bypass.
+    if (!force && (Date.now() - lastTickAt) < MIN_TICK_INTERVAL_MS) return { ok: false, reason: 'throttled' };
+    lastTickAt = Date.now();
     running = true;
     try {
       const harvested = harvestTokensFromDb(db);
@@ -439,6 +496,7 @@ module.exports = {
   fetchAshby,
   normalizeAtsRecord,
   titleMatchesKeywords,
+  locationEligible,
   harvestTokensFromDb,
   createAtsBoardsService,
   mergeTokenLists,
