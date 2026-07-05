@@ -55,6 +55,55 @@ test('easyApplyOnly: Indeed discovery asks JobSpy for easy_apply=true (applyable
   assert.equal(captured?.easy_apply, true, 'Indeed under easyApplyOnly requests only board-hosted jobs');
 });
 
+test('source-aware refill gate: a queue full of ATS jobs does NOT starve jobspy/LinkedIn discovery', async () => {
+  for (const t of db.queueList({})) db.queueDelete(t.id);   // isolate the queue for this test
+  db.patchSettings({ autoApply: {
+    enabled: true, easyApplyOnly: true, keywords: ['developer'], boards: ['linkedin'],
+    locations: ['Toronto'], country: 'Canada',
+    discovery: { enabled: true, intervalMinutes: 5, refillBelow: 3, perRunLimit: 10 },
+  } });
+  db.kvSet('discoveryPlannerIndex', 0); db.kvSet('discoveryBoardIndex', 0);
+  // 5 direct-ATS (greenhouse) queued + 1 LinkedIn. Total (6) >= refillBelow(3) would trip the OLD
+  // global gate; NON-ATS (1) < 3 must NOT — otherwise ATS supply starves LinkedIn discovery.
+  for (let i = 0; i < 5; i++) {
+    const up = db.upsertJob({ source: 'greenhouse', title: `GH ${i}`, company: `co${i}`, jobUrl: `https://boards.greenhouse.io/co${i}/jobs/${i}`, status: 'started' });
+    db.queueAdd(up.job.id, { mode: 'auto' });
+  }
+  const lj = db.upsertJob({ source: 'linkedin', title: 'LI dev', company: 'lico', jobUrl: 'https://www.linkedin.com/jobs/view/990001', status: 'started' });
+  db.queueAdd(lj.job.id, { mode: 'auto' });
+
+  let ran = false;
+  const svc = discovery.createDiscoveryService({
+    runner: async () => { ran = true; return { ok: true, jobs: [] }; },
+    ingestJobs: async () => ({ enqueued: 0, duplicates: 0, rejected: 0 }),
+  });
+  const res = await svc.runTick();   // force:false exercises the gate (fresh svc passes the interval throttle)
+  assert.notEqual(res.reason, 'queue-full', 'an ATS-only backlog must NOT block jobspy discovery');
+  assert.equal(ran, true, 'jobspy discovery ran despite 5 queued ATS jobs (only 1 non-ATS < refillBelow)');
+});
+
+test('source-aware refill gate: enough NON-ATS queued still gates jobspy (no needless scraping)', async () => {
+  for (const t of db.queueList({})) db.queueDelete(t.id);
+  db.patchSettings({ autoApply: {
+    enabled: true, easyApplyOnly: true, keywords: ['developer'], boards: ['linkedin'],
+    locations: ['Toronto'], country: 'Canada',
+    discovery: { enabled: true, intervalMinutes: 5, refillBelow: 3, perRunLimit: 10 },
+  } });
+  for (let i = 0; i < 4; i++) {
+    const up = db.upsertJob({ source: 'linkedin', title: `LI ${i}`, company: `lico${i}`, jobUrl: `https://www.linkedin.com/jobs/view/9910${i}`, status: 'started' });
+    db.queueAdd(up.job.id, { mode: 'auto' });
+  }
+  let ran = false;
+  const svc = discovery.createDiscoveryService({
+    runner: async () => { ran = true; return { ok: true, jobs: [] }; },
+    ingestJobs: async () => ({ enqueued: 0, duplicates: 0, rejected: 0 }),
+  });
+  const res = await svc.runTick();
+  assert.equal(res.reason, 'queue-full', '4 non-ATS queued >= refillBelow(3) still gates jobspy');
+  assert.equal(ran, false);
+  for (const t of db.queueList({})) db.queueDelete(t.id);   // leave the shared queue empty for later tests
+});
+
 test('easyApplyOnly OFF: Indeed discovery does NOT set easy_apply (keeps the freshness window)', async () => {
   db.patchSettings({ autoApply: {
     enabled: true, easyApplyOnly: false, keywords: ['developer'], boards: ['indeed'],

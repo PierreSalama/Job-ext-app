@@ -27,7 +27,7 @@ const ROTATION_KV_KEY = 'atsBoardsTokenIndex';
 const COOLDOWN_MS = 30 * 60 * 1000;      // 30 min cooldown for a token that 429/403'd
 const SPACING_MS = 2000;                  // ~2s between sequential fetches (be a good citizen)
 const TOKENS_PER_TICK = 10;               // round-robin N tokens per tick
-const MIN_TICK_INTERVAL_MS = 55000;       // self-throttle: never scan more than ~once/min no matter how often poked
+const MIN_TICK_INTERVAL_MS = 840000;      // self-throttle floor (~14 min): the idle-watchdog also pokes runTick, so this caps ATS scans to the ~15-min cadence even when the queue is idle (was 55s → ~16k batches/day)
 
 function text(v) { return v == null ? '' : String(v).trim(); }
 

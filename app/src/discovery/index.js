@@ -261,7 +261,18 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     // (floor 60s), no matter how often we're called. A manual/forced run bypasses this.
     const ivMs = Math.max(1, Number(aa.discovery?.intervalMinutes) || 1) * 60000;
     if (!force && (Date.now() - lastTickAt) < ivMs) return { ok: false, reason: 'throttled' };
-    if (!force && db.queueList({ state: 'queued' }).length >= (aa.discovery?.refillBelow || 3)) return { ok: false, reason: 'queue-full' };
+    // SOURCE-AWARE refill gate. jobspy discovers linkedin/indeed; the direct-ATS board feed
+    // (ats-boards.js — greenhouse/lever/ashby) fills the SAME queue from a SEPARATE provider. Gate
+    // jobspy on the queued depth of NON-ATS jobs only — otherwise a backlog of slow ATS jobs keeps
+    // the total queue ≥ refillBelow and STARVES fresh LinkedIn discovery (the high-volume Easy-Apply
+    // source). Confirmed root cause of a 24h-run collapse: jobspy ran only 3× in 24h (9–11h gaps)
+    // while the queue sat full of ATS jobs, so LinkedIn dribbled ~2/hr instead of its ~30/hr.
+    if (!force) {
+      const ATS_FEED_SOURCES = new Set(['greenhouse', 'lever', 'ashby']);
+      const jobspyQueued = db.queueList({ state: 'queued' })
+        .filter((t) => !ATS_FEED_SOURCES.has(String((t.job && t.job.source) || '').toLowerCase())).length;
+      if (jobspyQueued >= (aa.discovery?.refillBelow || 3)) return { ok: false, reason: 'queue-full' };
+    }
     // Board selection happens BEFORE combo selection: which boards a combo would scan on is needed
     // to test that combo for saturation (see isComboSaturated below), and board choice never depends
     // on which combo is picked.

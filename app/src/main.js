@@ -677,7 +677,11 @@ app.whenReady().then(async () => {
   // self-gates on auto-apply enablement, so starting it here means it's live the moment the user
   // toggles auto-apply on in the dashboard — instead of only ever running if it happened to be
   // enabled at launch. That boot-gate was why the feed had never run once (launch-off→toggle-on).
-  atsBoardsService.start({ intervalMs: 60000 });
+  // 15-min cadence (was 60s): the ATS board APIs are re-scanned on rotation for NEW postings, which
+  // appear a few times/day — every-60s produced ~16k useless discovery batches/day (32k provenance
+  // rows) for ~35 jobs and helped clog the queue. 15 min = each of the 113 companies scanned ~8×/day,
+  // ample for fresh-posting detection, ~95% less churn.
+  atsBoardsService.start({ intervalMs: 900000 });
   pipelineWatchdogInterval = setInterval(() => pipelineWatchdogTick().catch((e) => log.warn('pipeline watchdog failed', e.message)), 60000);
   setTimeout(() => pipelineWatchdogTick().catch(() => {}), 18000);
 
