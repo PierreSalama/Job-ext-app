@@ -34,8 +34,19 @@ export const OPEN_KEYWORDS = [
   /^apply\b/i, /^easy apply/i, /^postuler\b/i,
 ];
 
+// Indeed smartapply renders the advance/submit label prefixed by a loading affordance while its
+// React module hydrates: "Loading...Continue", "Loading…Continue", or a leading spinner glyph.
+// Strip ONLY a LEADING loading token (optional spinner glyph(s) + the word "loading" + trailing
+// dots/ellipsis/space). The anchors in ADVANCE_KEYWORDS are otherwise UNCHANGED, so "Continue
+// reading" / "Continue as guest" still never match (no leading 'loading', /^continue$/i stays exact),
+// and every clean LinkedIn label ("Next", "Continue", "Submit application") is a no-op.
+const LOADING_PREFIX_RX = /^(?:[⏳⌛↻⟳⮮🔄🔃\s]*loading[.…\s]*)+/i;
+export function stripLoadingPrefix(text) {
+  return String(text || '').replace(LOADING_PREFIX_RX, '').trim();
+}
+
 export function isAdvanceLabel(text, { allowOpen = false } = {}) {
-  const t = String(text || '').trim();
+  const t = stripLoadingPrefix(text);
   if (!t || t.length > 40) return false;
   if (ADVANCE_KEYWORDS.some((re) => re.test(t))) return true;
   if (allowOpen && OPEN_KEYWORDS.some((re) => re.test(t))) return true;

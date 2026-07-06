@@ -3,7 +3,8 @@
 // advance-vs-opener decision lives in extension/content/lib/advance.js.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isAdvanceLabel, ADVANCE_KEYWORDS, OPEN_KEYWORDS } from '../extension/content/lib/advance.js';
+import { isAdvanceLabel, ADVANCE_KEYWORDS, OPEN_KEYWORDS, stripLoadingPrefix } from '../extension/content/lib/advance.js';
+import { isLinkedInApplyAdvanceLabel } from '../extension/content/lib/linkedin-apply.js';
 
 test('the Easy Apply OPENER is not an advance button when allowOpen=false', () => {
   // The exact label from the live transcript.
@@ -51,4 +52,32 @@ test('empty / overlong labels never match', () => {
   assert.equal(isAdvanceLabel('', { allowOpen: true }), false);
   assert.equal(isAdvanceLabel('   ', { allowOpen: true }), false);
   assert.equal(isAdvanceLabel('Apply to all the jobs you can possibly find today now', { allowOpen: true }), false);
+});
+
+// v11.86: Indeed smartapply renders "Loading...Continue" while its module hydrates — the anchored
+// /^continue$/i used to miss it → "no generic advance found" → 30s blind-wait → the throughput killer.
+test('stripLoadingPrefix removes only a LEADING loading token', () => {
+  assert.equal(stripLoadingPrefix('Loading...Continue'), 'Continue');
+  assert.equal(stripLoadingPrefix('Loading…Continue'), 'Continue');
+  assert.equal(stripLoadingPrefix('loading Submit application'), 'Submit application');
+  assert.equal(stripLoadingPrefix('Continue'), 'Continue');            // clean label → no-op
+  assert.equal(stripLoadingPrefix('Next'), 'Next');                    // no-op
+  assert.equal(stripLoadingPrefix('Continue reading'), 'Continue reading'); // NOT a leading loading token
+});
+
+test('a Loading-prefixed advance label is recognized; false-positives still rejected', () => {
+  assert.equal(isAdvanceLabel('Loading...Continue'), true);
+  assert.equal(isAdvanceLabel('Loading…Submit application'), true);
+  // The false-positive guards MUST still hold (anchors unchanged):
+  assert.equal(isAdvanceLabel('Continue reading'), false);
+  assert.equal(isAdvanceLabel('Continue as guest'), false);
+  assert.equal(isAdvanceLabel('Continue shopping'), false);
+});
+
+test('LinkedIn advance labels unchanged + a hypothetical loading-prefixed one matches', () => {
+  assert.equal(isLinkedInApplyAdvanceLabel('Next'), true);       // unchanged
+  assert.equal(isLinkedInApplyAdvanceLabel('Submit application'), true);
+  assert.equal(isLinkedInApplyAdvanceLabel('Continue'), true);
+  assert.equal(isLinkedInApplyAdvanceLabel('Loading…Continue'), true);
+  assert.equal(isLinkedInApplyAdvanceLabel('Easy Apply to this job'), false); // never the opener
 });

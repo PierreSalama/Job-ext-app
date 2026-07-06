@@ -24,7 +24,7 @@ import { classifyApplyControl, observeRoute, applyRouteForState } from './route.
 import { classifyInterstitial } from './lib/interstitial.js';
 import { shouldFrontOnOpenerStall, classifyNoChangeRoute } from './lib/opener-stall.js';
 import { detectBotChallenge, botChallengeLastError } from './lib/challenge.js';
-import { ADVANCE_KEYWORDS, isAdvanceLabel } from './lib/advance.js';
+import { ADVANCE_KEYWORDS, isAdvanceLabel, stripLoadingPrefix } from './lib/advance.js';
 import { isLinkedInEasyApplyApplyUrl, isLinkedInApplyAdvanceLabel, deriveApplyRootFromAdvanceButton, shouldUseGenericOpenFallback, detectLinkedInExternalPosting, decideResumePage, isUploadResumeAffordanceLabel, pageRequiresResume, groundedEligibilityAnswer, isEligibilityScreeningQuestion, isReferralQuestion, referralDefaultAnswer, decideAnswerOrPark } from './lib/linkedin-apply.js';
 import { sitePack } from './sites/index.js';
 import { confirmSignalsMatched, findPackSubmitBroadened } from './lib/ats-drive.js';
@@ -459,7 +459,11 @@ function easyApplyLimitHit() {
 function btnText(el) {
   // LinkedIn's modal Next/Review/Submit buttons are often icon-only with the
   // real label in aria-label, so include it.
-  return compactText(el?.getAttribute?.('aria-label') || el?.textContent || el?.value || '');
+  // Strip Indeed smartapply's hydration prefix ("Loading...Continue") at THIS single choke point
+  // so every downstream label matcher — isAdvanceLabel, ADVANCE_KEYWORDS (findApplyDialog),
+  // FINAL_SUBMIT_RX (isFinalSubmit), isLinkedInApplyAdvanceLabel — sees the REAL label. Only a
+  // LEADING loading token is removed; no LinkedIn label carries one, so LinkedIn passes through unchanged.
+  return stripLoadingPrefix(compactText(el?.getAttribute?.('aria-label') || el?.textContent || el?.value || ''));
 }
 // Structural guard: is this candidate the LinkedIn Easy Apply page-level OPENER (the
 // top-card "Easy Apply to this job" button)? We must NEVER return it from the in-form
@@ -501,6 +505,24 @@ function findAdvanceButton(root, { allowOpen = false } = {}) {
       if (!href || href === '#' || /^javascript:/i.test(href)) continue;
       if (looksLikeAdvance(a, { allowOpen: true })) return a;
     }
+  }
+  return null;
+}
+
+// A PRESENT advance/submit control that is currently DISABLED — Indeed smartapply's Continue while
+// its React module hydrates ("Loading...Continue", disabled until ready). Same label test as
+// looksLikeAdvance but WITHOUT the disabled gate, and it must be genuinely on-screen. DETECTION
+// ONLY — the caller NEVER clicks the returned element; it waits for it to ENABLE, at which point the
+// normal findBtn() picks it up. Excludes the page-level Easy-Apply opener so a disabled opener can
+// never be mistaken for an in-form advance.
+function findLoadingAdvanceButton(root) {
+  for (const el of qsa('button, input[type="submit"], [role="button"]', root || document)) {
+    if (!el || !isProbablyVisible(el)) continue;
+    if (isEasyApplyOpener(el)) continue;
+    const disabled = el.disabled || el.getAttribute?.('aria-disabled') === 'true';
+    if (!disabled) continue;
+    const label = btnText(el);
+    if (isAdvanceLabel(label) || isLinkedInApplyAdvanceLabel(label)) return el;
   }
   return null;
 }
@@ -2605,6 +2627,12 @@ export async function run(task, context, helpers) {
       // mere ABSENCE of an Easy-Apply opener keeps the full hydration wait below, so a genuinely
       // slow-hydrating REAL Easy Apply is NEVER mis-skipped.
       const onLI_fs = /(^|\.)linkedin\.com$/i.test(location.hostname);
+      // Indeed smartapply keeps Continue DISABLED while its React module hydrates, so findBtn()
+      // (which rejects disabled) returns null and we would blind-wait the full cap. Detect that a
+      // loading advance IS present so we (a) wait SHORT and re-check for enable (the loop already
+      // re-calls findBtn each tick), (b) cap fast on a genuinely stuck module, and (c) trace honestly.
+      const onSmartApply_fs = /(^|\.)smartapply\.indeed\.com$/i.test(location.hostname);
+      const loadingAdvance = findLoadingAdvanceButton(root || document);
       // The fast-skip is an EASY-APPLY-ONLY optimization: when the user only wants Easy Apply,
       // a positively-external LinkedIn posting has nothing to drive, so skip it in ~0s. But in
       // BOTH mode (allowExternal — easyApplyOnly OFF) we WANT to apply to externals: don't
@@ -2663,10 +2691,18 @@ export async function run(task, context, helpers) {
       // enough to blaze through externals. KEEP the long wait for: hidden/throttled tabs (timers
       // throttled → opener hydrates late) and for the /apply/ page-LOAD + in-form-advance cases
       // (a full page must navigate + render, which genuinely takes longer).
-      const initialTries = opening ? (wasHidden ? 40 : 16) : 60;   // ~20s hidden / ~8s visible-opener / ~30s /apply/-load
+      // Smartapply fast-fail: once the module was already seen (everHadForm) and a loading Continue
+      // is present but never re-enables, the step is genuinely stuck — cap at ~11s (22×500) instead
+      // of 30s so the forced-serial worker isn't burned. ~11s comfortably exceeds a normal 1-3s
+      // smartapply inter-step hydration, and the loop below re-calls findBtn() every tick, so the
+      // REAL Continue is clicked the instant it enables — the cap only bites a truly stuck module.
+      // Triple-gated on onSmartApply_fs, so every LinkedIn initialTries path is byte-unchanged.
+      const initialTries = opening ? (wasHidden ? 40 : 16)
+        : (onSmartApply_fs && everHadForm && loadingAdvance ? 22 : 60);   // ~11s stuck-smartapply / ~30s /apply/-load
       // [TRACE 7] HYDRATION — entering the wait, with the occlusion/visibility cause + cap.
       const hydrateStart = Date.now();
-      vlog('hydrate', `wait begin opening=${opening} applyPageLoading=${applyPageLoading} hidden=${wasHidden} cap=${initialTries * 500}ms`);
+      if (loadingAdvance) vlog('hydrate', `advance button present but loading ("${redactLabel(btnText(loadingAdvance))}") — waiting for it to enable`);
+      vlog('hydrate', `wait begin opening=${opening} applyPageLoading=${applyPageLoading} hidden=${wasHidden}${onSmartApply_fs ? ' smartapply' : ''} cap=${initialTries * 500}ms`);
       for (let i = 0; i < initialTries && !S.cancelled; i++) {
         if ((opening || applyPageLoading) && i % 4 === 0) { try { window.scrollTo(0, 600); window.scrollTo(0, 0); } catch {} }
         await sleep(500);
@@ -2800,7 +2836,9 @@ export async function run(task, context, helpers) {
             ? (wasHidden
                 ? 'apply window was occluded → Chrome throttled the tab so LinkedIn never hydrated — keep its window uncovered (or enable bring-to-front) — will retry'
                 : 'Easy-Apply form did not hydrate — will retry')
-            : 'no advance button found — will retry',
+            : (onSmartApply_fs && everHadForm
+                ? 'smartapply step did not advance — module stuck (Continue never enabled); will retry'
+                : 'no advance button found — will retry'),
         });
         finalState = 'failed';
         break;

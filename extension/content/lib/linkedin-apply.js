@@ -16,6 +16,8 @@
 //   • deriveApplyRootFromAdvanceButton(btn, opts)   — walk UP to the field-bearing ancestor.
 // findLinkedInApplyPageRoot() composes them against the live DOM (the only DOM-coupled fn).
 
+import { stripLoadingPrefix } from './advance.js';
+
 // The advance button on the new full-page flow: a <button> whose TRIMMED text is exactly one
 // of Next / Review / Review your application / Submit application / Continue (LinkedIn renders
 // the label in plain text or aria-label). Kept tight (exact match) so it never matches the
@@ -32,7 +34,7 @@ export function isLinkedInEasyApplyApplyUrl(pathname) {
 
 // Is this trimmed button text the new full-page flow's advance/submit CTA?
 export function isLinkedInApplyAdvanceLabel(text) {
-  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  const t = stripLoadingPrefix(String(text || '').replace(/\s+/g, ' '));
   if (!t || t.length > 40) return false;
   return APPLY_ADVANCE_LABEL_RX.test(t);
 }
