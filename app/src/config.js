@@ -210,13 +210,17 @@ const DEFAULTS = {
   // norms — retention pruning, periodic VACUUM, pause background work on sleep, and an
   // opt-in battery saver. Generous defaults so nothing the user cares about is lost.
   maintenance: {
-    eventRetentionDays: 400,        // prune timeline events older than this
-    taskRetentionDays: 60,          // prune terminal (skipped/failed) auto-apply tasks older than this
-    transcriptClearDays: 14,        // null out the (large) transcript blob of terminal tasks older than this — keeps the row + evidence, drops the bloat (perf audit v11.82.0)
-    aiLogRetentionDays: 30,         // prune AI-call diagnostics older than this (no FK, pure telemetry)
-    discoveryRetentionDays: 30,     // was 90 — provenance (biggest table) cascades off discovery_batches, so a tighter window is the single biggest DB-size win
+    // v11.85: tightened hard after the DB reached 74MB (37k provenance + 17k discovery batches +
+    // 15MB transcripts) and became a live lag source. All of these tables are insert-only telemetry
+    // with no user-facing read path beyond a few days — short windows are safe and are the biggest
+    // single lag/DB-size win. The user's actual applications live in `jobs` (never pruned here).
+    eventRetentionDays: 90,         // was 400 — timeline events; 90 days is ample history
+    taskRetentionDays: 14,          // was 60 — prune terminal (skipped/failed) apply tasks; also shrinks the /queue payload the dashboard re-fetches
+    transcriptClearDays: 3,         // was 14 — null the large transcript blob of terminal tasks fast (keeps the row + submission evidence)
+    aiLogRetentionDays: 7,          // was 30 — AI-call diagnostics, pure telemetry
+    discoveryRetentionDays: 5,      // was 30 — provenance (biggest table, 37k rows) cascades off discovery_batches; short window is the #1 DB-size win
     emailRetentionDays: 365,        // prune UNMATCHED emails older than this (matched/manual are always kept)
-    vacuumEveryDays: 7,             // reclaim disk by compacting the DB at most this often
+    vacuumEveryDays: 3,             // was 7 — compact more often now that pruning frees pages daily
     pauseBackgroundOnBattery: false,// when true, defer background email/gmail sync while on battery
     memoryGuardMB: 1400,            // skip a background sync tick if the app's own RSS exceeds this
   },

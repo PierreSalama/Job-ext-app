@@ -335,30 +335,26 @@ function createAtsBoardsService({ ingestJobs, broadcast = () => {}, db, fetchFn 
       return { ats, token, status: 'cooldown', found: 0, accepted: 0 };
     }
 
-    let batch = null;
     const hasBatchApi = db && typeof db.discoveryBatchStart === 'function' && typeof db.discoveryBatchComplete === 'function';
-    if (hasBatchApi) {
+    // Record a discovery_batch ONLY when the scan is worth it — found matching jobs, or a
+    // rate-limit/error worth diagnosing. An empty/dedup scan (the ~90% case: re-scanning a company
+    // whose jobs are already discovered) records NOTHING — no batch row, no broadcast. This stops the
+    // ATS feed spamming ~12k empty discovery_batches (each with a discovery.updated broadcast), which
+    // was a live DB-bloat + dashboard-SSE-refetch lag source (v11.85).
+    const recordBatch = (patch) => {
+      if (!hasBatchApi) return;
       try {
-        batch = db.discoveryBatchStart({ provider: `${ats}-api`, source: ats, keyword: token, location: '' });
-        broadcast('discovery.updated', { batch });
-      } catch (e) {
-        logger.warn(`discoveryBatchStart failed for ${key}:`, e?.message || e);
-        batch = null;
-      }
-    }
+        const b = db.discoveryBatchStart({ provider: `${ats}-api`, source: ats, keyword: token, location: '' });
+        const done = db.discoveryBatchComplete(b.id, { ...patch, diagnostics: { engine: `${ats}-api`, token } });
+        broadcast('discovery.updated', { batch: done });
+      } catch (e) { logger.warn(`discovery batch record failed for ${key}:`, e?.message || e); }
+    };
 
     try {
       const probe = await probeStatus(ats, token, fetchFn);
       if (probe.status === 429 || probe.status === 403) {
         setCooldown(key);
-        if (batch) {
-          try {
-            const done = db.discoveryBatchComplete(batch.id, {
-              status: 'rate_limited', error: `HTTP ${probe.status}`, diagnostics: { engine: `${ats}-api`, token },
-            });
-            broadcast('discovery.updated', { batch: done });
-          } catch {}
-        }
+        recordBatch({ status: 'rate_limited', error: `HTTP ${probe.status}` });
         return { ats, token, status: 'rate_limited', found: 0, accepted: 0 };
       }
       if (probe.error) throw probe.error;
@@ -395,36 +391,33 @@ function createAtsBoardsService({ ingestJobs, broadcast = () => {}, db, fetchFn 
         .filter((j) => titleMatchesKeywords(j.title, targetKeywords))
         .filter((j) => locationEligible(j, targetLocations, targetCountry));
 
-      let intake = { enqueued: 0, duplicates: 0, rejected: 0 };
-      if (jobs.length && typeof ingestJobs === 'function') {
-        intake = await ingestJobs(ats, jobs, { provider: `${ats}-api`, batchId: batch?.id || null }) || intake;
-      }
+      // Empty/dedup scan → record nothing (no batch, no provenance, no broadcast) — the churn fix.
+      if (!jobs.length) return { ats, token, status: 'empty', found: 0, accepted: 0 };
 
-      if (batch) {
+      // Found matching jobs → create the batch so ingest can attach provenance, then ingest + complete.
+      let batchId = null;
+      if (hasBatchApi) {
+        try { batchId = db.discoveryBatchStart({ provider: `${ats}-api`, source: ats, keyword: token, location: '' }).id; } catch {}
+      }
+      let intake = { enqueued: 0, duplicates: 0, rejected: 0 };
+      if (typeof ingestJobs === 'function') {
+        intake = await ingestJobs(ats, jobs, { provider: `${ats}-api`, batchId }) || intake;
+      }
+      if (batchId) {
         try {
-          const done = db.discoveryBatchComplete(batch.id, {
-            status: jobs.length ? 'ok' : 'empty',
-            found: jobs.length, accepted: intake.enqueued || 0,
+          const done = db.discoveryBatchComplete(batchId, {
+            status: 'ok', found: jobs.length, accepted: intake.enqueued || 0,
             duplicates: intake.duplicates || 0, rejected: intake.rejected || 0,
             diagnostics: { engine: `${ats}-api`, token },
           });
           broadcast('discovery.updated', { batch: done });
         } catch (e) { logger.warn(`discoveryBatchComplete failed for ${key}:`, e?.message || e); }
       }
-
       return { ats, token, status: 'ok', found: jobs.length, accepted: intake.enqueued || 0 };
     } catch (e) {
       logger.warn(`scanToken(${key}) failed:`, e?.message || e);
       if (isRateLimitedError(e)) setCooldown(key);
-      if (batch) {
-        try {
-          const done = db.discoveryBatchComplete(batch.id, {
-            status: isRateLimitedError(e) ? 'rate_limited' : 'failed',
-            error: text(e?.message || e), diagnostics: { engine: `${ats}-api`, token },
-          });
-          broadcast('discovery.updated', { batch: done });
-        } catch {}
-      }
+      recordBatch({ status: isRateLimitedError(e) ? 'rate_limited' : 'failed', error: text(e?.message || e) });
       return { ats, token, status: 'error', error: text(e?.message || e), found: 0, accepted: 0 };
     }
   }

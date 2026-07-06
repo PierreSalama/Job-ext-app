@@ -871,6 +871,11 @@ function maintenance() {
     // Cascades to job_discovery_provenance + discovery_fallbacks (FK ON DELETE CASCADE) — the
     // provenance table (biggest by row count) shrinks with this.
     discovery = run('DELETE FROM discovery_batches WHERE started_at < ?', [cut(m.discoveryRetentionDays, 30)])?.changes || 0;
+    // ZERO-YIELD purge (v11.85): a scan that found nothing is pure noise. The ATS feed used to write
+    // one such batch per empty dedup scan (~12k rows + provenance) — scanToken no longer creates them,
+    // but this clears the backlog + any straggler beyond 6h, regardless of the retention window.
+    const emptyCut = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
+    discovery += run("DELETE FROM discovery_batches WHERE (found_count IS NULL OR found_count = 0) AND (accepted_count IS NULL OR accepted_count = 0) AND started_at < ?", [emptyCut])?.changes || 0;
   });
   // VACUUM must run OUTSIDE a transaction; gate it so it doesn't run every call.
   let vacuumed = false;
@@ -1044,9 +1049,11 @@ function migrateMemoryPlaceholders() {
 function migrateForceVacuumOnce() {
   if (!db) return;
   try {
-    if (kvGet('forceVacuumV1182')) return;
-    kvSet('lastVacuumAt', '');   // falsy → next maintenance() VACUUMs regardless of the 7-day gate
-    kvSet('forceVacuumV1182', 1);
+    // Bump the flag per release that needs a one-time reclaim. v11.85 tightened retention hard after
+    // the DB hit 74MB; force a compact on this upgrade so the freed pages return to the OS immediately.
+    if (kvGet('forceVacuumV1185')) return;
+    kvSet('lastVacuumAt', '');   // falsy → next maintenance() VACUUMs regardless of the day gate
+    kvSet('forceVacuumV1185', 1);
   } catch (e) { log.warn && log.warn('force-vacuum migration skipped:', e.message); }
 }
 
