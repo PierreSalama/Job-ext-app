@@ -1283,6 +1283,12 @@ async function handle(req, res, parsed) {
     // not raw concurrency — the gap now paces per site at baseGap/perSiteCap. Use it for the rate
     // estimate so the dashboard's "effective per hour" stays honest.
     const perSiteCap = concurrency > 1 ? Math.max(1, Math.min(concurrency, Number(s.perSiteConcurrency) || 2)) : 1;
+    // The extension pump gates dispatch on THIS endpoint's active+scheduled counts (its busy-slot
+    // signal). Reclaim stranded in-flight rows BEFORE counting — a 'scheduled' task interrupted right
+    // after dispatch (MV3 evicted the SW before the executor flipped it to 'running') would otherwise
+    // pin the serial slot for 8 min and re-create the ~9-min apply gap. Mirror queueNext's self-heal so
+    // the pump never gates on a phantom busy slot. Scheduled rows reclaim fast (2 min); running keeps 8.
+    try { db.reconcileStaleRunning({ olderThanMinutes: 8, scheduledOlderThanMinutes: 2 }); } catch {}
     const live = db.queueLive({ startedAt: s.startedAt || '' });
     const stats = db.queueRunStats();
     // R3 — honest, run-scoped breakdown (verified submits vs. site-gates vs. our failures).

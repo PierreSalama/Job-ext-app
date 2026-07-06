@@ -3113,9 +3113,17 @@ function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25, m
 // executor hung on a frozen tab) never reconcile themselves — they hold the pool slot
 // and STALL the whole pipeline (zero new applies). Flip ones with no activity for
 // `olderThanMinutes` back to retriable 'failed' so the slot frees + the job retries.
-function reconcileStaleRunning({ olderThanMinutes = 8 } = {}) {
-  const cutoff = new Date(Date.now() - Math.max(1, olderThanMinutes) * 60000).toISOString();
-  const rows = all("SELECT id FROM auto_apply_tasks WHERE state IN ('running','scheduled') AND updated_at < ?", [cutoff]);
+// Reclaim tasks stuck in-flight. `scheduledOlderThanMinutes` (default = olderThanMinutes) lets a
+// caller reclaim STRANDED 'scheduled' rows faster than genuinely-'running' ones: a dispatched task
+// flips scheduled→running within ~10s (the executor starts fast), so a 'scheduled' row older than a
+// couple minutes was interrupted (e.g. MV3 evicted the SW right after dispatch). This matters because
+// the extension pump now counts scheduled+running as busy slots (reconcileAaTabsAndSlots) — a stranded
+// 'scheduled' row would otherwise pin the serial slot until the 8-min running-timeout, re-creating the
+// ~9-min apply gap the slot fix removed.
+function reconcileStaleRunning({ olderThanMinutes = 8, scheduledOlderThanMinutes = olderThanMinutes } = {}) {
+  const runCut = new Date(Date.now() - Math.max(1, olderThanMinutes) * 60000).toISOString();
+  const schedCut = new Date(Date.now() - Math.max(1, scheduledOlderThanMinutes) * 60000).toISOString();
+  const rows = all("SELECT id FROM auto_apply_tasks WHERE (state='running' AND updated_at < ?) OR (state='scheduled' AND updated_at < ?)", [runCut, schedCut]);
   for (const r of rows) run("UPDATE auto_apply_tasks SET state='failed', last_error=COALESCE(NULLIF(last_error,''),'timed out / interrupted — will retry'), updated_at=? WHERE id=?", [now(), r.id]);
   return rows.length;
 }

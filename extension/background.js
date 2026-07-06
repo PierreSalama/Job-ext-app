@@ -1179,10 +1179,24 @@ async function reconcileAaTabsAndSlots() {
     if (activeCount > 0) activeCount = 0;
     return 0;
   }
-  // After MV3 service-worker eviction, activeCount resets to 0 while old apply tabs
-  // are still alive. Treat persisted live AA tabs as occupied slots so the next alarm
-  // cannot launch more windows on top of them.
-  activeCount = Math.max(activeCount, Math.min(live.length, Math.max(1, currentConcurrency)));
+  // Count BUSY slots by how many applies are ACTUALLY IN FLIGHT (app truth: running + scheduled),
+  // NOT by how many tabs are open. In serial mode the ONE warm reuse-tab (aaReuseTabId) stays open
+  // BETWEEN applies to preserve the site session — but it's IDLE, not running an apply. The old code
+  // counted every live tab as an occupied slot, so that single idle warm tab pinned the concurrency-1
+  // slot until it aged out at AA_TAB_MAX_AGE_MS (8 min) — the pump then refused to dispatch and applies
+  // gapped ~9 min apart (THE root cause of the ~7/hr collapse). Using the in-flight count frees the
+  // slot the instant an apply finishes, while `scheduled` still counts a just-dispatched apply so we
+  // NEVER open a second on top of a genuinely-running one (preserves the parallel-window freeze guard).
+  // Falls back to the old live-tab count only if the app is unreachable (stays conservative → no burst).
+  let inFlight = null;
+  try {
+    const r = await api.call('GET', '/auto-apply/live', null, 5000);
+    if (r && (Number.isFinite(r.active) || Number.isFinite(r.scheduled))) {
+      inFlight = (Number(r.active) || 0) + (Number(r.scheduled) || 0);
+    }
+  } catch {}
+  const busy = inFlight != null ? inFlight : live.length;
+  activeCount = Math.max(0, Math.min(busy, live.length, Math.max(1, currentConcurrency)));
   return live.length;
 }
 
