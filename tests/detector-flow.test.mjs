@@ -95,3 +95,81 @@ test('external-ATS (Workday) apply page creates an entry on arrival, via the boa
   // Clean up the engine's resident timers so the test process exits promptly.
   try { globalThis.window.dispatchEvent(new globalThis.Event('pagehide')); } catch {}
 });
+
+const CHECKOUT = `
+<form id="checkout" class="checkout-form">
+  <h1>Checkout</h1>
+  <label for="em">Email</label><input id="em" type="email" required value="me@x.com" />
+  <label for="fn">First name</label><input id="fn" required value="Pierre" />
+  <label for="ln">Last name</label><input id="ln" required value="Salama" />
+  <label for="addr">Billing address</label><input id="addr" required value="1 King St" />
+  <label for="card">Card number</label><input id="card" required value="4111 1111 1111 1111" />
+  <label for="cvv">CVV</label><input id="cvv" required value="123" />
+  <div class="promo"><input placeholder="Promo code" /><button type="button" id="promo-apply">Apply</button></div>
+  <button type="submit" id="pay">Continue to payment</button>
+</form>`;
+
+test('a promo "Apply" click on a credit-card checkout starts NO flow (no entry created)', async () => {
+  sent.length = 0;
+  for (const k of Object.keys(storage)) delete storage[k];
+  setupChrome();   // no board handoff — this is an unrelated shop page
+  const w = mount(CHECKOUT, 'https://shop.example.com/checkout');
+  w.document.title = 'Checkout — Example Shop';   // neutralize the harness's jobby default title
+
+  const mod = await import(detectorUrl + '?t=' + Date.now().toString(36) + 'chk');
+  mod.init();
+  await wait(200);
+
+  const applyBtn = w.document.querySelector('#promo-apply');
+  applyBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  await wait(150);
+  const payBtn = w.document.querySelector('#pay');
+  payBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  await wait(150);
+
+  assert.equal(sent.length, 0, `checkout must not create an application entry — got ${JSON.stringify(sent)}`);
+  try { w.dispatchEvent(new w.Event('pagehide')); } catch {}
+});
+
+// (the sticky-dismiss test lives in tests/panel-dismiss.test.mjs — it needs a
+// pristine process; see the note at the top of that file.)
+
+// A mid-confidence job-ish page: job heading + job-detail prose, neutral title, no
+// apply form -> scores into the "unsure" band and hasJobContext() is true, so the
+// "Track this application?" card is exactly what would appear.
+const UNSURE_PAGE = `
+<div>
+  <h1>Software Engineer</h1>
+  <p>Responsibilities: build things. Qualifications: experience. Benefits and compensation are competitive.</p>
+</div>`;
+
+test('"Not a job" host suppression is honoured (the card does not come back)', async () => {
+  // control: without suppression the unsure card DOES appear
+  sent.length = 0;
+  for (const k of Object.keys(storage)) delete storage[k];
+  setupChrome();
+  let w = mount(UNSURE_PAGE, 'https://random-site.example/page');
+  w.document.title = 'Random Site';
+  w.sessionStorage.clear();
+  let mod = await import(detectorUrl + '?t=' + Date.now().toString(36) + 'u1');
+  mod.init();
+  await wait(400);
+  const cardShown = !!w.document.querySelector('[data-act="no"]');
+  try { w.dispatchEvent(new w.Event('pagehide')); } catch {}
+  assert.ok(cardShown, 'control failed: the unsure card should appear on an unsuppressed host');
+
+  // suppressed: same page, host already in the "Not a job" list -> no card
+  sent.length = 0;
+  for (const k of Object.keys(storage)) delete storage[k];
+  setupChrome();
+  storage['jat11.suppressHosts'] = ['random-site.example'];
+  w = mount(UNSURE_PAGE, 'https://random-site.example/page');
+  w.document.title = 'Random Site';
+  w.sessionStorage.clear();
+  mod = await import(detectorUrl + '?t=' + Date.now().toString(36) + 'u2');
+  mod.init();
+  await wait(400);
+  assert.equal(w.document.querySelector('[data-act="no"]'), null,
+    '"Not a job" must suppress the card on this host — it came back');
+  try { w.dispatchEvent(new w.Event('pagehide')); } catch {}
+});

@@ -9,6 +9,13 @@
 const DEFAULTS = {
   server: {
     port: 7744,
+    // false = loopback only (127.0.0.1 — the default, nothing reachable from outside this machine).
+    // true  = ALSO listen on the local network (0.0.0.0) so another machine on the SAME LAN can open
+    //         the dashboard (http://<this-ip>:7744/app/?token=…) for live remote monitoring — the
+    //         Pierre-watches-Dad's-auto-apply feature. Token auth applies to every data route either
+    //         way. Requires an app restart AND a Windows Firewall inbound rule for the port
+    //         (the USB kit's enable-remote.ps1 does both).
+    remoteAccess: false,
   },
 
   app: {
@@ -18,7 +25,7 @@ const DEFAULTS = {
   },
 
   autoUpdate: {
-    mode: 'auto',            // 'auto' = silently install when the machine is idle + safe; 'prompt' = only via the in-app banner; 'manual' = only the tray check + Restart button
+    mode: 'auto',            // 'auto' = silently install when the machine is idle + safe; 'prompt' = only via the in-app banner; 'manual' = only the tray check + Restart button; 'pinned' = NEVER check or install — this machine stays on its installed version until someone changes this setting (Dad's laptop: Pierre updates it in person)
     idleMinutes: 5,          // OS idle (no keyboard/mouse) required before an unattended install
     graceMinutes: 10,        // after download, wait this long for the user to choose before auto-install is eligible
     checkEveryMinutes: 30,   // background poll cadence (floored to 15min)
@@ -26,6 +33,13 @@ const DEFAULTS = {
   },
 
   ai: {
+    // MASTER SWITCH — true turns every AI feature off cleanly (no provider is ever
+    // probed or spawned; AI surfaces show one clear "turned off on this computer"
+    // message). For machines that can't run AI (Dad's laptop): no Ollama download,
+    // no Codex/Claude CLI probes, no crash-prone child processes. The deterministic
+    // no-model answer floor still works — it's rules, not AI.
+    disabled: false,
+
     // Priority order — tried top to bottom, first one that's configured wins.
     // Reorder freely in Settings. Default: ChatGPT → Claude → local.
     // ChatGPT (Codex CLI subscription) is first because it's the signed-in, working
@@ -58,16 +72,20 @@ const DEFAULTS = {
     },
 
     local: {
+      // Local AI is STRICTLY OPT-IN. Off (the default) means the app NEVER touches Ollama:
+      // no probes, no `ollama serve` spawns, no background installer downloads. Cloud
+      // providers + the deterministic floor still work. Flip in Settings → Local card.
+      enabled: false,
       provider: 'ollama',
       url: 'http://localhost:11434',
       autoPick: true,               // pick the model that fits this machine
-      autoSetup: true,              // auto-download Ollama + models in the background on first run when no cloud key is set (zero-config local AI fallback)
+      autoSetup: false,             // (requires enabled) auto-download Ollama + models when no cloud key is set
       structuredModel: '',          // '' = use the hardware recommendation
       proseModel: '',               // '' = use the hardware recommendation
       timeoutMs: 90000,
       numCtx: 8192,
       keepAlive: '15m',
-      trySpawn: true,               // try `ollama serve` if it's down
+      trySpawn: false,              // (requires enabled) try `ollama serve` if it's down
       exePath: '',                  // '' = resolve from PATH
     },
   },
@@ -149,6 +167,12 @@ const DEFAULTS = {
     // ---- relevance / fit filters (skip jobs that don't match your level) ----
     experienceYears: 0,           // your years of experience; >0 = skip jobs that demand many more
     seniorityMax: 'any',          // 'any' | 'entry' | 'mid' | 'senior' — skip roles above this level
+    // Require a discovered job's TITLE to match at least one of your keywords before applying.
+    // Without this the relevance gate is negative-only (keywords built the search query but nothing
+    // re-checked the results), so anything the search dragged in that wasn't explicitly banned got
+    // applied to — live 2026-07-25, 36 of 42 queued jobs were off-field. ON by default: widen the
+    // net by ADDING a keyword, instead of guessing which junk word to ban next.
+    requireKeywordMatch: true,
     excludeKeywords: [],          // title terms to always skip, e.g. ['game','manager','sales']
     // High-volume IT-staffing reposters / job aggregators / recruiters that flood discovery with
     // duplicate, often-ghost listings (substring, case-insensitive). Curated from live data — these
@@ -220,6 +244,8 @@ const DEFAULTS = {
     aiLogRetentionDays: 7,          // was 30 — AI-call diagnostics, pure telemetry
     discoveryRetentionDays: 5,      // was 30 — provenance (biggest table, 37k rows) cascades off discovery_batches; short window is the #1 DB-size win
     emailRetentionDays: 365,        // prune UNMATCHED emails older than this (matched/manual are always kept)
+    screenshotRetentionDays: 14,    // sweep ORPHANED teach screenshots (PNG + row) past this age — nothing
+                                    // ever referenced them, so they grew forever (43MB measured live)
     vacuumEveryDays: 3,             // was 7 — compact more often now that pruning frees pages daily
     pauseBackgroundOnBattery: false,// when true, defer background email/gmail sync while on battery
     memoryGuardMB: 1400,            // skip a background sync tick if the app's own RSS exceeds this
@@ -240,7 +266,10 @@ const DEFAULTS = {
   },
 
   backups: {
-    keep: 14,                // daily backups retained
+    keep: 7,                 // daily backups retained (each is a FULL copy of the DB)
+    maxTotalMb: 300,         // hard byte budget for the whole backups folder, across EVERY
+                             // backup file (daily + manual + per-migration). Oldest go first;
+                             // today's is never removed.
   },
 };
 

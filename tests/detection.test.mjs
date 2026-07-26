@@ -277,8 +277,39 @@ const PLEX_MEDIA = `
   <button>Pause</button>
   <p>Stream your movies, shows and music anywhere. Remote access enabled. Premium benefits for Plex Pass members.</p>
 </div>`;
+// Credit-card checkout: generic contact fields + billing + a "Continue"/"Apply promo" button.
+// It has the word "apply" (promo code) and name/email/phone/address — exactly what used to
+// trip the detector. No résumé, no work-auth, no job phrasing → must be rejected.
+const CHECKOUT = `
+<form id="checkout" class="checkout-form">
+  <h1>Checkout</h1>
+  <label for="em">Email</label><input id="em" type="email" required />
+  <label for="fn">First name</label><input id="fn" required />
+  <label for="ln">Last name</label><input id="ln" required />
+  <label for="addr">Billing address</label><input id="addr" required />
+  <label for="city">City</label><input id="city" required />
+  <label for="ph">Phone</label><input id="ph" />
+  <label for="card">Card number</label><input id="card" inputmode="numeric" required />
+  <label for="cvv">CVV</label><input id="cvv" required />
+  <div class="promo"><input placeholder="Promo code" /><button type="button">Apply</button></div>
+  <button type="submit">Continue to payment</button>
+</form>`;
+// Sign-up form with NO password on this step (email + name + "Create account"/"Continue").
+// looksLikeAccountForm keys on a password field, so this one slips past that check — the
+// job-specific gate is what must reject it.
+const SIGNUP_NO_PW = `
+<form id="register">
+  <h1>Sign up to get started</h1>
+  <label for="em">Email address</label><input id="em" type="email" required />
+  <label for="fn">First name</label><input id="fn" required />
+  <label for="ln">Last name</label><input id="ln" required />
+  <label for="ph">Phone number</label><input id="ph" />
+  <button type="submit">Continue</button>
+</form>`;
 const NEGATIVE = [
   ['Sign-up form', SIGNUP],
+  ['Sign-up form without a password field', SIGNUP_NO_PW],
+  ['Credit-card checkout', CHECKOUT],
   ['Contact form', CONTACT],
   ['Newsletter', NEWSLETTER],
   ['Media SPA with a bare file input (Plex)', PLEX_MEDIA],

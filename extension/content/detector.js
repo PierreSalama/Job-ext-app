@@ -79,7 +79,42 @@ const state = {
   recognitionDone: false,      // true once the page is classified (stop re-trying)
   recognitionAttempts: 0,      // bounded re-recognition while a SPA hydrates
   autofillBundle: undefined,   // undefined=not fetched, null=off/empty, obj=ready
+  panelDismissed: false,       // user closed the panel for THIS job — never re-open it
+  hostSuppressed: false,       // user answered "Not a job" on this host — never prompt here again
 };
+
+// ---- panel dismissal (per job, survives SPA navigation within the apply flow) ----
+// Dismiss is a DISPLAY action: capture keeps running silently, we just stop drawing.
+// Persisted in sessionStorage keyed by the job so a multi-step ATS flow (Workday
+// step 1 → step 2 is a real navigation) doesn't resurrect a panel the user closed,
+// while landing on a DIFFERENT job shows it again.
+// Pending recognition-retry timers, cancelled on pagehide.
+const retryTimers = [];
+
+const PANEL_DISMISS_KEY = 'jat11.panelDismissed';
+function dismissalKey() {
+  const src = state.source || detectSource() || location.hostname;
+  const id = state.externalId || normalizeKey(state.ctx?.title || '') + ':' + normalizeKey(state.ctx?.company || '');
+  return `${src}|${id}`;
+}
+function markPanelDismissed() {
+  state.panelDismissed = true;
+  try { sessionStorage.setItem(PANEL_DISMISS_KEY, dismissalKey()); } catch {}
+  log('panel dismissed for', dismissalKey());
+}
+function panelDismissedForThisJob() {
+  if (state.panelDismissed) return true;
+  try {
+    const stored = sessionStorage.getItem(PANEL_DISMISS_KEY);
+    if (stored && stored === dismissalKey()) { state.panelDismissed = true; return true; }
+  } catch {}
+  return false;
+}
+// A genuinely different job → the old dismissal no longer applies.
+function clearPanelDismissal() {
+  state.panelDismissed = false;
+  try { sessionStorage.removeItem(PANEL_DISMISS_KEY); } catch {}
+}
 
 // ============================================================
 // Settings (via SW; fall back to silent defaults)
@@ -89,6 +124,17 @@ async function loadSettings() {
     const r = await new Promise((res) => chrome.runtime.sendMessage(
       { type: 'api-call', method: 'GET', path: '/settings' }, (x) => { void chrome.runtime.lastError; res(x); }));
     if (r?.ok && r.settings?.capture) state.settings = { ...state.settings, ...r.settings.capture };
+  } catch {}
+  await loadHostSuppression();
+}
+
+// "Not a job" wrote the host into storage but NOTHING ever read it back — so the
+// prompt returned on that site forever. Read it now and honour it.
+async function loadHostSuppression() {
+  try {
+    const list = (await chrome.storage.local.get(SUPPRESS_KEY))[SUPPRESS_KEY] || [];
+    state.hostSuppressed = Array.isArray(list) && list.includes(location.hostname);
+    if (state.hostSuppressed) log('host suppressed by "Not a job" —', location.hostname);
   } catch {}
 }
 
@@ -359,6 +405,10 @@ function buildFingerprint(stage) {
 
 function paintPanel() {
   if (!IS_TOP) return;
+  // Dismiss must STICK. Every persist/mutation/step-advance calls paintPanel(), so
+  // without this guard the panel reappeared the instant the user typed anything —
+  // the "it won't go away and keeps popping back up" bug.
+  if (panelDismissedForThisJob()) return;
   const show = state.stage && (state.stage !== 'detected' || state.settings.panelOnDetect);
   if (!show) return;
   renderPanel({
@@ -369,7 +419,7 @@ function paintPanel() {
     answersCount: state.answersCount,
     saveState: state.saveState,
   }, {
-    onDismiss: () => {},
+    onDismiss: markPanelDismissed,
   });
 }
 
@@ -561,6 +611,7 @@ async function evaluate(reason) {
   // Mid-confidence: ask once instead of silently tracking or silently missing.
   if (probe.score < MIN_PAGE_SCORE) {
     if (!state.settings.askWhenUnsure || state.asked || !IS_TOP) return;
+    if (state.hostSuppressed) return;   // user already said "Not a job" here — never ask again
     if (sessionStorage.getItem('jat11.unsureAsked')) return;
     // GATE the "Track this application?" card on a STRONG, job-specific signal — not the loose
     // hasApplySignal (which is true for nearly any SPA: a '/careers' path scores 0.10 and generic
@@ -569,17 +620,17 @@ async function evaluate(reason) {
     // a job-shaped URL (>=0.24, i.e. a real /jobs//job//apply path or job-id param — NOT the bare
     // 'careers' bucket), JSON-LD JobPosting, a real Apply control, or a grounded apply form. Genuine
     // job/apply pages satisfy >=1 of these; Plex/media/marketing SPAs satisfy none.
-    const strongJobSignal = onAtsHost()
-      || urlLooksJobby() >= 0.24
-      || !!readJsonLdJobPosting()
-      || hasApplyAction()
-      || !!applyFormHere;
+    // Gate on a genuine job-domain signal. hasApplyAction() is deliberately NOT here:
+    // a bare "Apply" (promo code) button satisfies it on shops/checkouts. A real apply
+    // control on a real job page is already covered by hasJobContext()/applyFormHere.
+    const strongJobSignal = hasJobContext() || !!applyFormHere;
     if (!strongJobSignal) return;
     state.asked = true;
     sessionStorage.setItem('jat11.unsureAsked', '1');
     promptUnsure(probe.ctx, {
       onYes: () => acceptContext(probe),
       onNo: async () => {
+        state.hostSuppressed = true;   // take effect IMMEDIATELY, not just next load
         try {
           const cur = (await chrome.storage.local.get(SUPPRESS_KEY))[SUPPRESS_KEY] || [];
           if (!cur.includes(location.hostname)) cur.push(location.hostname);
@@ -660,6 +711,7 @@ function enterApplyFlow(probe) {
 function resetForNewJob(probe) {
   dismissPanel();
   stopSuccessTicker();
+  clearPanelDismissal();   // a DIFFERENT job — the previous job's dismissal no longer applies
   Object.assign(state, {
     ctx: probe.ctx,
     jobId: null,
@@ -689,6 +741,7 @@ function resetForNewJob(probe) {
 function hardReset() {
   dismissPanel();
   stopSuccessTicker();
+  clearPanelDismissal();   // navigated off jobs entirely — start clean
   Object.assign(state, {
     ctx: null, jobId: null, externalId: null, source: null, stage: null,
     resumeName: null, attachments: [], answers: {}, answersCount: 0,
@@ -697,10 +750,28 @@ function hardReset() {
     lastProgressAt: 0, asked: false,
     recognitionDone: false, recognitionAttempts: 0,
     autofillBundle: undefined,
+    panelDismissed: false,
   });
 }
 
 function onAtsHost() { return ATS_HOST_RX.test(location.hostname); }
+
+// Is there a GENUINE job-domain signal on this page? Gates every entry-creation /
+// panel path that isn't already a recognized job page — so a bare "Apply" (promo
+// code), a "Continue" checkout step, or a sign-up button on a shop/marketing/media
+// site can never start a flow. A real job/apply page satisfies at least one of these.
+function hasJobContext() {
+  if (onAtsHost()) return true;
+  if (urlLooksJobby() >= 0.24) return true;                 // real /jobs//job//apply path or job-id param
+  if (readJsonLdJobPosting()) return true;                  // schema.org JobPosting
+  const pack = sitePack();
+  if (pack?.getContext?.()?.title) return true;             // LinkedIn/Indeed/… precise context
+  const heading = readPrimaryHeading();
+  const text = (document.body?.innerText || document.body?.textContent || '').slice(0, 8000);
+  if (JOB_HEADING_RX.test(heading) && JOB_DETAIL_TEXT_RX.test(text)) return true;   // job title + job-detail prose
+  if (/\b(upload\s+(?:your\s+|a\s+)?(?:resume|cv)|cover\s*letter|work\s*authorization|visa\s+sponsorship|years?\s+of\s+experience)\b/i.test(text)) return true;
+  return false;
+}
 
 // True when the URL now points at a DIFFERENT job on the SAME board (e.g. a
 // different LinkedIn/Indeed search-result card). This is the fix for the
@@ -924,13 +995,16 @@ function installWatchers() {
     const txt = (t.textContent || '').trim().slice(0, 80);
 
     if (!state.ctx && isApplyClick(t)) {
-      // Apply clicked on a page we hadn't recognized. Only accept if there's a
-      // real job signal here — a recognized page, an actual apply form, or a
-      // job-ish URL. Otherwise this is likely an "Apply"/sign-up button on an
-      // unrelated page and accepting it would capture noise.
-      const probe = recognizePage();
-      if (probe) acceptContext(probe);
-      else if (detectApplyForm() || urlLooksJobby() > 0) acceptContext({ score: 0.4, ctx: ctxFromMeta() });
+      // Apply clicked on a page we hadn't recognized. Require a GENUINE job signal —
+      // otherwise this is a promo-code "Apply", a "Continue" checkout step, or a
+      // sign-up button on an unrelated site, and accepting it captures noise (the
+      // credit-card / sign-up false positives). recognizePage() alone isn't enough:
+      // its score can be nudged over the floor by a stray "Apply"/"remote"/"benefits".
+      if (hasJobContext()) {
+        const probe = recognizePage();
+        if (probe) acceptContext(probe);
+        else if (detectApplyForm()) acceptContext({ score: 0.4, ctx: ctxFromMeta() });
+      }
     }
     if (!state.ctx) return;
 
@@ -1075,6 +1149,9 @@ function installWatchers() {
   window.addEventListener('pagehide', () => {
     stopSuccessTicker();
     if (urlTickerId) { clearInterval(urlTickerId); urlTickerId = null; }
+    // Cancel pending recognition retries — the page is going away, and leaving up
+    // to 14s of scheduled re-scans running is pure wasted work on a dead page.
+    for (const id of retryTimers.splice(0)) clearTimeout(id);
   }, { once: true });
 }
 
@@ -1147,12 +1224,14 @@ export async function init() {
   await evaluate('init');
   // ATS/job SPAs render their form AFTER document_idle. Re-attempt recognition
   // on a backoff until the page is classified (bounded by recognitionDone).
+  // Timer ids are tracked so pagehide can cancel them — otherwise this keeps
+  // re-scanning for 14s after the page is already gone.
   for (const delay of [600, 1300, 2600, 5000, 9000, 14000]) {
-    setTimeout(() => {
+    retryTimers.push(setTimeout(() => {
       if (state.ctx || state.recognitionDone) return;
       state.recognitionAttempts++;
       evaluate('retry');
-    }, delay);
+    }, delay));
   }
 }
 

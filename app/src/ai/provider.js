@@ -90,6 +90,7 @@ function buildAttempts(s, { prose, modelOverride, providerOverride }) {
       }
     } else if (key === 'local') {
       const cfg = s.local || {};
+      if (!cfg.enabled) continue;   // local AI is opt-in: off → never in the chain, no spawn path exists
       const rec = (cfg.autoPick !== false) ? localRecommend() : { structured: cfg.structuredModel, prose: cfg.proseModel };
       const model = modelOverride || (prose ? (cfg.proseModel || rec.prose) : (cfg.structuredModel || rec.structured));
       attempts.push({ name: 'ollama', model, run: (a) => ollama.generate({ ...a, model, timeoutMs: cfg.timeoutMs, cfg }) });
@@ -100,15 +101,34 @@ function buildAttempts(s, { prose, modelOverride, providerOverride }) {
 
 let lastStatus = { checkedAt: 0, valid: false };
 
+// The disabled shape: everything unavailable with ONE consistent human reason. No probe,
+// no spawn — codex/claude-cli/ollama status checks all launch child processes, and on a
+// machine with none of them installed those probes are pure noise (and were Dad's crash source).
+const AI_OFF_MSG = 'AI features are turned off on this computer.';
+function disabledStatus() {
+  const off = { available: false, reason: AI_OFF_MSG };
+  return {
+    disabled: true,
+    claude: { available: false, subscription: off, apiKey: off, useSubscription: false },
+    chatgpt: { available: false, subscription: off, apiKey: off, useSubscription: false },
+    local: off, codex: off, ollama: off,
+    order: [], checkedAt: Date.now(), valid: true,
+  };
+}
+
 async function statusAll(force = false) {
   const s = db.getSettings().ai;
+  if (s.disabled) return disabledStatus();
   if (!force && lastStatus.valid && Date.now() - lastStatus.checkedAt < 30000) return lastStatus;
   const chatgptCfg = bridgeChatgpt(s);
   const claudeCfg = s.claude || {};
+  // Local off → don't even ping Ollama's port; report one clear reason instead.
+  const localCfg = s.local || {};
+  const localOff = { available: false, reason: 'Local AI is turned off — enable it in Settings to use Ollama.', disabled: true };
   const [cx, claudeCliSt, ol, claudeApiSt, openaiSt] = await Promise.all([
     codex.status().catch((e) => ({ available: false, reason: e.message })),
     claudeCli.status().catch((e) => ({ available: false, reason: e.message })),
-    ollama.status(s.local || {}).catch((e) => ({ available: false, reason: e.message })),
+    localCfg.enabled ? ollama.status(localCfg).catch((e) => ({ available: false, reason: e.message })) : Promise.resolve(localOff),
     anthropic.status(claudeCfg).catch((e) => ({ available: false, reason: e.message })),
     openai.status(chatgptCfg).catch((e) => ({ available: false, reason: e.message })),
   ]);
@@ -155,6 +175,14 @@ function tryDeterministic({ kind, deterministicCtx }) {
 // deterministic: optional no-model floor ctx for answer-question (see tryDeterministic)
 async function run({ kind, prompt, system, schema, prose = false, modelOverride = null, providerOverride = null, deterministic: deterministicCtx = null }) {
   const s = db.getSettings().ai;
+  if (s.disabled) {
+    // AI is off: the deterministic no-model floor still answers the grounded questions
+    // (it's rules, not a model); everything else gets the ONE clean message — no provider
+    // is attempted, no process spawns, nothing logs a failure chain.
+    const det = tryDeterministic({ kind, deterministicCtx });
+    if (det) return det;
+    throw Object.assign(new Error(AI_OFF_MSG), { code: 'AI_DISABLED' });
+  }
   const attempts = buildAttempts(s, { prose, modelOverride, providerOverride });
   if (!attempts.length) {
     // No cloud/local provider configured — the floor under `local` still answers

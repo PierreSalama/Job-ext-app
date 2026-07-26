@@ -791,12 +791,42 @@ function runMigrations() {
 // ============================================================
 // Open / close / backup
 // ============================================================
+// node-sqlite3-wasm guards the DB file with a mkdir-based `<file>.lock` directory. If the app
+// exits UNCLEANLY -- a crash, a force-kill, or an installer that overlaps a still-running instance
+// -- that lock directory leaks, and then EVERY later launch throws "database is locked" on the
+// first query, so db.open() fails, the server never starts, and the app "won't boot / goes gray
+// and stops". Confirmed on Dad's laptop 2026-07-22 (re-running the installer over his first install
+// left a stale lock) and reproduced locally by planting the lock dir.
+//
+// Electron's single-instance lock (main.js requestSingleInstanceLock) guarantees we are the ONLY
+// JAT instance, so a lock present at open time is ALWAYS stale -- no live owner can exist. Clear
+// it before opening; if the very first query still reports locked, clear once more and retry, then
+// let a genuine failure surface.
+function openDbClearingStaleLock(file) {
+  const lockDir = file + '.lock';
+  const clearStale = () => {
+    try { if (fs.existsSync(lockDir)) { fs.rmSync(lockDir, { recursive: true, force: true }); log.warn('cleared a stale jat.db.lock before opening the database'); } } catch {}
+  };
+  clearStale();
+  let d = new Database(file);
+  try {
+    d.exec('PRAGMA user_version');            // force real DB access so a lock surfaces HERE, not mid-migration
+  } catch (e) {
+    if (!/database is locked/i.test(String(e && e.message))) throw e;
+    try { d.close(); } catch {}
+    clearStale();
+    d = new Database(file);
+    d.exec('PRAGMA user_version');            // still locked after clearing → genuine problem, let it throw
+  }
+  return d;
+}
+
 function open(userDataDir) {
   if (db) return db;
   userDir = userDataDir;
   if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true });
   const file = path.join(userDataDir, 'jat.db');
-  db = new Database(file);
+  db = openDbClearingStaleLock(file);
   exec('PRAGMA foreign_keys = ON');
   runMigrations();
   migrateSecrets();
@@ -837,15 +867,41 @@ function backupNow(tag) {
 }
 
 function dailyBackup() {
-  const keep = getSettings().backups.keep || 14;
+  const cfg = getSettings().backups || {};
+  const keep = cfg.keep || 7;
   const today = new Date().toISOString().slice(0, 10);
   const dest = path.join(backupDir(), `jat-${today}.db`);
   if (!fs.existsSync(dest)) backupNow(today);
-  const files = fs.readdirSync(backupDir())
+
+  // 1) Daily rotation by COUNT (newest `keep` date-named files survive).
+  const dated = fs.readdirSync(backupDir())
     .filter((f) => /^jat-\d{4}-\d{2}-\d{2}\.db$/.test(f)).sort();
-  while (files.length > keep) {
-    const victim = files.shift();
+  while (dated.length > keep) {
+    const victim = dated.shift();
     try { fs.rmSync(path.join(backupDir(), victim)); } catch {}
+  }
+
+  // 2) TOTAL SIZE BUDGET across EVERY backup file. The old rotation only matched the
+  //    date-named pattern, so jat-manual-*.db and the per-migration jat-pre-vN.db files
+  //    were never pruned at all (measured live: 14 such files, 82MB, one more added every
+  //    migration forever). And each daily backup is a FULL copy — 14 x ~48MB was 675MB for
+  //    a 38MB database. A byte budget bounds the folder no matter how big the DB gets or
+  //    what naming a future backup uses. Newest files survive; today's is never deleted.
+  const budget = Math.max(50, cfg.maxTotalMb || 300) * 1024 * 1024;
+  let all2 = [];
+  try {
+    all2 = fs.readdirSync(backupDir())
+      .filter((f) => f.endsWith('.db'))
+      .map((f) => { const p = path.join(backupDir(), f); let st = null; try { st = fs.statSync(p); } catch {} return st ? { f, p, size: st.size, mtime: st.mtimeMs } : null; })
+      .filter(Boolean)
+      .sort((a, b) => b.mtime - a.mtime);   // newest first
+  } catch { return; }
+  let total = all2.reduce((n, x) => n + x.size, 0);
+  const keepName = path.basename(dest);
+  for (let i = all2.length - 1; i >= 0 && total > budget; i--) {
+    const victim = all2[i];
+    if (victim.f === keepName) continue;   // never drop today's backup
+    try { fs.rmSync(victim.p); total -= victim.size; log.info('backup budget: removed', victim.f); } catch {}
   }
 }
 
@@ -857,6 +913,25 @@ function maintenance() {
   const m = getSettings().maintenance || {};
   const cut = (days, fallback) => new Date(Date.now() - Math.max(1, days || fallback) * 86400 * 1000).toISOString();
   let events = 0, tasks = 0, emails = 0, discovery = 0, transcripts = 0, aiLog = 0;
+  // Teach screenshots are deleted by REFERENCE COUNT (maybeDeleteScreenshot), but nothing
+  // ever sets demonstrations.screenshot_id / recipe_steps.screenshot_id — so every capture
+  // was orphaned at birth and NOTHING could ever collect it. Measured on a live install:
+  // 1,992 files / 43MB, 100% orphaned, growing ~57/day forever. Sweep orphans past a grace
+  // window (recent ones are kept in case the linkage is restored), unlinking the PNG too.
+  const shots = pruneOrphanScreenshots(cut(m.screenshotRetentionDays, 14));
+  // Junk-keyed learned answers (ids / field names / option words saved AS the question).
+  // qaLookup is fuzzy, so these can answer a REAL question with the wrong value — clearing
+  // them is a correctness fix, not just tidying. New writes are already blocked in qaRecord.
+  let junkQa = 0;
+  try {
+    // Spare anything the USER entered themselves (mirrored from a locked profile field with
+    // lineage 'user') — they are allowed a terse label; only machine-captured junk goes.
+    const bad = all('SELECT id, question, answer_lineage FROM qa')
+      .filter((r) => isJunkQuestionKey(r.question) && !/"source"\s*:\s*"user"/.test(String(r.answer_lineage || '')));
+    if (bad.length) {
+      transaction(() => { for (const r of bad) { run('DELETE FROM qa WHERE id = ?', [r.id]); junkQa++; } });
+    }
+  } catch (e) { log.warn('junk-qa prune failed', e.message); }
   transaction(() => {
     events = run('DELETE FROM events WHERE timestamp < ?', [cut(m.eventRetentionDays, 400)])?.changes || 0;
     tasks = run("DELETE FROM auto_apply_tasks WHERE state IN ('skipped','failed') AND updated_at < ?", [cut(m.taskRetentionDays, 60)])?.changes || 0;
@@ -884,8 +959,33 @@ function maintenance() {
   if (!last || (Date.now() - Date.parse(last)) > everyMs) {
     try { exec('VACUUM'); kvSet('lastVacuumAt', new Date().toISOString()); vacuumed = true; } catch (e) { log.warn('VACUUM failed', e.message); }
   }
-  if (events || tasks || emails || discovery || transcripts || aiLog || vacuumed) log.info(`maintenance: pruned ${events} events, ${tasks} tasks, ${emails} emails, ${discovery} discovery batches, ${aiLog} ai-log; cleared ${transcripts} transcripts${vacuumed ? ' + vacuumed' : ''}`);
-  return { events, tasks, emails, discovery, transcripts, aiLog, vacuumed };
+  if (events || tasks || emails || discovery || transcripts || aiLog || shots || junkQa || vacuumed) log.info(`maintenance: pruned ${events} events, ${tasks} tasks, ${emails} emails, ${discovery} discovery batches, ${aiLog} ai-log, ${shots} orphan screenshots, ${junkQa} junk answers; cleared ${transcripts} transcripts${vacuumed ? ' + vacuumed' : ''}`);
+  return { events, tasks, emails, discovery, transcripts, aiLog, shots, junkQa, vacuumed };
+}
+
+// Delete teach screenshots that NOTHING references and that are older than `cutoffIso`,
+// removing the PNG from disk as well. Returns the number swept.
+function pruneOrphanScreenshots(cutoffIso) {
+  if (!db) return 0;
+  let rows = [];
+  try {
+    rows = all(`
+      SELECT ts.id, ts.path FROM teach_screenshots ts
+      WHERE (ts.ts IS NULL OR ts.ts < ?)
+        AND NOT EXISTS (SELECT 1 FROM demonstrations d WHERE d.screenshot_id = ts.id)
+        AND NOT EXISTS (SELECT 1 FROM recipe_steps rs WHERE rs.screenshot_id = ts.id)
+      LIMIT 5000`, [cutoffIso]);
+  } catch (e) { log.warn('orphan screenshot scan failed', e.message); return 0; }
+  if (!rows.length) return 0;
+  let n = 0;
+  transaction(() => {
+    for (const r of rows) {
+      if (r.path) { try { fs.unlinkSync(r.path); } catch {} }
+      run('DELETE FROM teach_screenshots WHERE id = ?', [r.id]);
+      n++;
+    }
+  });
+  return n;
 }
 
 // ============================================================
@@ -1601,11 +1701,41 @@ function isPlaceholderAnswer(v) {
   return !s || PLACEHOLDER_ANSWER_RX.test(s);
 }
 
+// Would this string pollute the store if kept as a QUESTION? Measured on the live DB:
+// 231 of 2,641 qa rows (9%) are keyed by junk rather than a question — React element ids
+// ("rn", "r1s", "r20"), bare field names ("name", "email", "city") and option/UI text
+// ("yes", "oui", "easy apply"). They are written when a control has no resolvable label and
+// the client falls back to input.name / the element id.
+// These are not merely useless: qaLookup is FUZZY, so such a key can match a REAL screening
+// question later and answer it with the wrong value. Observed live:
+//     "oui"  -> "84301"      (a postal code as the answer to a French yes/no)
+//     "name" -> "Plex Hub"
+// The extension guards its own write path; this is the server-side backstop so ANY client —
+// or an older extension build — cannot reintroduce them. Conservative on purpose: a genuine
+// screening question is multi-word and descriptive, so this cannot reject one.
+const QA_UI_NOISE_RX = /^(easy apply|apply|apply now|submit|submit application|next|continue|save|back|review|done|yes|no|oui|non|true|false|select|choose|search|name|email|phone|city|country|resume|cv)$/i;
+function isJunkQuestionKey(q) {
+  const t = String(q == null ? '' : q).replace(/\s+/g, ' ').trim();
+  if (t.length < 8) return true;                    // too short to be a real question
+  if (!/\s/.test(t)) return true;                   // single token → a field name or an id
+  if (QA_UI_NOISE_RX.test(t)) return true;          // button / option / field-name noise
+  if (/^r[0-9a-z]{1,4}$/i.test(t)) return true;     // React-generated element id
+  if (/^[«»]/.test(t)) return true;                 // React id rendered with guillemets («rj»)
+  if (/^q_[0-9a-f]{8,}$/i.test(t)) return true;     // smartapply field id
+  if (/^[0-9a-f]{8}-[0-9a-f-]{12,}$/i.test(t)) return true;   // uuid
+  return false;
+}
+
 function qaRecord({ profileId, question, answer, source, fieldType, lineageSource }) {
   if (isSensitiveKey(question)) return null;   // write-boundary safety rail (see profileFieldUpsert)
   const qn = normalizeQuestion(question);
   if (!qn || answer == null || answer === '') return null;
   if (isPlaceholderAnswer(answer)) return null;   // never store a dropdown placeholder as an answer
+  // Never AUTO-LEARN an id / field-name / option word AS the question. Scoped to machine-
+  // captured writes on purpose: a user-entered profile field is high-trust and mirrors here
+  // with lineageSource 'user', and the user is allowed a terse label. The junk comes from the
+  // capture path falling back to input.name / the element id when a control has no label.
+  if (lineageSource !== 'user' && isJunkQuestionKey(question)) return null;
   if (!profileId) { log.warn('qaRecord: missing profileId — answer not saved'); return null; }
   const cur = get('SELECT * FROM qa WHERE profile_id = ? AND question_norm = ?', [profileId, qn]);
   const ts = now();
@@ -3213,6 +3343,42 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
   // Terminal-state integrity is enforced at the storage boundary. Executors can be
   // interrupted or old extension versions can omit fields, but the ledger must never
   // contain an unexplained failure, a fake user-wait, or an unproven submission.
+  // A SUBMITTED APPLICATION CANNOT BECOME UNSUBMITTED. If the row already carries VERIFIED
+  // evidence, no later patch may move it off 'done'. The rule below already guards the opposite
+  // direction (done without evidence gets downgraded); this is the missing half.
+  //
+  // Live 2026-07-20: pausing auto-apply patched in-flight rows to 'skipped', and a recovery script
+  // requeued rows by their skip reason — between them, 5 real applications (dcbel Inc, Intégral,
+  // Systematix, Farber, one smartapply) were rewritten from 'done' to 'skipped'. The submissions
+  // had happened; only the ledger was wrong, so the day read 50 instead of 55 and those employers
+  // could have been re-applied to. Enforcing it HERE covers every caller — the executor's cancel(),
+  // background's teardown reconcile, maintenance scripts, and anything written later — instead of
+  // trusting each one to remember.
+  //
+  // Deliberately narrow: only `type:"verified"` evidence (the R1-proven markers) is protected, and
+  // only against leaving 'done'. Everything else patches normally.
+  if (nextState && nextState !== 'done' && cur.state === 'done') {
+    let proven = false;
+    try {
+      const ev = safeParse(cur.submission_evidence, null);
+      proven = !!(ev && ev.type === 'verified');
+    } catch { proven = false; }
+    if (proven) {
+      const attempted = nextState;
+      nextState = 'done';
+      nextError = null;
+      nextParkReason = null;
+      // Keep whatever the caller wanted to record — transcriptAppend accepts an array — so the
+      // refusal is added to the history rather than erasing why the patch was attempted.
+      const refusal = {
+        kind: 'recovery',
+        note: `refused to move a VERIFIED submission out of done (attempted → ${attempted}) — the application was already sent`,
+      };
+      transcriptAppend = transcriptAppend
+        ? (Array.isArray(transcriptAppend) ? [...transcriptAppend, refusal] : [transcriptAppend, refusal])
+        : refusal;
+    }
+  }
   if (nextState === 'failed' && !String(nextError || '').trim()) nextError = 'auto-apply failed without a diagnostic';
   if (nextState === 'skipped' && !String(nextError || '').trim()) {
     // Derive an HONEST reason instead of the opaque fallback. A skip with no diagnostic is almost
@@ -4487,7 +4653,7 @@ module.exports = {
   memoryToProfileData, pushProfileDataToMemory, ensureDefaultProfileId, resolveProfileId,
   classifyAts, normCompanyKey, recordNavEvent, navEventsForProfile, isSensitiveKey,
   upsertRecipe, getRecipe, upsertRecipeStep, recipeSteps, markRecipeOutcome, recordRecipeCorrection, resolveRecipe,
-  recordDemonstration, pruneDemonstrations, demonstrationsFor, demonstrationsForSession, recordTeachScreenshot, maybeDeleteScreenshot,
+  recordDemonstration, pruneDemonstrations, demonstrationsFor, demonstrationsForSession, recordTeachScreenshot, maybeDeleteScreenshot, pruneOrphanScreenshots,
   listRecipesWithSteps, updateRecipeStepFields, deleteRecipeStep, getTeachScreenshotPath,
   listProfiles, saveProfile, deleteProfile, profileForSource,
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,

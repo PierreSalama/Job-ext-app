@@ -28,10 +28,25 @@ const log = scope('server');
 
 const MAX_BODY = 15 * 1024 * 1024;
 const HOST_RX = /^(localhost|127\.0\.0\.1)(:\d+)?$/i;
+// With LAN remote access ON, also accept PRIVATE-RANGE host headers (the LAN IP another machine
+// on the same network dials). Public hostnames stay rejected — the rebinding guard's whole point.
+const LAN_HOST_RX = /^(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|100\.\d{1,3}\.\d{1,3}\.\d{1,3})(:\d+)?$/;
+function hostAllowed(hostHeader) {
+  if (HOST_RX.test(hostHeader)) return true;
+  try { if (db.getSettings().server.remoteAccess && LAN_HOST_RX.test(hostHeader)) return true; } catch {}
+  return false;
+}
 
 let server = null;
 let sseClients = new Set();
 let pairAttempts = new Map();   // origin → { count, firstAt } for the /pair rate-limit
+// Recently paired clients (in-memory, newest-first, capped) — lets the setup script confirm the
+// Firefox extension actually connected (a moz-extension:// origin shows up here after it loads).
+let pairedClients = [];
+function recordPairedClient(info) {
+  const entry = { client: info.client || '', origin: info.origin || '', at: Date.now() };
+  pairedClients = [entry, ...pairedClients.filter((c) => c.origin !== entry.origin)].slice(0, 20);
+}
 let opts = {};   // { getVersion, userDataDir, confirmPair(info)→Promise<bool>, notify(type,payload) }
 
 // ---------- token ----------
@@ -58,6 +73,21 @@ function sendJson(res, status, body) {
   const data = JSON.stringify(body);
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(data);
+}
+
+// Read a raw request body as UTF-8 text, capped at `max` bytes (for the setup-report ingest).
+function readBodyText(req, max) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > max) { reject(Object.assign(new Error('too large'), { status: 413 })); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
 }
 
 function readJson(req) {
@@ -171,6 +201,32 @@ function jobFit(jobOrTitle, aa) {
   for (const kw of (aa && aa.excludeLocations) || []) {
     const k = String(kw || '').trim().toLowerCase();
     if (k && location.includes(k)) return { ok: false, reason: `excluded location "${k}"` };
+  }
+  // POSITIVE RELEVANCE GATE (opt-in via autoApply.requireKeywordMatch).
+  //
+  // Everything above is NEGATIVE-only: a posting passes unless it is explicitly banned. Keywords
+  // were used solely to BUILD search queries — nothing ever re-checked what came back. So any job
+  // the search dragged in that wasn't on an exclude list got applied to. Live 2026-07-25 on Ashraf's
+  // machine: 36 of 42 queued jobs were off-field — "Call center agent", "Brand Ambassador",
+  // "Emergency Communications Nurse", "iOS Developer", Stripe payments roles — for a telecom /
+  // structured-cabling project manager. Banning each bad word is whack-a-mole (a Stripe finance
+  // title still slipped through a 80-entry exclude list), so require a POSITIVE match instead.
+  //
+  // A keyword matches when ALL of its significant tokens appear in the title (order-independent),
+  // or, for a single-token keyword, that token appears whole-word. Strict and predictable: to widen
+  // the net you add a keyword, rather than guessing which junk word to ban next.
+  if (aa && aa.requireKeywordMatch) {
+    const kws = (aa.keywords || []).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean);
+    if (kws.length) {
+      const STOP = new Set(['and', 'or', 'the', 'a', 'an', 'of', 'for', 'in', 'to', 'with', 'at', 'on']);
+      const titleTokens = new Set(t.split(/[^a-z0-9+#]+/).filter(Boolean));
+      const matched = kws.some((k) => {
+        if (t.includes(k)) return true;                       // full phrase present
+        const toks = k.split(/[^a-z0-9+#]+/).filter((x) => x && !STOP.has(x));
+        return toks.length > 0 && toks.every((x) => titleTokens.has(x));
+      });
+      if (!matched) return { ok: false, reason: 'off-target: title matches none of your keywords' };
+    }
   }
   return { ok: true };
 }
@@ -351,6 +407,7 @@ async function queueNext(force = false) {
   let cooledDown = false;
   try { cooledDown = db.easyApplyCooledDown(); } catch {}
   let easyApplyDeferred = false;
+  let hostDeferred = false;
   let siteDeferred = false;
   let siteGapDeferred = false;
   let siteGapNextAt = null;
@@ -396,6 +453,17 @@ async function queueNext(force = false) {
       continue;
     }
     if (cooledDown && !db.easyApplyEligible(j)) { easyApplyDeferred = true; continue; }
+    // NOT-BEFORE DEFERRAL: a queued task whose scheduled_at is in the FUTURE is waiting out a
+    // transient site condition (the extension's host circuit breaker sets this when a host starts
+    // serving a Cloudflare/verification wall). Leave it QUEUED and take the next candidate, the
+    // same way the Easy-Apply cooldown defers instead of burning the job.
+    //
+    // Why this exists: the breaker used to PATCH those tasks to state 'skipped', which is terminal
+    // and non-retriable. Live 2026-07-20, Indeed began serving a challenge and the breaker
+    // destroyed 40+ queued jobs in ten minutes, all with attempts=0 -- never even attempted --
+    // draining the Indeed queue from 60 to 16. A transient wall must never permanently discard a
+    // job. Normal queued tasks carry a past scheduled_at, so this is a no-op for them.
+    if (!force && t.scheduledAt && Date.parse(t.scheduledAt) > Date.now()) { hostDeferred = true; continue; }
     const siteKey = db.taskSiteKey(j);
     if (!force && concurrency > 1 && siteKey) {
       // (1) PER-SITE CAP — never run more than perSiteCap applies on one site at once.
@@ -418,6 +486,8 @@ async function queueNext(force = false) {
   // Nothing dispatchable BUT we held back LinkedIn jobs for the cooldown → tell the pump
   // why it's idling (it isn't out of work; it's waiting out the Easy-Apply cap).
   if (!candidates.length && easyApplyDeferred) return { task: null, reason: 'easyapply-cooldown', concurrency };
+  // Held back for a host serving a verification wall — idling on purpose, not out of work.
+  if (!candidates.length && hostDeferred) return { task: null, reason: 'host-cooldown', concurrency };
   // Per-site gap wins over site-busy as the idle reason so the pump's gapTimer wakes it exactly
   // when the next same-site start becomes eligible (bounded), instead of idling to the next alarm.
   if (!candidates.length && siteGapDeferred) return { task: null, reason: 'gap', nextEligibleAt: new Date(siteGapNextAt).toISOString(), concurrency };
@@ -689,12 +759,110 @@ async function handle(req, res, parsed) {
     const allowed = await opts.confirmPair(info);
     if (!allowed) return sendJson(res, 403, { ok: false, error: 'pairing rejected' });
     log.info('paired client', info);
+    recordPairedClient(info);   // remembered so setup can verify the extension actually connected
     return sendJson(res, 200, { ok: true, token: getToken() });
+  }
+
+  // ---- the dashboard over HTTP (support/debug surface) ----
+  // The SAME SPA the Electron window loads: http://127.0.0.1:7744/app/#/settings
+  // Served WITHOUT the token gate: these are the same static shell files that ship inside the
+  // public extension zip (no data in them); sub-resources (app.js/app.css) load token-less from
+  // the HTML. Every DATA route below stays token-gated — the SPA itself carries the token
+  // (?token= in the URL) for its API calls. Loopback-only server; serve-the-dir with a
+  // confinement guard — never an enumerated whitelist (the v13 blank-dashboard scar).
+  if (req.method === 'GET' && (pathname === '/app' || pathname === '/app/' || pathname.startsWith('/app/'))) {
+    const fs2 = require('fs');
+    const appDir = path.join(__dirname, 'app');
+    const rel = pathname.replace(/^\/app\/?/, '') || 'app.html';
+    const file = path.normalize(path.join(appDir, rel));
+    if (!file.startsWith(appDir)) return sendJson(res, 403, { ok: false, error: 'forbidden' });
+    const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml' };
+    try {
+      const data = fs2.readFileSync(file);
+      // no-store: this is a live dev/support surface — a stale cached SPA is worse than a re-download.
+      res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-store' });
+      return res.end(data);
+    } catch {
+      return sendJson(res, 404, { ok: false, error: 'not found' });
+    }
+  }
+
+  // ---- setup-report INGEST (Pierre's machine receives Dad's setup report over the LAN) ---------
+  // Deliberately NOT token-gated: the pushing machine (Dad's setup script) can't know THIS machine's
+  // token. Guarded instead by (a) remoteAccess must be ON here, (b) the host guard already limited us
+  // to private-range callers, (c) a hard body-size cap, (d) it only ever WRITES a plain-text file into
+  // a dedicated setup-reports/ dir — no code path reads it back or executes it. Off by default.
+  if (req.method === 'POST' && pathname === '/remote/report') {
+    let remoteOn = false;
+    try { remoteOn = !!db.getSettings().server.remoteAccess; } catch {}
+    if (!remoteOn) return sendJson(res, 403, { ok: false, error: 'remote access is off on this machine' });
+    let text = '';
+    try { text = await readBodyText(req, 512 * 1024); } catch { return sendJson(res, 413, { ok: false, error: 'too large' }); }
+    const fsR = require('fs');
+    const dir = path.join(opts.userDataDir, 'setup-reports');
+    try { fsR.mkdirSync(dir, { recursive: true }); } catch {}
+    const from = String(parsed.searchParams.get('from') || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 40);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const file = path.join(dir, `setup-${from}-${stamp}.txt`);
+    try { fsR.writeFileSync(file, text); } catch (e) { return sendJson(res, 500, { ok: false, error: 'write failed' }); }
+    try { if (opts.notify) opts.notify('status', { kind: 'setup-report', from, file }); } catch {}
+    log.info('received setup report', { from, bytes: text.length });
+    return sendJson(res, 200, { ok: true, saved: path.basename(file) });
   }
 
   // ---- everything else requires the token ----
   if (!authed(req, parsed)) {
     return sendJson(res, 401, { ok: false, error: 'unauthorized', pairHint: 'POST /pair' });
+  }
+
+  // ---- remote intel: network info + logs over the API (the watch-Dad's-machine surface) --------
+  // GET /netinfo → the URLs another machine on the LAN can open (Settings shows these).
+  if (req.method === 'GET' && pathname === '/netinfo') {
+    const os2 = require('os');
+    const ips = [];
+    try {
+      for (const [name, addrs] of Object.entries(os2.networkInterfaces())) {
+        for (const a of addrs || []) {
+          if (a.family === 'IPv4' && !a.internal) ips.push({ iface: name, ip: a.address });
+        }
+      }
+    } catch {}
+    let remoteAccess = false;
+    try { remoteAccess = !!db.getSettings().server.remoteAccess; } catch {}
+    let port = 7744;
+    try { port = db.getSettings().server.port || 7744; } catch {}
+    const extensionConnected = pairedClients.some((c) => /^moz-extension:\/\//.test(c.origin) || /^chrome-extension:\/\//.test(c.origin));
+    return sendJson(res, 200, { ok: true, hostname: (() => { try { return os2.hostname(); } catch { return ''; } })(), port, remoteAccess, ips, pairedClients, extensionConnected });
+  }
+  // GET /logs → the app's log files (name/size/mtime, newest first).
+  if (req.method === 'GET' && pathname === '/logs') {
+    const fsL = require('fs');
+    const dir = path.join(opts.userDataDir, 'logs');
+    let files = [];
+    try {
+      files = fsL.readdirSync(dir)
+        .map((name) => { const st = fsL.statSync(path.join(dir, name)); return { name, size: st.size, mtime: st.mtimeMs }; })
+        .sort((a, b) => b.mtime - a.mtime);
+    } catch {}
+    return sendJson(res, 200, { ok: true, files });
+  }
+  // GET /logs/tail?file=<name>&lines=500 → the tail of one log file, as text.
+  if (req.method === 'GET' && pathname === '/logs/tail') {
+    const fsL = require('fs');
+    const dir = path.join(opts.userDataDir, 'logs');
+    const name = String(parsed.searchParams.get('file') || '');
+    const lines = Math.min(Math.max(parseInt(parsed.searchParams.get('lines') || '500', 10) || 500, 1), 5000);
+    const file = path.normalize(path.join(dir, name));
+    if (!name || !file.startsWith(dir)) return sendJson(res, 400, { ok: false, error: 'bad file' });
+    try {
+      const raw = fsL.readFileSync(file, 'utf8');
+      const all = raw.split(/\r?\n/);
+      const text = all.slice(Math.max(0, all.length - lines)).join('\n');
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+      return res.end(text);
+    } catch {
+      return sendJson(res, 404, { ok: false, error: 'not found' });
+    }
   }
 
   // ---- SSE stream ----
@@ -1443,9 +1611,18 @@ async function handle(req, res, parsed) {
     return sendJson(res, 200, { ok: true, state: localsetup.getState() });
   }
   if (req.method === 'POST' && pathname === '/ai/local/detect') {
-    return sendJson(res, 200, { ok: true, ...(await localsetup.detect(db.getSettings().ai.local)) });
+    // Local off → no probing at all (detect() runs where.exe + pings the Ollama port).
+    const lcD = db.getSettings().ai.local || {};
+    if (!lcD.enabled) return sendJson(res, 200, { ok: true, installed: false, serverUp: false, models: [], localDisabled: true });
+    return sendJson(res, 200, { ok: true, ...(await localsetup.detect(lcD)) });
   }
   if (req.method === 'POST' && pathname === '/ai/local/setup') {
+    if (db.getSettings().ai.disabled) {
+      return sendJson(res, 400, { ok: false, error: 'AI features are turned off on this computer.' });
+    }
+    // Clicking "Set up local AI" IS the explicit opt-in — flip the master on so the
+    // freshly installed Ollama is actually usable (and future boots may maintain it).
+    if (!(db.getSettings().ai.local || {}).enabled) db.patchSettings({ ai: { local: { enabled: true } } });
     const body = await readJson(req);
     const lc = db.getSettings().ai.local;
     const rec = hardware.probe().recommend;
@@ -1726,8 +1903,8 @@ function startServer(port, options) {
   localsetup.setEmitter((st) => broadcast('ai.local', st));   // stream setup progress to the dashboard
   return new Promise((resolve, reject) => {
     server = http.createServer(async (req, res) => {
-      // DNS-rebinding guard
-      if (!HOST_RX.test(req.headers.host || '')) {
+      // DNS-rebinding guard (private-range hosts allowed only when LAN remote access is ON)
+      if (!hostAllowed(req.headers.host || '')) {
         return sendJson(res, 403, { ok: false, error: 'bad host' });
       }
       // CORS: token is the access control; echo origin so extension pages can read.
@@ -1744,15 +1921,26 @@ function startServer(port, options) {
       try {
         await handle(req, res, parsed);
       } catch (e) {
-        const status = e.status || 500;
+        // User-facing conditions surface their real message; only unexpected throws hide behind
+        // 'internal error'. AI_DISABLED is the Dad's-laptop master switch; the others are the
+        // provider chain's honest "nothing configured / still setting up" states.
+        const SURFACED = new Set(['AI_DISABLED', 'NO_PROVIDER', 'AI_SETTING_UP']);
+        const status = e.status || (SURFACED.has(e.code) ? 400 : 500);
         log.error(req.method, parsed.pathname, e);
         if (!res.headersSent) {
-          sendJson(res, status, { ok: false, error: status === 500 ? 'internal error' : String(e.message || e) });
+          sendJson(res, status, { ok: false, code: e.code, error: status === 500 ? 'internal error' : String(e.message || e) });
         }
       }
     });
     server.on('error', reject);
-    server.listen(port, '127.0.0.1', () => resolve(server));
+    // Bind loopback-only unless the user opted into LAN remote access (Settings ▸ Remote access).
+    // Every data route is token-gated either way; remote just widens WHO can reach the listener.
+    let host = '127.0.0.1';
+    try { if (db.getSettings().server.remoteAccess) host = '0.0.0.0'; } catch {}
+    server.listen(port, host, () => {
+      log.info(`listening on ${host}:${port}${host === '0.0.0.0' ? ' (LAN remote access ENABLED)' : ''}`);
+      resolve(server);
+    });
   });
 }
 
@@ -1762,4 +1950,4 @@ function stopServer() {
   if (server) { try { server.close(); } catch {} server = null; }
 }
 
-module.exports = { startServer, stopServer, broadcast, getToken, rescanAllFolders, startFolderWatchers, ingestDiscoveredJobs, jobFit, easyApplyIngestEligible, queueNext };
+module.exports = { startServer, stopServer, broadcast, getToken, rescanAllFolders, startFolderWatchers, ingestDiscoveredJobs, jobFit, easyApplyIngestEligible, queueNext, hostAllowed };

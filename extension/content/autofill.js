@@ -47,13 +47,13 @@ function stripAccents(s) {
 export function fieldLabel(input) {
   const root = input.getRootNode?.() || document;
   const sources = [
-    input.closest('label')?.textContent,
-    input.id ? root.querySelector?.(`label[for="${cssEscape(input.id)}"]`)?.textContent : '',
+    elLabelText(input.closest('label')),
+    input.id ? elLabelText(root.querySelector?.(`label[for="${cssEscape(input.id)}"]`)) : '',
     input.getAttribute('aria-label'),
     input.getAttribute('aria-labelledby') ? idRefText(root, input.getAttribute('aria-labelledby')) : '',
-    input.closest('[role="group"]')?.querySelector('label, [class*="label"], [class*="Label"]')?.textContent,
-    input.previousElementSibling?.textContent,
-    input.parentElement?.querySelector('label, [class*="label"], [class*="Label"]')?.textContent,
+    elLabelText(input.closest('[role="group"]')?.querySelector('label, [class*="label"], [class*="Label"]')),
+    elLabelText(input.previousElementSibling),
+    elLabelText(input.parentElement?.querySelector('label, [class*="label"], [class*="Label"]')),
     input.placeholder,
     input.name,
   ];
@@ -81,8 +81,41 @@ export function fieldLabel(input) {
 
 function idRefText(root, ids) {
   return String(ids || '').split(/\s+/)
-    .map((id) => root.getElementById?.(id)?.textContent || '')
+    .map((id) => elLabelText(root.getElementById?.(id)))
     .join(' ').trim();
+}
+
+// A label element's text, reduced to the segment that actually NAMES the field.
+//
+// ATS labels are often a BLOCK: a section heading, a helper sentence, then the real field name
+// last. Captured live from Indeed smartapply 2026-07-20 (the dominant "stuck on a step" failure,
+// 17 failed vs 17 done over 7 days), the <label> wired to the required country dropdown was:
+//
+//   "MOBILE NUMBER
+//    Provide valid phone numbers to allow Recruiters to contact you.
+//    Country *"
+//
+// Two things went wrong with that. textContent drops block boundaries, so the words arrived
+// JAMMED together ("mobile numberprovide valid phone numbers…country *"). And even spaced, the
+// blob matches /phone|mobile/ at index 0 and /country/ only at index 78 -- so the COUNTRY dropdown
+// was matched to the phone profile field and "filled" with a phone number, which matches no
+// country option. The control stayed empty, Indeed refused to advance, and the re-scan reported
+// no unanswered required field because, as far as it could tell, the field had been handled.
+//
+// Use innerText (block-aware) and, when the label is clearly a stacked block, prefer its LAST
+// segment -- the part sitting directly against the control. Conservative on purpose: only when
+// there are multiple segments, the last one is short enough to be a field name, and the whole
+// blob is long enough to be a heading+helper stack. Anything else returns the text unchanged.
+function elLabelText(el) {
+  if (!el) return '';
+  let t = '';
+  try { t = el.innerText || el.textContent || ''; } catch { t = el.textContent || ''; }
+  const segs = String(t).split(/\n+/).map((s) => s.trim()).filter(Boolean);
+  if (segs.length >= 2) {
+    const last = segs[segs.length - 1];
+    if (last.length <= 40 && segs.join(' ').length >= 60) return last;
+  }
+  return t;
 }
 
 // Field-id / option-value shapes that must NEVER be emitted as a question label. Deliberately
@@ -100,15 +133,59 @@ export function isLikelyOptionOrId(text, optionTexts) {
   return false;
 }
 
+// Would this string pollute the learned-answer store if saved as a QUESTION?
+// Measured on the live store: 143 of 2,576 saved answers (6%) are keyed by junk — React
+// element ids ("rn", "r1s", "r20"), bare field names ("name", "email", "city"), and option
+// text ("yes", "oui", "easy apply"). They get there when a control has no resolvable label
+// and fieldLabel() falls back to input.name / the id. Junk keys are worse than useless: the
+// server's qaLookup is FUZZY, so "city" or "name" can match a real question later and answer
+// it with the wrong value on a real application.
+// Deliberately conservative — a real screening question is multi-word and descriptive, so
+// requiring that cannot reject one.
+const UI_NOISE_RX = /^(easy apply|apply|apply now|submit|submit application|next|continue|save|back|review|done|yes|no|oui|non|true|false|select|choose|search|name|email|phone|city|country|resume|cv)$/i;
+export function isJunkQuestionKey(text) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (t.length < 8) return true;                       // too short to be a real question
+  if (!/\s/.test(t)) return true;                      // single token → a field name or an id
+  if (UI_NOISE_RX.test(t)) return true;                // button / option / field-name noise
+  if (/^r[0-9a-z]{1,4}$/i.test(t)) return true;        // React-generated element id
+  if (/^[«»]/.test(t)) return true;                    // React id rendered with guillemets («rj»)
+  if (isLikelyOptionOrId(t, null)) return true;        // q_<hex>, uuid, _N_lang, bare option word
+  return false;
+}
+
 // The visible option text of a single radio (its <label> text minus the input, id-stripped).
 // Used both to build the AI's option list and as the prompt-walk-up blacklist.
+// The visible choice text for ONE radio. Order matters: every DOM-authored source is tried
+// before input.value, because a radio with no value attribute reports the browser DEFAULT
+// "on" — which is not a choice at all. LinkedIn's rebuilt Easy Apply dialog uses NON-wrapping
+// <label for="id"> siblings, so closest('label') misses and we used to fall straight through
+// to value: every Yes/No group came back as options ["on","on"], unanswerable, so the task
+// parked ("needs 1 answer(s)") and "on" even got saved as a learned answer.
+function labelTextOf(el) {
+  if (!el) return '';
+  const c = el.cloneNode(true);
+  c.querySelectorAll?.('input,select,textarea').forEach((n) => n.remove());
+  return String(c.textContent || '');
+}
 function optionLabelText(r) {
   try {
-    let t = '';
-    const lab = r.closest?.('label');
-    if (lab) { const c = lab.cloneNode(true); c.querySelectorAll?.('input,select,textarea').forEach((n) => n.remove()); t = c.textContent; }
-    t = String(t || r.getAttribute?.('aria-label') || r.value || '').replace(/\s+/g, ' ').trim();
+    let t = labelTextOf(r.closest?.('label'));
+    const root = r.getRootNode?.() || document;
+    // non-wrapping <label for="…"> — the standard (and LinkedIn's current) pattern
+    if (!t.trim() && r.id) {
+      try { t = labelTextOf(root.querySelector?.(`label[for="${cssEscape(r.id)}"]`)); } catch {}
+    }
+    if (!t.trim()) {
+      const ids = String(r.getAttribute?.('aria-labelledby') || '').trim();
+      if (ids) t = ids.split(/\s+/).map((id) => { try { return labelTextOf(root.getElementById?.(id) || document.getElementById(id)); } catch { return ''; } }).join(' ');
+    }
+    if (!t.trim()) t = String(r.getAttribute?.('aria-label') || '');
+    t = t.replace(/\s+/g, ' ').trim();
     t = t.replace(/[\s*]*(?:q_[0-9a-f]{8,}|_\d+_[a-z]+)$/i, '').trim();   // drop a trailing field-id if the label was empty
+    // LAST resort only, and never the browser's default placeholder value.
+    if (!t) { const v = String(r.value ?? '').replace(/\s+/g, ' ').trim(); if (v && !/^(on|off)$/i.test(v)) t = v; }
+    if (/^(on|off)$/i.test(t)) t = '';
     return t.slice(0, 60);
   } catch { return ''; }
 }
@@ -519,8 +596,19 @@ export async function fillCombobox(el, value) {
     if (!v) return false;
     const vl = v.toLowerCase();
     el.focus?.();
-    try { el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch {}
-    try { el.click?.(); } catch {}
+    // Open with the FULL pointer sequence, not just mousedown+click. Measured live on Indeed
+    // smartapply 2026-07-20: the required country dropdown is a <div role="combobox"
+    // aria-haspopup="dialog">, and a bare .click() left aria-expanded="false" (no option list
+    // rendered at all) while the pointerover/pointerdown/pointerup/click sequence flipped it to
+    // "true" and rendered 242 options. React widgets bind pointer events, so a control that never
+    // opens yields no options, no pick, and a required field left silently empty.
+    try {
+      ['pointerover', 'mouseover', 'mousemove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']
+        .forEach((ev) => el.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, view: window })));
+    } catch {
+      try { el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch {}
+      try { el.click?.(); } catch {}
+    }
     // Typeable combobox/typeahead (location, etc.): type the value to trigger suggestions.
     if (el.tagName === 'INPUT' || el.isContentEditable) {
       try { setNativeValue(el, v); } catch {}
@@ -576,22 +664,37 @@ export class AutofillEngine {
   }
 
   // Empty fillable fields + a suggestion for each (profile first, then qa).
-  async scanFillable(rootEl) {
+  // `onSkip(reason, input, label)` is an OPTIONAL diagnostic side-channel (behavior-neutral).
+  // It exists because "fillable=0 while a required control blocks the step" is the dominant
+  // live park and could not be reproduced in the harness — so the engine has to say WHY it
+  // passed over every field. Only the executor's trace consumes it, and only when nothing
+  // was fillable.
+  async scanFillable(rootEl, onSkip) {
     const profile = await this.getProfile();
     const out = [];
+    const skip = (reason, input, label) => { try { onSkip?.(reason, input, label); } catch {} };
     for (const input of this.fields(rootEl)) {
-      if (!isFillable(input)) continue;
-      if (isSiteChromeInput(input)) continue;   // never touch the global search bar / header chrome
-      if (input.tagName !== 'SELECT' && input.value && String(input.value).trim() && !looksPrefilledPlaceholder(input)) continue;
-      if (input.tagName === 'SELECT' && input.selectedIndex > 0) continue;
-      if ((input.type === 'checkbox' || input.type === 'radio') && input.checked) continue;
+      if (!isFillable(input)) { skip('not-fillable', input); continue; }
+      if (isSiteChromeInput(input)) { skip('site-chrome', input); continue; }   // never touch the global search bar / header chrome
+      // NOTE on radios reading as "already-has-value" here: that is BY DESIGN, not a bug.
+      // A radio reports the browser default "on" even when unchecked, so it trips this test —
+      // and that is fine, because radios are deliberately NOT handled by scanFillable at all.
+      // They need an OPTION SELECTED, not a profile string typed in, so scanUnknown routes them
+      // to the answer path (groundedEligibilityAnswer / AI → pickRadioInGroup) using the GROUP's
+      // question via radioGroupLabel(). Pulling them in here makes fieldLabel() return the
+      // per-option text ("Yes"), which is the "yes yes q_<id>" garbage that once parked every
+      // Indeed job — the indeed-smartapply-radios fixtures fail immediately if that regresses.
+      if (input.tagName !== 'SELECT' && input.value && String(input.value).trim() && !looksPrefilledPlaceholder(input)) { skip('already-has-value', input); continue; }
+      if (input.tagName === 'SELECT' && input.selectedIndex > 0) { skip('select-already-chosen', input); continue; }
+      if ((input.type === 'checkbox' || input.type === 'radio') && input.checked) { skip('already-checked', input); continue; }
       const label = fieldLabel(input);
-      if (!label) continue;
-      if (NEVER_AUTOFILL_RX.test(label)) continue;
+      if (!label) { skip('no-label', input); continue; }
+      if (NEVER_AUTOFILL_RX.test(label)) { skip('never-autofill', input, label); continue; }
       const pm = profileFieldFor(label, profile || {});
       if (pm) { out.push({ input, label, source: 'profile', field: pm.field, value: pm.value }); continue; }
       const qa = await this.lookupAnswer(label);
-      if (qa?.answer) out.push({ input, label, source: 'qa', value: qa.answer, qa });
+      if (qa?.answer) { out.push({ input, label, source: 'qa', value: qa.answer, qa }); continue; }
+      skip('no-profile-or-qa-answer', input, label);
     }
     return out;
   }

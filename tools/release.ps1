@@ -56,13 +56,25 @@ $pairs = @(
   @{ src = '.github'; dst = '.github' },
   @{ src = 'README.md'; dst = 'README.md' }
 )
+# The bundled JobSpy worker is a 130 MB PyInstaller BUILD ARTIFACT that CI regenerates from
+# source (see the "Build bundled JobSpy discovery worker" step in .github/workflows/release.yml,
+# which rm -rf's these very directories first). Syncing it made the push fail outright:
+#   remote: error: File app/build/discovery/jat-discovery.exe is 130.95 MB; exceeds GitHub's 100 MB limit
+#   ! [remote rejected] v11.88.18 -> v11.88.18 (pre-receive hook declined)
+# origin/v11 has never carried a single file under app/build. Excluded by FULL path so the
+# similarly-named SOURCE tree app\src\discovery is untouched (a bare /XD discovery would kill it).
+$excludeDirs = @(
+  (Join-Path $Root 'app\build\discovery'),
+  (Join-Path $Root 'app\build\discovery-work'),
+  (Join-Path $Root 'app\build\discovery-spec')
+)
 foreach ($p in $pairs) {
   $src = Join-Path $Root $p.src
   $dst = Join-Path $Publish $p.dst
   if (Test-Path $src -PathType Container) {
     # /XF: never sync local secrets into the public publish repo (GitHub push
     # protection blocks them, and they must never leave this machine).
-    robocopy $src $dst /MIR /NFL /NDL /NJH /NJS /XD node_modules dist /XF .cws-credentials.json *.local.json | Out-Null
+    robocopy $src $dst /MIR /NFL /NDL /NJH /NJS /XD node_modules dist @excludeDirs /XF .cws-credentials.json *.local.json | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $($p.src)" }
   } elseif (Test-Path $src) {
     New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
@@ -78,8 +90,15 @@ try {
   git commit -m "v$Version - $Message"
   git tag "v$Version"
   if (-not $NoPush) {
+    # CHECK THE PUSH. This used to print "pushed - CI is building" unconditionally, so a REJECTED
+    # push still reported success (2026-07-25: GitHub blocked the 130 MB discovery binary and the
+    # script cheerfully claimed the release was building — nothing was published, and the only clue
+    # was buried in the log). A failed release must fail loudly, or someone waits on a build that
+    # will never exist.
     git push origin HEAD
+    if ($LASTEXITCODE -ne 0) { throw "git push of the branch FAILED (exit $LASTEXITCODE) - nothing was released. See the errors above." }
     git push origin "v$Version"
+    if ($LASTEXITCODE -ne 0) { throw "git push of tag v$Version FAILED (exit $LASTEXITCODE) - no release build was triggered." }
     Write-Host "pushed - CI is building the v$Version release" -ForegroundColor Green
   } else {
     Write-Host "staged locally (NoPush). Push with: git push origin HEAD; git push origin v$Version" -ForegroundColor Yellow

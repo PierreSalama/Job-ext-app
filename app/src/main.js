@@ -20,6 +20,10 @@ const { scope, log: rootLog } = require('./logger');
 const log = scope('main');
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 
+// Test isolation (same convention as v13): JAT_USERDATA points the whole app (db, logs, backups)
+// at a scratch dir so dev/test runs never touch the real jat11-app data. Unset = normal behavior.
+if (process.env.JAT_USERDATA) app.setPath('userData', process.env.JAT_USERDATA);
+
 // Last-resort crash guards: a background subsystem (e.g. a child-process spawn ENOENT,
 // a rejected promise deep in the AI chain) must NEVER take the whole app down. Dad's
 // logs showed an uncaughtException from `spawn ollama ENOENT`. Log and keep running.
@@ -300,7 +304,29 @@ function notifyEvent(type, payload) {
 // (window already open) and a jat:pending-pair poll the renderer runs on boot
 // (window was just opened by showWindow()). Times out → denied.
 let pendingPair = null;   // { id, info:{client,origin}, resolve(allow), timer }
+
+// Unattended-setup auto-approve: during the USB setup script's run, the app must pair the script
+// AND the force-installed extension with ZERO clicks. The script drops a sentinel file
+// <userData>/.setup-autopair before launching the app; while it exists and is fresh (< 15 min),
+// every pairing request is auto-approved (and logged). The window closes itself after that TTL, so
+// this can never silently auto-approve later — it's a one-time, time-boxed setup convenience.
+const SETUP_AUTOPAIR_TTL_MS = 15 * 60 * 1000;
+function setupAutopairActive() {
+  try {
+    const f = path.join(app.getPath('userData'), '.setup-autopair');
+    const st = require('fs').statSync(f);
+    if (Date.now() - st.mtimeMs < SETUP_AUTOPAIR_TTL_MS) return true;
+    try { require('fs').unlinkSync(f); } catch {}   // expired → clean it up
+  } catch {}
+  return false;
+}
+
 function confirmPair(info) {
+  // Unattended setup window: approve immediately, no modal (the script + extension pair silently).
+  if (setupAutopairActive()) {
+    try { log.info('pairing auto-approved (setup window)', { client: String(info.client || '').slice(0, 60), origin: String(info.origin || '').slice(0, 200) }); } catch {}
+    return Promise.resolve(true);
+  }
   return new Promise((resolve) => {
     if (pendingPair) { try { pendingPair.resolve(false); } catch {} }   // supersede any stale request
     const id = crypto.randomUUID();
@@ -337,10 +363,15 @@ function setUpdateState(patch) {
   try { broadcast('updates.state', updateState); } catch {}
 }
 
-// A background check that no-ops in dev and when the user set mode:'manual'.
+// A background check that no-ops in dev, when the user set mode:'manual', and ALWAYS when
+// mode:'pinned' — a pinned machine never even asks the release feed (Dad's laptop stays on
+// its installed version until the setting is changed in person).
 function maybeCheck() {
   if (!app.isPackaged) return;
-  try { if (db.getSettings().autoUpdate.mode === 'manual') return; } catch {}
+  try {
+    const m = db.getSettings().autoUpdate.mode;
+    if (m === 'manual' || m === 'pinned') return;
+  } catch {}
   autoUpdater.checkForUpdates().catch((e) => log.warn('[updater] check failed:', e?.message || e));
 }
 
@@ -434,6 +465,12 @@ function setupAutoUpdater() {
 // Manual check that resolves with a user-facing result (tray + dashboard).
 function manualCheckForUpdates() {
   if (!app.isPackaged) return Promise.resolve({ status: 'dev', current: app.getVersion() });
+  // pinned wins over even an explicit check — the machine is frozen on purpose.
+  try {
+    if (db.getSettings().autoUpdate.mode === 'pinned') {
+      return Promise.resolve({ status: 'pinned', current: app.getVersion() });
+    }
+  } catch {}
   return new Promise((resolve) => {
     let settled = false;
     const finish = (r) => { if (!settled) { settled = true; resolve({ current: app.getVersion(), ...r }); } };
@@ -700,8 +737,9 @@ app.whenReady().then(async () => {
     // Auto-download local AI in the background ONLY when the user hasn't supplied a
     // cloud key — so a fresh machine (e.g. Dad's) gets working AI with zero config,
     // without forcing a multi-GB download on someone who set their own Claude/OpenAI key.
+    // ai.disabled wins over everything: an AI-off machine never downloads Ollama.
     const hasCloudKey = !!((ai.claude && ai.claude.apiKey) || (ai.chatgpt && ai.chatgpt.apiKey));
-    if (lc && lc.autoSetup && !hasCloudKey) {
+    if (!ai.disabled && lc && lc.enabled && lc.autoSetup && !hasCloudKey) {
       const ls = require('./localsetup');
       const rec = require('./hardware').probe().recommend;
       // Kick off after a short delay so it never competes with launch/first-paint —

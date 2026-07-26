@@ -21,6 +21,19 @@ export function hostOfUrl(url) {
   catch { return ''; }
 }
 
+// Reduce a host to its registrable domain (eTLD+1) so the breaker keys ONE entry per site.
+// A Cloudflare wall on the apply flow (smartapply.indeed.com) must gate the job's host
+// (ca.indeed.com) too — both normalize to "indeed.com". Keying on the exact hostname is what let
+// Indeed jobs keep reopening into a wall the breaker had already seen (the "refreshes a lot" loop).
+const BREAKER_MULTI_TLDS = new Set(['co.uk', 'com.au', 'co.jp', 'co.nz', 'co.in', 'com.br', 'co.za', 'com.mx', 'org.uk', 'gov.uk']);
+export function registrableDomain(host) {
+  const h = String(host || '').toLowerCase().replace(/^www\./, '').replace(/:.*$/, '').trim();
+  const parts = h.split('.').filter(Boolean);
+  if (parts.length <= 2) return h;
+  const last2 = parts.slice(-2).join('.');
+  return BREAKER_MULTI_TLDS.has(last2) ? parts.slice(-3).join('.') : last2;
+}
+
 // PURE: may we dispatch a job for `host` right now? `state` is the breaker map (host→entry,
 // a Map or a plain object). Returns { dispatch:boolean, reason, until } — dispatch=false
 // means the host is cooling down.

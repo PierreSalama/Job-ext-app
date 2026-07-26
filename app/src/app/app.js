@@ -1970,9 +1970,23 @@ route('/queue', async () => {
     box.dataset.filled = '1';
   };
 
+  // OOM FIX 2: cap the number of task CARDS rendered per state group. Rendering every task
+  // built ~23,400 nodes on a real queue (1,716 tasks) and the renderer's heap climbed to
+  // 441-561MB over hours until Chromium OOM-killed it (10 crashes in the live [heap] log,
+  // every one on route #/queue, peaking at 2,995MB of a 3,586MB limit). Terminal states are
+  // the bulk and are pure history — show the newest few and reveal more on demand.
+  const renderCap = (s) => (['running', 'awaiting_review', 'awaiting_input', 'queued', 'scheduled'].includes(s) ? 60 : 15);
   const groupsHtml = [...groups.entries()]
     .filter(([, list]) => list.length)
-    .map(([s, list]) => `<div class="queue-group-head"><span>${esc(QUEUE_STATE_LABEL[s] || s)}</span><span class="n">${list.length}</span></div>${list.map(taskCard).join('')}`)
+    .map(([s, list]) => {
+      const cap = renderCap(s);
+      const shown = list.slice(0, cap);
+      const hidden = list.length - shown.length;
+      const more = hidden > 0
+        ? `<div class="queue-more"><button class="btn small" data-more-state="${esc(s)}">Show ${Math.min(hidden, cap)} more</button><span class="muted" style="margin-left:10px">${hidden} older hidden</span></div>`
+        : '';
+      return `<div class="queue-group-head"><span>${esc(QUEUE_STATE_LABEL[s] || s)}</span><span class="n">${list.length}</span></div>${shown.map(taskCard).join('')}${more}`;
+    })
     .join('') || emptyHtml('Idle', 'Nothing queued', 'Add keywords above and press Start — it searches Easy-Apply jobs and applies, paced.');
   // Which queue pane is showing (driven by a stored pref so a soft morph refresh
   // doesn't reset the user's Queue↔History choice).
@@ -2182,9 +2196,19 @@ route('/queue', async () => {
         toast('Auto-apply started — searching & applying, paced');
       } else {
         await api('/settings', { method: 'PATCH', body: { autoApply: { enabled: false } } });
+        // STOPPING MUST NOT DESTROY THE QUEUE. This used to patch every queued/scheduled/running
+        // task to 'skipped' — terminal and never re-dispatched — so pressing Stop threw away the
+        // whole backlog. Live 2026-07-20: 67 jobs sat permanently skipped from previous stops,
+        // none of them ever attempted. Turning the engine off is not a decision about any job.
+        //
+        // Queued and scheduled tasks are now left exactly as they are: autoApply.enabled is already
+        // false above, so nothing will dispatch them, and they are waiting when you start again.
+        // Only a RUNNING task needs standing down, and it goes back to 'queued' so it is retried
+        // rather than lost. (A running task that has already submitted is protected by the storage
+        // guard in db.js, which refuses to move a verified submission out of 'done'.)
         for (const t of tasks) {
-          if (['queued', 'scheduled', 'running'].includes(t.state)) {
-            await api('/queue/' + encodeURIComponent(t.id), { method: 'PATCH', body: { state: 'skipped', transcriptAppend: { note: 'stopped from dashboard' } } });
+          if (t.state === 'running') {
+            await api('/queue/' + encodeURIComponent(t.id), { method: 'PATCH', body: { state: 'queued', lastError: null, transcriptAppend: { note: 'stopped from dashboard — returned to the queue, not skipped' } } });
           }
         }
         stopAutoApplyTabs();   // close the run's tabs + drop the group (state already saved)
@@ -2459,7 +2483,7 @@ route('/queue', async () => {
     } catch (err) { errToast(err); btn.disabled = false; }
   });
 
-  v.querySelectorAll('.task-card').forEach((card) => {
+  const wireCard = (card) => {
     const taskId = card.dataset.task;
     const t = tasks.find((x) => x.id === taskId);
     card.addEventListener('contextmenu', (e) => contextMenu(e, [
@@ -2485,7 +2509,33 @@ route('/queue', async () => {
         navigate();
       } catch (e) { errToast(e); }
     }));
-  });
+  };
+  v.querySelectorAll('.task-card').forEach(wireCard);
+
+  // "Show more": append the NEXT batch for that group and wire the new cards (they miss
+  // the initial pass). Keeps every task reachable while the default render stays small.
+  const shownPerState = new Map([...groups.entries()].map(([s, list]) => [s, Math.min(list.length, renderCap(s))]));
+  v.querySelectorAll('[data-more-state]').forEach((btn) => btn.addEventListener('click', () => {
+    const s = btn.dataset.moreState;
+    const list = groups.get(s) || [];
+    const cap = renderCap(s);
+    const from = shownPerState.get(s) || 0;
+    const next = list.slice(from, from + cap);
+    if (!next.length) return;
+    const wrap = btn.closest('.queue-more');
+    const holder = document.createElement('div');
+    holder.innerHTML = next.map(taskCard).join('');
+    const added = [...holder.children];
+    for (const c of added) wrap.parentNode.insertBefore(c, wrap);
+    added.forEach(wireCard);
+    const nowShown = from + next.length;
+    shownPerState.set(s, nowShown);
+    const hidden = list.length - nowShown;
+    if (hidden <= 0) { wrap.remove(); return; }
+    btn.textContent = `Show ${Math.min(hidden, cap)} more`;
+    const lbl = wrap.querySelector('.muted');
+    if (lbl) lbl.textContent = `${hidden} older hidden`;
+  }));
 
   return v;
 });
@@ -3571,6 +3621,60 @@ route('/settings', async () => {
     ? `<span class="sys-chip ${st.available ? 'ok' : 'bad'}" title="${esc(st.reason || '')}">${esc(label)} ${st.available ? '● ready' : '○ ' + esc((st.reason || 'unavailable').slice(0, 40))}</span>`
     : `<span class="sys-chip">${esc(label)} · unknown</span>`;
 
+  // The AI section body: the ONE clean message when AI is off (master switch), else the full
+  // provider UI. When off, none of the provider inputs exist — the save payload handles both shapes.
+  const aiBodyHtml = () => s.ai.disabled ? `
+      <div class="section-body"><div class="muted" style="line-height:1.7">
+        <b>AI features are turned off on this computer.</b><br/>
+        Everything else works normally — applications are captured and auto-apply still runs.
+        Questions it can't answer from your profile are saved for you under <b>Needs You</b>,
+        and every answer you give there is remembered for next time.
+      </div></div>` : `
+      <div class="ai-order" id="ai-order-list">
+        ${aiOrder.map((k, i) => `<div class="ai-rank" data-prov="${k}">
+          <span class="ai-rank-n">${i + 1}</span>
+          <span class="ai-rank-label">${esc(PROV_LABEL[k])}</span>
+          ${aiDot(provStatusOf(k))}
+          <span class="ai-rank-moves"><button class="btn small" data-up title="Move up">↑</button><button class="btn small" data-down title="Move down">↓</button></span>
+        </div>`).join('')}
+      </div>
+
+      <div class="ai-prov">
+        <div class="ai-prov-head">Claude (Anthropic) ${aiDot(aiSt?.claude)}</div>
+        ${row('API key', `<input class="input" id="ai-claude-key" type="password" placeholder="${state.secretsPresent && state.secretsPresent.claudeKey ? 'saved — leave blank to keep current' : 'sk-ant-…'}" value="${esc(claude.apiKey || '')}" />`, 'from console.anthropic.com — Claude can only run via an API key (subscriptions are blocked outside Claude Code)')}
+        ${row('Model', `<input class="input" id="ai-claude-model" value="${esc(claude.model || 'claude-sonnet-4-6')}" />`)}
+        <div class="section-body"><button class="btn small" data-test="claude">Test Claude</button></div>
+      </div>
+
+      <div class="ai-prov">
+        <div class="ai-prov-head">ChatGPT (OpenAI) ${aiDot(aiSt?.chatgpt)}</div>
+        ${row('Use my ChatGPT subscription', toggle('ai-cg-sub', chatgpt.useSubscription !== false), 'via the official Codex CLI (personal use)')}
+        <div class="form-row"><div class="form-label">Subscription</div><div class="form-control">${aiDot(aiSt?.chatgpt?.subscription)}
+          <button class="btn small" data-connect-codex>Connect / sign in</button> <button class="btn small" data-recheck>Re-check</button></div></div>
+        ${row('OpenAI API key', `<input class="input" id="ai-oai-key" type="password" placeholder="${state.secretsPresent && state.secretsPresent.chatgptKey ? 'saved — leave blank to keep current' : 'sk-…'}" value="${esc(chatgpt.apiKey || '')}" />`, 'alternative to the subscription')}
+        ${row('Model', `<input class="input" id="ai-cg-model" value="${esc(chatgpt.model || 'gpt-5.4')}" />`)}
+        <div class="section-body"><button class="btn small" data-test="chatgpt">Test ChatGPT</button></div>
+      </div>
+
+      <div class="ai-prov">
+        <div class="ai-prov-head">Local (Ollama) ${aiDot(aiSt?.local)}</div>
+        ${row('Enable local AI', toggle('ai-local-enabled', !!localAi.enabled), 'off = JAT never runs, probes, or downloads Ollama (cloud providers still work)')}
+        <div id="ai-local-body" ${localAi.enabled ? '' : 'hidden'}>
+        ${row('This machine', `<span class="muted">${hw ? esc(hw.ramGb + ' GB RAM · ' + (hw.gpuName ? hw.gpuName + ' (' + hw.vramGb + ' GB)' : 'no GPU detected')) : 'detecting…'}</span>`)}
+        ${row('Recommended', hw ? `<span>${esc(hw.recommend.label)} — <span class="mono">${esc(hw.recommend.structured)}</span></span>` : '—', hw ? '~' + hw.recommend.approxGb + ' GB download' : '')}
+        ${row('Auto-pick for hardware', toggle('ai-local-autopick', localAi.autoPick !== false))}
+        ${row('Auto-download in background', toggle('ai-local-autosetup', !!localAi.autoSetup), 'set up local AI automatically on launch (off = set up here on demand)')}
+        <div class="form-row"><div class="form-label">Set up local AI<div class="form-hint">downloads Ollama + models</div></div><div class="form-control">
+          <button class="btn small primary" data-setup-local>Set up / update</button>
+          <div class="setup-bar" id="setup-bar" hidden><div class="setup-track"><div class="setup-fill"></div></div><span class="setup-msg"></span></div>
+        </div></div>
+        ${row('Server URL', `<input class="input" id="ai-local-url" value="${esc(localAi.url || 'http://localhost:11434')}" />`)}
+        ${row('Structured model', `<input class="input" id="ai-local-structured" value="${esc(localAi.structuredModel || '')}" placeholder="(use recommendation)" />`, 'blank = recommended')}
+        ${row('Prose model', `<input class="input" id="ai-local-prose" value="${esc(localAi.proseModel || '')}" placeholder="(use recommendation)" />`, 'blank = recommended')}
+        <div class="section-body"><button class="btn small" data-test="local">Test local</button></div>
+        </div>
+      </div>`;
+
   // ---- email integration (multi-provider IMAP) ----
   const emailPresets = (emailR && emailR.presets) || {};
   const emailAccts = (emailR && emailR.accounts) || [];
@@ -3624,47 +3728,8 @@ route('/settings', async () => {
         <div class="form-hint">Used by every AI feature. Tried top-to-bottom; first one that's set up wins. Drag-free reorder with ↑ ↓.</div></div>
         <button class="btn small primary" data-save-section="ai">Save</button></header>
 
-      <div class="ai-order" id="ai-order-list">
-        ${aiOrder.map((k, i) => `<div class="ai-rank" data-prov="${k}">
-          <span class="ai-rank-n">${i + 1}</span>
-          <span class="ai-rank-label">${esc(PROV_LABEL[k])}</span>
-          ${aiDot(provStatusOf(k))}
-          <span class="ai-rank-moves"><button class="btn small" data-up title="Move up">↑</button><button class="btn small" data-down title="Move down">↓</button></span>
-        </div>`).join('')}
-      </div>
-
-      <div class="ai-prov">
-        <div class="ai-prov-head">Claude (Anthropic) ${aiDot(aiSt?.claude)}</div>
-        ${row('API key', `<input class="input" id="ai-claude-key" type="password" placeholder="${state.secretsPresent && state.secretsPresent.claudeKey ? 'saved — leave blank to keep current' : 'sk-ant-…'}" value="${esc(claude.apiKey || '')}" />`, 'from console.anthropic.com — Claude can only run via an API key (subscriptions are blocked outside Claude Code)')}
-        ${row('Model', `<input class="input" id="ai-claude-model" value="${esc(claude.model || 'claude-sonnet-4-6')}" />`)}
-        <div class="section-body"><button class="btn small" data-test="claude">Test Claude</button></div>
-      </div>
-
-      <div class="ai-prov">
-        <div class="ai-prov-head">ChatGPT (OpenAI) ${aiDot(aiSt?.chatgpt)}</div>
-        ${row('Use my ChatGPT subscription', toggle('ai-cg-sub', chatgpt.useSubscription !== false), 'via the official Codex CLI (personal use)')}
-        <div class="form-row"><div class="form-label">Subscription</div><div class="form-control">${aiDot(aiSt?.chatgpt?.subscription)}
-          <button class="btn small" data-connect-codex>Connect / sign in</button> <button class="btn small" data-recheck>Re-check</button></div></div>
-        ${row('OpenAI API key', `<input class="input" id="ai-oai-key" type="password" placeholder="${state.secretsPresent && state.secretsPresent.chatgptKey ? 'saved — leave blank to keep current' : 'sk-…'}" value="${esc(chatgpt.apiKey || '')}" />`, 'alternative to the subscription')}
-        ${row('Model', `<input class="input" id="ai-cg-model" value="${esc(chatgpt.model || 'gpt-5.4')}" />`)}
-        <div class="section-body"><button class="btn small" data-test="chatgpt">Test ChatGPT</button></div>
-      </div>
-
-      <div class="ai-prov">
-        <div class="ai-prov-head">Local (Ollama) ${aiDot(aiSt?.local)}</div>
-        ${row('This machine', `<span class="muted">${hw ? esc(hw.ramGb + ' GB RAM · ' + (hw.gpuName ? hw.gpuName + ' (' + hw.vramGb + ' GB)' : 'no GPU detected')) : 'detecting…'}</span>`)}
-        ${row('Recommended', hw ? `<span>${esc(hw.recommend.label)} — <span class="mono">${esc(hw.recommend.structured)}</span></span>` : '—', hw ? '~' + hw.recommend.approxGb + ' GB download' : '')}
-        ${row('Auto-pick for hardware', toggle('ai-local-autopick', localAi.autoPick !== false))}
-        ${row('Auto-download in background', toggle('ai-local-autosetup', !!localAi.autoSetup), 'set up local AI automatically on launch (off = set up here on demand)')}
-        <div class="form-row"><div class="form-label">Set up local AI<div class="form-hint">downloads Ollama + models</div></div><div class="form-control">
-          <button class="btn small primary" data-setup-local>Set up / update</button>
-          <div class="setup-bar" id="setup-bar" hidden><div class="setup-track"><div class="setup-fill"></div></div><span class="setup-msg"></span></div>
-        </div></div>
-        ${row('Server URL', `<input class="input" id="ai-local-url" value="${esc(localAi.url || 'http://localhost:11434')}" />`)}
-        ${row('Structured model', `<input class="input" id="ai-local-structured" value="${esc(localAi.structuredModel || '')}" placeholder="(use recommendation)" />`, 'blank = recommended')}
-        ${row('Prose model', `<input class="input" id="ai-local-prose" value="${esc(localAi.proseModel || '')}" placeholder="(use recommendation)" />`, 'blank = recommended')}
-        <div class="section-body"><button class="btn small" data-test="local">Test local</button></div>
-      </div>
+      ${row('AI features', toggle('ai-master', !s.ai.disabled), 'off = AI is fully disabled on this computer — no downloads, no background AI, no keys needed')}
+      ${aiBodyHtml()}
     </section>
 
     <section class="section">
@@ -3754,15 +3819,30 @@ route('/settings', async () => {
       <header class="section-header"><div><div class="section-eyebrow">About</div><h2 class="section-title">Version & updates</h2></div></header>
       <div class="section-body">
         <div class="kv"><span class="muted">App version</span> <strong id="upd-version">v${esc(state.version || '?')}</strong></div>
+        <div class="form-row" style="margin-top:10px"><div class="form-label">Update mode<div class="form-hint">pinned = never check or install — stays on this version until changed here</div></div>
+          <div class="form-control"><select class="select" id="upd-mode">
+            ${['auto', 'prompt', 'manual', 'pinned'].map((m) => `<option value="${m}" ${(s.autoUpdate?.mode || 'auto') === m ? 'selected' : ''}>${{ auto: 'Automatic (install when idle)', prompt: 'Notify me (in-app banner)', manual: 'Manual check only', pinned: 'Pinned — never update' }[m]}</option>`).join('')}
+          </select></div></div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
           <button class="btn small" data-check-updates>Check for updates</button>
           <button class="btn small" data-restart-update hidden>Restart to apply update</button>
           <button class="btn small" data-releases>Releases &amp; downloads</button>
         </div>
         <div class="status-line" id="upd-status" style="margin-top:8px"></div>
-        <div class="section-footer muted">${state.host === 'desktop'
-          ? 'The app checks automatically on launch and every 4 hours, downloads in the background, and prompts you to restart.'
-          : 'The desktop app self-updates; you can also re-download the installer from the toolbar popup or the releases page.'}</div>
+        <div class="section-footer muted">${(s.autoUpdate?.mode === 'pinned')
+          ? 'Updates are PINNED — this computer stays on its installed version until the mode above is changed.'
+          : state.host === 'desktop'
+            ? 'The app checks automatically on launch and every 4 hours, downloads in the background, and prompts you to restart.'
+            : 'The desktop app self-updates; you can also re-download the installer from the toolbar popup or the releases page.'}</div>
+      </div>
+    </section>
+
+    <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">Network</div><h2 class="section-title">Remote access (local network)</h2>
+        <div class="form-hint">Watch this JAT live from another computer on the same network — the full dashboard: auto-apply running now, every application, activity, logs.</div></div></header>
+      <div class="section-body">
+        ${row('Allow local-network access', toggle('remote-access', !!s.server.remoteAccess), 'off = this computer only. Changing this needs an app restart (and a firewall rule the USB kit sets up).')}
+        <div id="remote-urls" class="muted" style="font-size:12px;line-height:1.7;margin-top:6px">${s.server.remoteAccess ? 'Loading addresses…' : 'Turn on, restart the app, then the connect links appear here.'}</div>
       </div>
     </section>
 
@@ -3787,8 +3867,37 @@ route('/settings', async () => {
     </section>
   </div>`);
 
+  // remote access (LAN)
+  v.querySelector('#remote-access')?.addEventListener('change', async (e) => {
+    try {
+      await api('/settings', { method: 'PATCH', body: { server: { remoteAccess: e.target.checked } } });
+      state.settings = null;
+      toast(e.target.checked
+        ? 'Remote access ON after the next app restart (quit from the tray, reopen)'
+        : 'Remote access OFF after the next app restart', 'info', { ttl: 6000 });
+    } catch (err) { errToast(err); }
+  });
+  if (s.server.remoteAccess) {
+    api('/netinfo').then((n) => {
+      const box = v.querySelector('#remote-urls');
+      if (!box) return;
+      if (!n.ips?.length) { box.textContent = 'No network address found — is this computer on the network?'; return; }
+      box.innerHTML = 'Open from another computer on the same network:<br/>' + n.ips.map((i) =>
+        `<span class="mono">http://${esc(i.ip)}:${esc(String(n.port))}/app/?token=${esc(state.token || '')}#/auto-apply</span> <span class="muted">(${esc(i.iface)})</span>`
+      ).join('<br/>') + '<br/>The link includes this JAT’s access key — share it only with your own devices.';
+    }).catch(() => {});
+  }
+
   // updates
   const updStatus = (msg, cls = '') => { const el = v.querySelector('#upd-status'); el.className = 'status-line ' + cls; el.textContent = msg; };
+  v.querySelector('#upd-mode')?.addEventListener('change', async (e) => {
+    try {
+      await api('/settings', { method: 'PATCH', body: { autoUpdate: { mode: e.target.value } } });
+      state.settings = null;
+      toast(e.target.value === 'pinned' ? 'Updates pinned — this computer stays on its current version' : `Update mode: ${e.target.value}`);
+      navigate();   // footer text reflects the mode
+    } catch (err) { errToast(err); }
+  });
   v.querySelector('[data-releases]').addEventListener('click', () => {
     if (window.jatDesktop) window.jatDesktop.openReleases();
     else window.open('https://github.com/PierreSalama/Job-ext-app/releases', '_blank');
@@ -3803,7 +3912,8 @@ route('/settings', async () => {
         else if (r.status === 'available' || r.status === 'downloaded') {
           updStatus(`Update v${r.version} found — downloading. You'll be prompted to restart.`, 'ok');
           if (r.status === 'downloaded') v.querySelector('[data-restart-update]').hidden = false;
-        } else if (r.status === 'dev') updStatus('Dev build — updates only run in the installed app.');
+        } else if (r.status === 'pinned') updStatus('Updates are pinned on this computer — change the update mode above to check.');
+        else if (r.status === 'dev') updStatus('Dev build — updates only run in the installed app.');
         else if (r.status === 'error') updStatus(r.error || 'Update check failed.', 'bad');
         else updStatus('Still checking — try again shortly.');
       } else {
@@ -3829,25 +3939,34 @@ route('/settings', async () => {
       autoLaunch: v.querySelector('#app-autolaunch').checked,
       globalHotkey: v.querySelector('#app-hotkey').checked,
     } }),
-    ai: () => ({ ai: {
-      order: [...v.querySelectorAll('#ai-order-list .ai-rank')].map((el2) => el2.dataset.prov),
-      claude: {
-        apiKey: v.querySelector('#ai-claude-key').value.trim(),
-        model: v.querySelector('#ai-claude-model').value.trim() || 'claude-sonnet-4-6',
-      },
-      chatgpt: {
-        useSubscription: v.querySelector('#ai-cg-sub').checked,
-        apiKey: v.querySelector('#ai-oai-key').value.trim(),
-        model: v.querySelector('#ai-cg-model').value.trim() || 'gpt-5.4',
-      },
-      local: {
-        url: v.querySelector('#ai-local-url').value.trim() || 'http://localhost:11434',
-        autoPick: v.querySelector('#ai-local-autopick').checked,
-        autoSetup: v.querySelector('#ai-local-autosetup').checked,
-        structuredModel: v.querySelector('#ai-local-structured').value.trim(),
-        proseModel: v.querySelector('#ai-local-prose').value.trim(),
-      },
-    } }),
+    ai: () => {
+      // Master switch first: when AI is off (or being turned off) the provider inputs may not
+      // exist in the DOM — send ONLY the flag; the PATCH deep-merge keeps everything else.
+      const master = v.querySelector('#ai-master');
+      const disabled = master ? !master.checked : false;
+      if (disabled || !v.querySelector('#ai-order-list')) return { ai: { disabled } };
+      return { ai: {
+        disabled: false,
+        order: [...v.querySelectorAll('#ai-order-list .ai-rank')].map((el2) => el2.dataset.prov),
+        claude: {
+          apiKey: v.querySelector('#ai-claude-key').value.trim(),
+          model: v.querySelector('#ai-claude-model').value.trim() || 'claude-sonnet-4-6',
+        },
+        chatgpt: {
+          useSubscription: v.querySelector('#ai-cg-sub').checked,
+          apiKey: v.querySelector('#ai-oai-key').value.trim(),
+          model: v.querySelector('#ai-cg-model').value.trim() || 'gpt-5.4',
+        },
+        local: {
+          enabled: v.querySelector('#ai-local-enabled').checked,
+          url: v.querySelector('#ai-local-url').value.trim() || 'http://localhost:11434',
+          autoPick: v.querySelector('#ai-local-autopick').checked,
+          autoSetup: v.querySelector('#ai-local-autosetup').checked,
+          structuredModel: v.querySelector('#ai-local-structured').value.trim(),
+          proseModel: v.querySelector('#ai-local-prose').value.trim(),
+        },
+      } };
+    },
     capture: () => ({ capture: {
       panelOnDetect: v.querySelector('#cap-panel').checked,
       askWhenUnsure: v.querySelector('#cap-ask').checked,
@@ -3884,6 +4003,7 @@ route('/settings', async () => {
       state.settings = null;
       toast(`${name[0].toUpperCase() + name.slice(1)} settings saved`);
       if ((name === 'app' || name === 'gmail') && window.jatDesktop) window.jatDesktop.settingsChanged();
+      if (name === 'ai') navigate();   // the AI section body swaps between full UI and the off message
     } catch (e) { errToast(e); }
   }));
 
@@ -3921,6 +4041,11 @@ route('/settings', async () => {
   v.querySelector('[data-recheck]')?.addEventListener('click', () => { state.settings = null; navigate(); });
 
   // Set up local AI (download Ollama + models) with a live progress bar
+  // Local-AI master: reveal/hide the card body immediately (saving still requires Save)
+  v.querySelector('#ai-local-enabled')?.addEventListener('change', (e) => {
+    const body = v.querySelector('#ai-local-body');
+    if (body) body.hidden = !e.target.checked;
+  });
   v.querySelector('[data-setup-local]')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget; btn.disabled = true;
     const bar = v.querySelector('#setup-bar'); bar.hidden = false;
@@ -4086,7 +4211,16 @@ async function boot(reauth = false) {
   try { applyTheme(localStorage.getItem(LS_THEME) || DEFAULT_THEME); } catch {}
 
   if (!state.host || state.host === 'web' || reauth) {
-    if (typeof chrome !== 'undefined' && chrome.runtime?.id) {
+    // WEB host: a plain browser tab against the loopback server, token in the URL — the same
+    // convention the /stream EventSource route already accepts. Support/debug surface (e.g.
+    // helping Dad remotely): http://127.0.0.1:7744/app/?token=<token>#/settings
+    const urlTok = (() => { try { return new URLSearchParams(location.search).get('token'); } catch { return null; } })();
+    const inExtension = typeof chrome !== 'undefined' && chrome.runtime?.id;
+    if (urlTok && !inExtension && !window.jatDesktop) {
+      state.host = 'web';
+      state.token = urlTok;
+      state.base = location.origin;   // same-origin (localhost vs 127.0.0.1 differ — CORS otherwise)
+    } else if (inExtension) {
       state.host = 'extension';
       try {
         const r = await new Promise((res) => chrome.runtime.sendMessage({ type: 'get-token' }, (x) => {

@@ -10,14 +10,25 @@ import { qsa, compactText, isProbablyVisible } from '../lib/dom.js';
 
 const FILE_LABEL_RX = /(resume|cv|curriculum|résumé)/i;
 const COVER_LABEL_RX = /(cover|letter|lettre)/i;
-const APPLY_FORM_FIELD_HINTS = [
+// GENERIC fields appear on EVERY form — checkout, signup, contact, newsletter.
+// On their own they must NOT make a page an "apply form" (that was the source of
+// the panel popping on credit-card / sign-up pages).
+const GENERIC_FIELD_HINTS = [
   /first\s*name|pr[ée]nom/i, /last\s*name|nom\s*de\s*famille/i, /full\s*name/i,
   /email|courriel/i, /phone|mobile|t[ée]l[ée]phone/i, /linkedin|portfolio|website/i,
   /address|city|location|ville|adresse/i,
-  /work auth|authorization|sponsorship|visa/i,
-  /experience|years|ann[ée]es/i,
-  /resume|cv|cover|lettre/i,
 ];
+// JOB-SPECIFIC fields — a checkout/signup form essentially never has these.
+const JOB_FIELD_HINTS = [
+  /work auth|authorization|sponsorship|visa/i,
+  /years?\s+of\s+experience|ann[ée]es\s+d'exp[ée]rience/i,
+  // word-bounded: bare "cv" must NOT match "CVV" (card verification value on checkouts)
+  /\bresume\b|\br[ée]sum[ée]\b|\bcv\b|\bcurriculum\b|cover\s*letter|lettre\s*de\s*motivation/i,
+];
+const APPLY_FORM_FIELD_HINTS = [...GENERIC_FIELD_HINTS, ...JOB_FIELD_HINTS];
+// Unambiguous "this is a JOB application" phrasing. Note: NOT the bare word "apply"
+// — that shows up as "apply promo code" / "apply filters" / "apply coupon" on shops.
+const JOB_SURFACE_RX = /\b(resume|cv|curriculum\s*vitae|cover\s*letter|lettre\s*de\s*motivation|work\s*authorization|require\s*sponsorship|visa\s*sponsorship|years?\s+of\s+experience|submit\s+your\s+application|review\s+your\s+application|your\s+application|application\s+form|apply\s+for\s+this\s+(?:job|position|role)|job\s+application)\b/i;
 const APPLY_SURFACE_RX = /apply|application|candidate|candidature|resume|cv|cover\s*letter|upload|attach|drag\s*(?:and|&)\s*drop|work\s*authorization|visa|sponsorship/i;
 const ACTION_TEXT_RX = /submit(?:\s+your)?\s+application|send(?:\s+your)?\s+application|apply\s+now|postuler|next|continue|suivant|continuer|review|save\s*(?:&|and)\s*continue|finish\s+application|complete\s+application/i;
 const DIALOG_SELECTOR = '[role="dialog"], [aria-modal="true"], [data-test-modal], [data-testid*="apply"], [class*="modal"], [class*="dialog"], [class*="apply"], [class*="application"]';
@@ -27,6 +38,22 @@ const ATTR_NAMES = ['title', 'aria-label', 'alt', 'data-filename', 'data-name', 
 const ACCOUNT_TEXT_RX = /\b(create\s+(an\s+)?account|create\s+your\s+account|sign\s+up|register|join\s+(now|free)|log\s*in|sign\s*in|welcome\s+back|forgot\s+(your\s+)?password|s'inscrire|se\s+connecter|cr[ée]er\s+un\s+compte|mot\s+de\s+passe\s+oubli[ée])\b/i;
 const NEWSLETTER_RX = /\b(subscribe|newsletter|stay\s+(up\s+to\s+date|informed)|get\s+updates|abonnez|infolettre)\b/i;
 const CONTACT_RX = /\b(contact\s+us|get\s+in\s+touch|send\s+us\s+a\s+message|your\s+message|nous\s+contacter)\b/i;
+
+// Unmistakable ATS apply-FLOW container markers (Workday applyFlowPage/legalNameSection/
+// bottom-navigation, quick-apply review, smartapply, explicit application-form classes).
+// A multi-step ATS page (e.g. Workday "My Information") can have only generic fields on a
+// given step — the marker IS its job signal. Deliberately excludes loose hooks like
+// id*="application" (React app roots) that a checkout/marketing SPA would also match.
+const ATS_APPLY_MARKER_SEL = [
+  '[data-automation-id="applyFlowPage"]', '[data-automation-id*="applyFlow"]',
+  '[data-automation-id*="legalNameSection"]', '[data-automation-id*="bottom-navigation"]',
+  '[data-automation-id="jobApplication"]', '[data-automation-id*="quickApply"]',
+  '[data-testid*="smartapply"]', '[data-test="application-form"]',
+  '[class*="application-form"]', '[class*="apply-form"]', '[class*="ats-application"]',
+].join(', ');
+function hasAtsApplyMarker(root) {
+  return !!(root && (root.matches?.(ATS_APPLY_MARKER_SEL) || root.querySelector?.(ATS_APPLY_MARKER_SEL)));
+}
 
 function looksLikeAccountForm(root) {
   const pw = qsa('input[type="password"]', root);
@@ -116,9 +143,25 @@ function scoreContainer(root) {
   let score = 0;
   const hasRealFileInput = qsa('input[type="file"]', root).length > 0;
   const hasUploadWidget = hasUploadSurface(root);
-  const labelHits = collectFieldLabels(root)
+  const fieldLabels = collectFieldLabels(root);
+  const jobLabelHits = fieldLabels.filter((label) => JOB_FIELD_HINTS.some((rx) => rx.test(label))).length;
+  const labelHits = fieldLabels
     .filter((label) => APPLY_FORM_FIELD_HINTS.some((rx) => rx.test(label)))
     .length;
+
+  // HARD GATE: a form is an "apply form" only if it carries a genuinely job-specific
+  // signal — a resume/CV/cover-letter upload, a work-auth / experience field, or real
+  // application phrasing. Generic name/email/phone/address + an "Apply"/"Continue" button
+  // (every checkout & sign-up form) is NOT enough. This is the fix for the panel appearing
+  // while filling out a credit card or signing up to a site.
+  const hasJobSpecificSignal =
+    hasUploadWidget
+    || jobLabelHits >= 1
+    || JOB_SURFACE_RX.test(fullText)
+    || JOB_SURFACE_RX.test(headingText(root))
+    || hasAtsApplyMarker(root)
+    || (hasRealFileInput && (JOB_SURFACE_RX.test(fullText) || jobLabelHits >= 1));
+  if (!hasJobSpecificSignal) return 0;
   const interactiveFields = countInteractiveFields(root);
   const actionButtons = countActionButtons(root);
   const heading = headingText(root);
@@ -299,7 +342,10 @@ function hasUploadSurface(root) {
   if (!root) return false;
   if (root.querySelector?.('[data-testid*="resume"], [data-test*="resume"], [class*="resume"], [id*="resume"], [aria-label*="resume" i], [data-automation-id*="file-upload"]')) return true;
   const text = collectText(root, 5000);
-  return /\b(upload|attach|resume|cv|cover\s*letter|drag\s*(?:and|&)\s*drop|t[ée]l[ée]verser|joindre)\b/i.test(text);
+  // Require résumé-specific context — a bare "upload"/"attach" is a signup avatar or a
+  // receipt uploader, not a job application. Drag-drop résumé zones say "resume/CV".
+  return /\b(resume|r[ée]sum[ée]|cv|curriculum|cover\s*letter|lettre\s*de\s*motivation)\b/i.test(text)
+    && /\b(upload|attach|drag\s*(?:and|&)\s*drop|t[ée]l[ée]verser|joindre|resume|cv|curriculum)\b/i.test(text);
 }
 
 function readIdRefsText(ids, el) {

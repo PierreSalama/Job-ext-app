@@ -32,13 +32,13 @@ test('buildAttempts: full config yields claude-cli → claude → codex → open
     order: ['claude', 'chatgpt', 'local'],
     claude: { useSubscription: true, apiKey: 'k', model: 'claude-sonnet-4-6' },
     chatgpt: { useSubscription: true, apiKey: 'k2', model: 'gpt-5.4' },
-    local: { autoPick: true },
+    local: { enabled: true, autoPick: true },
   };
   assert.deepEqual(names(provider.buildAttempts(s, {})), ['claude-cli', 'claude', 'codex', 'openai', 'ollama']);
 });
 
 test('buildAttempts: unconfigured providers are skipped', () => {
-  const base = { order: ['claude', 'chatgpt', 'local'], local: { autoPick: true } };
+  const base = { order: ['claude', 'chatgpt', 'local'], local: { enabled: true, autoPick: true } };
   // claude subscription OFF + no key → claude skipped entirely; chatgpt subscription ON → codex.
   assert.deepEqual(names(provider.buildAttempts({ ...base, claude: { useSubscription: false }, chatgpt: { useSubscription: true } }, {})), ['codex', 'ollama']);
   // claude API key only (subscription OFF) → anthropic 'claude'; chatgpt subscription OFF + no key → skipped.
@@ -61,19 +61,19 @@ test('buildAttempts: legacy ai.cloud OpenAI key survives the bridge (backward co
 });
 
 test('buildAttempts: providerOverride restricts to one provider', () => {
-  const s = { order: ['claude', 'chatgpt', 'local'], claude: { useSubscription: true, apiKey: 'k' }, chatgpt: { useSubscription: true }, local: {} };
+  const s = { order: ['claude', 'chatgpt', 'local'], claude: { useSubscription: true, apiKey: 'k' }, chatgpt: { useSubscription: true }, local: { enabled: true } };
   // override to claude → only claude's attempts (CLI subscription first, then the API key).
   assert.deepEqual(names(provider.buildAttempts(s, { providerOverride: 'claude' })), ['claude-cli', 'claude']);
   assert.deepEqual(names(provider.buildAttempts(s, { providerOverride: 'local' })), ['ollama']);
 });
 
 test('buildAttempts: local model auto-picks for hardware, prose uses prose model', () => {
-  const s = { order: ['local'], local: { autoPick: true } };
+  const s = { order: ['local'], local: { enabled: true, autoPick: true } };
   const structured = provider.buildAttempts(s, { prose: false })[0];
   const prose = provider.buildAttempts(s, { prose: true })[0];
   assert.ok(structured.model && prose.model, 'both resolve a model');
   // an explicit override wins over the recommendation
-  const overridden = provider.buildAttempts({ order: ['local'], local: { structuredModel: 'mymodel:7b' } }, {})[0];
+  const overridden = provider.buildAttempts({ order: ['local'], local: { enabled: true, structuredModel: 'mymodel:7b' } }, {})[0];
   assert.equal(overridden.model, 'mymodel:7b');
 });
 

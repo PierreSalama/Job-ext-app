@@ -13,7 +13,7 @@
 // questions only ever come from the profile, never the AI (enforced by the
 // prompt server-side AND a local guard here).
 
-import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput, isFillable, radioGroupLabel, selectGroupLabel, isSiteChromeInput, bestFuzzyIndex } from './autofill.js';
+import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput, isFillable, radioGroupLabel, selectGroupLabel, isSiteChromeInput, bestFuzzyIndex, isJunkQuestionKey } from './autofill.js';
 import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
 import { pageTextLooksLikeSuccess, urlLooksLikeSuccess, evaluateSubmitEvidence } from './signals/success.js';
@@ -49,12 +49,21 @@ const OPTIONAL_SKIP_RX = /(head\s?shot|profile (photo|picture|image)|upload (a )
 // reCAPTCHA" privacy badge that Indeed and most sites embed for background form protection (the
 // live false-positive that aborted every Indeed apply). A real wall says "complete the captcha",
 // "captcha to continue", "verify you're human", "press and hold", etc.
-const CAPTCHA_RX = /(?:complete|solve|enter|pass|type)\s+(?:the\s+)?(?:security\s+)?captcha|captcha\s+(?:to continue|required|verification|challenge)|verify (that )?you('| a)re (a )?human|unusual activity|are you a robot|press (?:and|&) hold/i;
+const CAPTCHA_RX = /(?:complete|solve|enter|pass|type)\s+(?:the\s+)?(?:security\s+)?captcha|captcha\s+(?:to continue|required|verification|challenge)|verify (that )?you(['’ʼ]| a)re (a )?human|unusual activity|are you a robot|press (?:and|&) hold/i;
 // LinkedIn caps Easy Apply at ~50 submissions / rolling 24h. When hit it shows a modal
 // "You reached today's Easy Apply limit." Detect it so the server can cool down the
 // route and PIVOT to external/company-site jobs instead of wasting the cooldown trying.
-const EASYAPPLY_LIMIT_RX = /reached (today'?s )?easy apply limit/i;
-const DAILY_LIMIT_NEAR_EASYAPPLY_RX = /(daily|today'?s)[^.]{0,40}\blimit\b/i;
+// APOSTROPHE CLASS, not a bare ': LinkedIn renders the TYPOGRAPHIC apostrophe U+2019 --
+// "You reached today’s Easy Apply limit" -- so /today'?s/ never matched the real modal and the
+// cap went undetected on every run. Verified against the live DOM 2026-07-20: clicking the
+// opener opens the modal (dialog present, body contains the copy) while both regexes below
+// returned false; they return true only against an ASCII-apostrophe version of the same string
+// that LinkedIn never actually ships. Consequence: setEasyApplyCooldown() had never once armed,
+// so after hitting the ~50/24h cap the pool kept feeding LinkedIn jobs that could not succeed,
+// each failing as "repeated page-level action did not transfer: Easy Apply to this job".
+const APOS = "['’ʼ‘`´]";
+const EASYAPPLY_LIMIT_RX = new RegExp(`reached (today${APOS}?s )?easy apply limit`, 'i');
+const DAILY_LIMIT_NEAR_EASYAPPLY_RX = new RegExp(`(daily|today${APOS}?s)[^.]{0,40}\\blimit\\b`, 'i');
 const LOGIN_APPLY_RX = /(?:sign\s*in|log\s*in|connectez[- ]vous|se connecter|connexion)[^.!?\n]{0,80}(?:apply|postuler)|(?:apply|postuler)[^.!?\n]{0,80}(?:sign\s*in|log\s*in|connectez[- ]vous|se connecter|connexion)/i;
 const EXTERNAL_APPLY_RX = /apply on (?:the )?(?:company|employer)|apply externally|on company (?:site|website)|apply on .* website|postuler sur le site (?:de l['’]employeur|employeur|de l['’]entreprise|entreprise)|site (?:de l['’]employeur|employeur|de l['’]entreprise|entreprise)/i;
 // LinkedIn's OWN marker that a posting routes applicants to the employer's ATS rather than
@@ -66,7 +75,17 @@ const MANAGED_OFF_LINKEDIN_RX = /responses managed off linkedin|r[ée]ponses g[�
 // ADVANCE_KEYWORDS / OPEN_KEYWORDS / isAdvanceLabel are the pure advance-vs-opener
 // decision (BUG-1), in ./lib/advance.js so they're node-testable without a DOM.
 const FINAL_SUBMIT_RX = /^(submit( application)?|send( application)?|soumettre|envoyer( ma candidature)?|confirm and submit)$/i;
-const APPLY_DIALOG_SEL = '.jobs-easy-apply-modal, .jobs-easy-apply-content, .jobs-easy-apply-content__wrapper, .jobs-easy-apply-modal-content, [data-test-modal][role="dialog"], [role="dialog"][aria-modal="true"], .ia-Modal, [data-testid="smartapply-container"]';
+// NOTE on the native <dialog> entries: LinkedIn rebuilt Easy Apply on the native HTML
+// <dialog> element with fully OBFUSCATED class names (._495513b8._7402b93d…) and NO
+// explicit role attribute. A native <dialog> only carries an IMPLICIT aria role, so
+// '[role="dialog"]' — an attribute selector — can never match it. The modal was opening
+// and working perfectly while findApplyDialog() stayed blind to it, which surfaced as
+// "apply opener clicked but the modal did not mount" → "repeated page-level action did
+// not transfer" on EVERY LinkedIn Easy Apply. Verified against the live DOM: both
+// dialog[data-testid="dialog"] and [data-testid="dialog-content"] resolve the real modal
+// ("Apply to <Company> · 1/4 pages · Contact info") and clear findApplyDialog's
+// field/advance/text gates. Class names are hashed per build, so they are NOT usable.
+const APPLY_DIALOG_SEL = '.jobs-easy-apply-modal, .jobs-easy-apply-content, .jobs-easy-apply-content__wrapper, .jobs-easy-apply-modal-content, [data-test-modal][role="dialog"], [role="dialog"][aria-modal="true"], dialog[open], [data-testid="dialog"], [data-testid="dialog-content"], .ia-Modal, [data-testid="smartapply-container"]';
 
 // ---- relevance / fit (mirror of server jobFit + a page "needs N years" scan) ----
 function jobLevel(title) {
@@ -214,7 +233,13 @@ function showOverlay(title) {
     e.currentTarget.textContent = S.paused ? 'Resume' : 'Pause';
   });
   if (!window.__jat11_aa_esc) {
-    window.__jat11_aa_esc = (e) => { if (e.key === 'Escape' && S.running) cancel('escape'); };
+    // Escape aborts the run — but ONLY a real user keypress. autofill's fillCombobox
+    // dispatches a SYNTHETIC Escape to dismiss a typeahead dropdown when none of its options
+    // match what we typed (LinkedIn's "Location (city)" box does this constantly). That event
+    // bubbles to window, so the engine was cancelling its OWN task mid-apply: 6 "stopped by
+    // escape" skips in a single hour of the live run. isTrusted is false for anything
+    // dispatched from script, so this keeps the user's real Escape working and ignores ours.
+    window.__jat11_aa_esc = (e) => { if (e.isTrusted && e.key === 'Escape' && S.running) cancel('escape'); };
     window.addEventListener('keydown', window.__jat11_aa_esc);
   }
 }
@@ -271,6 +296,26 @@ function vlog(category, text) {
 function pagePathOf() {
   try { return (location.pathname || '/') + (location.search ? '?…' : ''); } catch { return '?'; }
 }
+// Has the job page actually RENDERED its body yet? Gates the terminal "this posting has no
+// Easy Apply" decision, which is non-retriable and so must never be taken on a page that
+// simply had not finished loading. Measured live 2026-07-20: LinkedIn's rebuilt job view can
+// still be blank at 7s on a VISIBLE, focused tab (chrome + the Premium upsell render early;
+// the job body arrives much later), and its Easy Apply modal then opens normally.
+// Non-LinkedIn hosts are unaffected (returns true) so no other route changes behaviour.
+const JOB_BODY_RX = /\b(about the job|job description|À propos du poste|description du poste|responsibilities|qualifications)\b/i;
+function jobPageHydrated() {
+  try {
+    if (!/(^|\.)linkedin\.com$/i.test(location.hostname)) return true;
+    const t = document.body?.innerText || '';
+    // Heading-only on purpose. A text-LENGTH fallback was tried and is unusable: the executor
+    // injects its own status overlay, so a job page with an EMPTY body still measured 2,862
+    // chars in the harness and read as "hydrated". If some locale's heading is missing from the
+    // regex we fall to "not hydrated" → a bounded retry, which is the safe direction: retrying
+    // costs seconds, a wrong terminal skip discards a real job forever.
+    return JOB_BODY_RX.test(t);
+  } catch { return true; }   // never let a probe error cause an infinite retry
+}
+
 function reportSeen(root, phase) {
   try {
     const scope = root || document;
@@ -309,10 +354,30 @@ function reportSeen(root, phase) {
     } });
   } catch {}
 }
+// Interrupting a run is NOT a decision about the job. Stopping the overlay, pressing Escape to
+// take the tab back, or ending a teach session all mean "not now" — the posting is untouched and
+// should go back in the queue. Only an explicit user choice NOT to apply ('recovery-skip', the
+// skip button on the recovery prompt) or a declined final submit ('submit-not-approved') is a
+// real verdict on the job, and only those stay terminal.
+//
+// Live 2026-07-20: 123 jobs sat permanently skipped as "stopped by …" — 88 from a pause and 35
+// from Escape (the newest that same day) — none of them ever attempted. Same pattern as the
+// bot-challenge breaker and the anchor-opener skip: a TRANSIENT interruption written as a
+// PERMANENT state.
+const TRANSIENT_CANCEL = new Set(['user', 'escape', 'teach-stop', 'pause']);
 function cancel(reason) {
   if (!S.running) return;
   S.cancelled = true;
   setStatus(`Stopped (${reason})`);
+  if (TRANSIENT_CANCEL.has(reason)) {
+    // Back to 'queued', not 'skipped' — the run stops, the job survives.
+    report({
+      state: 'queued',
+      lastError: null,
+      transcriptAppend: { kind: 'recovery', note: `run interrupted (${reason}) — returned to the queue, not skipped` },
+    });
+    return;
+  }
   report({ state: 'skipped', lastError: `stopped by ${reason}`, transcriptAppend: { note: `stopped by ${reason}` } });
 }
 
@@ -527,6 +592,29 @@ function findLoadingAdvanceButton(root) {
   return null;
 }
 
+// A company career page that EMBEDS its ATS application in a cross-origin iframe
+// (pinterestcareers.com and app.careerpuck.com both embed job-boards.greenhouse.io).
+// The top frame can never see or drive that form, so the apply looked like a dead
+// opener. Returns { src, host } for the first visible frame on a known ATS host.
+// Deliberately narrow: only real ATS hosts, only reasonably-sized visible frames, so a
+// tracking pixel or a marketing widget can never redirect the tab.
+const EMBEDDED_ATS_HOST_RX = /(^|\.)(job-boards\.greenhouse\.io|boards\.greenhouse\.io|greenhouse\.io|jobs\.lever\.co|jobs\.ashbyhq\.com|ashbyhq\.com|apply\.workable\.com|smartrecruiters\.com|myworkdayjobs\.com|icims\.com|bamboohr\.com)$/i;
+function findEmbeddedAtsFrame() {
+  try {
+    for (const f of qsa('iframe')) {
+      const src = String(f.getAttribute('src') || f.src || '');
+      if (!/^https?:\/\//i.test(src)) continue;
+      let u; try { u = new URL(src); } catch { continue; }
+      if (!EMBEDDED_ATS_HOST_RX.test(u.hostname)) continue;
+      if (u.hostname === location.hostname) continue;          // already top-level here
+      const r = f.getBoundingClientRect?.() || { width: 0, height: 0 };
+      if (r.width < 200 || r.height < 120) continue;           // not a real application surface
+      return { src, host: u.hostname };
+    }
+  } catch {}
+  return null;
+}
+
 function findApplyDialog({ requireFields = false } = {}) {
   for (const d of qsa(APPLY_DIALOG_SEL)) {
     // LinkedIn sometimes gives the stable outer Easy Apply shell no measurable box
@@ -674,7 +762,19 @@ async function handleLinkedInInterstitial() {
 // generic advance scan misses it (some postings render an icon/badged button).
 function findEasyApplyButton() {
   const sel = 'button.jobs-apply-button, .jobs-apply-button--top-card button, [data-live-test-job-apply-button], button[aria-label*="easy apply" i], button[aria-label*="candidature simpli" i]';
-  const candidates = [...qsa(sel), ...qsa('button, a[role="button"], [role="button"]')];
+  // Plain <a> is in the scan on purpose. Measured live 2026-07-20 on the rebuilt LinkedIn job view
+  // (e.g. jobs/view/4420497662, Paymentus): the Easy Apply control renders as an ANCHOR with
+  // obfuscated classes, NO role="button", NO aria-label and an href back to the job view itself —
+  // so none of the specific selectors matched and `a[role="button"]` did not either. The old scan
+  // found 0 candidates on that page; adding `a` finds exactly 1, and clicking it opens the real
+  // Easy Apply modal. Every such posting was being terminal-skipped as "external, apply on the
+  // company site" (68 of 87 LinkedIn attempts in a 100-minute sample), which ALSO hid LinkedIn's
+  // daily-cap modal from the executor, so the easyapply-limit backoff never armed either.
+  // Safe to widen because selection is LABEL-driven, not tag-driven: classifyApplyControl matches
+  // EASY_RX on the label before any href/off-origin test, and already excludes search-filter pills
+  // (FILTER_LABEL_RX / FILTER_BAR_SEL), so an external "Apply on company website" anchor still
+  // classifies external and a "Easy Apply filter" pill still classifies unknown.
+  const candidates = [...qsa(sel), ...qsa('button, a, a[role="button"], [role="button"]')];
   for (const el of [...new Set(candidates)]) {
     if (!el || el.disabled || !isProbablyVisible(el)) continue;
     if (classifyApplyControl(el).state === 'linkedin_easy_apply_modal') return el;
@@ -1227,7 +1327,20 @@ export async function run(task, context, helpers) {
       const r = await send({ type: 'api-call', method: 'POST', path: '/qa/lookup', body: { question: label, profileId } });
       return (r?.ok && r.match && typeof r.match.answer === 'string') ? { answer: r.match.answer } : null;
     },
-    recordAnswer: async (item) => send({ type: 'qa-record', data: { ...item, source: job?.source, profileId } }),
+    // Never LEARN an answer under a junk key. When a control has no resolvable label,
+    // fieldLabel() falls back to input.name / the element id, and that string was being saved
+    // as the QUESTION: 143 of 2,576 live entries (6%) are keyed "rn" / "r1s" / "name" /
+    // "city" / "easy apply". Because the server's qaLookup is FUZZY, those keys can later
+    // match a real screening question and answer it with the wrong value on a real
+    // application — so the store is worse than empty. Drop them at the source.
+    recordAnswer: async (item) => {
+      const q = String(item?.question || '');
+      if (isJunkQuestionKey(q)) {
+        vlog('qa', `not learning an answer under a junk key: "${redactLabel(q).slice(0, 40)}"`);
+        return null;
+      }
+      return send({ type: 'qa-record', data: { ...item, source: job?.source, profileId } });
+    },
   });
 
   let finished = false;
@@ -1518,6 +1631,14 @@ export async function run(task, context, helpers) {
   // guessed. Bounded per task so a confused page can't loop or rack up cost.
   let aiRescueCount = 0;
   const MAX_AI_RESCUE = 2;
+  // When the AI parks without naming a target, its reason still identifies the field it refused
+  // to answer — pull the quoted label out so the needs-you queue shows the QUESTION rather than
+  // the internal stage name. Returns '' when the reason has no quoted field, so the caller keeps
+  // its existing fallback. Straight/curly quotes both, because model output uses either.
+  function fieldFromParkReason(reason) {
+    const m = String(reason || '').match(/['"‘’“”]([^'"‘’“”]{3,80})['"‘’“”]/);
+    return m ? m[1].trim() : '';
+  }
   // EXT-4 token moderation: the rescue already fires ONLY from the hard-stall path
   // (noChange >= stallLimit), so the deterministic ladder always runs first and most
   // applies spend ZERO rescue tokens. The remaining leak is calling the model AGAIN on a
@@ -1610,7 +1731,17 @@ export async function run(task, context, helpers) {
       if (S.cancelled) break;
       const target = String(act.target || '');
       const t = target.toLowerCase();
-      if (act.type === 'park') { park(target || 'AI rescue', 'text', null, act.reason || 'AI could not safely proceed — needs you'); return 'parked'; }
+      if (act.type === 'park') {
+        // Label the park with the FIELD, never the internal stage name. When the AI omits a
+        // target, its reason still names the field it refused to answer, e.g.
+        //   "Required field 'work authorization in canada*' cannot be answered truthfully …"
+        // The old `target || 'AI rescue'` fallback threw that away, so the needs-you queue filled
+        // with rows all reading "AI rescue" (21 of 83 pending questions on 2026-07-20) and Pierre
+        // could not tell what any of them were asking without opening each one.
+        park(target || fieldFromParkReason(act.reason) || 'AI rescue', 'text', null,
+             act.reason || 'AI could not safely proceed — needs you');
+        return 'parked';
+      }
       if (act.type === 'click') {
         const btn = btnRefs.find((b) => b.label.toLowerCase() === t) || btnRefs.find((b) => t && (b.label.toLowerCase().includes(t) || t.includes(b.label.toLowerCase())));
         if (!btn) { vlog('rescue', `click target not found: "${redactLabel(target)}"`); continue; }
@@ -2115,14 +2246,27 @@ export async function run(task, context, helpers) {
       logLine('warn', `${why} (${challenge.reason}) — stopping; not our flow's failure`);
       setStatus('Site bot-challenge — needs you to verify');
       signalHydrated();   // release any held front-until-hydrated; we are NOT waiting on hydration
+      // DEFER, don't skip. A verification wall is TRANSIENT: it clears, and this posting was never
+      // attempted. This is the twin of the host-breaker bug fixed in 11.88.14 -- the breaker stopped
+      // destroying jobs it declined to dispatch, but the executor was still terminally skipping the
+      // job that first hit the wall (8 such jobs live on 2026-07-20, every one attempts=0).
+      // Stay 'queued' with scheduled_at past the breaker window so the pump passes over it
+      // (server.js hostDeferred) and it becomes dispatchable again by itself once the wall lifts.
+      // The botChallenge hint below still arms the host breaker exactly as before.
+      // Mirrors HOST_BREAKER_COOLDOWN_MS in ../lib/host-breaker.js. Inlined deliberately: that
+      // module is not in web_accessible_resources, and importing it made the whole executor module
+      // fail to load ("Failed to fetch dynamically imported module"), which breaks every apply.
+      const HOST_BREAKER_COOLDOWN_MS = 20 * 60 * 1000;
+      const deferUntil = new Date(Date.now() + HOST_BREAKER_COOLDOWN_MS).toISOString();
       report({
-        state: 'skipped',
-        lastError: why,
-        parkReason: 'bot_challenge',
+        state: 'queued',
+        scheduledAt: deferUntil,
+        lastError: null,
+        parkReason: null,
         botChallenge: { kind: challenge.kind, host: location.hostname.replace(/^www\./, ''), reason: challenge.reason },
-        transcriptAppend: { kind: 'recovery', note: `${why} [${challenge.reason}] — site anti-automation gate, parked (host breaker armed)` },
+        transcriptAppend: { kind: 'recovery', note: `${why} [${challenge.reason}] — site anti-automation gate; deferred until ${deferUntil}, not skipped (host breaker armed)` },
       });
-      finalState = 'skipped';
+      finalState = 'queued';
       break;
     }
 
@@ -2299,6 +2443,34 @@ export async function run(task, context, helpers) {
     // failing here would abort a live full-page application; the no-button hydration wait below
     // handles that case correctly without ever re-clicking the opener.
     if (!haveForm && everHadForm && onLinkedIn && !isLinkedInEasyApplyApplyUrl(location.pathname)) {
+      // The modal also vanishes for the BEST reason: the advance COMPLETED the application and
+      // LinkedIn replaced it with its confirmation. Failing blindly here recorded genuinely
+      // SUBMITTED applications as failures — and "will retry" then re-applied to a job the user
+      // had already applied to. So look for POSITIVE success evidence before calling it a loss.
+      //
+      // Deliberately NOT using confirmSubmitted()'s "apply form closed" branch: the form is
+      // closed by definition in this branch, so that heuristic would mark EVERY disappearance as
+      // a submit — a false positive, which is worse than the bug. Only success TEXT or a success
+      // URL counts. Poll briefly because the banner renders a beat after the click.
+      let lateSuccess = null;
+      for (let i = 0; i < 8 && !S.cancelled; i++) {
+        if (urlLooksLikeSuccess()) { lateSuccess = 'success-url'; break; }
+        if (pageTextLooksLikeSuccess(8000)) { lateSuccess = 'success-text'; break; }
+        await sleep(400);
+      }
+      if (lateSuccess) {
+        vlog('submit', `→ DONE evidence=verified:${lateSuccess} (modal closed because the application completed)`);
+        logLine('ok', `✓ application submitted (${lateSuccess})`);
+        setStatus('✓ Application submitted');
+        if (job?.id) await send({ type: 'api-call', method: 'PATCH', path: '/jobs/' + encodeURIComponent(job.id), body: { status: 'submitted' } });
+        report({
+          state: 'done', lastError: null, parkReason: null, pendingQuestions: [], applyRoute: 'easy-apply',
+          submissionEvidence: { type: 'verified', reason: lateSuccess, detail: 'modal closed after advance with success on the page', url: location.href, at: new Date().toISOString() },
+          transcriptAppend: { note: `submitted — verified (${lateSuccess}) after the Easy Apply modal closed` },
+        });
+        finalState = 'done';
+        break;
+      }
       const fingerprint = recoveryFingerprint({ hostname: location.hostname, pathname: location.pathname, label: 'easy apply form', stage: 'lost-after-advance' });
       logLine('warn', 'Easy Apply form disappeared after advancing — stopping instead of re-clicking the opener');
       report({ state: 'failed', lastError: 'Easy Apply form disappeared after advancing — will retry', applyRoute: 'easy-apply', transcriptAppend: { kind: 'recovery', note: 'sticky Easy Apply scope was lost after advance', fingerprint } });
@@ -2308,7 +2480,20 @@ export async function run(task, context, helpers) {
 
     // ---- fill from profile + learned answers ----
     setStatus(`Step ${S.step}: ${haveForm ? 'filling fields…' : 'opening the application…'}`);
-    const suggestions = haveForm ? (await engine.scanFillable(root)).filter((s) => {
+    // Collect WHY each field was passed over, so a `fillable=0` step can explain itself.
+    const scanSkips = [];
+    const noteSkip = (reason, input, label) => {
+      if (scanSkips.length >= 14) return;
+      let d = '';
+      try {
+        d = (input.tagName || '').toLowerCase() + (input.type ? ':' + input.type : '')
+          + (input.id ? ' #' + String(input.id).slice(0, 18) : '')
+          + (input.placeholder ? ' ph="' + String(input.placeholder).slice(0, 26) + '"' : '')
+          + (label ? ' lbl="' + redactLabel(String(label)).slice(0, 34) + '"' : '');
+      } catch {}
+      scanSkips.push(reason + ' ← ' + d);
+    };
+    const suggestions = haveForm ? (await engine.scanFillable(root, noteSkip)).filter((s) => {
       if (NEVER_AUTOFILL_RX.test(s.label)) {
         logLine('warn', `left sensitive field for you: "${s.label.slice(0, 40)}"`);
         return false;
@@ -2332,6 +2517,13 @@ export async function run(task, context, helpers) {
       vlog('scan', `fillable=${suggestions.length}`);
       for (const s of suggestions.slice(0, 12)) {
         vlog('field', `"${redactLabel(s.label)}" type=${traceFieldType(s.input)} src=${s.source || '?'} → ${redactValue(s.value, s.label)}`);
+      }
+      // NOTHING fillable but the step still won't advance — the single dominant live park
+      // ("needs N answer(s)" with fillable=0 + sawRequired=false). Say WHY each field was
+      // passed over, so the failure is diagnosable from the transcript instead of guessed at.
+      if (!suggestions.length && scanSkips.length) {
+        vlog('scan', `skipped ${scanSkips.length} field(s):`);
+        for (const s of scanSkips.slice(0, 10)) vlog('scan', '  ' + s);
       }
     }
     const filled = await engine.fill(suggestions, ({ suggestion, outcome, detail }) => {
@@ -2379,6 +2571,21 @@ export async function run(task, context, helpers) {
         // A saved-resume card selected satisfies the requirement WITHOUT an attach — so the
         // attached===0 attach-failure guard below must not fire on it.
         resumeSatisfiedBySelect = resumePage.satisfied && resumePage.attached === 0;
+      } else if (resumePage.satisfied) {
+        // ALREADY SATISFIED without acting: ensureResume returns { acted:false, satisfied:true }
+        // for 'saved-resume-already-selected'. Branching on `acted` alone sent that case into the
+        // legacy attach below, which re-uploads the file into every file input on the page even
+        // though the decision just said nothing was needed. Live 2026-07-20 that showed up as
+        //   trace:resume … → action=none (saved-resume-already-selected)
+        //   attached PierreSalama_2026.2.pdf          ← re-upload, unwanted
+        //   trace:button no control found (tier=in-form-advance)
+        //   trace:hydrate initial wait EXHAUSTED (31876ms) — no control yet
+        // on Indeed's resume-selection module: the re-upload puts the module back into
+        // processing, the Continue button goes away, and the run dies as "module stuck
+        // (Continue never enabled)" after burning the full 30s hydrate cap.
+        att = { attempted: false, attached: 0 };
+        resumeSatisfiedBySelect = true;
+        vlog('resume', 'already satisfied by a selected saved resume — skipping the legacy attach');
       } else {
         // No resume-shaped UI handled → legacy attach path (file input already present, etc.).
         att = await tryAttachResume(root, resume);
@@ -2807,7 +3014,20 @@ export async function run(task, context, helpers) {
         // server classifier reads it as terminal (not transient_page), and (c) the user learns
         // WHY. CONSERVATIVE: fires ONLY when opening && !wasHidden && the form NEVER opened — a
         // hidden/throttled tab (where late hydration is real) still fails RETRIABLY below.
-        if (opening && !wasHidden && !everHadForm) {
+        // 2026-07-20 CORRECTION to the premise above. That reasoning assumed a visible tab is
+        // always hydrated within the settle wait ("observed: <2s when it exists"). Measured live
+        // on the rebuilt LinkedIn job page, that is NO LONGER TRUE: on a visible, focused,
+        // un-throttled tab the job body was still not rendered at SEVEN seconds, and a trusted
+        // click then opened a perfectly normal Easy Apply modal. Because this branch is TERMINAL
+        // and non-retriable, every such posting was permanently discarded as "external" — 24 of
+        // them after the native-<dialog> fix alone, each a REAL Easy Apply job thrown away.
+        // So only conclude "no Easy Apply" once the page has actually rendered its job body;
+        // otherwise fall through to the RETRIABLE path below (which is attempt-capped, so the
+        // worst case is a few bounded retries instead of silently losing the job).
+        if (opening && !wasHidden && !everHadForm && !jobPageHydrated()) {
+          vlog('button', 'no opener yet, but the job page has NOT rendered its body — not concluding "no Easy Apply"; retrying later');
+          logLine('warn', 'page had not finished loading — will retry rather than write this off as external');
+        } else if (opening && !wasHidden && !everHadForm) {
           vlog('button', 'no Easy-Apply opener after the visible settle wait (un-throttled tab) → terminal-skip: this posting has no Easy Apply');
           logLine('warn', 'no Easy Apply on this posting — no apply control appeared on a visible tab; skipping (not retried)');
           S.routeState = 'external_same_tab';
@@ -2962,6 +3182,31 @@ export async function run(task, context, helpers) {
         report({ transcriptAppend: { kind: 'recovery', note: 'advanced LinkedIn resume/continue interstitial', fingerprint: pageAction } });
         lastPageAction = null; lastPageActionUrl = '';   // the interstitial advance is real progress; allow the next opener/advance
         continue;
+      }
+      // EMBEDDED ATS: a company career site (pinterestcareers.com, app.careerpuck.com, …)
+      // often hosts the real application in a CROSS-ORIGIN iframe (job-boards.greenhouse.io,
+      // lever, ashby…), while its own "Apply Now" is just an anchor that scrolls to it. The
+      // top frame therefore never sees a form and the opener never "transfers" — which is
+      // why this reported the misleading "did not transfer" instead of applying. The form is
+      // right there, just one origin away: navigate to the iframe's own URL so the ATS page
+      // becomes top-level and the existing site pack drives it normally.
+      const atsFrame = findEmbeddedAtsFrame();
+      if (atsFrame) {
+        // Report the TRUTH instead of "did not transfer": nothing was ever going to transfer,
+        // the form is one origin away and the top frame cannot drive it.
+        // NOTE: navigating the tab to atsFrame.src was tried and is NOT safe — a cross-origin
+        // navigation tears down the content script, so the executor kills its own run mid-task
+        // (harness: "message channel closed before a response was received"). Driving these
+        // needs the task to survive navigation, which is a separate change.
+        logLine('warn', `application is embedded from ${atsFrame.host} — not auto-applicable from this page`);
+        report({
+          state: 'skipped',
+          lastError: `application form is embedded from ${atsFrame.host} — open that page directly to apply`,
+          applyRoute: 'external',
+          transcriptAppend: { kind: 'recovery', note: `embedded ATS iframe detected → ${atsFrame.host}`, fingerprint: pageAction },
+        });
+        finalState = 'skipped';
+        break;
       }
       logLine('warn', `same page-level action repeated — stopping before another "${label}" click`);
       report({ state: 'failed', lastError: `repeated page-level action did not transfer: ${label}`, transcriptAppend: { kind: 'recovery', note: 'duplicate opener blocked', fingerprint: pageAction } });

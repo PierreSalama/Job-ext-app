@@ -68,6 +68,9 @@
   <div class="toasts" id="toasts"></div>
   <div id="overlay-root"></div>
 
+  <script>/* Early error trap — records load/module failures that predate any in-app handler
+     (window.__errs, capture-phase). Costs nothing; turns "silent blank page" into evidence. */
+  window.__errs=[];addEventListener('error',function(e){window.__errs.push(String((e.error&&e.error.stack)||e.message||e.type))},true);addEventListener('unhandledrejection',function(e){window.__errs.push('REJ '+String((e.reason&&e.reason.stack)||e.reason))});</script>
   <script src="app.js" type="module"></script>
 </body>
 </html>

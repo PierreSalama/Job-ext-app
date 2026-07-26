@@ -20,7 +20,7 @@
 import * as api from './lib/api.js';
 import { computeIdleGate, clampIdleThreshold } from './lib/idle-gate.js';
 import { isJobPageUrl } from './lib/jobpage.js';
-import { HOST_BREAKER_COOLDOWN_MS, hostOfUrl, shouldDispatchHost, trippedEntry } from './lib/host-breaker.js';
+import { HOST_BREAKER_COOLDOWN_MS, hostOfUrl, shouldDispatchHost, trippedEntry, registrableDomain } from './lib/host-breaker.js';
 import { focusArbiterDecision } from './lib/focus-arbiter.js';
 import { pickApplyWindowBounds } from './lib/window-place.js';
 import { buildSearchUrl } from './lib/search-url.js';
@@ -360,8 +360,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       let patch = msg.patch || {};
       const bc = patch.botChallenge;
       if (bc && (bc.host || bc.kind)) {
-        const host = hostOfUrl(bc.url) || (bc.host ? String(bc.host).replace(/^www\./, '').toLowerCase() : '');
-        if (host) tripHostBreaker(host, bc.kind);
+        const host = hostOfUrl(bc.url) || bc.host || '';
+        if (host) tripHostBreaker(host, bc.kind);   // async persist (fire-and-forget); normalizes to registrable domain
         const { botChallenge, ...rest } = patch;   // eslint-disable-line no-unused-vars
         patch = rest;
       }
@@ -621,36 +621,50 @@ let pumpDirty = false;            // a re-pump request arrived while pumping —
 // pool silently runs serial (1) until the next grant re-learns the concurrency.
 try { chrome.storage.local?.get('jat11.concurrency').then((o) => { const c = o && o['jat11.concurrency']; if (c) currentConcurrency = Math.max(1, Math.min(8, Number(c))); }).catch(() => {}); } catch {}
 
-// ---------- host bot-challenge circuit breaker (per-run, in-memory) ----------
-// When the executor reports a bot-challenge (Cloudflare / CAPTCHA / verify wall) on a host,
-// we record it here and STOP dispatching further queued jobs for THAT host for a cooldown
-// window. Rationale: one Cloudflare wall on indeed.com is host-wide — without a breaker the
-// pool would feed every queued Indeed job straight into the same wall, burning the whole run
-// and tanking the success rate. While the breaker is tripped, same-host jobs are parked with
-// an honest "host under bot-challenge cooldown" reason instead of each hitting the wall.
+// ---------- host bot-challenge circuit breaker (PERSISTED) ----------
+// When the executor reports a bot-challenge (Cloudflare / CAPTCHA / verify wall) on a host, record
+// it and STOP dispatching further queued jobs for that host for a cooldown window. One Cloudflare
+// wall on indeed.com is host-wide — without a breaker the pool feeds every queued Indeed job
+// straight into the same wall, burning the run and tanking the success rate.
 //
-// In-memory ONLY (per run): the map is plain SW state, so an MV3 eviction / browser restart
-// clears it — exactly what we want (a fresh run gets to re-probe the host). The decision is a
-// pure, node-testable function (`shouldDispatchHost`) so the cooldown logic is covered by tests.
-const hostBreaker = new Map();                     // host → { trippedAt, until, kind, hits }
+// PERSISTED to chrome.storage.local, NOT an in-memory Map. This is an MV3 service worker: it evicts
+// after ~30s idle, and auto-apply tasks are minutes apart, so an in-memory breaker was WIPED between
+// tasks — every Indeed job then re-probed the wall. Live 2026-07-25 (Dad + Pierre): a single task
+// hit Cloudflare 126 times, Indeed "refreshed a lot" showing "there's a problem, please try again
+// later", and the pile-up of reopened tabs eventually white-screened Firefox. Persisting the breaker
+// makes the cooldown actually hold across evictions. Same fix pattern as the discovery freshness ramp.
+const HOST_BREAKER_KEY = 'jat11.hostBreaker';       // { [registrableDomain]: {trippedAt,until,kind,hits} }
 
-// Trip (or extend) the breaker for a host after a challenge was detected on it.
-function tripHostBreaker(host, kind, now = Date.now()) {
-  const h = String(host || '').toLowerCase();
-  if (!h) return;
-  hostBreaker.set(h, trippedEntry(hostBreaker.get(h), kind, now));
-  const mins = Math.round(HOST_BREAKER_COOLDOWN_MS / 60000);
-  console.log(`[jat11] host breaker TRIPPED: ${h} (bot-challenge: ${kind || 'unknown'}) — pausing dispatch ~${mins} min`);
+// registrableDomain() is imported from ./lib/host-breaker.js (pure + node-tested) — it maps every
+// subhost (ca.indeed.com, smartapply.indeed.com, www.indeed.com) to one key: "indeed.com".
+async function loadHostBreaker() {
+  try { const o = await chrome.storage.local.get(HOST_BREAKER_KEY); return o[HOST_BREAKER_KEY] || {}; }
+  catch { return {}; }
+}
+async function saveHostBreaker(map) {
+  try { await chrome.storage.local.set({ [HOST_BREAKER_KEY]: map }); } catch {}
 }
 
-// Best-effort expiry log so a cooled-down host is observable. Called lazily from the gate.
-function noteHostBreakerCooldownIfElapsed(host, now = Date.now()) {
-  const h = String(host || '').toLowerCase();
-  const entry = hostBreaker.get(h);
-  if (entry && now >= (Number(entry.until) || 0)) {
-    hostBreaker.delete(h);
-    console.log(`[jat11] host breaker cooled down: ${h} — resuming dispatch`);
+// Trip (or extend) the breaker for a host after a challenge was detected on it.
+async function tripHostBreaker(host, kind, now = Date.now()) {
+  const h = registrableDomain(host);
+  if (!h) return;
+  const map = await loadHostBreaker();
+  map[h] = trippedEntry(map[h], kind, now);
+  await saveHostBreaker(map);
+  const mins = Math.round(HOST_BREAKER_COOLDOWN_MS / 60000);
+  console.log(`[jat11] host breaker TRIPPED (persisted): ${h} (bot-challenge: ${kind || 'unknown'}) — pausing dispatch ~${mins} min`);
+}
+
+// Read the persisted breaker, dropping any host whose cooldown has elapsed. Returns the live map.
+async function loadHostBreakerPruned(now = Date.now()) {
+  const map = await loadHostBreaker();
+  let changed = false;
+  for (const [h, entry] of Object.entries(map)) {
+    if (!entry || now >= (Number(entry.until) || 0)) { delete map[h]; changed = true; console.log(`[jat11] host breaker cooled down: ${h} — resuming dispatch`); }
   }
+  if (changed) await saveHostBreaker(map);
+  return map;
 }
 
 // Keep every auto-apply / discovery tab in ONE labelled Chrome tab group so the
@@ -1792,16 +1806,27 @@ async function pump(force = false) {
       // HOST CIRCUIT BREAKER: if this job's host is cooling down after a bot-challenge,
       // don't burn it on the same wall. Park it honestly and pull the NEXT job instead
       // (no slot consumed). The breaker is in-memory/per-run and self-expires.
-      const jobHost = hostOfUrl(r.context?.job?.jobUrl || r.task?.jobUrl);
-      noteHostBreakerCooldownIfElapsed(jobHost);
-      const gate = shouldDispatchHost(jobHost, Date.now(), hostBreaker);
+      const jobHost = registrableDomain(hostOfUrl(r.context?.job?.jobUrl || r.task?.jobUrl));
+      const breakerMap = await loadHostBreakerPruned();   // PERSISTED — survives MV3 eviction between tasks
+      const gate = shouldDispatchHost(jobHost, Date.now(), breakerMap);
       if (!gate.dispatch && r.task?.id != null) {
-        console.log(`[jat11] parking ${jobHost} job ${r.task.id} — host under bot-challenge cooldown`);
+        console.log(`[jat11] deferring ${jobHost} job ${r.task.id} until ${new Date(gate.until).toISOString()} — host under bot-challenge cooldown`);
+        // DEFER, never skip. This used to PATCH state:'skipped', which is TERMINAL and
+        // non-retriable, so a temporary wall permanently discarded jobs that had never been
+        // attempted. Live 2026-07-20: Indeed began serving a Cloudflare challenge and this
+        // destroyed 40+ queued jobs in ten minutes (all attempts=0), draining the Indeed queue
+        // from 60 to 16. The breaker is right to stop dispatching into a wall, but the job must
+        // survive it — exactly how the Easy-Apply cooldown leaves its tasks queued.
+        //
+        // Staying 'queued' with a FUTURE scheduled_at is what makes this safe: queueNext skips
+        // not-yet-due tasks (server.js hostDeferred) so the pump moves to another host instead of
+        // handing back the same row forever, and the job becomes dispatchable again by itself
+        // once the breaker expires.
         await api.call('PATCH', '/queue/' + encodeURIComponent(r.task.id), {
-          state: 'skipped',
-          lastError: 'host under bot-challenge cooldown — site is serving a verification wall; will not retry this run',
-          parkReason: 'bot_challenge',
-          transcriptAppend: { kind: 'recovery', note: `host ${jobHost} under bot-challenge cooldown — parked without dispatch` },
+          state: 'queued',
+          scheduledAt: new Date(gate.until).toISOString(),
+          lastError: null,
+          transcriptAppend: { kind: 'recovery', note: `host ${jobHost} is serving a verification wall — deferred until ${new Date(gate.until).toISOString()} (not skipped)` },
         }).catch(() => {});
         reason = 'host-cooldown';
         // Bound the park loop so a server that keeps re-returning the same row can't spin
@@ -2008,8 +2033,33 @@ async function clearIdlePauseStatus() {
 // mandatory (empty location → country), work-mode → LinkedIn f_WT / Indeed remote attr,
 // and freshnessSeconds → LinkedIn f_TPR / Indeed fromage. The freshness tier per combo is
 // tracked in DISCOVER_TIERS below (newest-first ramp; widens only when a scan finds 0 new).
-const DISCOVER_TIERS = new Map();          // `${board}|${keyword}|${location}` → tier seconds
+// PERSISTED, not a bare Map. This is an MV3 service worker: Chrome evicts it after ~30s idle,
+// and discovery ticks are minutes apart (intervalMinutes, default 5), so an in-memory ramp was
+// GUARANTEED to be empty on every tick — every combo restarted at NARROWEST_TIER (1h) forever and
+// the ladder above 1h was unreachable dead code. Confirmed live 2026-07-20: the f_AL search
+// reported freshness 3600 → next 7200, found 15, enqueued 0 ("all 15 jobs here were already
+// tried"), i.e. it correctly computed the widened tier and then lost it. That is exactly the
+// SATURATED state the doctor reports, and the reason the 30d depth added for saturation never
+// helped. DISCOVER_IDX_KEY right below is persisted for this same eviction reason.
+const DISCOVER_TIERS_KEY = 'jat11.discoverTiers';   // { [comboKey]: tierSeconds }
 const comboKey = (board, keyword, location) => `${board}|${keyword}|${location}`;
+
+async function loadDiscoverTier(cKey) {
+  try {
+    const o = await chrome.storage.local.get(DISCOVER_TIERS_KEY);
+    const map = o[DISCOVER_TIERS_KEY];
+    const v = Number(map && map[cKey]);
+    return Number.isFinite(v) && v > 0 ? v : NARROWEST_TIER;
+  } catch { return NARROWEST_TIER; }
+}
+
+async function saveDiscoverTier(cKey, tierSeconds) {
+  try {
+    const o = await chrome.storage.local.get(DISCOVER_TIERS_KEY);
+    const map = { ...(o[DISCOVER_TIERS_KEY] || {}), [cKey]: tierSeconds };
+    await chrome.storage.local.set({ [DISCOVER_TIERS_KEY]: map });
+  } catch { /* a lost tier just means this combo restarts at the freshest window */ }
+}
 
 async function processDiscoveryFallback() {
   if (scanning || pumping) return { ok: false, note: 'busy' };
@@ -2090,33 +2140,47 @@ async function discoverTick(force = false) {
   }
   if (!force && !withinWindow(aa)) return { ok: false, note: 'outside the time window' };
 
-  // Only auto-discover when the queue is low — never over-enqueue. A manual run
-  // (force) bypasses this.
-  if (!force) {
-    const q = await api.call('GET', '/queue?state=queued', null, 6000);
-    if ((q?.items || []).length >= (aa.discovery.refillBelow || 3)) return { ok: false, note: 'queue already full' };
-  }
-
-  scanning = true;
-  let tab = null;
   // Cycle the FULL search space — board × keyword × location — so successive searches
   // surface FRESH jobs instead of re-finding the same handful from one fixed query
   // (the #1 cause of the "found 6, enqueued 0" pool exhaustion).
   const locList = (aa.locations || []).filter(Boolean);
   const combos = [];
   for (const b of boards) for (const k of keywords) for (const l of (locList.length ? locList : [''])) combos.push({ b, k, l });
-  // Read → use → persist the next index, so rotation survives SW eviction.
+  // PEEK the next combo before the refill gate: the gate below is per-board, so it needs to know
+  // which board this tick would scan. The index is only PERSISTED once we commit to scanning, so a
+  // gated tick does not burn a rotation slot (which would silently skip combos).
   let dIdx = 0;
   try { const o = await chrome.storage.local.get(DISCOVER_IDX_KEY); dIdx = Number(o[DISCOVER_IDX_KEY]) || 0; } catch {}
   const combo = combos[dIdx % combos.length];
-  try { await chrome.storage.local.set({ [DISCOVER_IDX_KEY]: (dIdx + 1) % 1000000 }); } catch {}
   const board = combo.b, keyword = combo.k, location = combo.l;
+
+  // SOURCE-AWARE refill gate — only auto-discover when the queue is low for THIS BOARD. A manual
+  // run (force) bypasses it.
+  //
+  // This gate used to count the WHOLE queue, which mirrors the exact starvation bug already fixed
+  // on the app side (discovery/index.js) and re-created it here: the app's JobSpy feed and the
+  // direct-ATS feed pour into the SAME queue, so their backlog held the total above refillBelow and
+  // this browser discovery — the ONLY source of real LinkedIn Easy-Apply jobs — never ran at all.
+  // Measured live 2026-07-20: 106 queued = 86 Indeed + 6 LinkedIn against refillBelow 40, so the
+  // Indeed backlog was permanently blocking the one feed that would have diluted it, and 58 of the
+  // last 90 minutes' outcomes were "external, no Easy Apply" skips. Per-board depth breaks the loop:
+  // a deep Indeed backlog no longer starves LinkedIn discovery, and each board still self-limits.
+  if (!force) {
+    const q = await api.call('GET', '/queue?state=queued', null, 6000);
+    const boardQueued = (q?.items || [])
+      .filter((t) => String(t?.job?.source || '').toLowerCase() === String(board).toLowerCase()).length;
+    if (boardQueued >= (aa.discovery.refillBelow || 3)) return { ok: false, note: `queue already full for ${board}` };
+  }
+
+  scanning = true;
+  let tab = null;
+  try { await chrome.storage.local.set({ [DISCOVER_IDX_KEY]: (dIdx + 1) % 1000000 }); } catch {}
   // Newest-first freshness ramp, per combo: start at the NARROWEST tier (last 1h) and keep
   // hammering it while it yields NEW jobs; widen one tier each time a scan enqueues 0 new,
   // capping at 7d so the queue always stays fed. LinkedIn gets the fine f_TPR ramp; Indeed
   // clamps sub-day tiers to fromage=1 inside buildSearchUrl.
   const cKey = comboKey(board, keyword, location);
-  const tierSeconds = DISCOVER_TIERS.has(cKey) ? DISCOVER_TIERS.get(cKey) : NARROWEST_TIER;
+  const tierSeconds = await loadDiscoverTier(cKey);
   const url = buildSearchUrl(board, keyword, location, {
     easyApplyOnly: aa.easyApplyOnly !== false,
     workModes: aa.workModes || [],
@@ -2166,7 +2230,7 @@ async function discoverTick(force = false) {
   const foundNew = enqueued > 0;
   const reachable = resp?.ok !== false;
   const nextTier = reachable ? nextFreshnessTier(tierSeconds, foundNew) : tierSeconds;
-  DISCOVER_TIERS.set(cKey, nextTier);
+  await saveDiscoverTier(cKey, nextTier);
   if (enqueued > 0 || requeued > 0) schedulePump();
   const status = { board, keyword, url, found, enqueued, note, ok: resp?.ok !== false, freshnessSeconds: tierSeconds, nextFreshnessSeconds: nextTier };
   await api.call('POST', '/auto-apply/discovery-status', status, 6000).catch(() => {});
