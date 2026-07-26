@@ -317,7 +317,9 @@ async function mergedStats() {
     for (const k in (data.bySource || {})) out.bySource[k] = (out.bySource[k] || 0) + data.bySource[k];
     for (const k of ['submitted', 'responded', 'interviews', 'offers']) out.funnel[k] += Number(data.funnel && data.funnel[k]) || 0;
   }
-  out.funnel.responseRate = out.funnel.submitted ? out.funnel.responded / out.funnel.submitted : 0;
+  // Match the server's format: an INTEGER percentage (the dashboard appends "%"). Computing the
+  // raw ratio here printed things like "0.00105820…%".
+  out.funnel.responseRate = out.funnel.submitted ? Math.round(100 * out.funnel.responded / out.funnel.submitted) : null;
   return out;
 }
 

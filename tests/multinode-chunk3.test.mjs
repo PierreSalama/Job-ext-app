@@ -43,7 +43,9 @@ test('merged stats sum the totals and the funnel across machines', () => {
   const body = fn.slice(0, 1400);
   assert.match(body, /'submittedTotal'/, 'submitted totals are summed');
   assert.match(body, /out\.byStatus\[k\] = \(out\.byStatus\[k\] \|\| 0\) \+ data\.byStatus\[k\]/, 'byStatus summed per key');
-  assert.match(body, /out\.funnel\.responseRate = out\.funnel\.submitted \?/, 'response rate recomputed on the combined funnel');
+  // Must match the server's format — an INTEGER percentage (the view appends "%"). A raw ratio
+  // printed "0.00105820…%" on the live dashboard.
+  assert.match(body, /out\.funnel\.responseRate = out\.funnel\.submitted \? Math\.round\(100 \* out\.funnel\.responded \/ out\.funnel\.submitted\)/, 'combined response rate must be a rounded integer percent');
 });
 
 test('the three combined pages are wired to the merged fetchers', () => {
