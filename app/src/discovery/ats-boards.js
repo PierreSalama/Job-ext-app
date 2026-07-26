@@ -121,11 +121,32 @@ const REMOTE_RX = /\bremote\b|\bwork from home\b|\bwfh\b|\banywhere\b/i;
 // phrase the user wants in the title (e.g. "software engineer", "full stack"); a title matches
 // if it contains any one of them (case-insensitive). Empty target list = no filtering (keep all),
 // so this never surprises a user who hasn't set keywords.
+// The configured keywords are whole PHRASES ("software engineer", "react developer"), matched as
+// substrings. That silently drops titles that are unambiguously the same kind of work but happen to
+// pair the role noun with a word nobody thought to enumerate. Measured over 33 real Canadian-employer
+// boards: the phrase list alone accepted 15 in-location postings, while also rejecting 14 equally
+// good ones — "Data Engineer @ Canada", "DevOps Engineer @ Vancouver", "Junior Site Reliability
+// Engineer @ Mississauga", "Product Engineer - Fullstack, Backend or Frontend @ Toronto". Nearly
+// half the available supply, lost to vocabulary rather than to relevance.
+//
+// So: accept a configured phrase OR a role NOUN paired with a recognised engineering DOMAIN word.
+// Both halves are required, which is what keeps the gate honest — "Sales Engineer" and "Technical
+// Recruiter" match no domain word, and jobFit's excludeKeywords still applies seniority and
+// sales/recruiting exclusions downstream. Empty keyword list = keep all, unchanged.
+const ROLE_NOUN_RX = /\b(engineer|engineering|developer|programmer|swe)\b/i;
+const ROLE_DOMAIN_RX = new RegExp('\\b(' + [
+  'software', 'full[\\s-]?stack', 'fullstack', 'front[\\s-]?end', 'frontend', 'back[\\s-]?end', 'backend',
+  'web', 'application', 'applications', 'platform', 'product', 'data', 'machine learning', 'ml',
+  'mobile', 'ios', 'android', 'cloud', 'devops', 'site reliability', 'reliability', 'infrastructure',
+  'systems', 'embedded', 'qa', 'quality', 'test', 'automation', 'integration', 'api', 'security',
+].join('|') + ')\\b', 'i');
+
 function titleMatchesKeywords(title, keywords) {
   const list = (keywords || []).map((k) => text(k).trim().toLowerCase()).filter(Boolean);
   if (!list.length) return true;
   const t = text(title).toLowerCase();
-  return list.some((k) => t.includes(k));
+  if (list.some((k) => t.includes(k))) return true;
+  return ROLE_NOUN_RX.test(t) && ROLE_DOMAIN_RX.test(t);
 }
 
 // Positive LOCATION gate for board-API supply. This is the location-analogue of

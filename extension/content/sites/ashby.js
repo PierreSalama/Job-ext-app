@@ -86,8 +86,16 @@ export default {
   fileInputSelector: 'input[type=file]',
   fileAffordanceSelector: 'button[class*="_upload" i], button',
 
+  // "_primary" is Ashby's styling for the page's main action — which on the JOB page is the
+  // "Apply for this Job" OPENER, not a submit. Claiming it made the executor click the opener as
+  // if it were the final submit, land on the untouched application form, and report an unverified
+  // submission that never happened (11 of 13 live Ashby tasks). The style selector still earns its
+  // keep for a submit button whose label we don't recognise, so keep it — but never let it claim a
+  // button that says it OPENS the application.
   isSubmitHint(txt, el) {
-    return /submit application/i.test(txt || '') ||
+    const t = String(txt || '');
+    if (/^\s*apply\b|apply for this job|apply now/i.test(t)) return false;
+    return /submit application/i.test(t) ||
       (el?.matches?.('button[class*="_primary"]') ?? false);
   },
 

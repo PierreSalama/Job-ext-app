@@ -13,7 +13,7 @@
 // questions only ever come from the profile, never the AI (enforced by the
 // prompt server-side AND a local guard here).
 
-import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput, isFillable, radioGroupLabel, selectGroupLabel, isSiteChromeInput, bestFuzzyIndex, isJunkQuestionKey } from './autofill.js';
+import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput, isFillable, radioGroupLabel, selectGroupLabel, isSiteChromeInput, bestFuzzyIndex, isJunkQuestionKey, nearestQuestionText } from './autofill.js';
 import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
 import { pageTextLooksLikeSuccess, urlLooksLikeSuccess, evaluateSubmitEvidence } from './signals/success.js';
@@ -1588,7 +1588,7 @@ export async function run(task, context, helpers) {
         const opts = Array.isArray(u.options) ? u.options : [];
         const yesText = opts.find((o) => /^\s*(yes|oui|s[ií]|ja)\b/i.test(o)) || 'Yes';
         const noText = opts.find((o) => /^\s*(no|non|nein)\b/i.test(o)) || 'No';
-        answer = groundedEligibilityAnswer(u.label, { authorizedToWork, yesText, noText });
+        answer = groundedEligibilityAnswer(u.label, { authorizedToWork, yesText, noText, options: opts });
         // [TRACE 8] grounded-eligibility default applied from the profile (never invented).
         if (answer != null) {
           vlog('screen', `grounded-eligibility "${redactLabel(u.label)}" = ${redactValue(answer, u.label)} (from profile, authorizedToWork=${authorizedToWork})`);
@@ -1635,8 +1635,57 @@ export async function run(task, context, helpers) {
   // to answer — pull the quoted label out so the needs-you queue shows the QUESTION rather than
   // the internal stage name. Returns '' when the reason has no quoted field, so the caller keeps
   // its existing fallback. Straight/curly quotes both, because model output uses either.
+  // The model delimits the field it refused with whatever quoting it feels like. Measured on the
+  // 41 live post-fix "AI rescue" parks: straight/curly quotes recovered only 4 (10%) because the
+  // model overwhelmingly writes BACKTICKS — "Required field `phone country code*` cannot be
+  // answered truthfully". Adding ` as a delimiter takes it to 11 (27%). The other 73% name no
+  // delimited field at all ("the required years fields for Java, Spring Boot and Angular are not
+  // grounded"), which no regex will ever recover — those are handled structurally at the park
+  // site from fieldRefs, which holds the page's REAL fields.
+  // ── NATIVE-VALIDATION GATE ─────────────────────────────────────────────────────────────────
+  // If the browser itself is going to refuse this submit, clicking it tells us nothing and
+  // produces a phantom "submit was clicked but could not be verified — please confirm".
+  //
+  // Greenhouse, observed live on job-boards.greenhouse.io 2026-07-26: required screening
+  // questions render as react-select comboboxes whose native-validation participation comes from
+  // a sentinel input:
+  //     <input required tabindex="-1" aria-hidden="true" class="…-requiredInput" value="">
+  // scanFillable correctly skips it (aria-hidden, tabindex -1) and never registers the visible
+  // combobox, so the run concludes `unknown=0 toResolve=0`, clicks a type=submit button, and the
+  // browser silently blocks the submit — no DOM mutation, no error node, no URL change. That is
+  // exactly the observed `changed=false newNodes=0 elapsed=24s`, identical across Dialpad,
+  // Robinhood and 8 others: all 10 Greenhouse "no-post-click-change" tasks.
+  //
+  // Precision matters here: native validation runs ONLY for a submit button inside a form that
+  // has not opted out. Requiring btn.type==='submit' and !form.noValidate means this can only
+  // fire where the browser would have refused anyway, so it cannot suppress a site that submits
+  // through its own JS handler.
+  function nativeValidationBlockers(btn) {
+    try {
+      if (!btn || btn.type !== 'submit') return [];
+      const form = btn.form || btn.closest?.('form');
+      if (!form || form.noValidate || typeof form.checkValidity !== 'function') return [];
+      if (form.checkValidity()) return [];
+      const out = [];
+      for (const el of Array.from(form.elements || [])) {
+        if (out.length >= 6) break;
+        try {
+          if (!el.willValidate || el.checkValidity()) continue;
+          // The sentinel is aria-hidden and unlabelled, so fieldLabel has no real source to work
+          // from and returns the surrounding widget chrome instead. For that shape go straight to
+          // the ancestor question block; only fall back to fieldLabel for normally-labelled fields.
+          const unlabelled = el.getAttribute('aria-hidden') === 'true' || (!el.id && !el.name);
+          const label = (unlabelled ? nearestQuestionText(el) : '')
+            || (fieldLabel(el) || '').trim() || nearestQuestionText(el) || el.name || el.id || 'a required field';
+          out.push({ label: String(label).slice(0, 200), message: String(el.validationMessage || '').slice(0, 120) });
+        } catch { /* skip this element */ }
+      }
+      return out;
+    } catch { return []; }
+  }
+
   function fieldFromParkReason(reason) {
-    const m = String(reason || '').match(/['"‘’“”]([^'"‘’“”]{3,80})['"‘’“”]/);
+    const m = String(reason || '').match(/[`'"‘’“”]([^`'"‘’“”]{3,160})[`'"‘’“”]/);
     return m ? m[1].trim() : '';
   }
   // EXT-4 token moderation: the rescue already fires ONLY from the hard-stall path
@@ -1644,6 +1693,10 @@ export async function run(task, context, helpers) {
   // applies spend ZERO rescue tokens. The remaining leak is calling the model AGAIN on a
   // page that hasn't changed since the last call (a genuinely stuck screen stalls twice).
   // Dedup on the page signature within a 60s window so the 2nd identical call is skipped.
+  // 250 covers a full country/phone-code select (~250) whole; radio groups are small but 12 could
+  // clip a work-status list, so give them headroom too.
+  const OPTION_CAP_SELECT = 250;
+  const OPTION_CAP_RADIO = 24;
   let lastRescueSig = '';
   let lastRescueAt = 0;
   async function tryAiRescue(reason) {
@@ -1666,9 +1719,22 @@ export async function run(task, context, helpers) {
           ? radioGroupLabel(el)
           : (el.tagName === 'SELECT' ? selectGroupLabel(el) : fieldLabel(el)) || el.getAttribute('aria-label') || el.name || '';
         if (!label) continue;
+        // Truncating the option list makes the AI refuse fields it could answer. The 20-option cap
+        // silently cut every long select: a phone country-code list is ~250 entries and "Canada"
+        // sits ~38th alphabetically, so the model was shown 20 options, correctly observed that
+        // Canada was not among them, and parked — "`Canada (+1)` is not among the options". That
+        // false premise blocked 7 otherwise-complete applications in the last week. Cap high enough
+        // that real-world lists fit whole, and when a list STILL overflows say so rather than
+        // letting a partial list read as complete.
         let options = null;
-        if (el.tagName === 'SELECT') options = Array.from(el.options).map((o) => (o.textContent || '').trim()).filter(Boolean).slice(0, 20);
-        else if (isRadio && el.name) options = qsa('input[type="radio"]', root).filter((r) => r.name === el.name).map((r) => fieldLabel(r)).filter(Boolean).slice(0, 12);
+        let optionsTotal = 0;
+        if (el.tagName === 'SELECT') {
+          const all = Array.from(el.options).map((o) => (o.textContent || '').trim()).filter(Boolean);
+          optionsTotal = all.length; options = all.slice(0, OPTION_CAP_SELECT);
+        } else if (isRadio && el.name) {
+          const all = qsa('input[type="radio"]', root).filter((r) => r.name === el.name).map((r) => fieldLabel(r)).filter(Boolean);
+          optionsTotal = all.length; options = all.slice(0, OPTION_CAP_RADIO);
+        }
         // A checkbox/radio's .value is its option value ("on"), NOT whether it's answered — report
         // CHECKED state so the AI sees an unchecked-required control as still needing action.
         const reportedValue = (el.type === 'checkbox' || el.type === 'radio')
@@ -1679,7 +1745,7 @@ export async function run(task, context, helpers) {
         const required = !!(el.required || el.getAttribute('aria-required') === 'true'
           || el.closest?.('[aria-required="true"], [class*="required" i], [data-required]')
           || /[*]|\brequired\b|\brequis\b|\bobligatoire\b/i.test(label));
-        fieldRefs.push({ el, label: String(label).slice(0, 160), type: el.type || el.tagName.toLowerCase(), required, value: reportedValue, options });
+        fieldRefs.push({ el, label: String(label).slice(0, 160), type: el.type || el.tagName.toLowerCase(), required, value: reportedValue, options, optionsTotal });
       } catch {}
     }
     const btnRefs = qsa('button, [role="button"], input[type="submit"], a[role="button"]', root)
@@ -1712,7 +1778,12 @@ export async function run(task, context, helpers) {
         body: {
           pageState: {
             url: location.href, routeState: S.routeState, failureReason: reason,
-            fields: fieldRefs.map((f) => ({ label: f.label, type: f.type, required: f.required, value: f.value, options: f.options })),
+            // optionsTruncated tells the model a partial list is partial, so "X is not among the
+            // options" is never inferred from a list we cut ourselves.
+            fields: fieldRefs.map((f) => ({
+              label: f.label, type: f.type, required: f.required, value: f.value, options: f.options,
+              ...(f.optionsTotal > (f.options?.length || 0) ? { optionsTruncated: true, optionsTotal: f.optionsTotal } : {}),
+            })),
             buttons: btnRefs.map((b) => b.label), pageText,
           },
           jobId: job?.id, profileId,
@@ -1732,14 +1803,29 @@ export async function run(task, context, helpers) {
       const target = String(act.target || '');
       const t = target.toLowerCase();
       if (act.type === 'park') {
-        // Label the park with the FIELD, never the internal stage name. When the AI omits a
-        // target, its reason still names the field it refused to answer, e.g.
-        //   "Required field 'work authorization in canada*' cannot be answered truthfully …"
-        // The old `target || 'AI rescue'` fallback threw that away, so the needs-you queue filled
-        // with rows all reading "AI rescue" (21 of 83 pending questions on 2026-07-20) and Pierre
-        // could not tell what any of them were asking without opening each one.
-        park(target || fieldFromParkReason(act.reason) || 'AI rescue', 'text', null,
-             act.reason || 'AI could not safely proceed — needs you');
+        // Label the park with the FIELD, never the internal stage name — a park is only actionable
+        // if its title says what is being asked. Three sources, in descending reliability:
+        //   1. the AI's own target;
+        //   2. the field it named inside its reason, e.g.
+        //      "Required field `work authorization in canada*` cannot be answered truthfully …";
+        //   3. the page's real unanswered required fields, when the reason is prose.
+        // The internal stage name is the last resort only. Parking straight to it filled the
+        // needs-you queue with 107 identical unanswerable rows across 57 tasks (measured 07-25).
+        const why = act.reason || 'AI could not safely proceed — needs you';
+        const named = target || fieldFromParkReason(act.reason);
+        if (named) { park(named, 'text', null, why); return 'parked'; }
+        // No delimited field name — the model wrote prose. 30 of the 41 live post-fix parks look
+        // like this, and scraping prose for a field name is a losing game. But we do not need to:
+        // fieldRefs already holds this page's REAL fields. Park the unanswered REQUIRED ones with
+        // their true labels, types and OPTIONS, so the needs-you queue shows an answerable question
+        // (a radio renders as its actual choices) and the answer becomes learnable + reusable.
+        // Same `required && !value` predicate the rescue signature uses above.
+        const blocking = fieldRefs.filter((f) => f.required && !f.value);
+        if (blocking.length) {
+          for (const f of blocking.slice(0, 6)) park(f.label, f.type, f.options, why);
+          return 'parked';
+        }
+        park('AI rescue', 'text', null, why);
         return 'parked';
       }
       if (act.type === 'click') {
@@ -2665,7 +2751,7 @@ export async function run(task, context, helpers) {
         const eopts = Array.isArray(u.options) ? u.options : [];
         const yesText = eopts.find((o) => /^\s*(yes|oui|s[ií]|ja)\b/i.test(o)) || 'Yes';
         const noText = eopts.find((o) => /^\s*(no|non|nein)\b/i.test(o)) || 'No';
-        const eg = groundedEligibilityAnswer(u.label, { authorizedToWork, yesText, noText });
+        const eg = groundedEligibilityAnswer(u.label, { authorizedToWork, yesText, noText, options: eopts });
         if (eg != null && await engine.fill([{ input: u.input, value: eg }])) {
           vlog('screen', `grounded-eligibility "${redactLabel(u.label)}" = ${redactValue(eg, u.label)} (authorizedToWork=${authorizedToWork})`);
           logLine('ok', `answered eligibility "${u.label.slice(0, 40)}" → ${eg} (from your work authorization)`);
@@ -2688,7 +2774,7 @@ export async function run(task, context, helpers) {
           // OWN option string so the grounded answer matches (else "Yes" wouldn't match "Oui").
           const yesText = opts.find((o) => /^\s*(yes|oui|s[ií]|ja)\b/i.test(o)) || 'Yes';
           const noText = opts.find((o) => /^\s*(no|non|nein)\b/i.test(o)) || 'No';
-          grounded = groundedEligibilityAnswer(u.label, { authorizedToWork, yesText, noText });
+          grounded = groundedEligibilityAnswer(u.label, { authorizedToWork, yesText, noText, options: opts });
         }
         if (grounded != null && await engine.fill([{ input: u.input, value: grounded }])) {
           // [TRACE 8] grounded-eligibility default applied from the profile (never invented).
@@ -3072,12 +3158,28 @@ export async function run(task, context, helpers) {
     if (driveablePack && typeof driveablePack.isSubmitHint === 'function') {
       try { packSubmit = !!driveablePack.isSubmitHint(btnText(btn), btn); } catch {}
     }
+    // NOTE: do NOT gate this on everHadForm. It tracks whether the form DETECTOR latched, not
+    // whether a form exists. Indeed's smartapply submits from a page reporting
+    // `haveForm=false root=none everHadForm=false` and is nonetheless a real, verifiable submit
+    // ("Submit your application", formGrounded=true, new-confirmation-node). Gating on it
+    // suppressed that genuine submit and broke the indeed-cloudflare fixture. The opener/submit
+    // distinction has to come from what the button SAYS, which is where it is now handled.
     const isFinal = packSubmit || isFinalSubmit(btn);
     // [TRACE 3] isFinalSubmit decision — is this the terminal submit, and via which recognizer.
     vlog('button', `isFinalSubmit("${redactLabel(btnText(btn))}")=${isFinal}${isFinal ? (packSubmit ? ' [ats-pack hint]' : ' [generic recognizer]') : ''} mode=${mode}`);
     if (isFinal) {
       // SAFETY NET: never submit a job that still has unanswered questions.
       if (parked.length) { reportParked('final-submit'); break; }
+      // SAFETY NET: never CLAIM a submit the browser is about to refuse. Park the fields it
+      // is refusing on — with their real question text — so they become answerable and learned,
+      // instead of clicking into a no-op and asking Pierre to confirm a phantom submission.
+      const blockers = nativeValidationBlockers(btn);
+      if (blockers.length) {
+        vlog('submit', `BLOCKED by native validation — ${blockers.length} required field(s) still invalid; not clicking`);
+        for (const b of blockers) park(b.label, 'text', null, b.message || 'required — the form will not submit until this is answered');
+        reportParked('native-validation');
+        break;
+      }
       // ---- CAPTCHA-gated ATS (BambooHR): fill everything, DO NOT submit ----
       // A reCAPTCHA sits above the submit button. We've filled the whole form; now we
       // PARK for a human to solve the CAPTCHA and click submit. Never auto-solve.

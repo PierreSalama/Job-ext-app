@@ -44,6 +44,134 @@ function stripAccents(s) {
   try { return s.normalize('NFKD').replace(/[̀-ͯ]/g, ''); } catch { return s; }
 }
 
+// Placeholder strings that describe the WIDGET, not the question — "Search to select an option",
+// "Select…", "Start typing". They must never become a field's label: the answer layer then sees a
+// prompt containing no question and refuses (correctly), which parks the whole application.
+const GENERIC_PLACEHOLDER_RX = /^\s*(?:search(?:\s+to\s+select(?:\s+an?\s+option)?)?|select(?:\s+an?)?(?:\s+(?:option|answer|one))?|choose(?:\s+an?)?(?:\s+(?:option|one))?|start\s+typing|type\s+to\s+search|please\s+select|-{1,2}\s*select\s*-{0,2}|n\/?a)\s*[.…]{0,3}\s*$/i;
+export function isGenericPlaceholder(s) {
+  const t = String(s || '').trim();
+  if (!t) return true;
+  return GENERIC_PLACEHOLDER_RX.test(t);
+}
+
+// Map a NUMERIC answer onto a RANGE option. Experience dropdowns are ranges — "Less than 1 year",
+// "1-3 years", "5-10 years", "More than 10 years" — while the profile holds a plain number ("6").
+// Text matching can never connect the two: "6" is not a substring of "5-10 years", so the field was
+// left unselected and the form refused to advance. Returns the index of the option whose range
+// contains the number, or -1 when the value is not numeric or no range fits.
+// PURE + exported so the arithmetic is node-testable without a DOM.
+export function matchNumericRangeOption(value, optionTexts) {
+  const raw = String(value == null ? '' : value).trim();
+  if (!/^\d{1,2}(?:\.\d+)?$/.test(raw)) return -1;         // only a bare number answers a range
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return -1;
+  const opts = (Array.isArray(optionTexts) ? optionTexts : []).map((t) => String(t || '').toLowerCase());
+  let fallbackMax = -1, fallbackMaxVal = -Infinity;
+  for (let i = 0; i < opts.length; i++) {
+    const t = opts[i];
+    if (!t) continue;
+    // "less than 1 year" / "under 1 year" / "<1"
+    let m = t.match(/(?:less than|under|fewer than|<)\s*(\d{1,2})/);
+    if (m && n < Number(m[1])) return i;
+    // "more than 10 years" / "over 10" / "10+" / "at least 10"
+    m = t.match(/(?:more than|over|at least|>=?|(\d{1,2})\s*\+)\s*(\d{1,2})?/);
+    if (m) {
+      const bound = Number(m[1] ?? m[2]);
+      if (Number.isFinite(bound) && /(?:more than|over|at least|\+|>)/.test(t)) {
+        if (n >= bound) { if (bound > fallbackMaxVal) { fallbackMaxVal = bound; fallbackMax = i; } }
+        continue;
+      }
+    }
+    // "1-3 years" / "1 to 3 years" / "3 – 5"
+    m = t.match(/(\d{1,2})\s*(?:-|–|—|to)\s*(\d{1,2})/);
+    if (m) {
+      const lo = Number(m[1]), hi = Number(m[2]);
+      if (n >= lo && n <= hi) return i;
+    }
+  }
+  return fallbackMax;    // e.g. 12 with options topping out at "more than 10 years"
+}
+
+// A text input that is really a SEARCHABLE SELECT: you must type and then PICK an option, and
+// typing alone leaves the widget unselected (the form then refuses to advance while the field
+// looks filled). Detected from a placeholder that implies CHOOSING — "Search to select an option",
+// "Select an option", "Choose one". Deliberately requires select/choose: a bare "Search…" box stays
+// plain text, so a real free-text field is never rerouted.
+const SEARCHABLE_SELECT_PLACEHOLDER_RX = /\b(?:select|choose|s[ée]lectionn|choisir)\b/i;
+export function looksLikeSearchableSelect(input) {
+  try {
+    if (!input || input.tagName !== 'INPUT') return false;
+    const type = String(input.type || 'text').toLowerCase();
+    if (type !== 'text' && type !== 'search') return false;
+    return SEARCHABLE_SELECT_PLACEHOLDER_RX.test(String(input.placeholder || ''));
+  } catch { return false; }
+}
+
+// Last-resort label: the real question often sits in an ancestor block ABOVE the widget (the same
+// shape as Indeed's stacked labels). Walk up a few levels, strip out nested form controls so we
+// read the PROMPT rather than the options, and take the nearest sensible text. Prefers an actual
+// question sentence when the block contains one.
+// maxUp was 5, which is not deep enough for react-select. Greenhouse nests the role=combobox input
+// SEVEN levels below the block holding the question:
+//   input → .select__input-container → .select__value-container → .select__control
+//         → .select-shell → .select__container → .select → .field-wrapper(question)
+// so the walk gave up, fieldLabel returned '', and scanUnknown dropped the field on its
+// `label.length < 4` guard — the required screening question was never even surfaced
+// (live: `trace:scan fillable=0 … unknown=0` on a form with 5 required questions).
+// Depth alone is not safe though: keep climbing and you eventually swallow the whole form and
+// blend several questions together. So the walk now stops the moment it leaves THIS field's own
+// wrapper — an ancestor containing more than one real control covers several questions. The
+// aria-hidden validation sentinel react-select puts beside the combobox is not a real control and
+// must not count, or the walk would stop one level short of the question every time.
+export function nearestQuestionText(input, maxUp = 8) {
+  try {
+    let el = input.parentElement;
+    for (let i = 0; i < maxUp && el; i++) {
+      try {
+        const controls = el.querySelectorAll?.('input:not([type="hidden"]):not([aria-hidden="true"]), select, textarea');
+        if (controls && controls.length > 1) break;
+      } catch { /* keep climbing */ }
+      let txt = '';
+      try {
+        const clone = el.cloneNode(true);
+        // Widget chrome is not part of the question. react-select renders its "Select…" prompt as
+        // a *div* (.select__placeholder), so element-type stripping alone leaves it glued to the
+        // front of the recovered label — "select... do you now, or will you in the future, …".
+        clone.querySelectorAll?.('input, select, textarea, button, option, [role="combobox"], [role="listbox"], [role="option"], [class*="placeholder" i]')
+          .forEach((n) => n.remove());
+        txt = String(clone.textContent || '').replace(/\s+/g, ' ').trim();
+      } catch { txt = ''; }
+      if (txt && txt.length >= 8 && txt.length <= 220 && !isGenericPlaceholder(txt)) {
+        // If the block holds a question, prefer that sentence over surrounding boilerplate.
+        const q = txt.match(/[^.?!]*\?/g);
+        return (q && q.length ? q[q.length - 1] : txt).trim();
+      }
+      el = el.parentElement;
+    }
+  } catch { /* fall through */ }
+  return '';
+}
+
+// The parent's FIRST label only belongs to this input if the parent wraps THIS FIELD ALONE.
+// Lever lays its form out flat — label, input, label, input, … all in one container — so
+// `parentElement.querySelector('label')` returned "Full name*" for EVERY field. The profile
+// matcher then saw "full name" in each label and filled the applicant's NAME into the email,
+// phone and location fields, and the application was submitted that way: the lever fixture passed
+// green while sending "Pierre Salama" as the email address. It only surfaced when the native
+// validation gate reported the browser's own complaint —
+//   "Please include an '@' in the email address. 'Pierre Salama' is missing an '@'."
+// Lever has 0 completed applies in production, consistent with sending malformed applications.
+// When the container holds several controls, its first label is whichever control comes first,
+// not ours — so skip this source and let label[for] / aria-label / previousElementSibling decide.
+function perFieldWrapperLabel(input) {
+  try {
+    const p = input.parentElement;
+    if (!p || typeof p.querySelectorAll !== 'function') return null;
+    if (p.querySelectorAll('input:not([type="hidden"]), select, textarea').length > 1) return null;
+    return p.querySelector('label, [class*="label"], [class*="Label"]');
+  } catch { return null; }
+}
+
 export function fieldLabel(input) {
   const root = input.getRootNode?.() || document;
   const sources = [
@@ -53,10 +181,22 @@ export function fieldLabel(input) {
     input.getAttribute('aria-labelledby') ? idRefText(root, input.getAttribute('aria-labelledby')) : '',
     elLabelText(input.closest('[role="group"]')?.querySelector('label, [class*="label"], [class*="Label"]')),
     elLabelText(input.previousElementSibling),
-    elLabelText(input.parentElement?.querySelector('label, [class*="label"], [class*="Label"]')),
-    input.placeholder,
+    elLabelText(perFieldWrapperLabel(input)),
+    // A GENERIC widget placeholder is UI chrome, not the question. Indeed's searchable dropdown
+    // renders "Search to select an option", and when no other source resolved, that string became
+    // the whole label — so the AI was handed a prompt with no question in it and correctly refused
+    // ("The actual application question is missing"), parking the application. Live 2026-07-25 this
+    // blocked 6 applications across 6 different employers. Drop the generic ones so the ancestor
+    // scan below gets a chance; a SPECIFIC placeholder ("e.g. 5 years") is still useful and kept.
+    isGenericPlaceholder(input.placeholder) ? '' : input.placeholder,
     input.name,
   ];
+  // Nothing usable yet? The real question often sits in an ancestor block above the widget (the
+  // same shape as Indeed's stacked labels). Look upward for the nearest question-like text.
+  if (!sources.some((s) => String(s || '').trim() && !isGenericPlaceholder(s))) {
+    const near = nearestQuestionText(input);
+    if (near) sources.push(near);
+  }
   let raw = sources.filter(Boolean).join(' ').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 300);
   // Collapse an EXACT "A A" doubling (two label sources — e.g. previousElementSibling AND the
   // parent's [class*=label] — returned the same heading), which otherwise reads as gibberish and
@@ -627,10 +767,16 @@ export async function fillCombobox(el, value) {
     // exact → the typed text is a prefix of the option (LinkedIn location: "Toronto, ON"
     // → "Toronto, Ontario, Canada") → substring. NO blind first-option pick (would mis-fill
     // a real dropdown like years-of-experience).
-    const pick = opts.find((o) => txt(o) === vl)
+    let pick = opts.find((o) => txt(o) === vl)
       || opts.find((o) => txt(o).startsWith(vl) && vl.length > 1)
       || opts.find((o) => vl.startsWith(txt(o)) && txt(o).length > 2)
       || opts.find((o) => txt(o).includes(vl) && vl.length > 2);
+    // A numeric answer against RANGE options ("6" vs "5-10 years") matches nothing textually —
+    // resolve it by arithmetic instead, else the widget stays unselected and the form won't advance.
+    if (!pick) {
+      const ri = matchNumericRangeOption(v, opts.map((o) => txt(o)));
+      if (ri >= 0) pick = opts[ri];
+    }
     if (!pick) {
       try { el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); } catch {}
       return false;
@@ -782,6 +928,13 @@ export class AutofillEngine {
         const v = String(s.value);
         const isCombo = s.input.getAttribute && (s.input.getAttribute('role') === 'combobox'
           || (s.input.closest && s.input.closest('[class*="select__control"],[class*="react-select"],[class*="-control"],[class*="basic-typeahead"]')));
+        // Indeed's searchable dropdown is a PLAIN <input type=text> — no role="combobox", no
+        // react-select class — whose placeholder ("Search to select an option") is the only hint
+        // that it expects a PICK, not typing. Typing into it leaves the widget unselected, so the
+        // form refuses to advance while the field looks filled. Detected via the placeholder and
+        // driven through the combobox path, with a fall-back to plain typing if no option list
+        // ever appears, so a genuinely-free-text field can never regress.
+        const isSearchableSelect = !isCombo && looksLikeSearchableSelect(s.input);
         if (s.input.tagName === 'SELECT') {
           const opt = matchOption(s.input, v);
           if (!opt) { emit(s, 'skipped-no-option'); continue; }
@@ -791,10 +944,13 @@ export class AutofillEngine {
             || String(opt.value).toLowerCase() === v.toLowerCase()
             || String(opt.text).toLowerCase().trim() === v.toLowerCase().trim());
           emit(s, snapped ? 'fuzzy-snapped' : 'filled', snapped ? (opt.text || opt.value) : undefined);
-        } else if (isCombo) {
+        } else if (isCombo || isSearchableSelect) {
           // custom dropdown / typeahead (Workday/Greenhouse/Lever/LinkedIn location) — async
-          if (!(await fillCombobox(s.input, v))) { emit(s, 'skipped-combobox-miss'); continue; }
-          emit(s, 'filled');
+          if (!(await fillCombobox(s.input, v))) {
+            if (!isSearchableSelect) { emit(s, 'skipped-combobox-miss'); continue; }
+            setNativeValue(s.input, v);          // no options appeared → it really was free text
+            emit(s, 'filled');
+          } else emit(s, 'filled');
         } else if (s.input.type === 'radio') {
           // Radio GROUPS (years-of-experience, work-authorization, salary band) are
           // not yes/no — pick the option in the group whose label best matches the

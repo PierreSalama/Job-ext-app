@@ -450,5 +450,125 @@
   {
     "ats": "greenhouse",
     "token": "collectivehealth"
+  },
+  {
+    "ats": "ashby",
+    "token": "wealthsimple"
+  },
+  {
+    "ats": "ashby",
+    "token": "jobber"
+  },
+  {
+    "ats": "ashby",
+    "token": "1password"
+  },
+  {
+    "ats": "ashby",
+    "token": "benevity"
+  },
+  {
+    "ats": "greenhouse",
+    "token": "thinkific"
+  },
+  {
+    "ats": "ashby",
+    "token": "docebo"
+  },
+  {
+    "ats": "ashby",
+    "token": "lightspeed"
+  },
+  {
+    "ats": "lever",
+    "token": "waveapps"
+  },
+  {
+    "ats": "ashby",
+    "token": "koho"
+  },
+  {
+    "ats": "ashby",
+    "token": "float"
+  },
+  {
+    "ats": "ashby",
+    "token": "hopper"
+  },
+  {
+    "ats": "greenhouse",
+    "token": "unbounce"
+  },
+  {
+    "ats": "greenhouse",
+    "token": "later"
+  },
+  {
+    "ats": "ashby",
+    "token": "jane"
+  },
+  {
+    "ats": "lever",
+    "token": "wattpad"
+  },
+  {
+    "ats": "greenhouse",
+    "token": "mejuri"
+  },
+  {
+    "ats": "lever",
+    "token": "knix"
+  },
+  {
+    "ats": "greenhouse",
+    "token": "geotab"
+  },
+  {
+    "ats": "greenhouse",
+    "token": "tulip"
+  },
+  {
+    "ats": "greenhouse",
+    "token": "flipp"
+  },
+  {
+    "ats": "ashby",
+    "token": "clearco"
+  },
+  {
+    "ats": "ashby",
+    "token": "neofinancial"
+  },
+  {
+    "ats": "ashby",
+    "token": "trulioo"
+  },
+  {
+    "ats": "ashby",
+    "token": "visier"
+  },
+  {
+    "ats": "ashby",
+    "token": "dapper"
+  },
+  {
+    "ats": "greenhouse",
+    "token": "figment"
+  },
+  {
+    "ats": "greenhouse",
+    "token": "tenstorrent"
+  },
+  {
+    "ats": "lever",
+    "token": "waabi"
+  },
+  {
+    "ats": "greenhouse",
+    "token": "pagerduty"
+  },
+  {
+    "ats": "lever",
+    "token": "pointclickcare"
   }
 ]

@@ -172,6 +172,43 @@ const SENIORITY_CAP = { any: 99, senior: 3, mid: 2, entry: 1 };
 // fit for a software-dev candidate — they require a doctorate. Skip them outright
 // (EN + FR, since LinkedIn QC postings are bilingual) so they never reach apply.
 const ACADEMIC_RE = /\b(post-?doc|postdoctoral|post-?doctorale|ph\.?\s?d|doctorate|doctoral|doctorant|research fellow(ship)?|bourse de recherche|bourse postdoctorale|professor|professeur|faculty|tenure[- ]track|lecturer|chercheur|chercheuse|ma[iî]tre de conf)\b/i;
+// Token-level keyword matching for the positive relevance gate, tolerant of the synonyms every job
+// board uses interchangeably. A strict all-tokens-must-appear rule looked right in tests but
+// over-filtered live: Pierre's keyword "frontend developer" missed the posting "Frontend Engineer",
+// and "web developer" missed "Web Programmer" — 36 of 75 queued jobs were being dropped, several of
+// them real matches. Developer/engineer/programmer are the SAME ROLE NOUN in postings, and
+// front end / front-end / frontend are the same word, so normalize both before comparing.
+// French forms matter on Canadian boards — a Montreal posting reads "Développeur(euse) Front-End",
+// which is the same job as "Frontend Developer" and was being filtered out as off-target.
+const ROLE_SYNONYMS = new Map([
+  ['engineer', 'developer'], ['programmer', 'developer'], ['dev', 'developer'], ['coder', 'developer'],
+  ['developpeur', 'developer'], ['developpeuse', 'developer'], ['programmeur', 'developer'],
+  ['ingenieur', 'developer'], ['ingenieure', 'developer'],
+  ['gestionnaire', 'manager'], ['chef', 'manager'], ['directeur', 'manager'],
+  ['projet', 'project'], ['projets', 'project'],
+]);
+// Strip accents so "développeur" / "ingénieur" reach the synonym table at all.
+const stripAccents = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '');
+function normalizeTitleText(s) {
+  return stripAccents(String(s || '')).toLowerCase()
+    .replace(/\bfront[\s-]?end\b/g, 'frontend')
+    .replace(/\bback[\s-]?end\b/g, 'backend')
+    .replace(/\bfull[\s-]?stack\b/g, 'fullstack');
+}
+const FIT_STOPWORDS = new Set(['and', 'or', 'the', 'a', 'an', 'of', 'for', 'in', 'to', 'with', 'at', 'on', 'sr', 'jr', 'senior', 'junior']);
+function fitTokens(s) {
+  return normalizeTitleText(s).split(/[^a-z0-9+#]+/)
+    .filter((x) => x && !FIT_STOPWORDS.has(x))
+    .map((x) => ROLE_SYNONYMS.get(x) || x);
+}
+// Every significant token of the keyword must appear in the title (order-independent, synonym-aware).
+function keywordTokensMatch(keyword, title) {
+  const kt = fitTokens(keyword);
+  if (!kt.length) return false;
+  const tt = new Set(fitTokens(title));
+  return kt.every((x) => tt.has(x));
+}
+
 function jobFit(jobOrTitle, aa) {
   const job = (jobOrTitle && typeof jobOrTitle === 'object') ? jobOrTitle : { title: jobOrTitle };
   const title = job.title || '';
@@ -218,13 +255,7 @@ function jobFit(jobOrTitle, aa) {
   if (aa && aa.requireKeywordMatch) {
     const kws = (aa.keywords || []).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean);
     if (kws.length) {
-      const STOP = new Set(['and', 'or', 'the', 'a', 'an', 'of', 'for', 'in', 'to', 'with', 'at', 'on']);
-      const titleTokens = new Set(t.split(/[^a-z0-9+#]+/).filter(Boolean));
-      const matched = kws.some((k) => {
-        if (t.includes(k)) return true;                       // full phrase present
-        const toks = k.split(/[^a-z0-9+#]+/).filter((x) => x && !STOP.has(x));
-        return toks.length > 0 && toks.every((x) => titleTokens.has(x));
-      });
+      const matched = kws.some((k) => t.includes(k) || keywordTokensMatch(k, t));
       if (!matched) return { ok: false, reason: 'off-target: title matches none of your keywords' };
     }
   }

@@ -97,3 +97,41 @@ test('exclusions still apply on top of a positive match', () => {
   const withExcl = { ...AA, excludeKeywords: ['intern'] };
   assert.equal(jobFit({ title: 'Telecom Project Manager Intern' }, withExcl).ok, false);
 });
+
+// ---- synonym tolerance -------------------------------------------------------------------------
+// A strict all-tokens rule read correctly but over-filtered live: with Pierre's keywords, 36 of 75
+// queued jobs were dropped — including "Frontend Engineer" (he has "frontend developer") and
+// "Web Programmer" (he has "web developer"). Boards use developer/engineer/programmer for the same
+// role, and front end / front-end / frontend for the same word.
+const DEV = {
+  requireKeywordMatch: true,
+  seniorityMax: 'any',
+  excludeKeywords: [],
+  keywords: ['full stack developer', 'frontend developer', 'web developer', 'software developer', 'react developer'],
+};
+
+test('developer / engineer / programmer are the same role noun', () => {
+  for (const title of ['Frontend Engineer', 'Web Programmer', 'Software Engineer', 'Full Stack Engineer'])
+    assert.ok(jobFit({ title }, DEV).ok, `${title} should match a *developer* keyword`);
+});
+
+test('front end / front-end / frontend are the same word', () => {
+  for (const title of ['Front End Developer', 'Front-End Developer', 'Frontend Developer'])
+    assert.ok(jobFit({ title }, DEV).ok, title);
+});
+
+test('French postings match their English keyword (Canadian boards)', () => {
+  // Real title from the live queue that was being filtered out as off-target.
+  assert.ok(jobFit({ title: 'Développeur(euse) Front-End' }, DEV).ok);
+  assert.ok(jobFit({ title: 'Développeur Web' }, DEV).ok);
+  // And for Ashraf's French-language equivalents.
+  assert.ok(jobFit({ title: 'Chef de projet télécommunications' }, AA).ok);
+});
+
+test('synonyms do NOT open the floodgates', () => {
+  // engineer→developer must not make unrelated engineering/trade roles match a software keyword.
+  for (const title of ['CNC Machinist', 'Electrical Project Engineer', 'PLC Programmer', 'Product Designer'])
+    assert.equal(jobFit({ title }, DEV).ok, false, `${title} must stay filtered`);
+  // ...and Ashraf's civil-engineering keywords must not swallow software roles.
+  assert.equal(jobFit({ title: 'Software Engineer, Networking' }, AA).ok, false);
+});

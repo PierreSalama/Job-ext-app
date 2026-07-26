@@ -259,7 +259,7 @@ export function pageRequiresResume(text) {
 // EN + FR + ES. Indeed smartapply screening questions are often French ("Êtes-vous autorisé à
 // travailler au Canada?") or Spanish; once the prompt is recovered the grounded default must
 // still match across language so the eligibility radio is answered, not parked.
-const ELIGIBILITY_AUTHORIZED_RX = /(legally\s+)?authori[sz]ed\s+to\s+work|eligible\s+to\s+work|right\s+to\s+work|work\s+(?:permit|authori[sz]ation)\b|are\s+you\s+(?:legally\s+)?(?:authori[sz]ed|eligible|permitted)\s+to\s+work|autoris[ée]{0,2}\s+(?:à|a|de|pour)\s+travailler|admissible\s+(?:à|a)\s+travailler|droit\s+de\s+travailler|permis\s+de\s+travail|habilit[ée]{0,2}\s+(?:à|a)\s+travailler|autorizad[oa]\s+(?:a|para)\s+trabajar|derecho\s+a\s+trabajar|elegible\s+para\s+trabajar/i;
+const ELIGIBILITY_AUTHORIZED_RX = /(legally\s+)?authori[sz]ed\s+to\s+work|eligible\s+to\s+work|right\s+to\s+work|work\s+(?:permit|authori[sz]ation)\b|are\s+you\s+(?:legally\s+)?(?:authori[sz]ed|eligible|permitted)\s+to\s+work|autoris[ée]{0,2}\s+(?:à|a|de|pour)\s+travailler|admissible\s+(?:à|a)\s+travailler|droit\s+de\s+travailler|permis\s+de\s+travail|habilit[ée]{0,2}\s+(?:à|a)\s+travailler|autorisation\s+(?:l[ée]gale\s+)?(?:de|d[’'])\s*travailler|autorizad[oa]\s+(?:a|para)\s+trabajar|derecho\s+a\s+trabajar|elegible\s+para\s+trabajar/i;
 const ELIGIBILITY_SPONSOR_RX = /(require|need|seek).{0,30}(sponsor|visa)|sponsor(ship)?\b.{0,30}(require|need|now or in the future)|(now or in the future).{0,30}sponsor|(?:besoin|exiger|exigez|requ[ié]|requerr|n[ée]cessit|aurez|avez)\b.{0,30}(?:parrainage|visa)|(?:parrainage|visa)\b.{0,30}(?:maintenant|futur|avenir|pr[ée]sent)|\bparrainage\b|\bpatrocinio\b/i;
 // "Are you able to perform the [essential] duties/functions of this position, with or without
 // reasonable accommodation?" — a standard ABILITY-to-do-the-job screen (very common on Indeed
@@ -281,9 +281,22 @@ const ABILITY_TO_PERFORM_RX = /\b(?:are you able to|able to|can you)\b[^?]{0,70}
 //                       null/undefined = unknown → return null (don't guess).
 //   yesText/noText    — the literal option strings to emit (defaults 'Yes'/'No') so a
 //                       select/radio whose options read e.g. "Yes, I am" can be matched.
-export function groundedEligibilityAnswer(label, { authorizedToWork = null, yesText = 'Yes', noText = 'No' } = {}) {
+export function groundedEligibilityAnswer(label, { authorizedToWork = null, yesText = 'Yes', noText = 'No', options = [] } = {}) {
   const t = String(label || '');
   if (!t.trim()) return null;
+  // A Yes/No answer is only meaningful if the control CAN express Yes/No. Work-authorization
+  // questions are frequently a STATUS list — "Canadian Citizen / Permanent Resident / Open Work
+  // Permit / Other" — with no yes-or-no option at all. The caller derives yesText from the options
+  // and falls back to the literal 'Yes', so without this guard we would try to select an option
+  // that does not exist on a LEGAL question, and a fuzzy match could land on an arbitrary status.
+  // Knowing someone is authorized to work does NOT tell us WHICH status they hold, so the honest
+  // outcome is to park for the user. (Live 2026-07-25: "Work authorization in Canada*" answered
+  // "Yes" against exactly such a list.)
+  const opts = Array.isArray(options) ? options.filter((o) => String(o || '').trim()) : [];
+  if (opts.length) {
+    const hasYesNo = opts.some((o) => /^\s*(yes|no|oui|non|s[ií]|nein|ja)\b/i.test(String(o)));
+    if (!hasYesNo) return null;
+  }
   // Ability-to-perform-the-job → always Yes (truthful for an applicant; independent of work auth).
   if (ABILITY_TO_PERFORM_RX.test(t)) return yesText;
   if (authorizedToWork == null) return null;        // unknown authorization → never guess

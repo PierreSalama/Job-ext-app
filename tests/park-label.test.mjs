@@ -50,8 +50,13 @@ test('no quoted field yields empty so the caller keeps its own fallback', () => 
 });
 
 test('the park call prefers target, then the reason field, and only then the stage name', () => {
+  // Ordering, not a literal expression — the fallback chain gained a structural step between the
+  // reason regex and the stage name (see ai-rescue-park-fields.test.mjs). What must never regress
+  // is that 'AI rescue' stays LAST; reaching it first makes the needs-you queue unreadable.
   const call = src.slice(src.indexOf("if (act.type === 'park')"));
-  const stmt = call.slice(0, call.indexOf('return \'parked\';'));
-  assert.match(stmt, /target \|\| fieldFromParkReason\(act\.reason\) \|\| 'AI rescue'/,
+  const stmt = call.slice(0, call.indexOf("if (act.type === 'click')"));
+  assert.match(stmt, /target \|\| fieldFromParkReason\(act\.reason\)/,
+    'the AI target then the field named in its reason must come first');
+  assert.ok(stmt.indexOf("fieldFromParkReason") < stmt.indexOf("'AI rescue'"),
     'regression: parking straight to the internal stage name makes the needs-you queue unreadable');
 });
