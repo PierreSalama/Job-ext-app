@@ -17,6 +17,9 @@ param(
 # ============================================================================
 
 $ErrorActionPreference = 'Continue'
+# Windows PowerShell 5.1 defaults to TLS 1.0/1.1, which GitHub/Google/Tailscale reject -
+# without this, every download below fails silently. Force TLS 1.2.
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 $Port = 7744; $Base = "http://127.0.0.1:$Port"; $Home_ = 'C:\ProgramData\JAT-Remote'
 $PierreTargets = @('100.93.122.106','BOBLAMA_PC','192.168.2.33','192.168.2.17')
 $AppUrl = 'https://github.com/PierreSalama/Job-ext-app/releases/download/v11.88.22/JAT-v11-setup.exe'
