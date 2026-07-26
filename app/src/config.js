@@ -18,6 +18,15 @@ const DEFAULTS = {
     remoteAccess: false,
   },
 
+  // Multi-node dashboard — OTHER JAT machines this dashboard can view (and, later,
+  // control): the "run a dedicated server laptop, watch it from my main PC" feature.
+  // The local machine ("This PC") is always implicit and never listed here; these are
+  // the REMOTE nodes, reached over the tailnet with each node's own token. Each entry:
+  //   { id: 'laptop', name: 'Laptop (server)', baseUrl: 'http://100.104.86.34:7744', token: '…' }
+  // Reads go direct from the dashboard (browser) to the node — CORS + remoteAccess make
+  // that work, the token is the access control. Empty by default (single-machine setup).
+  nodes: [],
+
   app: {
     closeToTray: true,       // closing the window keeps capture alive in the tray
     autoLaunch: false,       // start with Windows

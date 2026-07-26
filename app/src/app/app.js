@@ -171,6 +171,8 @@ const state = {
   pollTimer: null,
   lastWrite: 0,                      // ts of our last non-GET (suppresses own-change pills)
   route: { path: '/' },
+  nodes: [],                         // remote JAT machines (mirrors self settings.nodes)
+  aaNodeId: (() => { try { return localStorage.getItem('jat.aaNode') || 'self'; } catch { return 'self'; } })(),
   selection: new Set(),              // bulk selection on the applications list
   profileSel: null,
   apps: (() => {
@@ -200,28 +202,46 @@ function persistFilters() {
 }
 
 // ---------- API ----------
+// Multi-node: when a remote node is selected on the Auto-Apply page, `apiTarget` points
+// api() at that node's tailnet address + token instead of this machine. It defaults to
+// null (self), so every existing call is byte-for-byte unchanged. navigate() sets/clears
+// it per route; only the Auto-Apply view ever targets a remote node.
+let apiTarget = null;   // { base, token, isSelf } or null (self)
+function selfTarget() { return { base: state.base, token: state.token, isSelf: true, id: 'self', name: 'This PC' }; }
+// The node the Auto-Apply view is pointed at (persisted). Falls back to self if the stored
+// node was removed.
+function aaTarget() {
+  const id = state.aaNodeId || 'self';
+  if (id === 'self') return selfTarget();
+  const n = (state.nodes || []).find((x) => x && x.id === id);
+  if (!n || !n.baseUrl) return selfTarget();
+  return { base: n.baseUrl, token: n.token || '', isSelf: false, id: n.id, name: n.name || n.id };
+}
 async function api(path, opts = {}) {
   const { method = 'GET', body, timeoutMs = 20000, raw = false } = opts;
+  const tgt = opts.node || apiTarget || selfTarget();
   let res;
   try {
-    res = await fetch(state.base + path, {
+    res = await fetch(tgt.base + path, {
       method,
       headers: {
-        'X-JAT-Token': state.token || '',
+        'X-JAT-Token': tgt.token || '',
         ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (e) {
-    const err = new Error('app unreachable');
+    const err = new Error(tgt.isSelf ? 'app unreachable' : `${tgt.name} unreachable`);
     err.status = 0;
     throw err;
   }
   if (method !== 'GET') state.lastWrite = Date.now();
   if (res.status === 401) {
-    renderNotConnected();
-    const err = new Error('unauthorized');
+    // A 401 from THIS machine means we lost our token → show the reconnect screen. A 401
+    // from a REMOTE node must not blow away the local dashboard — surface it to the caller.
+    if (tgt.isSelf) renderNotConnected();
+    const err = new Error(tgt.isSelf ? 'unauthorized' : `${tgt.name}: unauthorized`);
     err.status = 401;
     throw err;
   }
@@ -239,11 +259,66 @@ async function api(path, opts = {}) {
   return data;
 }
 async function getSettings(force = false) {
+  // When the Auto-Apply view is pointed at a REMOTE node, return THAT node's settings
+  // (its keywords, enabled state, etc.) without overwriting this machine's cached settings
+  // — otherwise navigating away would show the remote node's config on local pages.
+  const remote = apiTarget && !apiTarget.isSelf;
+  if (remote) { const rr = await api('/settings'); return rr.settings || {}; }
   if (!force && state.settings) return state.settings;
   const r = await api('/settings');
   state.settings = r.settings || {};
   state.secretsPresent = r.secretsPresent || {};   // which secrets are saved (keys are redacted out of the response)
+  state.nodes = Array.isArray(state.settings.nodes) ? state.settings.nodes : [];   // remote-node registry
   return state.settings;
+}
+
+// ---------- Multi-node aggregation (Chunk 3) ----------
+// Dashboard / Applications / Pipeline ALWAYS show every machine combined. These helpers fetch a
+// path from this machine AND every remote node in parallel and merge the results. A node that is
+// unreachable is simply skipped (its data is omitted, the rest still render) — one machine being
+// off never blanks the combined view.
+function allTargets() {
+  const list = [selfTarget()];
+  for (const n of (state.nodes || [])) {
+    if (n && n.baseUrl) list.push({ base: n.baseUrl, token: n.token || '', isSelf: false, id: n.id, name: n.name || n.id });
+  }
+  return list;
+}
+async function fetchAllNodes(path) {
+  const targets = allTargets();
+  const settled = await Promise.allSettled(targets.map((t) => api(path, { node: t })));
+  return targets.map((t, i) => ({ node: t, ok: settled[i].status === 'fulfilled', data: settled[i].status === 'fulfilled' ? settled[i].value : null }));
+}
+// Same job applied from two machines = ONE row (deduped by URL), keeping the most-advanced status
+// so a combined total never double-counts.
+const _STATUS_RANK = { offer: 7, interview: 6, submitted: 5, applied: 5, awaiting_review: 4, responded: 4, rejected: 3, started: 2, saved: 1, new: 0 };
+async function mergedJobs(qs) {
+  const res = await fetchAllNodes('/jobs' + (qs ? ('?' + qs) : ''));
+  const seen = new Map();
+  for (const { node, data } of res) {
+    for (const j of (data && data.items) || []) {
+      const key = String(j.jobUrl || j.id || '').toLowerCase() || Math.random();
+      const ex = seen.get(key);
+      if (!ex || (_STATUS_RANK[j.status] || 0) > (_STATUS_RANK[ex.status] || 0)) {
+        seen.set(key, { ...j, _node: node.name, _nodeId: node.id });
+      }
+    }
+  }
+  const items = [...seen.values()].sort((a, b) => (Date.parse(b.updatedAt || 0) || 0) - (Date.parse(a.updatedAt || 0) || 0));
+  return { ok: true, items, total: items.length };
+}
+async function mergedStats() {
+  const res = await fetchAllNodes('/stats');
+  const out = { ok: true, total: 0, thisWeek: 0, needsReview: 0, submittedTotal: 0, submittedAuto: 0, submittedManual: 0, submittedToday: 0, byStatus: {}, bySource: {}, funnel: { submitted: 0, responded: 0, interviews: 0, offers: 0, responseRate: 0 } };
+  for (const { data } of res) {
+    if (!data) continue;
+    for (const k of ['total', 'thisWeek', 'needsReview', 'submittedTotal', 'submittedAuto', 'submittedManual', 'submittedToday']) out[k] += Number(data[k]) || 0;
+    for (const k in (data.byStatus || {})) out.byStatus[k] = (out.byStatus[k] || 0) + data.byStatus[k];
+    for (const k in (data.bySource || {})) out.bySource[k] = (out.bySource[k] || 0) + data.bySource[k];
+    for (const k of ['submitted', 'responded', 'interviews', 'offers']) out.funnel[k] += Number(data.funnel && data.funnel[k]) || 0;
+  }
+  out.funnel.responseRate = out.funnel.submitted ? out.funnel.responded / out.funnel.submitted : 0;
+  return out;
 }
 
 // ---------- Theme ----------
@@ -571,6 +646,9 @@ async function navigate(opts = {}) {
   const soft = opts && opts.soft === true;
   const path = (location.hash.replace(/^#/, '') || '/').replace(/\/+$/, '') || '/';
   state.route = { path };
+  // Multi-node: ONLY the Auto-Apply view can point at a remote node; every other route
+  // always talks to THIS machine. Self selection leaves apiTarget null → unchanged behavior.
+  apiTarget = (path === '/queue') ? (aaTarget().isSelf ? null : aaTarget()) : null;
   if (!soft) state.selection = new Set();   // keep multi-select intact across live refreshes
   if (!soft) closeAllOverlays();
   document.querySelectorAll('.nav-item').forEach((n) => {
@@ -883,8 +961,8 @@ async function paintRuntime() {
 // ============================================================
 route('/', async () => {
   const [statsR, jobsR, queueR, aiR, gmailR, liveR, bdR, trendR] = await Promise.all([
-    api('/stats'),
-    api('/jobs?limit=8'),
+    mergedStats(),               // headline totals = every machine combined
+    mergedJobs('limit=50'),      // recent applications across all machines (render slices to a few)
     api('/queue').catch(() => ({ items: [] })),
     api('/ai/status').catch(() => null),
     api('/gmail/status').catch(() => null),
@@ -1115,7 +1193,9 @@ route('/applications', async () => {
   else if (f.status !== 'all') q += '&status=' + encodeURIComponent(f.status);
   if (f.source !== 'all') q += '&source=' + encodeURIComponent(f.source);
   if (f.q) q += '&q=' + encodeURIComponent(f.q);
-  const [r, nyR] = await Promise.all([api(q), api('/auto-apply/needs-you').catch(() => ({ items: [] }))]);
+  // Applications is ALWAYS every machine combined (deduped by URL). needs-you stays local — it's
+  // this machine's "answer these to retry" queue, not a cross-machine total.
+  const [r, nyR] = await Promise.all([mergedJobs(q.slice(q.indexOf('?') + 1)), api('/auto-apply/needs-you').catch(() => ({ items: [] }))]);
   let rows = r.items || [];
   // Provenance filter (client-side — `via` is derived server-side, not a DB column).
   if (f.via === 'auto') rows = rows.filter((j) => j.via === 'auto' || j.autoApply);
@@ -1131,7 +1211,9 @@ route('/applications', async () => {
     return av.localeCompare(bv) * dir;
   });
 
-  const allSources = [...new Set((await api('/jobs?limit=500').catch(() => ({ items: rows }))).items?.map((j) => j.source).filter(Boolean) || [])].sort();
+  // Source filter options come from the already-merged combined rows (every machine), not a
+  // separate self-only fetch.
+  const allSources = [...new Set(rows.map((j) => j.source).filter(Boolean))].sort();
 
   const th = (key, label) => {
     const active = f.sort === key;
@@ -1692,7 +1774,7 @@ route(/^\/applications\/(?<id>.+)$/, async ({ id }) => {
 // VIEW: Pipeline kanban (#/pipeline)
 // ============================================================
 route('/pipeline', async () => {
-  const r = await api('/jobs?limit=500');
+  const r = await mergedJobs('limit=500');   // pipeline board = every machine combined
   const jobs = r.items || [];
   const b = state.board;
   const emailAcctR = await api('/email/accounts').catch(() => null);
@@ -2003,6 +2085,17 @@ route('/queue', async () => {
       <div class="section-footer"><button class="btn small primary" data-intake-save>Save answers & retry jobs</button></div>
     </section>` : '';
 
+  // Multi-node: which machine this view is pointed at. When a remote node is selected the
+  // whole page already reflects it (every call above went through api()→that node). Chunk 1
+  // is VIEW-ONLY: we surface the node's numbers but disable the controls (Start/Stop and
+  // settings for other machines land in the next chunk).
+  const aaTgt = aaTarget();
+  const viewingRemote = !aaTgt.isSelf;
+  const nodeOpts = [{ id: 'self', name: 'This PC' }].concat((state.nodes || []).map((n) => ({ id: n.id, name: n.name || n.id })));
+  const switcherHtml = nodeOpts.length > 1
+    ? `<select class="select aa-node-switch" id="aa-node-switch" title="Which machine's auto-apply to view">${nodeOpts.map((o) => `<option value="${esc(o.id)}"${o.id === (state.aaNodeId || 'self') ? ' selected' : ''}>${esc(o.name)}</option>`).join('')}</select>`
+    : '';
+
   const v = el(`<div>
     <header class="page-header">
       <div>
@@ -2011,11 +2104,13 @@ route('/queue', async () => {
         <div class="page-sub">Searches Easy-Apply jobs and applies — paced, review-first, always stoppable.</div>
       </div>
       <div class="page-actions aa-master">
+        ${switcherHtml}
         <span class="aa-timer" id="aa-timer" data-start="${aa.enabled && aa.startedAt ? esc(aa.startedAt) : ''}" title="Running for">${aa.enabled && aa.startedAt ? fmtElapsed(Date.now() - Date.parse(aa.startedAt)) : ''}</span>
         <button class="btn aa-power ${aa.enabled ? 'danger' : 'primary'}" data-power>${aa.enabled ? '⏹ Stop' : '▶ Start'}</button>
         <button class="btn" data-save>Save settings</button>
       </div>
     </header>
+    ${viewingRemote ? `<div class="aa-running" style="background:rgba(90,120,200,.14);border-color:rgba(90,120,200,.4)">👁 Viewing <strong>${esc(aaTgt.name)}</strong> — you can <strong>Start/Stop</strong> it from here. Editing its keywords and other settings stays on <strong>This PC</strong> for now.</div>` : ''}
 
     ${working ? '<div class="aa-running"><span class="aa-pulse"></span> Auto-apply is working in a background tab — <strong>don\'t touch that window</strong>. It\'s paced and you can Stop any time.</div>' : ''}
     ${(aa.enabled && aa.idleOnly === true && disc && disc.paused) ? `<div class="aa-running" style="background:rgba(120,124,160,.14);border-color:rgba(120,124,160,.35)">🌙 <strong>Idle-pause</strong> — ${esc(disc.pauseReason || 'you\'re using the computer')}. Auto-apply resumes automatically the moment you\'re idle and nothing is playing.</div>` : ''}
@@ -2193,7 +2288,7 @@ route('/queue', async () => {
     try {
       if (turnOn) {
         await api('/settings', { method: 'PATCH', body: { autoApply: { enabled: true } } });
-        toast('Auto-apply started — searching & applying, paced');
+        toast(viewingRemote ? `Auto-apply started on ${aaTgt.name}` : 'Auto-apply started — searching & applying, paced');
       } else {
         await api('/settings', { method: 'PATCH', body: { autoApply: { enabled: false } } });
         // STOPPING MUST NOT DESTROY THE QUEUE. This used to patch every queued/scheduled/running
@@ -2211,8 +2306,11 @@ route('/queue', async () => {
             await api('/queue/' + encodeURIComponent(t.id), { method: 'PATCH', body: { state: 'queued', lastError: null, transcriptAppend: { note: 'stopped from dashboard — returned to the queue, not skipped' } } });
           }
         }
-        stopAutoApplyTabs();   // close the run's tabs + drop the group (state already saved)
-        toast('Auto-apply stopped — tabs closed');
+        // stopAutoApplyTabs() closes THIS machine's browser tabs — only meaningful for a self
+        // stop. Stopping a remote node must not touch local tabs (the node winds its own down
+        // when enabled=false reaches its extension).
+        if (!viewingRemote) stopAutoApplyTabs();   // close the run's tabs + drop the group (state already saved)
+        toast(viewingRemote ? `Auto-apply stopped on ${aaTgt.name}` : 'Auto-apply stopped — tabs closed');
       }
       state.settings = null;
       navigate();
@@ -2419,7 +2517,11 @@ route('/queue', async () => {
     } catch { /* keep the last good render on a transient error */ }
   }
   aaLiveLoad = loadLive;
-  loadLive();
+  // Run it once the view is actually in the DOM (this render fn returns BEFORE navigate() mounts
+  // the node, so a synchronous loadLive() finds no #aa-live and no-ops — the panel then only
+  // filled via the 2.5s refresh interval, which is itself skipped while the tab is hidden). A
+  // deferred call paints the live numbers immediately and isn't visibility-gated.
+  setTimeout(loadLive, 0);
 
   aaHistoryLoad = loadHistory;
   v.querySelector('#aa-hist-range')?.addEventListener('change', loadHistory);
@@ -2536,6 +2638,27 @@ route('/queue', async () => {
     const lbl = wrap.querySelector('.muted');
     if (lbl) lbl.textContent = `${hidden} older hidden`;
   }));
+
+  // ---- Multi-node switcher (Chunk 1: view-only) ----
+  const nodeSwitch = v.querySelector('#aa-node-switch');
+  if (nodeSwitch) {
+    nodeSwitch.addEventListener('change', () => {
+      state.aaNodeId = nodeSwitch.value || 'self';
+      try { localStorage.setItem('jat.aaNode', state.aaNodeId); } catch {}
+      navigate();   // re-render this page against the newly-selected machine
+    });
+  }
+  // While viewing a REMOTE machine, keep it read-only EXCEPT the two controls that are safe and
+  // wanted cross-node: the node switcher, and Start/Stop (Chunk 2). Everything else — settings
+  // editing, retry/cancel of individual tasks — stays disabled so nothing is changed by accident
+  // on the other box. Start/Stop just flips that node's autoApply.enabled through api()→node.
+  if (viewingRemote) {
+    const powerBtn = v.querySelector('[data-power]');
+    v.querySelectorAll('button, input, select, textarea').forEach((elm) => {
+      if (elm === nodeSwitch || elm === powerBtn) return;
+      try { elm.disabled = true; elm.setAttribute('aria-disabled', 'true'); } catch {}
+    });
+  }
 
   return v;
 });
@@ -3847,6 +3970,23 @@ route('/settings', async () => {
     </section>
 
     <section class="section">
+      <header class="section-header"><div><div class="section-eyebrow">Network</div><h2 class="section-title">Machines (multi-node)</h2>
+        <div class="form-hint">Other JAT machines you view + control from here — e.g. an always-on server laptop. Each shows in the Auto-Apply switcher and is combined on Dashboard / Applications / Pipeline. Needs the machine's address (Tailscale or LAN) and its access token.</div></div></header>
+      <div class="section-body">
+        <div id="nodes-list">${(s.nodes || []).length
+          ? (s.nodes || []).map((n) => `<div class="rec-row" data-node="${esc(n.id)}"><span class="mono" style="flex:1;overflow:hidden;text-overflow:ellipsis">${esc(n.name)} — ${esc(n.baseUrl)}</span><button class="btn small rec-rm" type="button" data-node-rm="${esc(n.id)}">Remove</button></div>`).join('')
+          : '<div class="muted" style="font-size:12px">No other machines yet — add one below.</div>'}</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px">
+          <input class="input" id="node-name" placeholder="Name (e.g. Server laptop)" />
+          <input class="input" id="node-url" placeholder="http://100.x.x.x:7744" />
+          <input class="input" id="node-token" placeholder="Access token" style="grid-column:1/3" />
+          <button class="btn small primary" type="button" id="node-add" style="grid-column:1/3;justify-self:start">+ Add machine</button>
+        </div>
+        <div class="form-hint">On the other machine: Settings → Remote access shows its address; its token is in its dashboard URL (…/app/?token=<b>THIS</b>).</div>
+      </div>
+    </section>
+
+    <section class="section">
       <header class="section-header"><div><div class="section-eyebrow">Data</div><h2 class="section-title">Backup & portability</h2></div></header>
       <div class="section-body" style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn small" data-backup>Back up database now</button>
@@ -4159,6 +4299,32 @@ route('/settings', async () => {
     v.querySelectorAll('.swatch').forEach((x) => x.classList.toggle('active', x === sw));
   }));
 
+  // machines (multi-node registry) — writes settings.nodes on THIS machine
+  v.querySelector('#node-add')?.addEventListener('click', async () => {
+    const name = (v.querySelector('#node-name').value || '').trim();
+    const url = (v.querySelector('#node-url').value || '').trim().replace(/\/+$/, '');
+    const token = (v.querySelector('#node-token').value || '').trim();
+    if (!name || !url) { toast('Name and address are required', 'danger'); return; }
+    if (!/^https?:\/\//.test(url)) { toast('Address must start with http:// or https://', 'danger'); return; }
+    const base = (state.settings && state.settings.nodes) || [];
+    let id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || ('node-' + Date.now());
+    while (base.some((n) => n.id === id)) id += '-1';
+    try {
+      await api('/settings', { method: 'PATCH', body: { nodes: [...base, { id, name, baseUrl: url, token }] } });
+      state.settings = null; toast(`Added ${name}`); navigate();
+    } catch (e) { errToast(e); }
+  });
+  v.querySelectorAll('[data-node-rm]').forEach((btn) => btn.addEventListener('click', async () => {
+    const rmId = btn.dataset.nodeRm;
+    const base = (state.settings && state.settings.nodes) || [];
+    try {
+      await api('/settings', { method: 'PATCH', body: { nodes: base.filter((n) => n.id !== rmId) } });
+      // if the Auto-Apply view was pointed at the removed machine, fall back to This PC
+      if (state.aaNodeId === rmId) { state.aaNodeId = 'self'; try { localStorage.setItem('jat.aaNode', 'self'); } catch {} }
+      state.settings = null; toast('Machine removed'); navigate();
+    } catch (e) { errToast(e); }
+  }));
+
   // data section
   v.querySelector('[data-backup]').addEventListener('click', async () => {
     try {
@@ -4244,10 +4410,15 @@ async function boot(reauth = false) {
 
   if (state.token) {
     connectSSE();
-    getSettings(true).then((s) => {
+    // AWAIT the first settings load (not fire-and-forget) so the remote-node registry
+    // (state.nodes) is populated BEFORE the first navigate() — otherwise a page persisted
+    // on a remote node (Auto-Apply on "Laptop") can't resolve it yet and silently falls
+    // back to This PC.
+    try {
+      const s = await getSettings(true);
       const t = s.appearance?.theme;
       if (t) { applyTheme(t); try { localStorage.setItem(LS_THEME, t); } catch {} }
-    }).catch(() => {});
+    } catch {}
   }
 
   // Desktop host: reflect any pending update + a pairing request that may have
