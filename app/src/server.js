@@ -306,7 +306,10 @@ function easyApplyIngestEligible(source, easyApplyOnly, job = null) {
 // therefore share relevance, punishment, ranking, dedup and provenance behavior.
 function ingestDiscoveredJobs(source, jobs, { providerName = 'browser', batchId = null } = {}) {
   const s = db.getSettings().autoApply;
-  const easyApplyOnly = s.easyApplyOnly !== false;
+  // COOLDOWN FALLBACK: relax easyApplyOnly while LinkedIn Easy-Apply is cooled down (daily cap hit)
+  // so external/ATS postings are ingested (and then applied) instead of the queue starving until the
+  // cap resets. Reverts to Easy-Apply-only automatically once the cooldown lifts.
+  const easyApplyOnly = s.easyApplyOnly !== false && !db.easyApplyCooledDown();
   let enqueued = 0, rejected = 0, punished = 0, duplicates = 0;
   const ranked = [];
   for (const jd of (Array.isArray(jobs) ? jobs : []).slice(0, 100)) {

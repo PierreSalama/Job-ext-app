@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const db = require(path.join(here, '..', 'app', 'src', 'db.js'));
+const server = require(path.join(here, '..', 'app', 'src', 'server.js'));
 
 let dir;
 test.before(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jat-eatest-')); db.open(dir); });
@@ -81,4 +82,27 @@ test('queueNext pivot: cooled down skips LinkedIn Easy-Apply, still allows exter
 
   // Reset for any later tests.
   db.kvSet('easyApplyLimitUntil', new Date(Date.now() - 1000).toISOString());
+});
+
+// COOLDOWN FALLBACK (intake side): while Easy-Apply is cooled down, ingestDiscoveredJobs must relax
+// easyApplyOnly so external/ATS supply enters the queue (the dispatch pivot then flows it). Without
+// this the queue starved to LinkedIn-only during a cooldown and the node idled until the cap reset.
+test('cooldown fallback: intake ingests external jobs while Easy-Apply is cooled down', () => {
+  db.patchSettings({ autoApply: { easyApplyOnly: true } });
+  db.kvSet('easyApplyLimitUntil', new Date(Date.now() - 1000).toISOString());   // ensure NOT cooled down
+  assert.equal(db.easyApplyCooledDown(), false);
+
+  const extJob = () => ({ title: 'Software Engineer', company: 'ExtCo', source: 'ziprecruiter', location: 'Toronto, ON', jobUrl: `https://ext.example/${Math.random()}` });
+
+  // NOT cooled down + easyApplyOnly ON → a pure-aggregator external source is rejected (not enqueued).
+  const r1 = server.ingestDiscoveredJobs('ziprecruiter', [extJob()], { providerName: 'test' });
+  assert.equal(r1.enqueued, 0, 'external rejected under easyApplyOnly when not cooled down');
+
+  // Cooled down → easyApplyOnly relaxes at intake → the external job is ingested.
+  db.setEasyApplyCooldown({ hours: 24 });
+  assert.equal(db.easyApplyCooledDown(), true);
+  const r2 = server.ingestDiscoveredJobs('ziprecruiter', [extJob()], { providerName: 'test' });
+  assert.equal(r2.enqueued, 1, 'external ingested while cooled down (fallback keeps the node working)');
+
+  db.kvSet('easyApplyLimitUntil', new Date(Date.now() - 1000).toISOString());   // reset for later tests
 });

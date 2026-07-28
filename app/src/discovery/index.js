@@ -281,7 +281,11 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     // Fix 5(a): in Easy-Apply-only mode, only LinkedIn can yield real Easy-Apply jobs
     // (its search adds f_AL=true). Non-LinkedIn boards have no Easy-Apply concept, so
     // discovering from them just floods the queue with external postings that get skipped.
-    if (aa.easyApplyOnly !== false) {
+    // COOLDOWN FALLBACK: when LinkedIn Easy-Apply is cooled down (daily cap hit), relax easyApplyOnly
+    // so discovery also pulls external/ATS boards — the node keeps applying (external applies don't
+    // count against LinkedIn's cap) instead of idling until the cooldown lifts. Reverts automatically.
+    const effEasyApplyOnly = aa.easyApplyOnly !== false && !db.easyApplyCooledDown();
+    if (effEasyApplyOnly) {
       const easyBoards = selectBoards(boards, true);
       if (easyBoards.length) boards = easyBoards;
       else return { ok: false, reason: 'no-easy-apply-boards' };
@@ -359,7 +363,7 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
         // Under easyApplyOnly, ask JobSpy for ONLY board-hosted (Indeed-Apply / LinkedIn Easy-Apply)
         // jobs — the ones we can actually auto-submit — instead of the freshness window. This drops
         // the ~30% external company-site bounces that were the biggest source of wasted attempts.
-        const easyApply = aa.easyApplyOnly !== false && (source === 'indeed' || source === 'linkedin');
+        const easyApply = effEasyApplyOnly && (source === 'indeed' || source === 'linkedin');
         const done = await searchBoard({
           source, keyword: query.keyword, location: query.location, country, remote,
           limit: Math.max(10, Math.min(50, Number(aa.discovery?.perRunLimit) || 25)), force,
