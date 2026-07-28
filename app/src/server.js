@@ -409,7 +409,15 @@ async function queueNext(force = false) {
     if (concurrency <= 1 && stats.lastStart) {
       const baseGap = s.minGapMinutes + Math.random() * Math.max(0, s.maxGapMinutes - s.minGapMinutes);
       const eligibleAt = new Date(stats.lastStart).getTime() + baseGap * 60000;
-      if (Date.now() < eligibleAt) {
+      const wait = eligibleAt - Date.now();
+      // CLOCK-JUMP GUARD (headless laptop, 2026-07-27): the legitimate wait can NEVER exceed
+      // maxGapMinutes. On a box whose system clock jumps ("system time changed" events), a prior
+      // apply's `lastStart` can be recorded under a jumped-ahead clock, leaving `eligibleAt` hours
+      // in the future — the pump then gets reason='gap' on every 1-min tick and auto-apply stalls
+      // for hours (active=0, "stuck on pacing"). Only honour the gap when the wait is within the
+      // real max gap (+2s); a larger value means a corrupt clock, so dispatch instead of stalling.
+      const maxLegitWaitMs = Math.max(0, s.maxGapMinutes) * 60000 + 2000;
+      if (wait > 0 && wait <= maxLegitWaitMs) {
         return { task: null, reason: 'gap', nextEligibleAt: new Date(eligibleAt).toISOString(), concurrency };
       }
     }

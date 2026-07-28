@@ -687,7 +687,12 @@ const AA_PRIMARY_WINDOW_KEY = 'jat11.aaWindowId';
 const AA_WINDOW_POOL_KEY = 'jat11.aaWindowPool';
 const AA_REUSE_TAB_KEY = 'jat11.aaReuseTab';   // the ONE warm serial apply tab we navigate per job (Cloudflare session continuity)
 let aaReuseTabId = null;
-const AA_TAB_MAX_AGE_MS = 8 * 60 * 1000;   // a single apply should never need >8 min
+const AA_TAB_MAX_AGE_MS = 4.5 * 60 * 1000;   // 4.5 min. The 2-min jat11-aa-reaper alarm (alarms SURVIVE
+                                             // MV3 SW eviction, unlike setTimeout) closes an orphaned/hung
+                                             // apply tab here; reconcileAaTabsAndSlots then frees the
+                                             // concurrency slot. Kept just ABOVE APPLY_HARD_CAP_MS (4 min)
+                                             // so a normal run ends via its own cap first; this is the
+                                             // eviction-proof backstop that ends the 8-15 min pump stalls.
 const AA_TAB_CAP = 10;                       // hard ceiling on simultaneously-open AA tabs
 const AA_WINDOW_CAP = 5;                     // hard ceiling on owned AA windows (primary + workers); matches server concurrency clamp
 let aaTabs = {};                             // { [tabId]: createdAtMs }

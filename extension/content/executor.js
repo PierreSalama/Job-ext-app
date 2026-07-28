@@ -775,11 +775,38 @@ function findEasyApplyButton() {
   // (FILTER_LABEL_RX / FILTER_BAR_SEL), so an external "Apply on company website" anchor still
   // classifies external and a "Easy Apply filter" pill still classifies unknown.
   const candidates = [...qsa(sel), ...qsa('button, a, a[role="button"], [role="button"]')];
+  const matches = [];
   for (const el of [...new Set(candidates)]) {
     if (!el || el.disabled || !isProbablyVisible(el)) continue;
-    if (classifyApplyControl(el).state === 'linkedin_easy_apply_modal') return el;
+    if (classifyApplyControl(el).state === 'linkedin_easy_apply_modal') matches.push(el);
   }
-  return null;
+  if (!matches.length) return null;
+  // FIX (2026-07-27, laptop node): labelOf() reads textContent, so TWO false positives classify as
+  // Easy-Apply openers even though clicking them NEVER opens the modal (it navigates to the card's
+  // job / does nothing → haveForm stays false → the task times out — THE dominant LinkedIn failure):
+  //   (a) a job-LIST CARD: an <a> showing an "Easy Apply" BADGE inside a long
+  //       title+company+location+salary blob (measured live: labelLen ~155, 5 such cards on the page); and
+  //   (b) a top-card CONTAINER wrapping the real (obfuscated <a>) button.
+  // A genuine opener is the button ITSELF: an "Easy Apply" aria-label, one of LinkedIn's apply-button
+  // selectors, or a control whose OWN visible text is short (just "Easy Apply", not a card blob).
+  const EA_ARIA = /\beasy apply\b|candidature simplifi/i;
+  const ariaEA = (el) => { try { return EA_ARIA.test(el.getAttribute('aria-label') || ''); } catch { return false; } };
+  const isSel = (el) => { try { return !!(el.matches && el.matches(sel)); } catch { return false; } };
+  const shortLabel = (el) => { try { return ((el.textContent || '').replace(/\s+/g, ' ').trim().length <= 40); } catch { return true; } };
+  let real = matches.filter((el) => ariaEA(el) || isSel(el) || shortLabel(el));
+  // If a surviving opener still WRAPS another, keep the innermost actual control.
+  if (real.length > 1) real = real.filter((el) => !real.some((o) => o !== el && el.contains && el.contains(o)));
+  // No real opener yet — a search-LIST view (only card badges), or the detail-pane button hasn't
+  // rendered. Return null so the caller WAITS / retries (transient) instead of clicking a card blob
+  // and stalling forever.
+  if (!real.length) {
+    // All matches were false positives (job-list card badges / a wrapping container), or the real
+    // detail-pane button hasn't rendered yet. Return null so the caller waits/retries the transient
+    // page instead of clicking a card blob and stalling.
+    try { vlog('button', `easy-apply opener: ${matches.length} candidate(s) matched but none is a real button — waiting for the apply button`); } catch {}
+    return null;
+  }
+  return real.find(ariaEA) || real.find(isSel) || real[0];
 }
 
 function isFinalSubmit(el) {

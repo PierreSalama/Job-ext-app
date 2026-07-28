@@ -35,7 +35,11 @@ test('awaitingHuman (Cloudflare check) → LONG cap, overriding the hidden-stall
 });
 
 test('the caps changed: hidden-stall is much shorter than the full cap (75–90s range)', () => {
-  assert.equal(APPLY_HARD_CAP_MS, 330000);              // before: 5.5 min flat for every case
+  // 4 min (was 5.5): the setTimeout-based cap MUST fire before Chrome's ~5-min MV3 service-worker
+  // eviction (which destroys the setTimeout), or launchOne hangs and the concurrency-1 slot stays
+  // pinned until the server's 8-min stale-run reconcile — the headless-laptop "stuck on pacing" stall.
+  assert.equal(APPLY_HARD_CAP_MS, 240000);
+  assert.ok(APPLY_HARD_CAP_MS < 300000, 'cap must fire before Chrome\'s ~5-min SW eviction');
   assert.ok(APPLY_HIDDEN_STALL_CAP_MS >= 75000 && APPLY_HIDDEN_STALL_CAP_MS <= 90000, 'hidden cap in the 75–90s band');
   assert.ok(APPLY_HIDDEN_STALL_CAP_MS < APPLY_HARD_CAP_MS);
 });

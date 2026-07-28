@@ -9,7 +9,14 @@
 // cut its cap to ~90s so retry-stale re-attempts it later (when it may be foreground). A
 // merely-slow but VISIBLE tab never sends front-until-hydrated, so it keeps the full cap.
 
-export const APPLY_HARD_CAP_MS = 330000;          // 5.5 min — generous cap for a visible-but-slow tab
+// 4 min — MUST fire BEFORE Chrome's ~5-min MV3 service-worker eviction. The cap is enforced by a
+// setTimeout chain in background.js (launchOne), and Chrome DESTROYS all setTimeouts when it evicts
+// the SW. At the old 5.5 min the SW was evicted (~5 min) before the cap fired, so the timeout never
+// rejected, launchOne hung forever, and the concurrency-1 slot stayed pinned until the server's
+// 8-min stale-run reconcile — the "stuck on pacing for 8-15 min, nothing applies" stall on the
+// headless laptop node (2026-07-27). 4 min fires while the SW is still alive → the slot frees
+// cleanly. Still well above a normal Easy-Apply (1-3 min); a genuinely slower run is retried.
+export const APPLY_HARD_CAP_MS = 240000;
 export const APPLY_HIDDEN_STALL_CAP_MS = 90000;   // ~90s — hidden tab that asked to be fronted and still hasn't hydrated
 export const APPLY_HUMAN_CHECK_CAP_MS = 720000;   // 12 min — the USER is solving a Cloudflare check; never time them out
 
