@@ -269,8 +269,18 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     // while the queue sat full of ATS jobs, so LinkedIn dribbled ~2/hr instead of its ~30/hr.
     if (!force) {
       const ATS_FEED_SOURCES = new Set(['greenhouse', 'lever', 'ashby']);
+      // COOLDOWN: LinkedIn Easy-Apply is capped, so queued LinkedIn jobs CANNOT be dispatched — they
+      // must not count toward "queue full" or a backlog of stuck LinkedIn jobs starves the external/
+      // Indeed discovery that IS appliable during the cooldown (the node then idles until the cap resets).
+      let cooledDownGate = false;
+      try { cooledDownGate = db.easyApplyCooledDown(); } catch {}
       const jobspyQueued = db.queueList({ state: 'queued' })
-        .filter((t) => !ATS_FEED_SOURCES.has(String((t.job && t.job.source) || '').toLowerCase())).length;
+        .filter((t) => {
+          const src = String((t.job && t.job.source) || '').toLowerCase();
+          if (ATS_FEED_SOURCES.has(src)) return false;              // separate direct-ATS feed
+          if (cooledDownGate && src === 'linkedin') return false;   // stuck (capped) during cooldown
+          return true;
+        }).length;
       if (jobspyQueued >= (aa.discovery?.refillBelow || 3)) return { ok: false, reason: 'queue-full' };
     }
     // Board selection happens BEFORE combo selection: which boards a combo would scan on is needed
@@ -284,11 +294,19 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     // COOLDOWN FALLBACK: when LinkedIn Easy-Apply is cooled down (daily cap hit), relax easyApplyOnly
     // so discovery also pulls external/ATS boards — the node keeps applying (external applies don't
     // count against LinkedIn's cap) instead of idling until the cooldown lifts. Reverts automatically.
-    const effEasyApplyOnly = aa.easyApplyOnly !== false && !db.easyApplyCooledDown();
+    let cooledDown = false;
+    try { cooledDown = db.easyApplyCooledDown(); } catch {}
+    const effEasyApplyOnly = aa.easyApplyOnly !== false && !cooledDown;
     if (effEasyApplyOnly) {
       const easyBoards = selectBoards(boards, true);
       if (easyBoards.length) boards = easyBoards;
       else return { ok: false, reason: 'no-easy-apply-boards' };
+    } else if (cooledDown && aa.easyApplyOnly !== false) {
+      // During the cooldown, focus discovery on NON-LinkedIn boards (Indeed + external) we can actually
+      // apply to — searching LinkedIn would just pile up un-appliable jobs. If LinkedIn is the only
+      // configured board, leave it (nothing else to search; the queued LinkedIn jobs wait out the cap).
+      const nonLi = boards.filter((b) => b !== 'linkedin');
+      if (nonLi.length) boards = nonLi;
     }
     const boardIndex = Number(db.kvGet('discoveryBoardIndex')) || 0;
     const selectedBoards = [];
