@@ -69,9 +69,67 @@ function findFirefoxProfiles(profilesRoot) {
   });
 }
 
-// Snapshot cookies.sqlite (+ WAL/SHM) to a temp copy and read moz_cookies. Firefox holds
-// the live file open, so we never touch the original — we copy then read the copy.
+// Read moz_cookies. On Windows we read the LIVE file through the OS-bundled winsqlite3.dll
+// with immutable=1 — that opens a running Firefox's locked, WAL-mode cookies.sqlite CONCURRENTLY
+// (no lock conflict, ignores the hot WAL, reads the checkpointed main image). This is the only
+// thing that works while Firefox is actively applying: node-sqlite3-wasm can't read a locked file
+// at all, and a file-copy of a live WAL DB is torn/unopenable. Non-Windows (and as a fallback)
+// uses the copy-then-wasm path.
 function readCookieRows(dbPath) {
+  if (process.platform === 'win32') {
+    try {
+      const rows = readCookieRowsWinNative(dbPath);
+      if (Array.isArray(rows)) return rows;
+    } catch { /* fall through to the copy+wasm path */ }
+  }
+  return readCookieRowsCopyWasm(dbPath);
+}
+
+// Windows-native read via winsqlite3.dll (P/Invoke through PowerShell). Returns moz_cookies rows
+// [{name,value,host,path,expiry,isSecure,isHttpOnly,sameSite}] or throws.
+function readCookieRowsWinNative(dbPath) {
+  const { execFileSync } = require('child_process');
+  // C# helper: open file:...?immutable=1 READONLY|URI, emit LinkedIn+session rows as JSON.
+  const cs = [
+    'using System;using System.Runtime.InteropServices;using System.Text;using System.Collections.Generic;',
+    'public static class WSq{',
+    ' const string D=@"C:\\\\Windows\\\\System32\\\\winsqlite3.dll";',
+    ' [DllImport(D,CallingConvention=CallingConvention.Cdecl,CharSet=CharSet.Ansi)] static extern int sqlite3_open_v2(string f,out IntPtr db,int flags,IntPtr vfs);',
+    ' [DllImport(D,CallingConvention=CallingConvention.Cdecl,CharSet=CharSet.Ansi)] static extern int sqlite3_prepare_v2(IntPtr db,string sql,int n,out IntPtr st,IntPtr tail);',
+    ' [DllImport(D,CallingConvention=CallingConvention.Cdecl)] static extern int sqlite3_step(IntPtr st);',
+    ' [DllImport(D,CallingConvention=CallingConvention.Cdecl)] static extern IntPtr sqlite3_column_text(IntPtr st,int i);',
+    ' [DllImport(D,CallingConvention=CallingConvention.Cdecl)] static extern long sqlite3_column_int64(IntPtr st,int i);',
+    ' [DllImport(D,CallingConvention=CallingConvention.Cdecl)] static extern int sqlite3_finalize(IntPtr st);',
+    ' [DllImport(D,CallingConvention=CallingConvention.Cdecl)] static extern int sqlite3_close(IntPtr db);',
+    ' static string U(IntPtr p){ if(p==IntPtr.Zero) return ""; var b=new List<byte>(); int o=0; byte c; while((c=Marshal.ReadByte(p,o++))!=0) b.Add(c); return Encoding.UTF8.GetString(b.ToArray()); }',
+    ' static string J(string s){ if(s==null) return "\\"\\""; var sb=new StringBuilder("\\""); foreach(char c in s){ if(c==\'\\\\\'||c==\'"\') { sb.Append(\'\\\\\'); sb.Append(c);} else if(c==\'\\n\') sb.Append("\\\\n"); else if(c==\'\\r\') sb.Append("\\\\r"); else if(c==\'\\t\') sb.Append("\\\\t"); else if(c<32) sb.Append("\\\\u"+((int)c).ToString("x4")); else sb.Append(c);} sb.Append(\'"\'); return sb.ToString(); }',
+    ' public static string Json(string path){',
+    '  IntPtr db; int flags=1|0x40;',
+    '  string uri="file:///"+path.Replace("\\\\","/").Replace(" ","%20")+"?immutable=1";',
+    '  int rc=sqlite3_open_v2(uri,out db,flags,IntPtr.Zero); if(rc!=0) throw new Exception("open "+rc);',
+    '  IntPtr st; rc=sqlite3_prepare_v2(db,"SELECT name,value,host,path,expiry,isSecure,isHttpOnly,sameSite FROM moz_cookies",-1,out st,IntPtr.Zero);',
+    '  if(rc!=0){ sqlite3_close(db); throw new Exception("prep "+rc); }',
+    '  var sb=new StringBuilder("["); bool first=true;',
+    '  while(sqlite3_step(st)==100){ if(!first) sb.Append(","); first=false;',
+    '   sb.Append("{\\"name\\":"+J(U(sqlite3_column_text(st,0)))+",\\"value\\":"+J(U(sqlite3_column_text(st,1)))+",\\"host\\":"+J(U(sqlite3_column_text(st,2)))+",\\"path\\":"+J(U(sqlite3_column_text(st,3)))+",\\"expiry\\":"+sqlite3_column_int64(st,4)+",\\"isSecure\\":"+sqlite3_column_int64(st,5)+",\\"isHttpOnly\\":"+sqlite3_column_int64(st,6)+",\\"sameSite\\":"+sqlite3_column_int64(st,7)+"}"); }',
+    '  sqlite3_finalize(st); sqlite3_close(db); sb.Append("]"); return sb.ToString(); }',
+    '}',
+  ].join('\n');
+  const ps = "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';"
+    + '$cs=@"\n' + cs + '\n"@;'
+    + 'Add-Type -TypeDefinition $cs -Language CSharp;'
+    + '[Console]::OutputEncoding=[Text.Encoding]::UTF8;'
+    + '[WSq]::Json(' + JSON.stringify(dbPath) + ')';
+  const b64 = Buffer.from(ps, 'utf16le').toString('base64');
+  const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-EncodedCommand', b64],
+    { maxBuffer: 64 * 1024 * 1024, timeout: 25000, windowsHide: true }).toString('utf8').trim();
+  const json = out.slice(out.indexOf('['), out.lastIndexOf(']') + 1);
+  return JSON.parse(json);
+}
+
+// Fallback: snapshot cookies.sqlite (+ WAL/SHM) to a temp copy and read via node-sqlite3-wasm.
+// Works when the DB is unlocked (Firefox closed) or on non-Windows.
+function readCookieRowsCopyWasm(dbPath) {
   const tag = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const tmp = path.join(os.tmpdir(), `jat-cookies-${tag}.sqlite`);
   const copies = [tmp];
