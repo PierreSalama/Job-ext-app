@@ -3673,7 +3673,18 @@ function setEasyApplyCooldown({ hours = 24 } = {}) {
 function easyApplyCooledDown() {
   const until = kvGet('easyApplyLimitUntil');
   if (!until) return false;
-  return Date.now() < new Date(until).getTime();
+  if (Date.now() >= new Date(until).getTime()) return false;   // fixed 24h expiry — the safety net
+  // EARLY RESET DETECTION (the "switch back to Easy-Apply the instant the cap frees up"): LinkedIn's
+  // Easy-Apply cap is a ROLLING 24h (~50). As earlier applies age out of that window there's headroom
+  // again well BEFORE the fixed timer expires. So the moment the live rolling-24h count drops a safe
+  // margin below the observed limit, treat the cap as reset and resume Easy-Apply right away (external
+  // mode ends). The margin is a hysteresis band so it doesn't thrash one-apply-at-a-time at the edge.
+  const observed = Number(kvGet('easyApplyObservedLimit')) || 0;
+  if (observed > 0) {
+    const margin = Math.max(2, Math.round(observed * 0.1));
+    if (easyApplySubmitted24h() < observed - margin) return false;
+  }
+  return true;
 }
 
 function easyApplyStatus() {

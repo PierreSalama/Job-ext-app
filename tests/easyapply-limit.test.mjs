@@ -71,6 +71,7 @@ test('queueNext pivot: cooled down skips LinkedIn Easy-Apply, still allows exter
   assert.equal(db.easyApplyEligible(wd), true, 'Workday eligible when not cooled down');
 
   // Cooled down → LinkedIn NOT eligible, Workday still eligible.
+  db.kvSet('easyApplyObservedLimit', db.easyApplySubmitted24h());   // simulate: cap hit AT the current count (no headroom)
   db.setEasyApplyCooldown({ hours: 24 });
   assert.equal(db.easyApplyCooledDown(), true);
   assert.equal(db.easyApplyEligible(li), false, 'LinkedIn Easy-Apply deferred during cooldown');
@@ -99,10 +100,31 @@ test('cooldown fallback: intake ingests external jobs while Easy-Apply is cooled
   assert.equal(r1.enqueued, 0, 'external rejected under easyApplyOnly when not cooled down');
 
   // Cooled down → easyApplyOnly relaxes at intake → the external job is ingested.
+  db.kvSet('easyApplyObservedLimit', db.easyApplySubmitted24h());   // simulate: cap hit AT the current count (no headroom)
   db.setEasyApplyCooldown({ hours: 24 });
   assert.equal(db.easyApplyCooledDown(), true);
   const r2 = server.ingestDiscoveredJobs('ziprecruiter', [extJob()], { providerName: 'test' });
   assert.equal(r2.enqueued, 1, 'external ingested while cooled down (fallback keeps the node working)');
 
   db.kvSet('easyApplyLimitUntil', new Date(Date.now() - 1000).toISOString());   // reset for later tests
+});
+
+// EARLY RESET DETECTION: while the fixed 24h timer is still running, the cooldown must CLEAR the
+// instant the rolling-24h count drops a margin below the observed cap (headroom = the cap effectively
+// reset). This is what auto-switches back to Easy-Apply right away instead of waiting out the timer.
+test('early reset: cooldown clears once rolling-24h count is a margin below the observed limit', () => {
+  const now24 = db.easyApplySubmitted24h();
+  db.kvSet('easyApplyLimitUntil', new Date(Date.now() + 24 * 3600 * 1000).toISOString());   // fresh 24h timer
+
+  // Observed limit well ABOVE the current count → real headroom → cap treated as reset → NOT cooled.
+  db.kvSet('easyApplyObservedLimit', now24 + 50);
+  assert.equal(db.easyApplyCooledDown(), false, 'headroom below the cap → resume Easy-Apply right away');
+
+  // Observed limit == current count → sitting AT the cap → stay cooled (external mode).
+  db.kvSet('easyApplyObservedLimit', now24);
+  assert.equal(db.easyApplyCooledDown(), true, 'at the cap → stay in external mode');
+
+  // The fixed timer is still the outer safety net: expired timer → not cooled regardless of count.
+  db.kvSet('easyApplyLimitUntil', new Date(Date.now() - 1000).toISOString());
+  assert.equal(db.easyApplyCooledDown(), false, 'expired 24h timer always clears');
 });
