@@ -11,6 +11,7 @@ const {
 const path = require('path');
 const crypto = require('crypto');
 const { startServer, stopServer, getToken, broadcast, rescanAllFolders, startFolderWatchers, ingestDiscoveredJobs } = require('./server');
+const sessionSync = require('./session-sync');
 const { createDiscoveryService } = require('./discovery');
 const { createAtsBoardsService } = require('./discovery/ats-boards');
 const db = require('./db');
@@ -689,6 +690,12 @@ app.whenReady().then(async () => {
       await startServer(port, serverOpts);
       serverUp = true;
       log.info(`server listening on http://127.0.0.1:${port}${attempt > 1 ? ` (after ${attempt} attempts)` : ''}`);
+      // Session bridge: on the laptop's Dad-instance this starts the loop that keeps Dad's
+      // Chrome logged in. No-ops everywhere else (sessionSync.enabled is off by default).
+      try {
+        const r = sessionSync.applyFromSettings(db.getSettings(), { log: (lvl, m) => ((log[lvl] || log.info).call(log, m)) });
+        if (r.started) log.info('session sync started (Dad-instance)');
+      } catch (e) { log.warn('session sync boot skipped', e.message); }
     } catch (e) {
       if (e.code === 'EADDRINUSE' && attempt < 6) {
         log.warn(`port ${port} busy — retry ${attempt}/5 in 1.5s (a stale JAT socket may still be releasing)`);

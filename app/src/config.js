@@ -280,6 +280,16 @@ const DEFAULTS = {
                              // backup file (daily + manual + per-migration). Oldest go first;
                              // today's is never removed.
   },
+  // Session bridge (laptop dad-instance only): keep a dedicated browser logged in as another
+  // user by periodically pulling their LinkedIn session from THEIR node and injecting it via CDP.
+  // OFF everywhere by default; only the laptop's Dad-instance turns this on.
+  sessionSync: {
+    enabled: false,
+    sourceBaseUrl: '',       // e.g. http://100.105.39.32:7744 (Dad's node)
+    sourceToken: '',         // Dad's node token (sealed at rest)
+    cdpPort: 0,              // --remote-debugging-port of the dedicated Chrome on THIS machine
+    intervalMinutes: 30,     // how often to re-pull/re-inject (cookies rotate)
+  },
 };
 
 module.exports = { DEFAULTS };

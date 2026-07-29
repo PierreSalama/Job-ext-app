@@ -999,6 +999,7 @@ const SECRET_SETTINGS = [
   ['ai', 'claude.apiKey'],
   ['ai', 'chatgpt.apiKey'],
   ['gmail', 'clientSecret'],
+  ['sessionSync', 'sourceToken'],   // Dad's node token — sealed at rest, redacted to clients
 ];
 const SECRET_KV = new Set(['gmailTokens', 'emailAccounts']);
 

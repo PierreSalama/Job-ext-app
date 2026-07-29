@@ -22,6 +22,8 @@ const { extractText } = require('./ai/extract');
 const hardware = require('./hardware');
 const localsetup = require('./localsetup');
 const fit = require('./fit');
+const sessionBridge = require('./session-bridge');
+const sessionSync = require('./session-sync');
 const { scope } = require('./logger');
 
 const log = scope('server');
@@ -879,6 +881,50 @@ async function handle(req, res, parsed) {
     const extensionConnected = pairedClients.some((c) => /^moz-extension:\/\//.test(c.origin) || /^chrome-extension:\/\//.test(c.origin));
     return sendJson(res, 200, { ok: true, hostname: (() => { try { return os2.hostname(); } catch { return ''; } })(), port, remoteAccess, ips, pairedClients, extensionConnected });
   }
+  // ---- session bridge: serve THIS machine's logged-in LinkedIn session so another node
+  // (the server laptop running Dad's search) can assume it — no password, no new-device login.
+  // Opt-in per node (default OFF): the response carries li_at, which is full account access, so it
+  // is only ever exposed when explicitly enabled AND to a token-holder over the private tailnet.
+  // POST /session/bridge { enabled } → turn the source on/off for this node.
+  if (req.method === 'POST' && pathname === '/session/bridge') {
+    let body = {};
+    try { body = JSON.parse(await readBodyText(req, 4 * 1024) || '{}'); } catch { return sendJson(res, 400, { ok: false, error: 'bad json' }); }
+    db.kvSet('sessionBridgeEnabled', body.enabled ? 1 : 0);
+    if (body.firefoxProfilesRoot != null) db.kvSet('firefoxProfilesRoot', String(body.firefoxProfilesRoot || ''));
+    return sendJson(res, 200, { ok: true, enabled: !!body.enabled });
+  }
+  // GET /session/linkedin → the extracted LinkedIn session cookies (only when the bridge is on).
+  if (req.method === 'GET' && pathname === '/session/linkedin') {
+    if (!db.kvGet('sessionBridgeEnabled')) return sendJson(res, 403, { ok: false, error: 'session bridge is disabled on this node (POST /session/bridge {enabled:true})' });
+    const root = db.kvGet('firefoxProfilesRoot') || undefined;
+    const r = sessionBridge.extractLinkedInSession({ profilesRoot: root });
+    // Never put the local profile path on the wire.
+    const { source, ...safe } = r;
+    return sendJson(res, r.ok ? 200 : 404, safe);
+  }
+
+  // ---- session sync (laptop Dad-instance): keep Dad's Chrome logged in via the bridge ----
+  // GET /session/sync → is the loop running + its last result.
+  if (req.method === 'GET' && pathname === '/session/sync') {
+    return sendJson(res, 200, { ok: true, ...sessionSync.status() });
+  }
+  // POST /session/sync/config { enabled, sourceBaseUrl, sourceToken, cdpPort, intervalMinutes }
+  // → persist + (re)start the loop. How the laptop's Dad-instance gets pointed at Dad's node.
+  if (req.method === 'POST' && pathname === '/session/sync/config') {
+    let body = {};
+    try { body = JSON.parse(await readBodyText(req, 8 * 1024) || '{}'); } catch { return sendJson(res, 400, { ok: false, error: 'bad json' }); }
+    db.patchSettings({ sessionSync: body });
+    const applied = sessionSync.applyFromSettings(db.getSettings(), { log: (lvl, m) => ((log[lvl] || log.info).call(log, m)) });
+    return sendJson(res, 200, { ok: true, applied, status: sessionSync.status() });
+  }
+  // POST /session/sync/now → force one pull+inject immediately (setup / debugging).
+  if (req.method === 'POST' && pathname === '/session/sync/now') {
+    const a = sessionSync.active();
+    if (!a) return sendJson(res, 409, { ok: false, error: 'session sync is not enabled on this node' });
+    const r = await a.syncOnce();
+    return sendJson(res, r.ok ? 200 : 502, { ok: r.ok, result: r });
+  }
+
   // GET /logs → the app's log files (name/size/mtime, newest first).
   if (req.method === 'GET' && pathname === '/logs') {
     const fsL = require('fs');
