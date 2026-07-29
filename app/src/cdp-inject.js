@@ -32,34 +32,101 @@ async function cdpHttp(host, port, pathname) {
   return res.json();
 }
 
-// Open a CDP websocket. Returns { send(method, params) → Promise<result>, close() }.
+// Minimal WebSocket frame codec (RFC 6455). Client→server frames MUST be masked; the CDP server
+// sends unmasked text frames. Kept tiny — we only need text + close.
+function encodeTextFrame(payloadBuf) {
+  const len = payloadBuf.length;
+  const mask = require('crypto').randomBytes(4);
+  let header;
+  if (len < 126) { header = Buffer.from([0x81, 0x80 | len]); }
+  else if (len < 65536) { header = Buffer.alloc(4); header[0] = 0x81; header[1] = 0x80 | 126; header.writeUInt16BE(len, 2); }
+  else { header = Buffer.alloc(10); header[0] = 0x81; header[1] = 0x80 | 127; header.writeUInt32BE(0, 2); header.writeUInt32BE(len, 6); }
+  const masked = Buffer.alloc(len);
+  for (let i = 0; i < len; i++) masked[i] = payloadBuf[i] ^ mask[i & 3];
+  return Buffer.concat([header, mask, masked]);
+}
+function decodeFrame(buf) {
+  if (buf.length < 2) return null;
+  const opcode = buf[0] & 0x0f;
+  const masked = (buf[1] & 0x80) !== 0;
+  let len = buf[1] & 0x7f;
+  let off = 2;
+  if (len === 126) { if (buf.length < 4) return null; len = buf.readUInt16BE(2); off = 4; }
+  else if (len === 127) { if (buf.length < 10) return null; len = Number(buf.readBigUInt64BE(2)); off = 10; }
+  let maskKey = null;
+  if (masked) { if (buf.length < off + 4) return null; maskKey = buf.slice(off, off + 4); off += 4; }
+  if (buf.length < off + len) return null;
+  let payload = buf.slice(off, off + len);
+  if (masked) { const p = Buffer.alloc(len); for (let i = 0; i < len; i++) p[i] = payload[i] ^ maskKey[i & 3]; payload = p; }
+  return { opcode, payload, rest: buf.slice(off + len) };
+}
+
+// Open a CDP websocket over a raw TCP socket — no global WebSocket needed (Electron's main
+// process doesn't expose one). Returns { send(method, params) → Promise<result>, close() }.
 function openCdp(wsUrl, { timeoutMs = 8000 } = {}) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsUrl);
+    let u; try { u = new URL(wsUrl); } catch { return reject(new Error('bad ws url')); }
+    const net = require('net');
+    const crypto = require('crypto');
+    const host = u.hostname;
+    const port = Number(u.port) || 80;
+    const pathq = u.pathname + (u.search || '');
+    const key = crypto.randomBytes(16).toString('base64');
+    const sock = net.connect(port, host);
     const pending = new Map();
     let nextId = 1;
-    const to = setTimeout(() => { try { ws.close(); } catch {} reject(new Error('CDP connect timeout')); }, timeoutMs);
-    ws.addEventListener('open', () => {
-      clearTimeout(to);
-      resolve({
-        send(method, params = {}) {
-          return new Promise((res, rej) => {
-            const id = nextId++;
-            pending.set(id, { res, rej });
-            ws.send(JSON.stringify({ id, method, params }));
-          });
-        },
-        close() { try { ws.close(); } catch {} },
-      });
+    let handshaken = false;
+    let buf = Buffer.alloc(0);
+    const to = setTimeout(() => { try { sock.destroy(); } catch {} reject(new Error('CDP connect timeout')); }, timeoutMs);
+
+    const api = {
+      send(method, params = {}) {
+        return new Promise((res, rej) => {
+          const id = nextId++;
+          pending.set(id, { res, rej });
+          try { sock.write(encodeTextFrame(Buffer.from(JSON.stringify({ id, method, params }), 'utf8'))); }
+          catch (e) { pending.delete(id); rej(e); }
+        });
+      },
+      close() { try { sock.destroy(); } catch {} },
+    };
+
+    sock.on('connect', () => {
+      sock.write(
+        `GET ${pathq} HTTP/1.1\r\n` +
+        `Host: ${host}:${port}\r\n` +
+        `Upgrade: websocket\r\n` +
+        `Connection: Upgrade\r\n` +
+        `Sec-WebSocket-Key: ${key}\r\n` +
+        `Sec-WebSocket-Version: 13\r\n\r\n`,
+      );
     });
-    ws.addEventListener('message', (ev) => {
-      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.id && pending.has(msg.id)) {
-        const { res, rej } = pending.get(msg.id); pending.delete(msg.id);
-        if (msg.error) rej(new Error(msg.error.message || 'CDP error')); else res(msg.result);
+    sock.on('data', (d) => {
+      buf = Buffer.concat([buf, d]);
+      if (!handshaken) {
+        const idx = buf.indexOf('\r\n\r\n');
+        if (idx === -1) return;
+        const statusLine = buf.slice(0, idx).toString().split('\r\n')[0];
+        if (!/\b101\b/.test(statusLine)) { clearTimeout(to); sock.destroy(); return reject(new Error('ws handshake failed: ' + statusLine)); }
+        handshaken = true;
+        buf = buf.slice(idx + 4);
+        clearTimeout(to);
+        resolve(api);
+      }
+      while (handshaken) {
+        const frame = decodeFrame(buf);
+        if (!frame) break;
+        buf = frame.rest;
+        if (frame.opcode === 1) {
+          let msg; try { msg = JSON.parse(frame.payload.toString('utf8')); } catch { continue; }
+          if (msg.id && pending.has(msg.id)) {
+            const { res, rej } = pending.get(msg.id); pending.delete(msg.id);
+            if (msg.error) rej(new Error(msg.error.message || 'CDP error')); else res(msg.result);
+          }
+        } else if (frame.opcode === 8) { try { sock.destroy(); } catch {} }
       }
     });
-    ws.addEventListener('error', () => { clearTimeout(to); reject(new Error('CDP websocket error')); });
+    sock.on('error', (e) => { clearTimeout(to); reject(new Error('CDP socket: ' + e.message)); });
   });
 }
 
