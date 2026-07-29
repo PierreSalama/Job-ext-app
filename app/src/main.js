@@ -25,6 +25,15 @@ const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 // at a scratch dir so dev/test runs never touch the real jat11-app data. Unset = normal behavior.
 if (process.env.JAT_USERDATA) app.setPath('userData', process.env.JAT_USERDATA);
 
+// A SECOND instance on the same machine (the laptop running Dad's search alongside Pierre's)
+// sets JAT_PORT so it doesn't collide with the first on the default 7744. Falls back to the
+// stored setting. Paired with JAT_USERDATA, this makes a fully isolated co-resident instance.
+function effectivePort() {
+  const env = parseInt(process.env.JAT_PORT || '', 10);
+  if (env > 0 && env < 65536) return env;
+  try { return db.getSettings().server.port; } catch { return 7744; }
+}
+
 // Last-resort crash guards: a background subsystem (e.g. a child-process spawn ENOENT,
 // a rejected promise deep in the AI chain) must NEVER take the whole app down. Dad's
 // logs showed an uncaughtException from `spawn ollama ENOENT`. Log and keep running.
@@ -587,7 +596,7 @@ async function pipelineWatchdogTick() {
 ipcMain.handle('jat:boot', () => ({
   token: getToken(),
   version: app.getVersion(),
-  port: db.getSettings().server.port,
+  port: effectivePort(),
   platform: process.platform,
 }));
 ipcMain.handle('jat:open-external', (_e, url) => {
@@ -657,7 +666,7 @@ app.whenReady().then(async () => {
     if (discoveryRepair.interrupted || discoveryRepair.staleClaims) log.info(`reconciled discovery: ${discoveryRepair.interrupted} interrupted, ${discoveryRepair.staleClaims} stale fallback claim(s)`);
   } catch (e) { log.warn('reconcileDiscovery failed', e); }
 
-  const port = db.getSettings().server.port;
+  const port = effectivePort();
   discoveryService = createDiscoveryService({
     ingestJobs: (source, jobs, meta) => ingestDiscoveredJobs(source, jobs, {
       providerName: meta?.provider || 'jobspy', batchId: meta?.batchId || null,
