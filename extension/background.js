@@ -886,8 +886,20 @@ function allOwnedWindowIds() {
   return normalizeWindowIds([aaWindowId, ...aaWindowPool]);
 }
 function isBlankChromeTab(t) {
-  const u = String(t?.url || '');
-  return !u || u === 'about:blank' || u.startsWith('chrome://newtab') || u.startsWith('edge://newtab');
+  const u = String(t?.url || '').toLowerCase();
+  // Recognize the blank / new-tab / home page across Chrome, Edge AND FIREFOX. This gates whether a
+  // dedicated apply window counts as "empty" (safe to close) vs "has a real user tab" (leave open).
+  // The window that chrome.windows.create() opens gets a browser new-tab; on Firefox that URL is
+  // about:newtab / about:home (not chrome://newtab), so the OLD Chrome-only check misread it as a
+  // user tab → windowHasUserTabs()=true → the apply window was NEVER closed and orphaned windows piled
+  // up by the dozen (dad's Firefox: 20-30 windows that Stop couldn't clear). Cover the Firefox URLs.
+  return !u
+    || u === 'about:blank'
+    || u === 'about:newtab'
+    || u === 'about:home'
+    || u === 'about:privatebrowsing'
+    || u.startsWith('chrome://newtab')
+    || u.startsWith('edge://newtab');
 }
 // A user (or Chrome) closing a tab must drop it from the registry too.
 chrome.tabs.onRemoved.addListener((tabId) => {
