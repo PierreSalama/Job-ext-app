@@ -218,8 +218,12 @@ function aaTarget() {
   return { base: n.baseUrl, token: n.token || '', isSelf: false, id: n.id, name: n.name || n.id };
 }
 async function api(path, opts = {}) {
-  const { method = 'GET', body, timeoutMs = 20000, raw = false } = opts;
+  const { method = 'GET', body, raw = false } = opts;
   const tgt = opts.node || apiTarget || selfTarget();
+  // A REMOTE node that's offline/asleep must fail FAST (5s) so it can't hang the UI on 20s-per-call
+  // timeouts (the "picking dad's laptop loads forever + can't switch back" bug). Self keeps the
+  // generous 20s. An explicit opts.timeoutMs always wins (AI calls, uploads, folder scans).
+  const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : (tgt.isSelf ? 20000 : 5000);
   let res;
   try {
     res = await fetch(tgt.base + path, {
@@ -1984,14 +1988,56 @@ route('/pipeline', async () => {
 // ============================================================
 // VIEW: Auto-apply queue (#/queue)
 // ============================================================
+// Minimal Auto-apply view shown when a SELECTED REMOTE node is unreachable: just the machine
+// switcher (so you can switch back to This PC) + a clear error. Prevents the "loads forever, can't
+// switch back" hang when dad's laptop is offline/asleep.
+function remoteNodeUnreachableView(tgt) {
+  const nodeOpts = [{ id: 'self', name: 'This PC' }].concat((state.nodes || []).map((n) => ({ id: n.id, name: n.name || n.id })));
+  const v = el(`<div>
+    <header class="page-header">
+      <div>
+        <div class="page-eyebrow">Automate</div>
+        <h1 class="page-title">Auto-apply</h1>
+        <div class="page-sub">Searches Easy-Apply jobs and applies — paced, review-first, always stoppable.</div>
+      </div>
+      <div class="page-actions">
+        <select class="select aa-node-switch" id="aa-node-switch" title="Which machine's auto-apply to view">${nodeOpts.map((o) => `<option value="${esc(o.id)}"${o.id === (state.aaNodeId || 'self') ? ' selected' : ''}>${esc(o.name)}</option>`).join('')}</select>
+      </div>
+    </header>
+    <div class="aa-running" style="background:rgba(200,90,90,.14);border-color:rgba(200,90,90,.45)">
+      ⚠ Couldn't reach <strong>${esc(tgt.name)}</strong> — it may be offline, asleep, or off the network. Pick <strong>This PC</strong> (or another machine) above to switch back.
+      <button class="btn" data-retry style="margin-left:12px">Retry</button>
+    </div>
+  </div>`);
+  const sw = v.querySelector('#aa-node-switch');
+  sw.addEventListener('change', () => {
+    state.aaNodeId = sw.value || 'self';
+    try { localStorage.setItem('jat.aaNode', state.aaNodeId); } catch {}
+    apiTarget = null;   // clear the dead remote target immediately so the re-render can't reuse it
+    navigate();
+  });
+  v.querySelector('[data-retry]').addEventListener('click', () => navigate());
+  return v;
+}
+
 route('/queue', async () => {
-  const [settings, queueR, profilesR, docsR, parkedR, discR] = await Promise.all([
-    getSettings(true), api('/queue'),
-    api('/profiles').catch(() => ({ items: [] })),
-    api('/documents').catch(() => ({ items: [] })),
-    api('/queue/parked').catch(() => ({ items: [] })),
-    api('/auto-apply/discovery-status').catch(() => ({ status: null })),
-  ]);
+  const aaTgt = aaTarget();
+  const viewingRemote = !aaTgt.isSelf;
+  let settings, queueR, profilesR, docsR, parkedR, discR;
+  try {
+    [settings, queueR, profilesR, docsR, parkedR, discR] = await Promise.all([
+      getSettings(true), api('/queue'),
+      api('/profiles').catch(() => ({ items: [] })),
+      api('/documents').catch(() => ({ items: [] })),
+      api('/queue/parked').catch(() => ({ items: [] })),
+      api('/auto-apply/discovery-status').catch(() => ({ status: null })),
+    ]);
+  } catch (e) {
+    // A selected REMOTE node is unreachable → show the switcher + error so the user can switch back,
+    // instead of leaving the page stuck on "loading". A SELF failure keeps the existing behaviour.
+    if (viewingRemote) return remoteNodeUnreachableView(aaTgt);
+    throw e;
+  }
   const disc = discR.status || null;
   const discHealth = discR.health || { providers: [], pendingFallbacks: 0 };
   const latestDiscovery = (discR.batches || [])[0] || null;
@@ -2091,8 +2137,7 @@ route('/queue', async () => {
   // whole page already reflects it (every call above went through api()→that node). Chunk 1
   // is VIEW-ONLY: we surface the node's numbers but disable the controls (Start/Stop and
   // settings for other machines land in the next chunk).
-  const aaTgt = aaTarget();
-  const viewingRemote = !aaTgt.isSelf;
+  // aaTgt / viewingRemote are computed at the top of the route (before the data load).
   const nodeOpts = [{ id: 'self', name: 'This PC' }].concat((state.nodes || []).map((n) => ({ id: n.id, name: n.name || n.id })));
   const switcherHtml = nodeOpts.length > 1
     ? `<select class="select aa-node-switch" id="aa-node-switch" title="Which machine's auto-apply to view">${nodeOpts.map((o) => `<option value="${esc(o.id)}"${o.id === (state.aaNodeId || 'self') ? ' selected' : ''}>${esc(o.name)}</option>`).join('')}</select>`

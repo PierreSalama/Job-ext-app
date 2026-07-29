@@ -599,7 +599,10 @@ async function queueNext(force = false) {
       profileId,
       bringToFront: !!s.bringToFrontToHydrate,   // SW focuses the apply window so an occluded page isn't throttled
       frontToHydrate: s.frontToHydrate !== false,  // reactive front-until-hydrated when the apply tab reports itself occluded (default ON)
-      easyApplyOnly: s.easyApplyOnly !== false,
+      // COOLDOWN: relax easyApplyOnly for the EXECUTOR too, so it DRIVES external/company-site postings
+      // instead of fast-skipping them ("External site skipped") while LinkedIn Easy-Apply is capped —
+      // otherwise the dispatched external/Indeed jobs get skipped and the node still produces nothing.
+      easyApplyOnly: s.easyApplyOnly !== false && !db.easyApplyCooledDown(),
       // One-shot "Watch & Teach the next application" armed from the dashboard → run this
       // dispatch supervised, on-screen (Step/Run + Fix-this). bringToFront so it's visible.
       ...(superviseThis ? { supervised: true, bringToFront: true } : {}),
