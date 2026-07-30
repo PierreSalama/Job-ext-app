@@ -1027,11 +1027,28 @@ const CONTENT_ENTRY = 'content/loader.js';
 // is recoverable: force-inject the content entry, then retry. Only after injection +
 // retry still fails do we let the caller fall back.
 async function injectContentEntry(tabId) {
-  if (!chrome.scripting?.executeScript) return false;   // Firefox MV3 fallback / older runtimes
-  try {
-    await chrome.scripting.executeScript({ target: { tabId, allFrames: false }, files: [CONTENT_ENTRY] });
-    return true;
-  } catch { return false; }
+  // MV3 (Chrome + Firefox event-page): chrome.scripting.
+  if (chrome.scripting?.executeScript) {
+    try {
+      await chrome.scripting.executeScript({ target: { tabId, allFrames: false }, files: [CONTENT_ENTRY] });
+      return true;
+    } catch { return false; }
+  }
+  // MV2 (the persistent Firefox variant): chrome.scripting does not exist — use the classic
+  // tabs.executeScript. Without this the apply tab never gets the content entry, every task
+  // fails "Receiving end does not exist" → timed out/interrupted, and nothing ever submits.
+  if (chrome.tabs?.executeScript) {
+    try {
+      await new Promise((resolve, reject) => {
+        chrome.tabs.executeScript(tabId, { file: CONTENT_ENTRY, frameId: 0, runAt: 'document_idle' }, (r) => {
+          const e = chrome.runtime && chrome.runtime.lastError;
+          if (e) reject(e); else resolve(r);
+        });
+      });
+      return true;
+    } catch { return false; }
+  }
+  return false;
 }
 
 async function sendTaskWhenReady(tabId, message, timeoutMs = 20000) {

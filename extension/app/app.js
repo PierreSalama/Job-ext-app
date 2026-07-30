@@ -2033,9 +2033,17 @@ route('/queue', async () => {
       api('/auto-apply/discovery-status').catch(() => ({ status: null })),
     ]);
   } catch (e) {
-    // A selected REMOTE node is unreachable → show the switcher + error so the user can switch back,
-    // instead of leaving the page stuck on "loading". A SELF failure keeps the existing behaviour.
-    if (viewingRemote) return remoteNodeUnreachableView(aaTgt);
+    // A selected REMOTE node is unreachable. Don't trap the user on a dead-end wall — and don't let a
+    // stale localStorage node selection blank Auto-Apply on every app open. Fall back to This PC so
+    // their OWN data always shows; they can re-pick the machine from the switcher once it's reachable
+    // again. (Fixes: "I picked the laptop and now I can't see my own data at all.")
+    if (viewingRemote) {
+      state.aaNodeId = 'self';
+      try { localStorage.setItem('jat.aaNode', 'self'); } catch {}
+      apiTarget = null;
+      toast(`${aaTgt.name} was unreachable — showing This PC`, 'info');
+      return navigate();
+    }
     throw e;
   }
   const disc = discR.status || null;
