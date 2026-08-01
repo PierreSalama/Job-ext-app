@@ -45,6 +45,7 @@ let tray = null;
 let updateInterval = null;
 let backupInterval = null;
 let gmailInterval = null;
+let gmailWatchdogInterval = null;
 let emailInterval = null;
 let emailWarmup = null;
 let isQuitting = false;
@@ -493,19 +494,68 @@ function manualCheckForUpdates() {
   });
 }
 
+// Tell the user their mail sync is dead, at most once every RENOTIFY_HOURS. Email is
+// how every status past "submitted" is learned, so a silent sync means interviews and
+// rejections stop arriving with no visible symptom — that is precisely how a broken
+// refresh token went unnoticed for 31 days and 1,828 ticks. A native OS notification
+// is used (not just a toast) because the dashboard window is usually closed.
+const GMAIL_RENOTIFY_HOURS = 6;
+
+function warnIfGmailBroken(gmail) {
+  try {
+    const h = gmail.health();
+    const { stale, hours } = gmail.staleness();
+    if (!stale) return;
+    const last = h.lastNotifiedAt ? Date.parse(h.lastNotifiedAt) : 0;
+    if (Date.now() - last < GMAIL_RENOTIFY_HOURS * 3600000) return;
+
+    const since = Number.isFinite(hours)
+      ? `No successful sync in ${Math.floor(hours)}h.`
+      : 'It has never synced successfully.';
+    const why = h.needsAuth
+      ? 'Google rejected the saved authorization — reconnect Gmail in Settings.'
+      : (h.lastError || 'Unknown error.');
+
+    log.warn('gmail sync unhealthy', { hours, consecutiveFailures: h.consecutiveFailures, error: h.lastError });
+    nativeNotify('JAT: email sync is not working', `${since} ${why}`);
+    notify('status', 'Email sync is not working', `${since} ${why}`, 'error');
+    broadcast('gmail.unhealthy', { ...h, staleHours: hours });
+    gmail.markNotified();
+  } catch (e) { log.warn('gmail health check failed', e.message); }
+}
+
+// An INDEPENDENT watchdog. warnIfGmailBroken also runs from the sync tick, but that tick
+// is itself part of what can fail: if gmailInterval is never armed, gets cleared, or the
+// settings flip enabled without a restart, no tick ever runs and nothing would ever
+// complain. This timer's only job is to notice that success has gone stale, so the
+// alarm does not depend on the machinery it is watching.
+function scheduleGmailWatchdog() {
+  if (gmailWatchdogInterval) clearInterval(gmailWatchdogInterval);
+  const check = () => { try { warnIfGmailBroken(require('./gmail')); } catch (e) { log.warn('gmail watchdog failed', e.message); } };
+  setTimeout(check, 90 * 1000);                                  // once shortly after boot
+  gmailWatchdogInterval = setInterval(check, 60 * 60 * 1000);     // then hourly
+}
+
 // ---------- gmail scheduler ----------
 function scheduleGmail() {
   if (gmailInterval) clearInterval(gmailInterval);
   const s = db.getSettings().gmail;
   if (!s.enabled) return;
-  const everyMs = Math.max(5, s.intervalMinutes || 30) * 60000;
+  // Floor of 1 minute (was 5): near-real-time status updates are the whole point of the mail sync —
+  // an incremental tick only ever fetches the handful of messages newer than the watermark, so a
+  // 1-minute cadence is cheap and stays well inside Gmail's quota.
+  const everyMs = Math.max(1, s.intervalMinutes || 30) * 60000;
   gmailInterval = setInterval(async () => {
     if (!shouldRunBackground()) return;
     try {
       const gmail = require('./gmail');
       const r = await gmail.syncNow();
       if (r.ok && r.updated) broadcast('jobs.updated', { action: 'gmail-sync' });
-    } catch (e) { log.warn('gmail tick failed', e.message); }
+      if (!r.ok) warnIfGmailBroken(gmail);
+    } catch (e) {
+      log.warn('gmail tick failed', e.message);
+      try { warnIfGmailBroken(require('./gmail')); } catch {}
+    }
   }, everyMs);
   log.info(`gmail sync scheduled every ${everyMs / 60000}m`);
 }
@@ -552,6 +602,7 @@ function applyAppSettings() {
   }
   scheduleGmail();
   scheduleEmailSync();
+  scheduleGmailWatchdog();
   try {
     const aa = db.getSettings().autoApply || {};
     const shouldBlock = !!aa.enabled && aa.keepAwake !== false;
@@ -821,6 +872,7 @@ app.on('will-quit', () => {
   if (backupInterval) clearInterval(backupInterval);
   if (ghostSweepInterval) clearInterval(ghostSweepInterval);
   if (gmailInterval) clearInterval(gmailInterval);
+  if (gmailWatchdogInterval) clearInterval(gmailWatchdogInterval);
   if (emailInterval) clearInterval(emailInterval);
   if (emailWarmup) clearTimeout(emailWarmup);
   if (maintenanceInterval) clearInterval(maintenanceInterval);

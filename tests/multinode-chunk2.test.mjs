@@ -26,7 +26,9 @@ test('the two dashboard copies are still byte-identical', () => {
 });
 
 test('Start/Stop is re-enabled on a remote view; everything else stays disabled', () => {
-  const block = appJs.slice(appJs.indexOf('if (viewingRemote) {'));
+  // Anchor on the CONTROLS block specifically. `if (viewingRemote) {` also appears earlier now (the
+  // unreachable-node fallback in the /queue route), so indexOf() alone would slice the wrong block.
+  const block = appJs.slice(appJs.indexOf("const powerBtn = v.querySelector('[data-power]');"));
   // the power button is captured and excluded from the blanket disable, alongside the switcher
   assert.match(block.slice(0, 500), /const powerBtn = v\.querySelector\('\[data-power\]'\);/);
   assert.match(block.slice(0, 500), /if \(elm === nodeSwitch \|\| elm === powerBtn\) return;/);

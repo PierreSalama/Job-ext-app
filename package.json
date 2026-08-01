@@ -1,9 +1,9 @@
 {
     "name":  "jat11",
-    "version":  "11.90.4",
+    "version":  "11.90.5",
     "private":  true,
     "type":  "module",
-    "description":  "Job Application Tracker v11 Ã¢â‚¬â€ workspace root (extension + Electron app + tooling). See README.md.",
+    "description":  "Job Application Tracker v11 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â workspace root (extension + Electron app + tooling). See README.md.",
     "scripts":  {
                     "mirror":  "node tools/mirror.mjs",
                     "mirror:check":  "node tools/mirror.mjs --check",

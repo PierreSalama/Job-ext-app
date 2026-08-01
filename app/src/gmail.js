@@ -28,22 +28,110 @@ const API = 'https://gmail.googleapis.com/gmail/v1/users/me';
 let lastResult = null;
 let syncing = false;
 
+// ---------- health ----------
+// EVERY sync outcome — success or failure — is persisted here. Before this existed,
+// syncNow() returned early on "disabled" / "not authorized" without writing anything,
+// and the catch block only set the in-memory `lastResult`, so `gmailLastResult` in the
+// DB advanced ONLY on success. A dead sync was therefore indistinguishable from a sync
+// that simply hadn't run yet. Google started rejecting the refresh token at
+// 2026-06-30 18:59, and it failed 1,828 consecutive times over 31 days with nothing
+// surfaced anywhere. Nothing in this module may now fail without recording why.
+const HEALTH_KEY = 'gmailHealth';
+
+function blankHealth() {
+  return {
+    lastSuccessAt: null, lastFailureAt: null, lastError: null,
+    consecutiveFailures: 0, needsAuth: false, lastNotifiedAt: null,
+  };
+}
+
+function health() { return db.kvGet(HEALTH_KEY) || blankHealth(); }
+
+function recordSuccess(result) {
+  db.kvSet(HEALTH_KEY, {
+    ...health(),
+    lastSuccessAt: result.at,
+    lastError: null,
+    consecutiveFailures: 0,
+    needsAuth: false,
+  });
+}
+
+function recordFailure(error, { needsAuth = false } = {}) {
+  const h = health();
+  const at = new Date().toISOString();
+  const rec = {
+    ...h,
+    lastFailureAt: at,
+    lastError: String(error || 'unknown').slice(0, 300),
+    consecutiveFailures: (h.consecutiveFailures || 0) + 1,
+    needsAuth: needsAuth || h.needsAuth,
+  };
+  db.kvSet(HEALTH_KEY, rec);
+  // The DB-visible result must reflect the failure too, so neither the dashboard nor
+  // any external reader can mistake a broken sync for a quiet one.
+  const failed = {
+    at, error: rec.lastError, needsAuth: rec.needsAuth,
+    consecutiveFailures: rec.consecutiveFailures,
+  };
+  lastResult = failed;
+  db.kvSet('gmailLastResult', failed);
+  return rec;
+}
+
+// Called by the scheduler once it has actually told the user, so the warning repeats
+// on a slow cadence instead of once per tick.
+function markNotified() {
+  db.kvSet(HEALTH_KEY, { ...health(), lastNotifiedAt: new Date().toISOString() });
+}
+
 // ---------- OAuth ----------
 function tokens() { return db.kvGet('gmailTokens'); }
 
 async function refreshAccessToken() {
   const t = tokens();
   const s = db.getSettings().gmail;
-  if (!t?.refresh_token || !s.clientId || !s.clientSecret) return null;
-  const r = await fetch(TOKEN_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: s.clientId, client_secret: s.clientSecret,
-      refresh_token: t.refresh_token, grant_type: 'refresh_token',
-    }),
-  });
-  if (!r.ok) { log.warn('token refresh failed', r.status); return null; }
+  if (!t?.refresh_token || !s.clientId || !s.clientSecret) {
+    recordFailure('Gmail is not connected — missing refresh token or OAuth client credentials.', { needsAuth: true });
+    return null;
+  }
+  // The refresh happens BEFORE syncNow()'s try block, so a transport-level throw here
+  // (offline, DNS, TLS) would escape syncNow entirely and persist nothing — the same
+  // silent-death class of bug this module is being hardened against. Contain it.
+  let r;
+  try {
+    r = await fetch(TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: s.clientId, client_secret: s.clientSecret,
+        refresh_token: t.refresh_token, grant_type: 'refresh_token',
+      }),
+    });
+  } catch (e) {
+    log.warn('token refresh request failed', e.message);
+    recordFailure(`Could not reach Google to refresh the token: ${e.message}`);
+    return null;
+  }
+  if (!r.ok) {
+    // Google's body names WHICH failure this is: `invalid_grant` (the refresh token was
+    // revoked or expired → the user must re-consent) vs `invalid_client` (the clientId/
+    // secret no longer match the Cloud project → Settings need fixing, re-auth won't
+    // help). Logging only the bare status code is what made this undiagnosable.
+    let detail = '';
+    try {
+      const b = await r.json();
+      detail = b.error ? `${b.error}${b.error_description ? ': ' + b.error_description : ''}` : '';
+    } catch {
+      try { detail = (await r.text()).slice(0, 200); } catch {}
+    }
+    log.warn('token refresh failed', r.status, detail || '(no body)');
+    recordFailure(
+      `Google rejected the refresh token (HTTP ${r.status})${detail ? ' — ' + detail : ''}`,
+      { needsAuth: r.status === 400 || r.status === 401 },
+    );
+    return null;
+  }
   const body = await r.json();
   const next = { ...t, access_token: body.access_token, expires_at: Date.now() + (body.expires_in - 60) * 1000 };
   db.kvSet('gmailTokens', next);
@@ -93,6 +181,7 @@ async function startAuth() {
           refresh_token: body.refresh_token || tokens()?.refresh_token,
           expires_at: Date.now() + (body.expires_in - 60) * 1000,
         });
+        db.kvSet(HEALTH_KEY, blankHealth());   // a fresh grant clears the broken-auth state
         log.info('gmail authorized');
         resolve({ ok: true });
       } catch (e) { resolve({ ok: false, error: e.message }); }
@@ -210,9 +299,19 @@ function matchJob({ title, company }) {
 async function syncNow() {
   if (syncing) return { ok: false, error: 'sync already running' };
   const s = db.getSettings().gmail;
-  if (!s.enabled) return { ok: false, error: 'gmail sync is disabled in Settings' };
+  if (!s.enabled) {
+    const e = 'Gmail sync is turned off in Settings.';
+    recordFailure(e);
+    return { ok: false, error: e };
+  }
   const token = await accessToken();
-  if (!token) return { ok: false, error: 'not authorized — connect Gmail in Settings', needsAuth: true };
+  if (!token) {
+    // accessToken()/refreshAccessToken() already recorded the specific reason; only
+    // record a generic one if something upstream returned null without saying why.
+    const h = health();
+    if (!h.lastError) recordFailure('Not authorized — reconnect Gmail in Settings.', { needsAuth: true });
+    return { ok: false, error: h.lastError || 'not authorized — connect Gmail in Settings', needsAuth: true };
+  }
 
   syncing = true;
   const started = Date.now();
@@ -338,11 +437,14 @@ async function syncNow() {
     if (newWatermark > (db.kvGet('gmailWatermark') || 0)) db.kvSet('gmailWatermark', newWatermark);
     lastResult = { at: new Date().toISOString(), scanned, matched, updated, emailsWritten, ms: Date.now() - started };
     db.kvSet('gmailLastResult', lastResult);
+    recordSuccess(lastResult);
     log.info('sync done', lastResult);
     return { ok: true, ...lastResult };
   } catch (e) {
     log.error('sync failed', e.message);
-    lastResult = { at: new Date().toISOString(), error: e.message };
+    // recordFailure persists to the DB — the old code set only the in-memory copy here,
+    // so a throwing sync left `gmailLastResult` frozen at its last success forever.
+    recordFailure(e.message, { needsAuth: e.code === 'GMAIL_AUTH' });
     return { ok: false, error: e.message, needsAuth: e.code === 'GMAIL_AUTH' };
   } finally {
     syncing = false;
@@ -351,13 +453,33 @@ async function syncNow() {
 
 function status() {
   const s = db.getSettings().gmail;
+  const h = health();
   return {
     enabled: s.enabled,
     configured: !!(s.clientId && s.clientSecret),
     authorized: !!tokens()?.refresh_token,
     lastResult: lastResult || db.kvGet('gmailLastResult'),
     watermark: db.kvGet('gmailWatermark'),
+    health: h,
+    // A single field the UI/scheduler can act on: sync is enabled but hasn't succeeded
+    // in a long time, whatever the reason.
+    stale: staleness(h, s).stale,
+    staleHours: staleness(h, s).hours,
   };
 }
 
-module.exports = { startAuth, syncNow, status };
+// How long since the last SUCCESSFUL sync. Deliberately independent of the failure
+// counter: if the scheduler itself dies (interval cleared, ticks never fire) there are
+// no failures to count, yet mail silently stops flowing — that is exactly the 31-day
+// blind spot. Age-since-success catches every cause, known or not.
+const STALE_AFTER_HOURS = 6;
+
+function staleness(h = health(), s = db.getSettings().gmail) {
+  if (!s.enabled) return { stale: false, hours: 0 };
+  const since = h.lastSuccessAt ? Date.parse(h.lastSuccessAt) : null;
+  if (!since) return { stale: !!h.lastFailureAt, hours: Infinity };
+  const hours = (Date.now() - since) / 3600000;
+  return { stale: hours >= STALE_AFTER_HOURS, hours };
+}
+
+module.exports = { startAuth, syncNow, status, health, staleness, markNotified, STALE_AFTER_HOURS };
