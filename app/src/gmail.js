@@ -249,6 +249,14 @@ function bodyText(payload) {
 // ---------- parsing & classification (ported from Python, order matters) ----------
 const SUBJ_APPLIED_RX = /your application (?:to|for) (.+?) at (.+?)\s*$/i;
 const SUBJ_UPDATE_RX = /your update from (.+?)\s*$/i;
+// Formats the original parser missed entirely, so these emails stayed unmatched and the job never
+// advanced. Measured live: 23 of 100 emails unlinked — 9 "viewed by", 8 Indeed acknowledgements.
+//  - "Your application was viewed by <COMPANY>"  → company only (engagement signal)
+//  - "Thank you for applying to <COMPANY>"       → company only
+//  - "Indeed Application: <JOB TITLE>"           → TITLE only; Indeed never names the company
+const SUBJ_VIEWED_RX = /your application was viewed by\s+(.+?)\s*$/i;
+const SUBJ_THANKS_RX = /(?:thank you|thanks) for applying (?:to|at)\s+(.+?)\s*$/i;
+const SUBJ_INDEED_RX = /^\s*indeed application:\s*(.+?)\s*$/i;
 
 const BUCKETS = [
   ['rejected', /not (?:be )?moving forward|unfortunately|not selected|decided to (?:pursue|proceed with) other|no longer under consideration|position has been filled/i],
@@ -276,12 +284,27 @@ function parseLinkedIn(subject, body) {
     const bm = body.match(/(.+?)\n.*applied on/i);
     return { title: bm ? bm[1].trim() : '', company };
   }
+  m = subject.match(SUBJ_VIEWED_RX);
+  if (m) return { title: '', company: m[1].trim() };
+  m = subject.match(SUBJ_THANKS_RX);
+  if (m) return { title: '', company: m[1].trim() };
+  m = subject.match(SUBJ_INDEED_RX);
+  if (m) return { title: m[1].trim(), company: '' };
   return null;
 }
 
 function matchJob({ title, company }) {
-  if (!company) return null;
   const all = db.listJobs({ limit: 2000 });
+  // TITLE-ONLY match. Indeed's acknowledgement ("Indeed Application: <role>") never names the
+  // company, so requiring one dropped every single one of them on the floor. Match on an exact
+  // normalised title instead, and ONLY when it is unambiguous — if two different jobs share the
+  // title we cannot tell which was applied to, so we decline rather than guess and mis-advance a job.
+  if (!company) {
+    const tk0 = db.normKey(title);
+    if (!tk0) return null;
+    const byTitle = all.filter((j) => db.normKey(j.title) === tk0);
+    return byTitle.length === 1 ? byTitle[0] : null;
+  }
   const ck = db.normKey(company);
   const tk = db.normKey(title);
   // exact title+company → company + fuzzy title → company only if unique
