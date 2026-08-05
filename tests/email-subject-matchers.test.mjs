@@ -35,6 +35,37 @@ test('Indeed acknowledgements match on title, and ONLY when unambiguous', () => 
   assert.match(fn, /return fallback;/, 'an ambiguous title must not be guessed');
 });
 
-test('the Indeed branch only runs when there is no company to go on', () => {
-  assert.match(fn, /if \(!hints\.length && indeedAck\)/, 'company matching keeps priority');
+test('title-only matching is NOT gated on empty company hints', () => {
+  // This assertion originally required `!hints.length && indeedAck` — which WAS the bug: the sender
+  // indeedapply@indeed.com produces a bogus "indeed" company hint, so the branch never ran and all
+  // 8 acknowledgements stayed unmatched. A job board's domain is not the employer.
+  assert.ok(!/!hints\.length && (indeedAck|titleOnly)/.test(fn),
+    'must not require empty hints — the job-board sender always supplies one');
+  assert.match(fn, /if \(titleOnly\) \{/, 'title-only branch runs on subject shape alone');
+});
+
+// --- Regression cases taken VERBATIM from Pierre's inbox (the ones that stayed unmatched) ---
+
+test('Indeed acknowledgements are matched by title even though the sender yields an "indeed" hint', () => {
+  // The bug: the branch was gated on `!hints.length`, but indeedapply@indeed.com produces a bogus
+  // company hint, so it never ran and all 8 acks were dropped. A job board is not the employer.
+  assert.ok(!/if \(!hints\.length && (indeedAck|titleOnly)\)/.test(fn),
+    'title-only matching must NOT be gated on empty hints');
+  assert.match(fn, /const titleOnly = /, 'must have a title-only branch');
+});
+
+test('bilingual Indeed titles try each side of the slash', () => {
+  assert.match(fn, /raw\.split\('\/'\)/, 'must try each half of "Développeur X / Developer X"');
+});
+
+test('"We Got It: Thanks for applying for <role>" is treated as title-only', () => {
+  const rx = /^\s*we got it:\s*thanks for applying for\s+(.+?)\s*$/i;
+  assert.equal('We Got It: Thanks for applying for Software Engineer, Testing'.match(rx)[1], 'Software Engineer, Testing');
+  assert.match(fn, /we got it:/i);
+});
+
+test('"applying for the <role> position at <company>" recovers the company', () => {
+  const rx = /for applying for the .+? position at\s+(.+?)\s*$/i;
+  assert.equal('Thank you for applying for the Software Engineer, Testing position at Push Operations'.match(rx)[1], 'Push Operations');
+  assert.match(fn, /position at/i);
 });

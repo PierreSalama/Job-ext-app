@@ -219,7 +219,10 @@ function matchEmailToJob(email, jobs) {
   // Measured live: 9 "viewed by" + 3 "thank you for applying" unmatched out of 100.
   const subj = String(email.subject || '');
   const subjCo = subj.match(/your application was viewed by\s+(.+?)\s*$/i)
-              || subj.match(/(?:thank you|thanks) for applying (?:to|at)\s+(.+?)\s*$/i);
+              || subj.match(/(?:thank you|thanks) for applying (?:to|at)\s+(.+?)\s*$/i)
+              // "Thank you for applying for the <ROLE> position at <COMPANY>" — the company sits at
+              // the END after "position at", so the plain "applying to X" pattern grabbed nothing.
+              || subj.match(/for applying for the .+? position at\s+(.+?)\s*$/i);
   if (subjCo) {
     const k = db.normKey(subjCo[1]);
     if (k && !hints.includes(k)) hints.push(k);
@@ -228,12 +231,24 @@ function matchEmailToJob(email, jobs) {
   // company-driven matcher can never link it — 8 of 100 were lost this way. Match on an exact title
   // instead, and only when it is unambiguous: if two jobs share the title we cannot tell which was
   // applied to, and advancing the wrong application is worse than leaving it unmatched.
-  const indeedAck = subj.match(/^\s*indeed application:\s*(.+?)\s*$/i);
-  if (!hints.length && indeedAck) {
-    const tk = db.normKey(indeedAck[1]);
-    const byTitle = tk ? jobs.filter((j) => db.normKey(j.title || '') === tk) : [];
-    if (byTitle.length === 1) {
-      return { matchedJobId: byTitle[0].id, matchConfidence: 0.8, matchSource: 'auto', category, via: 'indeed-title' };
+  // Subjects that carry ONLY a role, never an employer:
+  //   "Indeed Application: <ROLE>"              (from indeedapply@indeed.com)
+  //   "We Got It: Thanks for applying for <ROLE>"
+  // NOTE this must NOT be gated on `!hints.length`: the sender indeed.com yields a bogus "indeed"
+  // company hint, so the branch never ran and all 8 acks stayed unmatched. A job board is not the
+  // employer, so its domain must never be treated as one.
+  const titleOnly = subj.match(/^\s*indeed application:\s*(.+?)\s*$/i)
+                 || subj.match(/^\s*we got it:\s*thanks for applying for\s+(.+?)\s*$/i);
+  if (titleOnly) {
+    const raw = titleOnly[1];
+    // Indeed sometimes shows a bilingual title ("Développeur X / Developer X") — try each side.
+    const variants = [raw, ...raw.split('/')].map((t) => db.normKey(t)).filter(Boolean);
+    for (const tk of variants) {
+      const byTitle = jobs.filter((j) => db.normKey(j.title || '') === tk);
+      // Only an unambiguous title is safe: advancing the wrong application is worse than no match.
+      if (byTitle.length === 1) {
+        return { matchedJobId: byTitle[0].id, matchConfidence: 0.8, matchSource: 'auto', category, via: 'title-only' };
+      }
     }
     return fallback;
   }
