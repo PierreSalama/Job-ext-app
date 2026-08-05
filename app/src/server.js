@@ -486,6 +486,12 @@ async function queueNext(force = false) {
     try { siteLastStart = db.lastStartBySiteKey({ minutes: 30 }); } catch {}
   }
   const candidates = [];
+  // Jobs held back ONLY by the per-site pacing gap. The gap exists to space applies within one
+  // site, which is right while other sites are available — but during an Easy-Apply cooldown
+  // Indeed is the ONLY dispatchable source, and every Indeed job shares one site key, so that
+  // single timer stalled the whole pipeline (live: 321 queued, nothing running all night).
+  // Holding them here lets us fall back to one when there is genuinely nothing else to do.
+  const gapOnly = [];
   for (let i = queued.length - 1; i >= 0; i--) {
     const t = queued[i];
     const j = db.getJob(t.jobId);
@@ -543,6 +549,7 @@ async function queueNext(force = false) {
           siteGapDeferred = true;
           if (!siteGapNextAt || eligibleAt < siteGapNextAt) siteGapNextAt = eligibleAt;
           passOver(t, j, `site-gap: ${siteKey} pacing until ${new Date(eligibleAt).toISOString()}`);
+          gapOnly.push({ t, j, order: i });   // keep it: usable if NOTHING else can run
           continue;
         }
       }
@@ -551,6 +558,12 @@ async function queueNext(force = false) {
   }
   // Nothing dispatchable BUT we held back LinkedIn jobs for the cooldown → tell the pump
   // why it's idling (it isn't out of work; it's waiting out the Easy-Apply cap).
+  // Nothing at all is runnable but some jobs are only waiting on the intra-site gap → release the
+  // oldest one. Pacing must never become a deadlock when a single site is all that is left.
+  if (!candidates.length && gapOnly.length) {
+    gapOnly.sort((a, b) => b.order - a.order);   // oldest-first (queue list is DESC)
+    candidates.push(gapOnly[0]);
+  }
   if (!candidates.length && easyApplyDeferred) return { task: null, reason: 'easyapply-cooldown', concurrency, passedOver: passOverSummary() };
   // Held back for a host serving a verification wall — idling on purpose, not out of work.
   if (!candidates.length && hostDeferred) return { task: null, reason: 'host-cooldown', concurrency, passedOver: passOverSummary() };
