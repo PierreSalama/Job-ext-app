@@ -273,6 +273,17 @@ async function getSettings(force = false) {
   state.settings = r.settings || {};
   state.secretsPresent = r.secretsPresent || {};   // which secrets are saved (keys are redacted out of the response)
   state.nodes = Array.isArray(state.settings.nodes) ? state.settings.nodes : [];   // remote-node registry
+  // DEFAULT NODE. A node flagged isDefault becomes the machine the Auto-Apply page opens on, so the
+  // always-on server is what you see rather than this PC (which the one-at-a-time coordinator will
+  // usually have stood down). Only applied when the user has NOT picked a node themselves — an
+  // explicit choice wins — and the unreachable-node fallback still drops back to This PC, so a dead
+  // server can never leave the page blank.
+  try {
+    if (!localStorage.getItem('jat.aaNode')) {
+      const def = state.nodes.find((n) => n && n.isDefault && n.id);
+      if (def) state.aaNodeId = def.id;
+    }
+  } catch {}
   return state.settings;
 }
 
