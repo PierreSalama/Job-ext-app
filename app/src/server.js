@@ -452,6 +452,27 @@ async function queueNext(force = false) {
   try { cooledDown = db.easyApplyCooledDown(); } catch {}
   let easyApplyDeferred = false;
   let hostDeferred = false;
+  // PER-JOB PASS-OVER DIAGNOSTIC. The deferral flags below collapse into ONE reason string, so a
+  // queue that looks full while nothing dispatches gives no clue which guard excluded which job
+  // (live: 69 Indeed jobs silently held during an Easy-Apply cooldown, reported only as
+  // 'easyapply-cooldown' because the LinkedIn jobs set that flag first). Record why each job was
+  // passed over so /queue/next can say it outright. Diagnostic only - never changes dispatch.
+  const passedOver = [];
+  // Grouped for the response: how many jobs each guard held back, with a couple of examples.
+  const passOverSummary = () => {
+    const by = {};
+    for (const p of passedOver) {
+      const key = String(p.why).split(':')[0];
+      by[key] = by[key] || { count: 0, sources: {}, examples: [] };
+      by[key].count++;
+      by[key].sources[p.source || '?'] = (by[key].sources[p.source || '?'] || 0) + 1;
+      if (by[key].examples.length < 2) by[key].examples.push(p.why);
+    }
+    return by;
+  };
+  const passOver = (t, j, why) => {
+    if (passedOver.length < 40) passedOver.push({ taskId: t.id, source: (j && j.source) || '', why });
+  };
   let siteDeferred = false;
   let siteGapDeferred = false;
   let siteGapNextAt = null;
@@ -496,7 +517,7 @@ async function queueNext(force = false) {
       broadcast('queue.updated', { taskId: t.id, state: 'skipped' });
       continue;
     }
-    if (cooledDown && !db.easyApplyEligible(j)) { easyApplyDeferred = true; continue; }
+    if (cooledDown && !db.easyApplyEligible(j)) { easyApplyDeferred = true; passOver(t, j, 'easyapply-cooldown: LinkedIn job held while the daily cap is spent'); continue; }
     // NOT-BEFORE DEFERRAL: a queued task whose scheduled_at is in the FUTURE is waiting out a
     // transient site condition (the extension's host circuit breaker sets this when a host starts
     // serving a Cloudflare/verification wall). Leave it QUEUED and take the next candidate, the
@@ -507,11 +528,11 @@ async function queueNext(force = false) {
     // destroyed 40+ queued jobs in ten minutes, all with attempts=0 -- never even attempted --
     // draining the Indeed queue from 60 to 16. A transient wall must never permanently discard a
     // job. Normal queued tasks carry a past scheduled_at, so this is a no-op for them.
-    if (!force && t.scheduledAt && Date.parse(t.scheduledAt) > Date.now()) { hostDeferred = true; continue; }
+    if (!force && t.scheduledAt && Date.parse(t.scheduledAt) > Date.now()) { hostDeferred = true; passOver(t, j, `scheduled-later: not due until ${t.scheduledAt}`); continue; }
     const siteKey = db.taskSiteKey(j);
     if (!force && concurrency > 1 && siteKey) {
       // (1) PER-SITE CAP — never run more than perSiteCap applies on one site at once.
-      if ((siteKeyCounts.get(siteKey) || 0) >= perSiteCap) { siteDeferred = true; continue; }
+      if ((siteKeyCounts.get(siteKey) || 0) >= perSiteCap) { siteDeferred = true; passOver(t, j, `site-cap: ${siteKey} already at ${perSiteCap} in flight`); continue; }
       // (2) PER-SITE GAP — space starts WITHIN a site (anti-throttle/ban) without serializing
       // different sites. gapMin = baseGap/perSiteCap so the site fills to its cap over one window.
       const last = siteLastStart[siteKey];
@@ -521,6 +542,7 @@ async function queueNext(force = false) {
         if (Date.now() < eligibleAt) {
           siteGapDeferred = true;
           if (!siteGapNextAt || eligibleAt < siteGapNextAt) siteGapNextAt = eligibleAt;
+          passOver(t, j, `site-gap: ${siteKey} pacing until ${new Date(eligibleAt).toISOString()}`);
           continue;
         }
       }
@@ -529,9 +551,9 @@ async function queueNext(force = false) {
   }
   // Nothing dispatchable BUT we held back LinkedIn jobs for the cooldown → tell the pump
   // why it's idling (it isn't out of work; it's waiting out the Easy-Apply cap).
-  if (!candidates.length && easyApplyDeferred) return { task: null, reason: 'easyapply-cooldown', concurrency };
+  if (!candidates.length && easyApplyDeferred) return { task: null, reason: 'easyapply-cooldown', concurrency, passedOver: passOverSummary() };
   // Held back for a host serving a verification wall — idling on purpose, not out of work.
-  if (!candidates.length && hostDeferred) return { task: null, reason: 'host-cooldown', concurrency };
+  if (!candidates.length && hostDeferred) return { task: null, reason: 'host-cooldown', concurrency, passedOver: passOverSummary() };
   // Per-site gap wins over site-busy as the idle reason so the pump's gapTimer wakes it exactly
   // when the next same-site start becomes eligible (bounded), instead of idling to the next alarm.
   if (!candidates.length && siteGapDeferred) return { task: null, reason: 'gap', nextEligibleAt: new Date(siteGapNextAt).toISOString(), concurrency };

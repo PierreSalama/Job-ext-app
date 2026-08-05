@@ -422,7 +422,29 @@ export function selectGroupLabel(input) {
   const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
   const direct = norm(fieldLabel(input));
   if (direct.length >= 4 && !isLikelyOptionOrId(direct, null) && !/_\d+_[a-z]+$|q_[0-9a-f]{12,}|[0-9a-f]{8}-[0-9a-f]{4}/.test(direct)) return direct.slice(0, 250);
-  return promptWalkUp(input, null) || direct.slice(0, 250);
+  const walked = promptWalkUp(input, null);
+  if (walked) return walked;
+  // LAST RESORT (fixes the dominant "stuck on a step" park): when neither resolver recovers a
+  // prompt, scanUnknown drops the field for having a <4-char label — so a REQUIRED, empty <select>
+  // is never answered, "Review" does nothing, and the job dies as stuck. Live example: a French
+  // proficiency select ("Quel est votre niveau en Français") whose prompt only exists on the
+  // surrounding form container. This is the same recovery the stuck-dump already used successfully
+  // on that exact markup, so the question reaches the AI instead of stalling the whole application.
+  try {
+    const holder = input.closest('label, fieldset, [class*="form"], [class*="question"], [data-testid]');
+    if (holder) {
+      const viaLabel = norm(holder.querySelector('label, legend')?.textContent || '');
+      if (viaLabel.length >= 4) return viaLabel.slice(0, 250);
+      const own = norm(holder.textContent || '');
+      // strip the option text so we keep the question, not the choices
+      const opts = new Set([...(input.options || [])].map((o) => norm(o.textContent)).filter(Boolean));
+      let cleaned = own;
+      for (const o of opts) if (o.length > 1) cleaned = cleaned.split(o).join(' ');
+      cleaned = norm(cleaned);
+      if (cleaned.length >= 4) return cleaned.slice(0, 250);
+    }
+  } catch {}
+  return direct.slice(0, 250);
 }
 
 function cssEscape(s) {
@@ -473,7 +495,18 @@ function profileFieldFor(label, profile) {
 
 // EEO / demographic / criminal-history fields are NEVER auto-filled, escalated to AI,
 // or harvested — regardless of settings (legal/ethical). Mirrors executor.js.
-export const NEVER_AUTOFILL_RX = /(ethnic|race|gender|disabilit|veteran|criminal|background.?check|felony|conviction|pronoun|sexual.?orientation|\blgbtq?)/i;
+// Protected characteristics we never answer on the applicant's behalf. `pronoun` was deliberately
+// REMOVED at Pierre's explicit request: he supplied his pronouns (stored on the profile), and every
+// posting that asks was parking forever behind this guard. Gender identity, transgender status,
+// race, disability, veteran and criminal history all remain blocked — those stay the user's call.
+export const NEVER_AUTOFILL_RX = /(ethnic|race|gender|disabilit|veteran|criminal|background.?check|felony|conviction|sexual.?orientation|\blgbtq?)/i;
+
+// Screen-reader instructions for a combobox/listbox ("5 results available. Use Up and Down to
+// choose options, press Enter to select…") get picked up as if they were the QUESTION. The job then
+// parks forever waiting on an answer to a string that is not a question, and the junk text would be
+// learned as a saved answer key. Treat this text as "no label" so the control is passed over
+// cleanly instead of stalling the application.
+export const UI_INSTRUCTION_RX = /results available|use up and down|press enter to select|press escape|press tab to select|screen ?reader/i;
 
 // A radio/checkbox is "visible enough" to be a real screening control when the native input
 // OR an associated <label> / styled wrapper is visible. LinkedIn (and many ATS) render the
@@ -835,6 +868,7 @@ export class AutofillEngine {
       if ((input.type === 'checkbox' || input.type === 'radio') && input.checked) { skip('already-checked', input); continue; }
       const label = fieldLabel(input);
       if (!label) { skip('no-label', input); continue; }
+      if (UI_INSTRUCTION_RX.test(label)) { skip('ui-instruction-text', input, label); continue; }
       if (NEVER_AUTOFILL_RX.test(label)) { skip('never-autofill', input, label); continue; }
       const pm = profileFieldFor(label, profile || {});
       if (pm) { out.push({ input, label, source: 'profile', field: pm.field, value: pm.value }); continue; }
@@ -879,6 +913,7 @@ export class AutofillEngine {
       else if (input.tagName === 'SELECT') label = selectGroupLabel(input);
       else label = fieldLabel(input);
       if (!label || label.length < 4) continue;
+      if (UI_INSTRUCTION_RX.test(label)) continue;   // combobox screen-reader help, not a question
       if (NEVER_AUTOFILL_RX.test(label)) continue;
       // (Generic site-search / global-search typeahead inputs are already skipped above
       // via isSiteChromeInput — they're never a real application question and would

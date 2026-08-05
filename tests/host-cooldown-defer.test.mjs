@@ -36,7 +36,11 @@ test('queueNext passes over a task that is not due yet', () => {
   const gstart = server.indexOf('NOT-BEFORE DEFERRAL');
   const gate = server.slice(gstart, server.indexOf('const siteKey', gstart));
   assert.match(gate, /Date\.parse\(t\.scheduledAt\) > Date\.now\(\)/, 'must compare against now');
-  assert.match(gate, /hostDeferred = true; continue;/, 'must defer, not dispatch and not skip');
+  // Allows the per-job pass-over diagnostic between the flag and the continue. What matters is that
+  // the task is DEFERRED (flag set, loop continues) and never patched to a terminal state — the
+  // diagnostic only records why it was passed over.
+  assert.match(gate, /hostDeferred = true;[^\n]*continue;/, 'must defer, not dispatch and not skip');
+  assert.ok(!/hostDeferred = true;[^\n]*queuePatch/.test(gate), 'deferral must never write a terminal state');
   assert.match(gate, /!force/, 'a forced/manual run must still be able to dispatch');
 });
 
