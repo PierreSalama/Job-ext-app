@@ -214,6 +214,29 @@ function matchEmailToJob(email, jobs) {
   } catch {}
   const fallback = { matchedJobId: null, matchConfidence: 0, matchSource: null, category };
   const hints = companyHints(email);
+  // SUBJECT-DERIVED COMPANY. Two very common formats name the company ONLY in the subject line, so
+  // companyHints (which works from the sender + body) came back empty and the email was dropped.
+  // Measured live: 9 "viewed by" + 3 "thank you for applying" unmatched out of 100.
+  const subj = String(email.subject || '');
+  const subjCo = subj.match(/your application was viewed by\s+(.+?)\s*$/i)
+              || subj.match(/(?:thank you|thanks) for applying (?:to|at)\s+(.+?)\s*$/i);
+  if (subjCo) {
+    const k = db.normKey(subjCo[1]);
+    if (k && !hints.includes(k)) hints.push(k);
+  }
+  // INDEED ACKNOWLEDGEMENT. "Indeed Application: <role>" names the ROLE and never the company, so a
+  // company-driven matcher can never link it — 8 of 100 were lost this way. Match on an exact title
+  // instead, and only when it is unambiguous: if two jobs share the title we cannot tell which was
+  // applied to, and advancing the wrong application is worse than leaving it unmatched.
+  const indeedAck = subj.match(/^\s*indeed application:\s*(.+?)\s*$/i);
+  if (!hints.length && indeedAck) {
+    const tk = db.normKey(indeedAck[1]);
+    const byTitle = tk ? jobs.filter((j) => db.normKey(j.title || '') === tk) : [];
+    if (byTitle.length === 1) {
+      return { matchedJobId: byTitle[0].id, matchConfidence: 0.8, matchSource: 'auto', category, via: 'indeed-title' };
+    }
+    return fallback;
+  }
   if (!hints.length) return fallback;
   const sentMs = Date.parse(email.sentAt) || Date.now();
   let cands = jobs.filter((j) => { const ck = db.normKey(j.company || ''); return ck && hints.some((h) => ck.includes(h) || h.includes(ck)); });
