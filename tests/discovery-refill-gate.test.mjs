@@ -63,6 +63,37 @@ test('app-side jobspy gate is source-aware too (both sides must hold the invaria
   assert.match(src, /ATS_FEED_SOURCES/, 'app-side gate must exclude the separate ATS feed');
 });
 
+// --- Third instance of the same invariant, live 2026-08-07 -------------------------------------
+// The gate excluded two classes of un-dispatchable queued tasks (other feeds' ATS jobs, and
+// cooldown-blocked LinkedIn jobs) but not the third: tasks the dispatch breaker deferred behind a
+// site verification wall by pushing scheduled_at into the FUTURE and leaving them 'queued'.
+// 65 Indeed jobs sat behind Indeed's wall (oldest 6 days), holding the count at 65 >= refillBelow
+// 60. jobspy did not run for 18h, LinkedIn supply went to zero, and the node submitted NOTHING for
+// 31 hours while every dashboard read "busy". Generalised: depth means DISPATCHABLE depth.
+test('tasks deferred into the future do not count toward "queue full"', () => {
+  const now = Date.now();
+  const future = new Date(now + 30 * 60000).toISOString();
+  const past = new Date(now - 30 * 60000).toISOString();
+  const queued = [
+    ...Array.from({ length: 65 }, () => ({ source: 'indeed', scheduledAt: future })), // wall-deferred
+    ...Array.from({ length: 2 }, () => ({ source: 'indeed', scheduledAt: past })),     // actually due
+  ];
+  const dispatchable = queued.filter((t) => !(t.scheduledAt && Date.parse(t.scheduledAt) > now));
+
+  assert.equal(queued.length >= 60, true, 'precondition: raw depth exceeds the threshold');
+  assert.equal(dispatchable.length, 2, 'only the due tasks are dispatchable');
+  assert.equal(dispatchable.length >= 60, false, 'so the gate must let discovery run');
+});
+
+test('the app-side gate implements the not-due exclusion', () => {
+  const src = read('app', 'src', 'discovery', 'index.js');
+  const gate = src.slice(src.indexOf('SOURCE-AWARE refill gate'), src.indexOf('jobspyQueued >='));
+  assert.match(gate, /scheduledAt/,
+    'the gate must read scheduled_at — a task not yet due cannot be dispatched');
+  assert.match(gate, /Date\.parse\(t\.scheduledAt\)\s*>/,
+    'a FUTURE scheduled_at is what marks a task un-dispatchable');
+});
+
 test('a gated tick does not consume a rotation slot', () => {
   // The gate reads the combo index to know its board, so it must PEEK: persisting the next index on
   // a gated tick would silently skip that combo the next time discovery actually runs.

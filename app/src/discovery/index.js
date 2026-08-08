@@ -274,11 +274,21 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
       // Indeed discovery that IS appliable during the cooldown (the node then idles until the cap resets).
       let cooledDownGate = false;
       try { cooledDownGate = db.easyApplyCooledDown(); } catch {}
+      // HOST-WALL DEFERRALS DON'T COUNT (same class of starvation as the two exclusions below).
+      // The dispatch breaker parks a task behind a Cloudflare/verification wall by pushing
+      // scheduled_at into the FUTURE and leaving it 'queued' (server.js queueNext) — deliberately,
+      // so a transient wall never discards a job. But a wall that does NOT lift leaves those tasks
+      // queued forever, and they counted as "queue full" here. Live 2026-08-07: 65 Indeed jobs sat
+      // behind Indeed's verification wall (oldest 6 days), pinning the count at 65 ≥ refillBelow 60,
+      // so jobspy did not run for 18h — no fresh LinkedIn supply, and the node submitted NOTHING for
+      // 31 hours while looking busy. A task that cannot be dispatched now must never gate discovery.
+      const nowMs = Date.now();
       const jobspyQueued = db.queueList({ state: 'queued' })
         .filter((t) => {
           const src = String((t.job && t.job.source) || '').toLowerCase();
           if (ATS_FEED_SOURCES.has(src)) return false;              // separate direct-ATS feed
           if (cooledDownGate && src === 'linkedin') return false;   // stuck (capped) during cooldown
+          if (t.scheduledAt && Date.parse(t.scheduledAt) > nowMs) return false;  // host wall / not due
           return true;
         }).length;
       if (jobspyQueued >= (aa.discovery?.refillBelow || 3)) return { ok: false, reason: 'queue-full' };

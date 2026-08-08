@@ -499,14 +499,20 @@ function profileFieldFor(label, profile) {
 // REMOVED at Pierre's explicit request: he supplied his pronouns (stored on the profile), and every
 // posting that asks was parking forever behind this guard. Gender identity, transgender status,
 // race, disability, veteran and criminal history all remain blocked — those stay the user's call.
-export const NEVER_AUTOFILL_RX = /(ethnic|race|gender|disabilit|veteran|criminal|background.?check|felony|conviction|sexual.?orientation|\blgbtq?)/i;
+// `convict` (not `conviction`) and `\bcrimes?\b` because the single most common phrasing —
+// "Have you been CONVICTED of a CRIME for which you have not received a pardon?" — matched NEITHER
+// `conviction` nor `criminal` and so was never blocked here. It only stayed unanswered because the
+// AI happened to decline it; the deterministic guard must not depend on that.
+export const NEVER_AUTOFILL_RX = /(ethnic|race|gender|disabilit|veteran|criminal|convict|\bcrimes?\b|background.?check|felony|sexual.?orientation|\blgbtq?)/i;
 
 // Screen-reader instructions for a combobox/listbox ("5 results available. Use Up and Down to
 // choose options, press Enter to select…") get picked up as if they were the QUESTION. The job then
 // parks forever waiting on an answer to a string that is not a question, and the junk text would be
 // learned as a saved answer key. Treat this text as "no label" so the control is passed over
 // cleanly instead of stalling the application.
-export const UI_INSTRUCTION_RX = /results available|use up and down|press enter to select|press escape|press tab to select|screen ?reader/i;
+// `results?` because the live string is SINGULAR when a combobox narrows to one option
+// ("1 result available.Use Up and Down to choose options, …") — the plural-only form missed it.
+export const UI_INSTRUCTION_RX = /results? available|use up and down|press enter to select|press escape|press tab to select|screen ?reader/i;
 
 // A radio/checkbox is "visible enough" to be a real screening control when the native input
 // OR an associated <label> / styled wrapper is visible. LinkedIn (and many ATS) render the

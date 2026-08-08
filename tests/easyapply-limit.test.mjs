@@ -115,10 +115,21 @@ test('cooldown fallback: intake ingests external jobs while Easy-Apply is cooled
 test('early reset: cooldown clears once rolling-24h count is a margin below the observed limit', () => {
   const now24 = db.easyApplySubmitted24h();
   db.kvSet('easyApplyLimitUntil', new Date(Date.now() + 24 * 3600 * 1000).toISOString());   // fresh 24h timer
+  // The early reset is only consulted OUTSIDE the post-refusal blackout (see easyApplyCooledDown:
+  // an explicit easyapply-limit from LinkedIn outranks this node's local count, because the cap is
+  // per-account and a second node's usage is invisible here). This test exercises the early-reset
+  // heuristic itself, so place the last refusal well in the past. The blackout has its own coverage
+  // in easyapply-multinode-cap.test.mjs.
+  db.kvSet('easyApplyLimitSeenAt', Date.now() - 6 * 3600 * 1000);
 
   // Observed limit well ABOVE the current count → real headroom → cap treated as reset → NOT cooled.
   db.kvSet('easyApplyObservedLimit', now24 + 50);
   assert.equal(db.easyApplyCooledDown(), false, 'headroom below the cap → resume Easy-Apply right away');
+
+  // ...but a FRESH refusal outranks that headroom, even with the same counts.
+  db.kvSet('easyApplyLimitSeenAt', Date.now());
+  assert.equal(db.easyApplyCooledDown(), true, 'LinkedIn just refused us → hold, whatever the local count says');
+  db.kvSet('easyApplyLimitSeenAt', Date.now() - 6 * 3600 * 1000);
 
   // Observed limit == current count → sitting AT the cap → stay cooled (external mode).
   db.kvSet('easyApplyObservedLimit', now24);

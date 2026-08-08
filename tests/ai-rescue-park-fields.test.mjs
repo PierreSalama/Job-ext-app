@@ -63,7 +63,11 @@ const parkBranch = src.slice(src.indexOf("if (act.type === 'park')"));
 const branch = parkBranch.slice(0, parkBranch.indexOf("if (act.type === 'click')"));
 
 test('the park branch falls back to the page\'s real unanswered required fields', () => {
-  assert.match(branch, /fieldRefs\.filter\(\(f\) => f\.required && !f\.value\)/,
+  // `answerable(f)` was added 2026-08-08 — the required && !value predicate is unchanged, but the
+  // labels are now screened through UI_INSTRUCTION_RX first. See rescue-park-answerable.test.mjs:
+  // this path was parking combobox screen-reader help ("1 result available.Use Up and Down…") as
+  // if it were a question, which is unanswerable in exactly the way this test file exists to stop.
+  assert.match(branch, /fieldRefs\.filter\(\(f\) => f\.required && !f\.value/,
     'must park from the real field list, not from prose');
   assert.match(branch, /park\(f\.label, f\.type, f\.options, why\)/,
     'each parked question must carry its true label, type AND options so it is answerable');

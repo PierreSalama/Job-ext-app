@@ -13,7 +13,7 @@
 // questions only ever come from the profile, never the AI (enforced by the
 // prompt server-side AND a local guard here).
 
-import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput, isFillable, radioGroupLabel, selectGroupLabel, isSiteChromeInput, bestFuzzyIndex, isJunkQuestionKey, nearestQuestionText } from './autofill.js';
+import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput, isFillable, radioGroupLabel, selectGroupLabel, isSiteChromeInput, bestFuzzyIndex, isJunkQuestionKey, nearestQuestionText, UI_INSTRUCTION_RX } from './autofill.js';
 import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
 import { pageTextLooksLikeSuccess, urlLooksLikeSuccess, evaluateSubmitEvidence } from './signals/success.js';
@@ -40,7 +40,15 @@ const LEGAL_RX = /(work.*authoriz|authoriz.*work|sponsor|visa|citizen|clearance|
 // the profile) — the user must consciously answer these in the form. Work
 // authorization / sponsorship / citizenship stay fillable (that's the profile's
 // purpose); this list is the EEO + criminal-history subset only.
-const NEVER_AUTOFILL_RX = /(ethnic|race\b|gender|\bsex\b|disabilit|veteran|criminal|background.*check|felony|conviction|pronoun)/i;
+// THIS IS THE THIRD COPY of the same guard (autofill.js NEVER_AUTOFILL_RX, db.js SENSITIVE_RX).
+// They must agree — see tests/pronoun-parity.test.mjs. Two corrections applied 2026-08-08:
+//   • `pronoun` REMOVED, matching the other two. Pierre asked for pronoun questions to be answered;
+//     autofill.js and db.js were updated but this copy was missed, so 12 postings kept parking on
+//     "Pronouns *" — the guard nearest the form still won.
+//   • `conviction` → `convict` plus `\bcrimes?\b`: the commonest real phrasing, "Have you been
+//     CONVICTED of a CRIME for which you have not received a pardon?", matched neither `conviction`
+//     nor `criminal` and so was never blocked.
+const NEVER_AUTOFILL_RX = /(ethnic|race\b|gender|\bsex\b|disabilit|veteran|criminal|convict|\bcrimes?\b|background.*check|felony)/i;
 // Optional, non-text-answerable fields (a profile photo/headshot URL, etc.) — leave
 // them BLANK and move on instead of parking the whole job. They're almost always
 // optional, and the AI correctly refuses to invent a photo URL.
@@ -1847,11 +1855,21 @@ export async function run(task, context, helpers) {
         // their true labels, types and OPTIONS, so the needs-you queue shows an answerable question
         // (a radio renders as its actual choices) and the answer becomes learnable + reusable.
         // Same `required && !value` predicate the rescue signature uses above.
-        const blocking = fieldRefs.filter((f) => f.required && !f.value);
+        // The two autofill scan paths already drop combobox screen-reader help via
+        // UI_INSTRUCTION_RX; this path parked raw labels and so re-introduced exactly what that
+        // guard exists to prevent. Live 2026-08-08: 6 rows reading "1 result available.Use Up and
+        // Down to choose options, press Enter to select…" and 9 reading a bare "Type" sat in the
+        // needs-you queue as if they were questions. A label that is not a question can never be
+        // answered, so the job parks forever.
+        const answerable = (f) => f.label && f.label.trim().length > 2 && !UI_INSTRUCTION_RX.test(f.label);
+        const blocking = fieldRefs.filter((f) => f.required && !f.value && answerable(f));
         if (blocking.length) {
           for (const f of blocking.slice(0, 6)) park(f.label, f.type, f.options, why);
           return 'parked';
         }
+        // Last resort, deliberately kept: a row the user cannot answer is still a signal that this
+        // job needs attention, and dropping it entirely would let the task retry-loop silently.
+        // See tests/ai-rescue-park-fields.test.mjs for why this stays behind the structural path.
         park('AI rescue', 'text', null, why);
         return 'parked';
       }

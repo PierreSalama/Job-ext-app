@@ -1,110 +1,110 @@
 {
-    "manifest_version":  3,
-    "name":  "Job Application Tracker v11",
-    "short_name":  "JAT v11",
-    "version":  "11.90.11",
-    "description":  "Capture, track, and organize your job applications across job boards, with a local desktop companion and assisted form-fill.",
-    "browser_specific_settings":  {
-                                      "gecko":  {
-                                                    "id":  "jat-v11@pierresalama.dev",
-                                                    "strict_min_version":  "121.0"
-                                                }
-                                  },
-    "permissions":  [
-                        "storage",
-                        "downloads",
-                        "downloads.open",
-                        "tabs",
-                        "tabGroups",
-                        "alarms",
-                        "webNavigation",
-                        "contextMenus",
-                        "scripting",
-                        "system.display",
-                        "notifications",
-                        "idle"
-                    ],
-    "host_permissions":  [
-                             "\u003call_urls\u003e",
-                             "http://localhost:7744/*",
-                             "http://127.0.0.1:7744/*",
-                             "https://api.github.com/*",
-                             "https://github.com/*",
-                             "https://*.githubusercontent.com/*"
-                         ],
-    "background":  {
-                       "service_worker":  "background.js",
-                       "type":  "module"
-                   },
-    "action":  {
-                   "default_popup":  "popup/popup.html",
-                   "default_title":  "Job Application Tracker v11",
-                   "default_icon":  {
-                                        "16":  "icons/icon16.png",
-                                        "32":  "icons/icon32.png",
-                                        "48":  "icons/icon48.png",
-                                        "128":  "icons/icon128.png"
-                                    }
-               },
-    "icons":  {
-                  "16":  "icons/icon16.png",
-                  "32":  "icons/icon32.png",
-                  "48":  "icons/icon48.png",
-                  "128":  "icons/icon128.png"
-              },
-    "content_scripts":  [
-                            {
-                                "matches":  [
-                                                "\u003call_urls\u003e"
-                                            ],
-                                "exclude_matches":  [
-                                                        "*://localhost/*",
-                                                        "*://127.0.0.1/*",
-                                                        "*://*.youtube.com/*",
-                                                        "*://mail.google.com/*",
-                                                        "*://docs.google.com/*",
-                                                        "*://accounts.google.com/*",
-                                                        "*://github.com/*",
-                                                        "*://*.github.com/*",
-                                                        "*://chat.openai.com/*",
-                                                        "*://chatgpt.com/*",
-                                                        "*://claude.ai/*",
-                                                        "*://app.plex.tv/*",
-                                                        "*://*.plex.tv/*",
-                                                        "*://*.plex.direct/*",
-                                                        "*://*.netflix.com/*",
-                                                        "*://*.spotify.com/*",
-                                                        "*://*.twitch.tv/*",
-                                                        "*://*.disneyplus.com/*"
-                                                    ],
-                                "js":  [
-                                           "content/loader.js"
-                                       ],
-                                "run_at":  "document_idle",
-                                "all_frames":  true,
-                                "match_about_blank":  false
-                            }
-                        ],
-    "web_accessible_resources":  [
-                                     {
-                                         "resources":  [
-                                                           "content/detector.js",
-                                                           "content/panel.js",
-                                                           "content/autofill.js",
-                                                           "content/executor.js",
-                                                           "content/replay.js",
-                                                           "content/route.js",
-                                                           "content/supervise.js",
-                                                           "content/recorder.js",
-                                                           "content/discover.js",
-                                                           "content/applied-sync.js",
-                                                           "content/lib/*.js",
-                                                           "content/signals/*.js",
-                                                           "content/sites/*.js"
-                                                       ],
-                                         "matches":  [
-                                                         "\u003call_urls\u003e"
-                                                     ]
-                                     }
-                                 ]
+  "manifest_version": 3,
+  "name": "Job Application Tracker v11",
+  "short_name": "JAT v11",
+  "version": "11.90.12",
+  "description": "Capture, track, and organize your job applications across job boards, with a local desktop companion and assisted form-fill.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "jat-v11@pierresalama.dev",
+      "strict_min_version": "121.0"
+    }
+  },
+  "permissions": [
+    "storage",
+    "downloads",
+    "downloads.open",
+    "tabs",
+    "tabGroups",
+    "alarms",
+    "webNavigation",
+    "contextMenus",
+    "scripting",
+    "system.display",
+    "notifications",
+    "idle"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://localhost:7744/*",
+    "http://127.0.0.1:7744/*",
+    "https://api.github.com/*",
+    "https://github.com/*",
+    "https://*.githubusercontent.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Job Application Tracker v11",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "exclude_matches": [
+        "*://localhost/*",
+        "*://127.0.0.1/*",
+        "*://*.youtube.com/*",
+        "*://mail.google.com/*",
+        "*://docs.google.com/*",
+        "*://accounts.google.com/*",
+        "*://github.com/*",
+        "*://*.github.com/*",
+        "*://chat.openai.com/*",
+        "*://chatgpt.com/*",
+        "*://claude.ai/*",
+        "*://app.plex.tv/*",
+        "*://*.plex.tv/*",
+        "*://*.plex.direct/*",
+        "*://*.netflix.com/*",
+        "*://*.spotify.com/*",
+        "*://*.twitch.tv/*",
+        "*://*.disneyplus.com/*"
+      ],
+      "js": [
+        "content/loader.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "content/detector.js",
+        "content/panel.js",
+        "content/autofill.js",
+        "content/executor.js",
+        "content/replay.js",
+        "content/route.js",
+        "content/supervise.js",
+        "content/recorder.js",
+        "content/discover.js",
+        "content/applied-sync.js",
+        "content/lib/*.js",
+        "content/signals/*.js",
+        "content/sites/*.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
 }

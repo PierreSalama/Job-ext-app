@@ -27,6 +27,16 @@ const API = 'https://gmail.googleapis.com/gmail/v1/users/me';
 
 let lastResult = null;
 let syncing = false;
+// When the CURRENT sync started, so a wedged one can be detected. `syncing` is cleared in a
+// finally, which only runs if the promise settles — a fetch that never resolves (no timeout on the
+// Gmail calls) leaves the flag true for the life of the process and EVERY later sync returns
+// "sync already running". Live 2026-08-06: a sync began at 04:30 and never finished, so Gmail went
+// 47h without a single successful run and no employer mail was ingested. Nothing surfaced it,
+// because the flag is in-memory and the health record only advances on a completed run.
+let syncStartedAt = 0;
+// A real sync (backfill, SCAN_CAP 1200) finishes in minutes. Past this, assume the previous run is
+// dead and let a new one take over rather than staying wedged forever.
+const SYNC_STALE_MS = 15 * 60 * 1000;
 
 // ---------- health ----------
 // EVERY sync outcome — success or failure — is persisted here. Before this existed,
@@ -320,7 +330,13 @@ function matchJob({ title, company }) {
 
 // ---------- sync ----------
 async function syncNow() {
-  if (syncing) return { ok: false, error: 'sync already running' };
+  if (syncing && (Date.now() - syncStartedAt) < SYNC_STALE_MS) {
+    return { ok: false, error: 'sync already running' };
+  }
+  if (syncing) {
+    // Previous run is wedged past SYNC_STALE_MS — take the flag over instead of blocking forever.
+    recordFailure(`previous sync wedged for ${Math.round((Date.now() - syncStartedAt) / 60000)} min — starting a new one`);
+  }
   const s = db.getSettings().gmail;
   if (!s.enabled) {
     const e = 'Gmail sync is turned off in Settings.';
@@ -337,6 +353,7 @@ async function syncNow() {
   }
 
   syncing = true;
+  syncStartedAt = Date.now();
   const started = Date.now();
   let scanned = 0, matched = 0, updated = 0, emailsWritten = 0;
   // Bound the AI second-stage per sync run (mirrors email.js AI_DISAMBIGUATE_CAP). On a backfill

@@ -1987,7 +1987,14 @@ function profileAutofillBundle(source) {
 // precise so they never eat legitimate fields: `security.?(question|answer)` (NOT bare
 // "security", so "security clearance" passes), `\bpin\b` (word-bounded, so "Pinterest"/
 // "shipping" pass), `pass(word|code|phrase)` (so "passport"/"compass" don't false-match).
-const SENSITIVE_RX = /(ethnic|race\b|gender|\bsex\b|disabilit|veteran|criminal|background.?check|felony|conviction|pronoun|sexual.?orientation|\blgbtq?|\bssn\b|social.?security|date.?of.?birth|\bdob\b|pass(word|code|phrase)|\bpwd\b|payment|credit.?card|card.?number|\bcardnum|\bcvv\b|\bcvc2?\b|security.?code|\bpin\b|\biban\b|routing.?number|bank.?account|sort.?code|\bpassport\b|credential|security.?(question|answer)|secret.?(question|answer))/i;
+// `pronoun` is deliberately ABSENT, matching the extension's NEVER_AUTOFILL_RX, which dropped it at
+// Pierre's explicit request. This backstop must agree with the client: while it still listed
+// `pronoun`, the answer could never be RETAINED, so autofill had nothing to recall and every posting
+// asking "Pronouns *" parked forever — 12 such jobs blocked live on 2026-08-08 on a question he had
+// already said to answer. Gender identity, transgender status, race, disability, veteran status and
+// criminal history all remain blocked here — those stay the user's call, and `gender` below still
+// catches "gender identity" regardless.
+const SENSITIVE_RX = /(ethnic|race\b|gender|\bsex\b|disabilit|veteran|criminal|convict|\bcrimes?\b|background.?check|felony|sexual.?orientation|\blgbtq?|\bssn\b|social.?security|date.?of.?birth|\bdob\b|pass(word|code|phrase)|\bpwd\b|payment|credit.?card|card.?number|\bcardnum|\bcvv\b|\bcvc2?\b|security.?code|\bpin\b|\biban\b|routing.?number|bank.?account|sort.?code|\bpassport\b|credential|security.?(question|answer)|secret.?(question|answer))/i;
 function isSensitiveKey(key) {
   const k = String(key || '');
   try { return SENSITIVE_RX.test(k) || SENSITIVE_RX.test(humanizeKey(k)); } catch { return SENSITIVE_RX.test(k); }
@@ -3659,9 +3666,15 @@ function easyApplySubmitted24h() {
   return r ? r.n : 0;
 }
 
+// How long an EXPLICIT "easyapply-limit" from LinkedIn outranks the local early-reset heuristic.
+// See easyApplyCooledDown() for why this exists.
+const EARLY_RESET_BLACKOUT_MS = 60 * 60 * 1000;
+
 function setEasyApplyCooldown({ hours = 24 } = {}) {
   const until = new Date(Date.now() + Math.max(0, hours) * 3600 * 1000).toISOString();
   kvSet('easyApplyLimitUntil', until);
+  // Remember WHEN LinkedIn last actually refused us, not just when the timer would expire.
+  kvSet('easyApplyLimitSeenAt', Date.now());
   // Learn the threshold: record the count we'd reached when the cap hit, keeping the MAX
   // ever observed (it may not be exactly 50, and it's per-account).
   const submitted = easyApplySubmitted24h();
@@ -3680,6 +3693,20 @@ function easyApplyCooledDown() {
   // again well BEFORE the fixed timer expires. So the moment the live rolling-24h count drops a safe
   // margin below the observed limit, treat the cap as reset and resume Easy-Apply right away (external
   // mode ends). The margin is a hysteresis band so it doesn't thrash one-apply-at-a-time at the edge.
+  //
+  // MULTI-NODE CORRECTION. easyApplySubmitted24h() counts only THIS node's applies, but the cap is
+  // per ACCOUNT. With two nodes on one LinkedIn account neither can see the other's usage, so both
+  // stay below `observed - margin` forever and the early reset fires permanently — each node decides
+  // the cap is free while LinkedIn is actively refusing it. Live 2026-08-08: laptop counted 19 and
+  // the PC 16 against an observed limit of 40; combined they had spent ~35 and LinkedIn was rejecting
+  // every attempt, yet BOTH reported cooledDown=false and kept dispatching. That is an unbounded loop
+  // of refused requests against an account that had already been warned for automated access.
+  //
+  // An explicit easyapply-limit from LinkedIn is ground truth about the ACCOUNT; the local count is
+  // only ever a guess about this node. So for a blackout window after a real refusal, LinkedIn wins.
+  // After that the early reset may resume, preserving fast recovery when the rolling window frees up.
+  const seenAt = Number(kvGet('easyApplyLimitSeenAt')) || 0;
+  if (seenAt && (Date.now() - seenAt) < EARLY_RESET_BLACKOUT_MS) return true;
   const observed = Number(kvGet('easyApplyObservedLimit')) || 0;
   if (observed > 0) {
     const margin = Math.max(2, Math.round(observed * 0.1));
