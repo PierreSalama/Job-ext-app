@@ -131,9 +131,32 @@ function checkFit(title, pageText, fit) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Default ceiling for a round-trip to the background service worker.
+export const SEND_TIMEOUT_MS = 30000;
+
+// EVERY executor↔SW call goes through here, and it used to have NO timeout: a bare
+// chrome.runtime.sendMessage wrapped in a Promise that settles ONLY when the callback fires. Under
+// MV3 the service worker can be evicted or stalled mid-call, the callback never runs, and the
+// promise never settles — so the executor waits forever holding a worker slot.
+//
+// Live 2026-08-09 on the laptop, one Machine Learning Engineer application: a 2602-second (43 MIN)
+// gap immediately after the resume step, which awaits send({type:'get-document'}). The task ran 50
+// minutes against a nominal 5.5-minute apply budget. Timeouts were 51% of all outcomes, and this is
+// why the per-apply timeout could not contain them — the hang is BELOW it, in an await that has no
+// ceiling of its own.
+//
+// Resolving null on timeout is safe by construction: every caller already handles a null/!ok reply
+// (`if (!r?.ok)`), because the SW could always legitimately fail. A message may ask for a longer
+// budget (the AI rescue passes timeoutMs: 150000); honour it, plus headroom, so the background's own
+// timeout wins and a legitimately slow call is never cut short.
 const send = (msg) => new Promise((res) => {
-  try { chrome.runtime.sendMessage(msg, (r) => { void chrome.runtime.lastError; res(r); }); }
-  catch { res(null); }
+  let settled = false;
+  const finish = (v) => { if (!settled) { settled = true; res(v); } };
+  const budget = Math.max(Number(msg && msg.timeoutMs) || 0, SEND_TIMEOUT_MS) + 5000;
+  const timer = setTimeout(() => finish(null), budget);
+  try {
+    chrome.runtime.sendMessage(msg, (r) => { clearTimeout(timer); void chrome.runtime.lastError; finish(r); });
+  } catch { clearTimeout(timer); finish(null); }
 });
 
 // In-tab alert for a human Cloudflare check — the reliable fallback when the OS suppresses the
