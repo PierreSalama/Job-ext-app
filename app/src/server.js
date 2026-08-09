@@ -451,6 +451,7 @@ async function queueNext(force = false) {
   let cooledDown = false;
   try { cooledDown = db.easyApplyCooledDown(); } catch {}
   let easyApplyDeferred = false;
+  let signedOutDeferred = false;
   let hostDeferred = false;
   // PER-JOB PASS-OVER DIAGNOSTIC. The deferral flags below collapse into ONE reason string, so a
   // queue that looks full while nothing dispatches gives no clue which guard excluded which job
@@ -524,6 +525,10 @@ async function queueNext(force = false) {
       continue;
     }
     if (cooledDown && !db.easyApplyEligible(j)) { easyApplyDeferred = true; passOver(t, j, 'easyapply-cooldown: LinkedIn job held while the daily cap is spent'); continue; }
+    // SIGNED OUT: a signed-out browser cannot apply on LinkedIn, so dispatching LinkedIn jobs would
+    // only generate sign-in-wall requests. Hold them (not skip — they are perfectly good jobs) and
+    // let non-LinkedIn work continue. Clears itself the moment a LinkedIn task succeeds again.
+    if (!db.signedOutEligible(j)) { signedOutDeferred = true; passOver(t, j, 'signed-out: LinkedIn job held until the browser is signed in again'); continue; }
     // NOT-BEFORE DEFERRAL: a queued task whose scheduled_at is in the FUTURE is waiting out a
     // transient site condition (the extension's host circuit breaker sets this when a host starts
     // serving a Cloudflare/verification wall). Leave it QUEUED and take the next candidate, the
@@ -565,6 +570,9 @@ async function queueNext(force = false) {
     candidates.push(gapOnly[0]);
   }
   if (!candidates.length && easyApplyDeferred) return { task: null, reason: 'easyapply-cooldown', concurrency, passedOver: passOverSummary() };
+  // Idling on purpose because the browser is signed out — a distinct, actionable reason rather than
+  // the generic 'empty', so the dashboard and any monitor can say what is actually wrong.
+  if (!candidates.length && signedOutDeferred) return { task: null, reason: 'signed-out', concurrency, signedOut: db.signedOutStatus(), passedOver: passOverSummary() };
   // Held back for a host serving a verification wall — idling on purpose, not out of work.
   if (!candidates.length && hostDeferred) return { task: null, reason: 'host-cooldown', concurrency, passedOver: passOverSummary() };
   // Per-site gap wins over site-busy as the idle reason so the pump's gapTimer wakes it exactly
@@ -1506,6 +1514,23 @@ async function handle(req, res, parsed) {
       try { db.setEasyApplyCooldown(); } catch {}
       broadcast('queue.updated', { action: 'easyapply-limit' });
     }
+    // SIGNED-OUT LATCH. The executor saw LinkedIn's sign-in wall: stop dispatching LinkedIn work at
+    // once. Latching here (rather than letting each worker rediscover it) is the whole point — the
+    // 31-hour outage happened because every worker independently hit the wall, reported a generic
+    // failure, and the next one tried again.
+    if (body.parkReason === 'signed_out' || (typeof body.lastError === 'string' && /^linkedin-signed-out/.test(body.lastError))) {
+      try { db.setSignedOut(body.lastError || 'signed out of LinkedIn'); } catch {}
+      broadcast('queue.updated', { action: 'signed-out' });
+      if (opts.notify) { try { opts.notify('signedOut', task); } catch {} }
+    }
+    // ...and clear it the moment a LinkedIn task genuinely succeeds. Self-healing: signing back in
+    // needs no button anywhere, the first successful apply proves the session and releases the latch.
+    if (['done', 'awaiting_review'].includes(String(body.state || '')) && db.isSignedOut()) {
+      try {
+        const j = task && task.job_id ? db.getJob(task.job_id) : null;
+        if (!j || String(j.source || '').toLowerCase() === 'linkedin') { db.clearSignedOut(); broadcast('queue.updated', { action: 'signed-in' }); }
+      } catch {}
+    }
     broadcast('queue.updated', { taskId: task.id, state: task.state });
     if (opts.notify && ['awaiting_review', 'awaiting_input', 'parked', 'done', 'failed'].includes(task.state)) {
       opts.notify('autoApply', task);
@@ -1563,6 +1588,16 @@ async function handle(req, res, parsed) {
   }
   // A1: LinkedIn Easy Apply daily-cap status — cooldown state, when it resumes, the
   // learned per-account threshold, and the rolling 24h submit count, for the dashboard.
+  // Signed-out latch state — so a monitor (or the dashboard) can say "the browser is signed out"
+  // instead of inferring it from a pile of generic failures, which is what took 31 hours last time.
+  if (req.method === 'GET' && pathname === '/auto-apply/signed-out') {
+    return sendJson(res, 200, { ok: true, ...db.signedOutStatus() });
+  }
+  if (req.method === 'POST' && pathname === '/auto-apply/signed-out/clear') {
+    db.clearSignedOut();
+    broadcast('queue.updated', { action: 'signed-in' });
+    return sendJson(res, 200, { ok: true, ...db.signedOutStatus() });
+  }
   if (req.method === 'GET' && pathname === '/auto-apply/easyapply-status') {
     return sendJson(res, 200, { ok: true, ...db.easyApplyStatus() });
   }

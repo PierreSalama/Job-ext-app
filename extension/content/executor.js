@@ -2206,6 +2206,29 @@ export async function run(task, context, helpers) {
     return null;
   }
 
+  // ---- SIGNED-OUT DETECTION -------------------------------------------------------------------
+  // The worst failure this project has had: the applier sat SIGNED OUT of LinkedIn for 31 hours
+  // (2026-08-06 → 08-07) while looking perfectly healthy. Every dispatch loaded a job page, got the
+  // sign-in wall, waited 30s for a control that could never appear, and reported the generic
+  // "no advance button found — will retry". Nothing anywhere detected the real cause, so it kept
+  // going: hundreds of automated requests from a signed-out session, which is exactly the pattern
+  // that earns an account an automated-access warning. It produced ZERO applications the whole time.
+  //
+  // Two INDEPENDENT signals are required so a working node is never falsely halted:
+  //   1. a password input — a signed-IN LinkedIn job page never renders one, and no Easy-Apply form
+  //      contains one either, so this alone is already strong;
+  //   2. the sign-in copy ("Join now" / "Sign in with Email" / "New to LinkedIn").
+  // Both must hold, on a linkedin.com host, before we call it.
+  function linkedInSignedOut() {
+    try {
+      if (!/(^|\.)linkedin\.com$/i.test(location.hostname)) return false;
+      if (!document.querySelector('input[type="password"]')) return false;
+      const t = (document.body?.innerText || '').slice(0, 4000);
+      if (!/\bsign in\b/i.test(t)) return false;
+      return /\bjoin now\b/i.test(t) || /sign in with email/i.test(t) || /new to linkedin/i.test(t);
+    } catch { return false; }
+  }
+
   // ---- BROADENED final-submit finder for a recognised pack (BUG: BambooHR submit in footer) ----
   // A recognised account-less ATS can render its FINAL "Submit Application" button OUTSIDE the
   // field container — BambooHR puts it in a page-level footer, so the root-scoped findPackAdvance
@@ -3009,6 +3032,20 @@ export async function run(task, context, helpers) {
       // Fronting is now a RARE last-resort safety net: only after an initial wait fails do we
       // escalate to front-until-hydrated (below). This avoids stealing the foreground on every
       // apply (the v11.26.0 disruption) while still rescuing a genuinely occluded+stuck tab.
+      // Before burning 30s waiting for a control that can never appear: are we simply signed out?
+      // This is the cheapest possible check and it converts the single most expensive silent
+      // failure mode into an explicit, actionable one.
+      if (linkedInSignedOut()) {
+        logLine('err', 'LinkedIn is SIGNED OUT in this browser — halting instead of retrying');
+        report({
+          state: 'failed',
+          parkReason: 'signed_out',
+          lastError: 'linkedin-signed-out — this browser is signed out of LinkedIn; auto-apply is halted until you sign in',
+          transcriptAppend: { kind: 'recovery', note: 'signed-out sign-in wall detected (password field + sign-in copy) — halted rather than retrying' },
+        });
+        finalState = 'failed';
+        break;
+      }
       logLine('warn', opening
         ? (wasHidden ? 'apply tab is hidden — waiting for the application to hydrate' : 'application not open yet — waiting for it to hydrate')
         : 'no advance button — waiting for the page (or you)');

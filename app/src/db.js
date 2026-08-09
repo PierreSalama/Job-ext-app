@@ -3715,6 +3715,44 @@ function easyApplyCooledDown() {
   return true;
 }
 
+// ---- SIGNED-OUT LATCH -------------------------------------------------------------------------
+// The executor reports `signed_out` when it sees LinkedIn's sign-in wall. One such report is enough:
+// a signed-out browser cannot apply to anything on LinkedIn, so continuing to dispatch LinkedIn jobs
+// only produces sign-in-wall requests — the exact behaviour that got this account warned. The latch
+// makes LinkedIn jobs ineligible until a LinkedIn task actually succeeds again, which clears it
+// automatically (no manual reset, and no risk of it sticking after Pierre signs back in).
+function setSignedOut(reason = '') {
+  kvSet('linkedInSignedOutAt', Date.now());
+  if (reason) kvSet('linkedInSignedOutReason', String(reason).slice(0, 300));
+  return signedOutStatus();
+}
+function clearSignedOut() {
+  kvSet('linkedInSignedOutAt', 0);
+  kvSet('linkedInSignedOutReason', '');
+}
+function isSignedOut() {
+  return (Number(kvGet('linkedInSignedOutAt')) || 0) > 0;
+}
+function signedOutStatus() {
+  const at = Number(kvGet('linkedInSignedOutAt')) || 0;
+  return {
+    signedOut: at > 0,
+    since: at ? new Date(at).toISOString() : null,
+    minutes: at ? Math.round((Date.now() - at) / 60000) : 0,
+    reason: kvGet('linkedInSignedOutReason') || '',
+  };
+}
+// Is this job dispatchable given the signed-out latch? Non-LinkedIn work is unaffected — a signed-out
+// LinkedIn session says nothing about Greenhouse/Lever/Indeed, so the node keeps earning elsewhere
+// instead of going fully idle. Mirrors easyApplyEligible's shape deliberately.
+function signedOutEligible(job) {
+  if (!isSignedOut()) return true;
+  if (!job) return true;
+  if (String(job.source || '').toLowerCase() === 'linkedin') return false;
+  try { if (classifyAts(job.jobUrl).ats === 'linkedin') return false; } catch {}
+  return true;
+}
+
 function easyApplyStatus() {
   const until = kvGet('easyApplyLimitUntil') || null;
   return {
@@ -4703,6 +4741,7 @@ module.exports = {
   queueList, queueGet, queueHistory, queueBreakdown, jobUrlsForAtsHarvest, summarizeRun, queueRunSummary, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, quarantineUntrustworthyDone, recoverRaceLostSubmissions, recoverVerifiedEvidenceFromTranscript, isTrustworthyEvidence, saveIntakeAnswer,
   classifyQueueFailure, taskSiteKey, queueActiveSiteKeys, lastStartBySiteKey,
   setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
+  setSignedOut, clearSignedOut, isSignedOut, signedOutStatus, signedOutEligible,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,
   emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching, findJobByThread, gmailStatusFromCategory, reprocessEmails, elevateJobFromEmail,
