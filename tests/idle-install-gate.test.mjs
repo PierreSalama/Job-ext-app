@@ -23,10 +23,15 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const main = fs.readFileSync(path.join(here, '..', 'app', 'src', 'main.js'), 'utf8');
 const gate = main.slice(main.indexOf('function tryIdleInstall'), main.indexOf('function setupAutoUpdater'));
 
-// Mirror the gate's decision: may we install right now?
-function mayInstall({ enabled, active, scheduled, queuedDepth }) {
+const H = 3600000;
+// Mirror the gate's decision: may we install right now? `waitingMs` is how long the downloaded
+// update has been pending — the gate relaxes as that grows, because an update that never lands is
+// the same bug in a slower disguise.
+function mayInstall({ enabled, active, scheduled, queuedDepth, waitingMs = 0 }) {
   if (!enabled) return true;                 // pool is off — nothing to protect
-  return active === 0 && scheduled === 0;    // queuedDepth deliberately NOT consulted
+  if (waitingMs < 4 * H) return active === 0 && scheduled === 0;   // queuedDepth NOT consulted
+  if (waitingMs < 12 * H) return active === 0;
+  return true;                               // 12h+ — startup recovery reclaims anything in flight
 }
 
 test('the live deadlock: a busy node with a full queue can now install', () => {
@@ -53,6 +58,41 @@ test('the implementation no longer consults queuedDepth', () => {
     'in-flight work must still gate the install');
   assert.doesNotMatch(gate, /live\.queuedDepth > 0/,
     'regression: queue depth is never zero on a working node, so this is a permanent deadlock');
+});
+
+// --- escalation: the update must actually LAND ---------------------------------------------------
+// Dropping queuedDepth alone does not guarantee delivery. A healthy node applies almost
+// continuously, so "nothing in flight" is a narrow window a 60s poll can miss forever. Measured on
+// the PC: active=1 on 11 of 12 samples across five minutes.
+test('a permanently busy node still gets the update eventually', () => {
+  const busy = { enabled: true, active: 1, scheduled: 0, queuedDepth: 57 };
+  assert.equal(mayInstall({ ...busy, waitingMs: 1 * H }), false, 'fresh: stay fully safe');
+  assert.equal(mayInstall({ ...busy, waitingMs: 6 * H }), false, 'still protects a RUNNING apply');
+  assert.equal(mayInstall({ ...busy, waitingMs: 13 * H }), true,
+    'after half a day a stuck update costs more than one interrupted application');
+});
+
+test('the 4h step only relaxes SCHEDULED, never a running application', () => {
+  const scheduledOnly = { enabled: true, active: 0, scheduled: 2, queuedDepth: 10 };
+  assert.equal(mayInstall({ ...scheduledOnly, waitingMs: 1 * H }), false);
+  assert.equal(mayInstall({ ...scheduledOnly, waitingMs: 5 * H }), true,
+    'dispatched-but-not-started is reclaimed by reconcileStaleRunning on restart');
+
+  const running = { enabled: true, active: 1, scheduled: 0, queuedDepth: 10 };
+  assert.equal(mayInstall({ ...running, waitingMs: 5 * H }), false,
+    'a RUNNING application must still be protected at this step');
+});
+
+test('a quiet node installs immediately — escalation never delays the normal case', () => {
+  assert.equal(mayInstall({ enabled: true, active: 0, scheduled: 0, queuedDepth: 122, waitingMs: 0 }), true);
+});
+
+test('the implementation escalates on how long the install has waited', () => {
+  assert.match(gate, /waitingMs/, 'must consider how long the update has been pending');
+  assert.match(gate, /4 \* 3600000/, '4h step');
+  assert.match(gate, /12 \* 3600000/, '12h step');
+  assert.match(gate, /startup recovery will reclaim them/i,
+    'forcing an install past in-flight work must be logged, not silent');
 });
 
 test('the other gates are untouched — grace, idle, suspend, pairing', () => {

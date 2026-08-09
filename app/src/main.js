@@ -421,11 +421,28 @@ function tryIdleInstall() {
     //
     // A QUEUED task has not started: it carries no in-flight state, it survives the restart in the
     // database, and the pump picks it straight back up. Queue depth is not a safety signal.
+    //
+    // ESCALATION. Dropping queuedDepth improves the odds but does not GUARANTEE delivery: a healthy
+    // node is applying almost continuously, so `active === 0 && scheduled === 0` is a narrow window
+    // that a 60-second poll can miss indefinitely. Measured on the PC: active=1 on 11 of 12 samples
+    // over five minutes. An update that never lands is the same bug in a slower disguise, so the
+    // gate relaxes the longer an install has been waiting — the recovery passes that run at every
+    // startup (reconcileStaleRunning, retryStaleQueue) exist precisely to pick these up.
+    //   <4h  : fully safe — nothing in flight at all
+    //   >=4h : allow a dispatched-but-not-started task to be reclaimed on restart
+    //   >=12h: install regardless; a stuck update now costs more than one interrupted application
     try {
       const aa = db.getSettings().autoApply;
       if (aa && aa.enabled) {
+        const waitingMs = Date.now() - (pendingInstall.downloadedAt || Date.now());
         const live = db.queueLive({ startedAt: aa.startedAt || '' });
-        if (live.active > 0 || live.scheduled > 0) return;
+        if (waitingMs < 4 * 3600000) {
+          if (live.active > 0 || live.scheduled > 0) return;
+        } else if (waitingMs < 12 * 3600000) {
+          if (live.active > 0) return;
+        } else if (live.active > 0) {
+          log.warn(`[updater] update has waited ${Math.round(waitingMs / 3600000)}h — installing despite ${live.active} in-flight application(s); startup recovery will reclaim them`);
+        }
       }
     } catch { return; }
     log.info('[updater] idle + safe → auto-installing update', pendingInstall.version);
