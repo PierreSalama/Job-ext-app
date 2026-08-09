@@ -1558,9 +1558,12 @@ async function handle(req, res, parsed) {
     // 31-hour outage happened because every worker independently hit the wall, reported a generic
     // failure, and the next one tried again.
     if (body.parkReason === 'signed_out' || (typeof body.lastError === 'string' && /^linkedin-signed-out/.test(body.lastError))) {
+      // Notify only on the clear→set TRANSITION. Every held task reports this, so notifying per
+      // report would fire a native popup dozens of times for one sign-out.
+      const wasSignedOut = db.isSignedOut();
       try { db.setSignedOut(body.lastError || 'signed out of LinkedIn'); } catch {}
       broadcast('queue.updated', { action: 'signed-out' });
-      if (opts.notify) { try { opts.notify('signedOut', task); } catch {} }
+      if (!wasSignedOut && opts.notify) { try { opts.notify('signedOut', task); } catch {} }
     }
     // ...and clear it the moment a LinkedIn task genuinely succeeds. Self-healing: signing back in
     // needs no button anywhere, the first successful apply proves the session and releases the latch.

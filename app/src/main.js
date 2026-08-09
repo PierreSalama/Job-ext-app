@@ -307,6 +307,23 @@ function notifyEvent(type, payload) {
       }
     } catch {}
   }
+  // SIGNED OUT OF LINKEDIN — the one state only Pierre can clear.
+  //
+  // The signed-out latch (v11.90.13) correctly halts LinkedIn dispatch the moment the executor sees
+  // the sign-in wall, which is what stops a repeat of the 31-hour outage that started this work. But
+  // the notify hook wired alongside it dispatched a type NOTHING here handled, so it silently did
+  // nothing: on 2026-08-09 the PC sat halted and signed out for 81 minutes with 23 LinkedIn jobs
+  // held back and no signal to anyone. Halting without telling him turns a loud failure into a quiet
+  // one — the node looks alive and simply produces nothing.
+  //
+  // Deliberately BOTH channels: the in-app feed for history, and a native OS popup because this
+  // requires him to act. server.js fires this only on the clear→set transition, so it cannot spam
+  // once per held task.
+  if (type === 'signedOut') {
+    const msg = 'Auto-apply is halted: this browser is signed out of LinkedIn. Sign in and it resumes by itself.';
+    notify('autoApply', 'Signed out of LinkedIn', msg, 'danger');
+    try { nativeNotify('🔴 Signed out of LinkedIn', msg); } catch {}
+  }
 }
 
 // ---------- pairing consent (in-app modal, never a native dialog) ----------
