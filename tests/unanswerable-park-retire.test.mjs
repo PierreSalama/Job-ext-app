@@ -88,3 +88,43 @@ test('it runs unattended in the pipeline watchdog', () => {
   assert.match(main, /db\.retireUnanswerableParks\(/,
     'otherwise it is another manual chore, which is the bug');
 });
+
+// --- the better half: RECOVER mixed parks instead of retiring them --------------------------------
+// Retiring an all-junk park is right. But the live parks were MIXED: "needs 5 answer(s)" where
+// memory already answered four and the fifth was scraped screen-reader text. queueRetryParked
+// requires stillMissing to reach ZERO before requeueing, and junk can never be "answered", so one
+// junk string pinned the task in 'parked' permanently. Those are recoverable APPLICATIONS — the fix
+// is to stop junk counting as missing, not to throw the job away.
+test('a junk question does not count as a missing answer', () => {
+  const isMissing = (q, answeredByMemory) =>
+    !!q && !UI_NOISE.test(q) && !answeredByMemory;
+
+  assert.equal(isMissing(NOISE, false), false, 'junk is never "missing" — it is not a question');
+  assert.equal(isMissing(REAL, false), true, 'a real unanswered question still blocks');
+  assert.equal(isMissing(REAL, true), false, 'answered from memory → not blocking');
+});
+
+test('the live mixed park becomes retryable once junk stops blocking', () => {
+  const pend = [
+    { q: 'What is your notice period?', mem: true },
+    { q: 'Are you authorized to work in Canada?', mem: true },
+    { q: 'Years of experience with React?', mem: true },
+    { q: 'Preferred location?', mem: true },
+    { q: NOISE, mem: false },
+  ];
+  const stillMissing = pend.filter((p) => !UI_NOISE.test(p.q) && !p.mem);
+  assert.equal(stillMissing.length, 0, 'nothing real is missing → the task must requeue and retry');
+
+  // And the guard that matters: a genuinely unanswered question must still hold it parked.
+  const withReal = [...pend, { q: REAL, mem: false }];
+  const missing2 = withReal.filter((p) => !UI_NOISE.test(p.q) && !p.mem);
+  assert.equal(missing2.length, 1, 'a real question still keeps the task parked');
+});
+
+test('queueRetryParked filters junk out of stillMissing', () => {
+  const fn = db.slice(db.indexOf('function queueRetryParked'), db.indexOf('function saveIntakeAnswer'));
+  assert.ok(fn.length, 'queueRetryParked must exist');
+  assert.match(fn, /UI_NOISE_Q_RX\.test\(q\.question\)/,
+    'junk must be excluded from stillMissing or one junk string pins the task forever');
+  assert.match(fn, /stillMissing\.length === 0/, 'the zero-missing requeue condition is preserved');
+});

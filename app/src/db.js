@@ -3644,7 +3644,15 @@ function queueRetryParked() {
   for (const t of tasks) {
     const pid = resolveProfileId(srcByJob[t.jobId]);
     const pend = t.pendingQuestions || [];
-    const stillMissing = pend.filter((q) => q && q.question && !profileFieldLookup(pid, q.question, cache) && !qaLookup(pid, q.question, cache));
+    // UI noise cannot block a retry. A combobox's screen-reader help ("1 result available.Use Up
+    // and Down…") is not a question, so memory can never "answer" it — and because this filter
+    // required stillMissing to reach ZERO, a single junk string pinned the whole task in 'parked'
+    // FOREVER. Live 2026-08-09: parks reading "needs 5 answer(s)" where memory already answered
+    // four and the fifth was scraped screen-reader text. Those are recoverable applications, not
+    // questions for Pierre. New junk stopped at source in v11.90.12; this releases the backlog.
+    const stillMissing = pend.filter((q) => q && q.question
+      && !UI_NOISE_Q_RX.test(q.question)
+      && !profileFieldLookup(pid, q.question, cache) && !qaLookup(pid, q.question, cache));
     if (pend.length && stillMissing.length === 0) {
       run("UPDATE auto_apply_tasks SET state = 'queued', park_reason = NULL, pending_questions = NULL, updated_at = ? WHERE id = ?", [now(), t.id]);
       requeued++;
