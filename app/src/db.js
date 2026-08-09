@@ -3284,7 +3284,19 @@ function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25, m
 // executor never gets to report, so the only surviving evidence is the transcript.
 const CLICKED_FINAL_SUBMIT_RX = /isfinalsubmit\([^)]*\)=true|submitted — verified|clicking final submit/i;
 
-function reconcileStaleRunning({ olderThanMinutes = 8, scheduledOlderThanMinutes = olderThanMinutes } = {}) {
+// `scheduledOlderThanMinutes` DEFAULTS TO 2, not to olderThanMinutes. The comment above explains
+// why a stranded 'scheduled' row must be reclaimed far sooner than a genuinely 'running' one — but
+// only ONE of four call sites was passing it, and the pipeline watchdog (the one that runs every
+// 60s, and so the one that matters) was not. Every stranded claim therefore pinned a worker slot
+// for 8 minutes instead of 2.
+//
+// Measured live on the laptop 2026-08-09: ~9 stranded claims per hour, steady, each with
+// entries=1 and last transcript line "scheduled (mode=auto)" — i.e. the extension claimed the task
+// and died before the executor started, so it never ran at all. Ruled out first: my own deploys
+// (the failures are evenly spread, not clustered at deploy times) and a tab leak (renderer count
+// held steady at 13 across five minutes). Defaulting here rather than fixing three call sites means
+// a future caller cannot reintroduce it by omission.
+function reconcileStaleRunning({ olderThanMinutes = 8, scheduledOlderThanMinutes = 2 } = {}) {
   const runCut = new Date(Date.now() - Math.max(1, olderThanMinutes) * 60000).toISOString();
   const schedCut = new Date(Date.now() - Math.max(1, scheduledOlderThanMinutes) * 60000).toISOString();
   const rows = all("SELECT id, transcript FROM auto_apply_tasks WHERE (state='running' AND updated_at < ?) OR (state='scheduled' AND updated_at < ?)", [runCut, schedCut]);
