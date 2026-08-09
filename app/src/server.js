@@ -1152,6 +1152,15 @@ async function handle(req, res, parsed) {
       const wasOn = !!db.getSettings().autoApply.enabled;
       if (body.autoApply.enabled && !wasOn) body.autoApply.startedAt = new Date().toISOString();
       else if (!body.autoApply.enabled) body.autoApply.startedAt = '';
+      // WHO TURNED THE ENGINE OFF? Auto-apply was found OFF after an update restart four times on
+      // 2026-08-09 and an hour of elimination could not name the culprit — because nothing recorded
+      // the transition. Every flip is now attributed (caller UA + IP) so the next occurrence is one
+      // query instead of an investigation. Cheap, and only on an actual state change.
+      if (wasOn !== body.autoApply.enabled) {
+        const who = `${req.headers['user-agent'] || 'unknown-agent'} via ${req.socket?.remoteAddress || '?'}`;
+        try { db.kvSet('autoApplyLastToggle', { to: body.autoApply.enabled, at: new Date().toISOString(), by: who.slice(0, 200) }); } catch {}
+        log.warn(`[settings] auto-apply ${wasOn ? 'ON→OFF' : 'OFF→ON'} by ${who.slice(0, 120)}`);
+      }
     }
     db.patchSettings(body);
     try { opts.onSettingsChanged?.(body); } catch {}

@@ -446,6 +446,10 @@ function tryIdleInstall() {
       }
     } catch { return; }
     log.info('[updater] idle + safe → auto-installing update', pendingInstall.version);
+    // Remember whether the engine was running, so the relaunch can restore it (see the
+    // resume-after-update check in whenReady). Recorded HERE because this is the moment we choose
+    // to restart — anything that clears the flag afterwards is exactly what we are compensating for.
+    try { db.kvSet('autoApplyResumeAfterUpdate', (db.getSettings().autoApply || {}).enabled ? 1 : 0); } catch {}
     clearInterval(autoInstallTimer); autoInstallTimer = null;
     isQuitting = true;
     autoUpdater.quitAndInstall(true, true);   // silent install + relaunch into the new version
@@ -749,6 +753,27 @@ app.whenReady().then(async () => {
     showFatalError('Database error', 'Could not open the JAT database:\n' + e.message + '\n\nIf this keeps happening, check the logs from the tray or app data folder.');
     return;
   }
+
+  // RESUME AUTO-APPLY AFTER AN UPDATE RESTART.
+  // An auto-install deliberately quits and relaunches the app. On the PC, auto-apply was found OFF
+  // after the restart four separate times on 2026-08-09, each needing a manual re-enable — the exact
+  // kind of chore this loop exists to remove. I could not identify what clears it: the app's quit
+  // path, migrations, the extension's automatic paths, a one-at-a-time enforcer and scheduled tasks
+  // were all ruled out. So rather than guess at the cause, make the outcome survivable — if the
+  // engine was running when we chose to restart, it must be running afterwards. tryIdleInstall
+  // records the state immediately before quitAndInstall; we restore it here exactly once.
+  try {
+    if (Number(db.kvGet('autoApplyResumeAfterUpdate')) === 1) {
+      db.kvSet('autoApplyResumeAfterUpdate', 0);
+      const aa = db.getSettings().autoApply || {};
+      if (!aa.enabled) {
+        db.patchSettings({ autoApply: { enabled: true, startedAt: new Date().toISOString() } });
+        log.warn('[updater] auto-apply was ON before the update restart but came back OFF — restored');
+      } else {
+        log.info('[updater] auto-apply survived the update restart');
+      }
+    }
+  } catch (e) { log.warn('resume-after-update check failed', e?.message || e); }
 
   // Self-heal on startup: transient auto-apply failures that were misfiled as
   // awaiting_input/parked with no real question used to block discovery forever
