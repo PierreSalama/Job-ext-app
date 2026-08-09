@@ -649,6 +649,17 @@ async function pipelineWatchdogTick() {
     if (cleared) log.warn(`pipeline watchdog retired ${cleared} unanswerable park(s)`);
     repaired += cleared;
   } catch {}
+  // Release parks that have BECOME answerable. queueRetryParked only ever ran from the intake
+  // endpoint — i.e. only when Pierre personally submitted an answer — so a task that became
+  // retryable any other way (memory learned the answer from a different application, or its only
+  // remaining blocker turned out to be non-question junk) stayed parked forever with nobody to
+  // notice. That also made the junk-unblocking fix inert on its own. Recovery must not depend on
+  // the user happening to type something.
+  try {
+    const requeued = db.queueRetryParked();
+    if (requeued) log.warn(`pipeline watchdog requeued ${requeued} park(s) that are now answerable`);
+    repaired += requeued;
+  } catch {}
   const health = db.pipelineHealth();
   if (repaired) {
     log.warn(`pipeline watchdog repaired ${repaired} stranded task(s)`);

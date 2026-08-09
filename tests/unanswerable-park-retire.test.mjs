@@ -121,6 +121,15 @@ test('the live mixed park becomes retryable once junk stops blocking', () => {
   assert.equal(missing2.length, 1, 'a real question still keeps the task parked');
 });
 
+test('queueRetryParked runs on a schedule, not only when Pierre types an answer', () => {
+  // It was wired ONLY to the intake endpoint, so a park that became answerable any other way
+  // (memory learned it from a different application; its only blocker was junk) stayed parked
+  // forever. That also made the junk-unblocking fix above inert by itself.
+  const tick = main.slice(main.indexOf('async function pipelineWatchdogTick'));
+  assert.match(tick.slice(0, 3500), /db\.queueRetryParked\(\)/,
+    'recovery must not depend on the user happening to submit an answer');
+});
+
 test('queueRetryParked filters junk out of stillMissing', () => {
   const fn = db.slice(db.indexOf('function queueRetryParked'), db.indexOf('function saveIntakeAnswer'));
   assert.ok(fn.length, 'queueRetryParked must exist');
