@@ -3230,7 +3230,20 @@ function queueLive({ startedAt } = {}) {
 // this). Genuine flow failures (stuck/max-steps/no-advance) still consume an attempt so a truly
 // broken job retires at maxAttempts. The maxAgeHours ceiling retires anything (even environmental)
 // that has been failing for a full day, so nothing retries forever.
-const ENVIRONMENTAL_FAILURE_RX = /occlud|throttl|hydrat|page stopped advancing|backgrounded|never hydrated/i;
+// Failures that say nothing about THIS job, so they must not consume its attempt budget.
+// retryStaleQueue retires a task once attempts hits maxAttempts, so anything counted here decides
+// whether a job is permanently abandoned.
+//
+// Added 2026-08-09 — `timed out / interrupted` and the host-wall reasons:
+//   • "timed out / interrupted — will retry" is written by reconcileStaleRunning when a DISPATCH was
+//     stranded (MV3 evicted the service worker before the executor could start). The job was never
+//     opened, let alone attempted. Note this is deliberately NOT "apply timed out after 5.5 min",
+//     which means the executor really did run and burn the budget — that still charges an attempt.
+//   • a verification wall / host cooldown is the SITE refusing automation. Nothing about the posting.
+// Measured live on the laptop: 210 tasks failing for these reasons, 15 of them already sitting at
+// attempts=4 — permanently retired without ever having been applied to. That is the same class of
+// loss as the 2026-07-20 incident, arriving slowly instead of all at once.
+const ENVIRONMENTAL_FAILURE_RX = /occlud|throttl|hydrat|page stopped advancing|backgrounded|never hydrated|timed out \/ interrupted|verification wall|host.?cooldown/i;
 function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25, maxAgeHours = 24 } = {}) {
   const cutoff = new Date(Date.now() - Math.max(1, olderThanMinutes) * 60000).toISOString();
   const ageFloor = new Date(Date.now() - Math.max(1, maxAgeHours) * 3600000).toISOString();
