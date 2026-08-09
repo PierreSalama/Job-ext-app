@@ -641,6 +641,14 @@ async function pipelineWatchdogTick() {
     if (retired) log.warn(`pipeline watchdog retired ${retired} task(s) stuck behind a host wall`);
     repaired += retired;
   } catch {}
+  // Keep "needs you" a real signal. Parks that only ever held unanswerable content (combobox
+  // screen-reader text, CAPTCHA gates, week-old site sign-in gates) bury the questions Pierre could
+  // actually answer — live it was 86 parked jobs with almost nothing actionable in them.
+  try {
+    const cleared = db.retireUnanswerableParks({ loginAfterDays: 7 });
+    if (cleared) log.warn(`pipeline watchdog retired ${cleared} unanswerable park(s)`);
+    repaired += cleared;
+  } catch {}
   const health = db.pipelineHealth();
   if (repaired) {
     log.warn(`pipeline watchdog repaired ${repaired} stranded task(s)`);

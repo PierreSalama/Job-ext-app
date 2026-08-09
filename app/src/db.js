@@ -3290,6 +3290,57 @@ function reclaimDeadParks() {
   return rows.length;
 }
 
+// RETIRE PARKS THAT CAN NEVER BE ANSWERED.
+// reclaimDeadParks above catches parks with NO question. This catches the ones that LOOK answerable
+// but aren't, which is worse: they sit in "needs you" looking like work for Pierre, and the real
+// questions hide among them. Measured live 2026-08-09: 86 parked jobs, of which the largest buckets
+// were 13 "Sign into this site in Chrome", 6 combobox screen-reader strings, and 2 CAPTCHAs — none
+// answerable, several dating to Aug 3. The queue had stopped being a signal.
+//
+// Three provably-unactionable classes, each with the right bound:
+//   • UI noise — a combobox's screen-reader help scraped as a question. Never a question at all, so
+//     no age bound is needed. New ones stopped at source in v11.90.12; this clears the backlog.
+//   • CAPTCHA gates — standing policy is never to auto-solve, and Pierre chose to skip rather than
+//     handle them, so a CAPTCHA park is dead on arrival.
+//   • Site sign-in gates — he genuinely COULD action these, so they get a generous age bound; after
+//     a week untouched on some random ATS, it is not happening and the job is stale anyway.
+const UI_NOISE_Q_RX = /results? available|use up and down|press enter to select|press escape|press tab to select/i;
+const CAPTCHA_Q_RX = /captcha|robot check|verification wall/i;
+const SITE_LOGIN_Q_RX = /sign in(to| to) this site|sign into this site|log in(to| to) this site/i;
+
+function retireUnanswerableParks({ loginAfterDays = 7, limit = 500 } = {}) {
+  const rows = all(
+    `SELECT id, pending_questions, updated_at FROM auto_apply_tasks
+      WHERE state IN ('awaiting_input','parked')
+        AND pending_questions IS NOT NULL
+        AND TRIM(pending_questions) NOT IN ('', '[]', 'null')
+      LIMIT ?`, [limit]);
+  const loginCutoff = Date.now() - Math.max(1, loginAfterDays) * 86400000;
+  let retired = 0;
+  for (const r of rows) {
+    let qs = [];
+    try { qs = JSON.parse(r.pending_questions) || []; } catch { continue; }
+    if (!Array.isArray(qs) || !qs.length) continue;
+    const texts = qs.map((q) => String((q && q.question) || ''));
+    // EVERY question must be unactionable — one real question keeps the whole park alive, because
+    // answering it is what unblocks the application.
+    const allNoise = texts.every((t) => UI_NOISE_Q_RX.test(t));
+    const allCaptcha = texts.every((t) => CAPTCHA_Q_RX.test(t));
+    const allLogin = texts.every((t) => SITE_LOGIN_Q_RX.test(t));
+    let why = null;
+    if (allNoise) why = 'parked on combobox screen-reader text, not a question — retired';
+    else if (allCaptcha) why = 'CAPTCHA gate — not auto-solvable by policy, retired rather than parked forever';
+    else if (allLogin && Date.parse(r.updated_at || '') < loginCutoff) {
+      why = `site sign-in gate untouched for ${loginAfterDays}d — retired (the posting is stale by now)`;
+    }
+    if (!why) continue;
+    run("UPDATE auto_apply_tasks SET state='skipped', pending_questions='[]', last_error=?, updated_at=? WHERE id=?",
+        [why, now(), r.id]);
+    retired++;
+  }
+  return retired;
+}
+
 // EXPIRE TASKS STUCK BEHIND A HOST WALL. The dispatch breaker parks a task behind a Cloudflare /
 // verification wall by pushing scheduled_at into the FUTURE and leaving it 'queued' — deliberately,
 // because on 2026-07-20 skipping them destroyed 40+ never-attempted jobs in ten minutes and a
@@ -4772,7 +4823,7 @@ module.exports = {
   classifyQueueFailure, taskSiteKey, queueActiveSiteKeys, lastStartBySiteKey,
   setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
   setSignedOut, clearSignedOut, isSignedOut, signedOutStatus, signedOutEligible,
-  expireWalledTasks,
+  expireWalledTasks, retireUnanswerableParks,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,
   emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching, findJobByThread, gmailStatusFromCategory, reprocessEmails, elevateJobFromEmail,
