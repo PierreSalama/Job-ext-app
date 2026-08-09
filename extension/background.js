@@ -1897,7 +1897,26 @@ async function pump(force = false) {
       activeCount++;
       dispatched++;
       launchOne(r.task, r.context)
-        .catch(() => {})
+        // A LAUNCH FAILURE MUST NOT BE SILENT. This was `.catch(() => {})`, so anything thrown
+        // between claiming the task and the executor starting vanished — and the task, already
+        // marked 'scheduled' by GET /queue/next, sat claimed until the reconciler reclaimed it and
+        // labelled it "timed out / interrupted". That label is why this looked like a timeout for
+        // three rounds. Note launchOne's very first statement (acquiring the apply window) is
+        // OUTSIDE its own try block, so a window/tab failure lands here.
+        //
+        // Measured 2026-08-09: ~10-15 stranded claims/hour on the laptop, every one with entries=1
+        // and executorStarted=0. Two guesses at the cause did not move that rate, because nothing
+        // recorded WHY the launch died. Now it does — and the claim is released immediately instead
+        // of holding a worker slot until the 2-minute reclaim.
+        .catch((e) => {
+          const msg = String((e && e.message) || e || 'unknown').slice(0, 200);
+          console.warn(`[jat11] launch FAILED before executor start for task ${r.task.id}: ${msg}`);
+          api.call('PATCH', '/queue/' + encodeURIComponent(r.task.id), {
+            state: 'queued',                 // never attempted — must stay retriable, and charge no attempt
+            lastError: `launch failed before the executor started: ${msg}`,
+            transcriptAppend: { kind: 'recovery', note: `launch failed before the executor started: ${msg} — returned to the queue` },
+          }).catch(() => {});
+        })
         .finally(() => { activeCount = Math.max(0, activeCount - 1); schedulePump(); });
       // Small stagger so parallel launches don't open N tabs in the same instant.
       if (activeCount < currentConcurrency) await new Promise((r2) => setTimeout(r2, 500));
