@@ -2686,8 +2686,25 @@ export async function run(task, context, helpers) {
       const src = suggestion.source === 'qa' ? 'filled-from-qa' : 'filled-from-profile';
       if (outcome === 'filled') vlog('fill', `"${lbl}" → ${src}`);
       else if (outcome === 'fuzzy-snapped') vlog('fill', `"${lbl}" → fuzzy-snapped-to "${redactLabel(detail)}"`);
-      else if (outcome === 'skipped-no-option') vlog('fill', `"${lbl}" → left-empty (no matching option)`);
-      else if (outcome === 'skipped-combobox-miss') vlog('fill', `"${lbl}" → left-empty (typeahead no match)`);
+      // A REQUIRED control we could not satisfy will block EVERY advance attempt, so leaving it
+      // silently empty is the expensive failure: the flow clicks the advance button against a form
+      // that can never move. Live 2026-08-09 on the PC — profile held a work-authorization answer,
+      // the select had no option matching that exact text, the field was left empty, and the task
+      // burned 75 of its 100 page iterations clicking "Review" before dying as a generic
+      // "stuck on a step". ~26 minutes per task, converting nothing.
+      //
+      // Parking it instead does two things: the existing `if (parked.length) reportParked(); break;`
+      // checks short-circuit the loop immediately, and the question surfaces WITH ITS REAL OPTIONS,
+      // so it is answerable once and then learned — the next posting fills it automatically.
+      else if (outcome === 'skipped-no-option' || outcome === 'skipped-combobox-miss') {
+        const how = outcome === 'skipped-no-option' ? 'no matching option' : 'typeahead no match';
+        vlog('fill', `"${lbl}" → left-empty (${how})`);
+        if (suggestion.required) {
+          park(suggestion.label, suggestion.fieldType || 'select', suggestion.options || null,
+            `we hold an answer for this, but none of this field's options match it — pick the right one once and it will be reused`);
+          vlog('fill', `"${lbl}" is REQUIRED and unfillable — parking instead of clicking a form that cannot advance`);
+        }
+      }
       else if (outcome === 'skipped-not-yes') vlog('fill', `"${lbl}" → skipped-optional (checkbox, answer not affirmative)`);
       else if (outcome === 'skipped-site-chrome') vlog('fill', `"${lbl}" → skipped (site chrome)`);
       else if (outcome === 'error') vlog('fill', `"${lbl}" → error (${String(detail || '').slice(0, 40)})`);
