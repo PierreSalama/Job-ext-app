@@ -3265,11 +3265,36 @@ function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25, m
 // the extension pump now counts scheduled+running as busy slots (reconcileAaTabsAndSlots) — a stranded
 // 'scheduled' row would otherwise pin the serial slot until the 8-min running-timeout, re-creating the
 // ~9-min apply gap the slot fix removed.
+// A task whose transcript shows we already CLICKED a final submit must never be silently retried.
+// The click is recorded as `isFinalSubmit("…")=true` immediately before the click, and a verified
+// completion as `submitted — verified`. If the run then dies (tab hung, MV3 evicted the SW) the
+// executor never gets to report, so the only surviving evidence is the transcript.
+const CLICKED_FINAL_SUBMIT_RX = /isfinalsubmit\([^)]*\)=true|submitted — verified|clicking final submit/i;
+
 function reconcileStaleRunning({ olderThanMinutes = 8, scheduledOlderThanMinutes = olderThanMinutes } = {}) {
   const runCut = new Date(Date.now() - Math.max(1, olderThanMinutes) * 60000).toISOString();
   const schedCut = new Date(Date.now() - Math.max(1, scheduledOlderThanMinutes) * 60000).toISOString();
-  const rows = all("SELECT id FROM auto_apply_tasks WHERE (state='running' AND updated_at < ?) OR (state='scheduled' AND updated_at < ?)", [runCut, schedCut]);
-  for (const r of rows) run("UPDATE auto_apply_tasks SET state='failed', last_error=COALESCE(NULLIF(last_error,''),'timed out / interrupted — will retry'), updated_at=? WHERE id=?", [now(), r.id]);
+  const rows = all("SELECT id, transcript FROM auto_apply_tasks WHERE (state='running' AND updated_at < ?) OR (state='scheduled' AND updated_at < ?)", [runCut, schedCut]);
+  for (const r of rows) {
+    // DUPLICATE-APPLICATION GUARD. Flipping every stale task to retriable 'failed' assumes nothing
+    // happened — but a run can die AFTER the final submit was clicked and before the confirmation
+    // could be read. Live 2026-08-09, a Greenhouse task: `chose "Submit application"` →
+    // `isFinalSubmit(...)=true` → the run stalled → this reconciler marked it
+    // "timed out / interrupted — will retry" and requeued it. That re-applies to a job Pierre may
+    // already have applied to, which is worse for him than a missed application: employers see a
+    // duplicate, and we would never know.
+    //
+    // We cannot prove it submitted (that is why the verified-evidence rule exists), so we do not
+    // claim it did. We route it to awaiting_review — the state that already means "submit was
+    // clicked, outcome unknown, confirm it" — instead of quietly doing it again.
+    if (CLICKED_FINAL_SUBMIT_RX.test(String(r.transcript || ''))) {
+      run(`UPDATE auto_apply_tasks SET state='awaiting_review',
+             last_error='interrupted AFTER the final submit was clicked — confirm whether this went through (not retried, to avoid a duplicate application)',
+             updated_at=? WHERE id=?`, [now(), r.id]);
+      continue;
+    }
+    run("UPDATE auto_apply_tasks SET state='failed', last_error=COALESCE(NULLIF(last_error,''),'timed out / interrupted — will retry'), updated_at=? WHERE id=?", [now(), r.id]);
+  }
   return rows.length;
 }
 
