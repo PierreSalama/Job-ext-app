@@ -409,13 +409,23 @@ function tryIdleInstall() {
     let idleSec = 0;
     try { idleSec = powerMonitor.getSystemIdleTime(); } catch { return; }
     if (idleSec < (au.idleMinutes || 5) * 60) return;
-    // GATE 3 (the data-safety gate): never restart while an application is running,
-    // dispatched, or still queued for this run — only when the pool is fully drained.
+    // GATE 3 (the data-safety gate): never restart while an application is IN FLIGHT — running or
+    // dispatched. Those have real state that a restart would lose.
+    //
+    // It used to also require queuedDepth === 0, which was a permanent deadlock: discovery refills
+    // the queue continuously, so a healthy working node NEVER has an empty queue and could never
+    // install an update. Live 2026-08-09: the PC downloaded 11.90.18 at 05:21 and was still on
+    // 11.90.17 hours later, re-downloading the same installer every 30 minutes forever. Every
+    // reliability fix we ship would silently never reach a node that was busy — i.e. exactly the
+    // nodes that need them.
+    //
+    // A QUEUED task has not started: it carries no in-flight state, it survives the restart in the
+    // database, and the pump picks it straight back up. Queue depth is not a safety signal.
     try {
       const aa = db.getSettings().autoApply;
       if (aa && aa.enabled) {
         const live = db.queueLive({ startedAt: aa.startedAt || '' });
-        if (live.active > 0 || live.scheduled > 0 || live.queuedDepth > 0) return;
+        if (live.active > 0 || live.scheduled > 0) return;
       }
     } catch { return; }
     log.info('[updater] idle + safe → auto-installing update', pendingInstall.version);
