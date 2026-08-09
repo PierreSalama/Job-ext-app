@@ -1838,7 +1838,20 @@ async function pump(force = false) {
   let parkedThisPump = 0;            // breaker parks per pump — bounds the no-dispatch loop
   try {
     while (activeCount < currentConcurrency) {
-      const r = await api.call('GET', '/queue/next' + (force ? '?force=1' : ''), null, 8000);
+      // Tell the server which hosts our breaker is currently holding, so it never hands us a job we
+      // would only have to hand straight back. The old flow claimed the task first (GET /queue/next
+      // marks it 'scheduled'), then checked the breaker, then PATCHed it back — and that release is
+      // `.catch(() => {})`, so a failed PATCH left the task claimed and stranded. Measured
+      // 2026-08-09: ~12 stranded claims/hour, 106 of 164 on Indeed. The breaker check below stays as
+      // the authority (the map can change between the request and the reply); this only stops the
+      // server offering walled work in the first place.
+      const nowMs = Date.now();
+      const walledHosts = Object.entries(await loadHostBreakerPruned(nowMs))
+        .filter(([, e]) => e && nowMs < (Number(e.until) || 0))
+        .map(([h]) => h);
+      const qs = [force ? 'force=1' : '', walledHosts.length ? 'skipHosts=' + encodeURIComponent(walledHosts.join(',')) : '']
+        .filter(Boolean).join('&');
+      const r = await api.call('GET', '/queue/next' + (qs ? '?' + qs : ''), null, 8000);
       if (r && r.concurrency) {
         const c = Math.max(1, Math.min(8, r.concurrency));
         if (c !== currentConcurrency) { currentConcurrency = c; try { chrome.storage.local?.set({ 'jat11.concurrency': c }); } catch {} }

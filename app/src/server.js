@@ -369,7 +369,20 @@ function withinWindow(settings) {
 // Decide whether a task may run now. Returns { task, context } or { wait }.
 // force=true (the dashboard "Test: apply now" button) skips the window/cap/gap
 // pacing so the user can shake it out immediately — but still needs enabled.
-async function queueNext(force = false) {
+// Reduce a job URL to its registrable domain, mirroring the extension's registrableDomain() so the
+// two agree on what "indeed.com" means (ca.indeed.com and smartapply.indeed.com are the same site).
+const QN_MULTI_TLDS = new Set(['co.uk', 'com.au', 'co.jp', 'co.nz', 'co.in', 'com.br', 'co.za', 'com.mx', 'org.uk', 'gov.uk']);
+function registrableDomainOf(url) {
+  try {
+    const h = new URL(String(url)).hostname.replace(/^www\./, '').toLowerCase();
+    const parts = h.split('.').filter(Boolean);
+    if (parts.length <= 2) return h;
+    const last2 = parts.slice(-2).join('.');
+    return QN_MULTI_TLDS.has(last2) ? parts.slice(-3).join('.') : last2;
+  } catch { return ''; }
+}
+
+async function queueNext(force = false, skipHosts = null) {
   // Free any pool slot held by a task stuck 'running'/'scheduled' (SW eviction / hung
   // tab) so a single stall can't freeze the whole pipeline — checked every dispatch tick.
   try { db.reconcileStaleRunning({ olderThanMinutes: 8 }); } catch {}
@@ -540,6 +553,19 @@ async function queueNext(force = false) {
     // draining the Indeed queue from 60 to 16. A transient wall must never permanently discard a
     // job. Normal queued tasks carry a past scheduled_at, so this is a no-op for them.
     if (!force && t.scheduledAt && Date.parse(t.scheduledAt) > Date.now()) { hostDeferred = true; passOver(t, j, `scheduled-later: not due until ${t.scheduledAt}`); continue; }
+    // NEVER HAND OUT A JOB FOR A HOST THE BREAKER IS ALREADY HOLDING DOWN.
+    // The extension's circuit breaker lives in the SW, so the server used to dispatch walled jobs
+    // blindly: the pump did GET /queue/next (which CLAIMS the task, marking it 'scheduled'), then
+    // checked the breaker, then PATCHed it back to 'queued' — and that release PATCH is
+    // `.catch(() => {})`, so any failure leaves the task claimed and stranded until the reconciler
+    // reclaims it. Live 2026-08-09: ~12 stranded claims/hour, 106 of 164 on Indeed, and 11 of 12
+    // sampled had host-wall history. The pump also churns through up to 25 of these per pump.
+    // Passing the breaker's hosts up front removes the claim/release cycle entirely — no claim, no
+    // PATCH, nothing to strand.
+    if (!force && skipHosts && skipHosts.size) {
+      const host = registrableDomainOf(j.jobUrl);
+      if (host && skipHosts.has(host)) { hostDeferred = true; passOver(t, j, `host ${host} is under the extension's bot-challenge breaker — not claimed`); continue; }
+    }
     const siteKey = db.taskSiteKey(j);
     if (!force && concurrency > 1 && siteKey) {
       // (1) PER-SITE CAP — never run more than perSiteCap applies on one site at once.
@@ -1494,7 +1520,11 @@ async function handle(req, res, parsed) {
     return sendJson(res, 200, { ok: true, items: db.queueList({ state: parsed.searchParams.get('state') || undefined }) });
   }
   if (req.method === 'GET' && pathname === '/queue/next') {
-    return sendJson(res, 200, { ok: true, ...(await queueNext(parsed.searchParams.get('force') === '1')) });
+    // skipHosts: registrable domains the extension's bot-challenge breaker is currently holding.
+    // Sent by the pump so a walled job is never claimed in the first place (see queueNext).
+    const skipHosts = new Set(String(parsed.searchParams.get('skipHosts') || '')
+      .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
+    return sendJson(res, 200, { ok: true, ...(await queueNext(parsed.searchParams.get('force') === '1', skipHosts)) });
   }
   if (req.method === 'POST' && pathname === '/queue') {
     const body = await readJson(req);
