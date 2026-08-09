@@ -20,7 +20,7 @@
 import * as api from './lib/api.js';
 import { computeIdleGate, clampIdleThreshold } from './lib/idle-gate.js';
 import { isJobPageUrl } from './lib/jobpage.js';
-import { HOST_BREAKER_COOLDOWN_MS, hostOfUrl, shouldDispatchHost, trippedEntry, registrableDomain } from './lib/host-breaker.js';
+import { HOST_BREAKER_COOLDOWN_MS, HOST_BREAKER_FORGET_MS, hostOfUrl, shouldDispatchHost, trippedEntry, registrableDomain, shouldForget, backoffMs } from './lib/host-breaker.js';
 import { focusArbiterDecision } from './lib/focus-arbiter.js';
 import { pickApplyWindowBounds } from './lib/window-place.js';
 import { buildSearchUrl } from './lib/search-url.js';
@@ -652,16 +652,27 @@ async function tripHostBreaker(host, kind, now = Date.now()) {
   const map = await loadHostBreaker();
   map[h] = trippedEntry(map[h], kind, now);
   await saveHostBreaker(map);
-  const mins = Math.round(HOST_BREAKER_COOLDOWN_MS / 60000);
-  console.log(`[jat11] host breaker TRIPPED (persisted): ${h} (bot-challenge: ${kind || 'unknown'}) — pausing dispatch ~${mins} min`);
+  // Report the ACTUAL backoff for this trip, not the base constant — a host on its 5th consecutive
+  // wall is paused for hours, and a log line claiming "~20 min" would hide exactly that.
+  const mins = Math.round(backoffMs(map[h].hits) / 60000);
+  console.log(`[jat11] host breaker TRIPPED (persisted): ${h} (bot-challenge: ${kind || 'unknown'}) hit #${map[h].hits} — pausing dispatch ~${mins} min`);
 }
 
-// Read the persisted breaker, dropping any host whose cooldown has elapsed. Returns the live map.
+// Read the persisted breaker, forgetting only hosts that have been QUIET for the forget window.
+//
+// This used to delete an entry the moment its cooldown elapsed, which silently defeated the hit
+// counter: `prev` was always undefined at the next trip, so `hits` was always 1 and every wall got
+// the same fixed cooldown forever. Entries must outlive their cooldown for a backoff to exist.
+// Dispatch is unaffected — shouldDispatchHost() compares against `until` and does not care whether
+// an entry is present, so a cooled-down host is dispatched exactly as before.
 async function loadHostBreakerPruned(now = Date.now()) {
   const map = await loadHostBreaker();
   let changed = false;
   for (const [h, entry] of Object.entries(map)) {
-    if (!entry || now >= (Number(entry.until) || 0)) { delete map[h]; changed = true; console.log(`[jat11] host breaker cooled down: ${h} — resuming dispatch`); }
+    if (shouldForget(entry, now)) {
+      delete map[h]; changed = true;
+      console.log(`[jat11] host breaker forgotten (quiet ${Math.round(HOST_BREAKER_FORGET_MS / 3600000)}h): ${h} — next wall starts from the base cooldown`);
+    }
   }
   if (changed) await saveHostBreaker(map);
   return map;

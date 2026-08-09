@@ -16,7 +16,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const ch = await import(pathToFileURL(path.join(here, '..', 'extension', 'content', 'lib', 'challenge.js')).href);
 const br = await import(pathToFileURL(path.join(here, '..', 'extension', 'lib', 'host-breaker.js')).href);
 const { detectBotChallenge, botChallengeLastError } = ch;
-const { shouldDispatchHost, trippedEntry, hostOfUrl, HOST_BREAKER_COOLDOWN_MS } = br;
+const { shouldDispatchHost, trippedEntry, hostOfUrl, HOST_BREAKER_COOLDOWN_MS, backoffMs } = br;
 
 // ---- FIXTURES: real-world challenge interstitials (MUST be blocked) ----
 
@@ -224,7 +224,12 @@ test('breaker: re-tripping extends the window and increments hit count', () => {
   state.set(host, trippedEntry(state.get(host), 'captcha', t1));
   const e = state.get(host);
   assert.equal(e.hits, 2);
-  assert.equal(e.until, t1 + HOST_BREAKER_COOLDOWN_MS);   // window extended from the new trip
+  // The window is extended from the NEW trip, and since 2026-08-09 it also BACKS OFF: the second
+  // consecutive wall waits twice the base. A host walling us repeatedly was previously re-probed on
+  // a constant 20-minute timer forever (live: 8 probes in 3h on one Indeed task, attempts=0).
+  // See tests/host-breaker-backoff.test.mjs.
+  assert.equal(e.until, t1 + backoffMs(2));
+  assert.equal(e.until, t1 + 2 * HOST_BREAKER_COOLDOWN_MS, 'second wall = 2× base');
   assert.equal(e.kind, 'captcha');
 });
 
