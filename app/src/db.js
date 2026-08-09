@@ -3290,6 +3290,36 @@ function reclaimDeadParks() {
   return rows.length;
 }
 
+// EXPIRE TASKS STUCK BEHIND A HOST WALL. The dispatch breaker parks a task behind a Cloudflare /
+// verification wall by pushing scheduled_at into the FUTURE and leaving it 'queued' — deliberately,
+// because on 2026-07-20 skipping them destroyed 40+ never-attempted jobs in ten minutes and a
+// TRANSIENT wall must never discard work. But a wall that does NOT lift leaves those tasks queued
+// forever. Live: 65 Indeed jobs sat behind Indeed's wall (oldest 6 days) and had to be cleared BY
+// HAND in nearly every check-up on 2026-08-07/08/09 — the single most repeated manual intervention
+// in this system, and the thing this loop exists to eliminate.
+//
+// The bound resolves both concerns: a transient wall (hours) still defers and retries untouched;
+// only a task that has been un-dispatchable for a full day is retired. `attempts = 0` is the
+// signature of the 07-20 bug (never even tried), so age — not attempts — is the correct gate here.
+function expireWalledTasks({ olderThanHours = 24, limit = 200 } = {}) {
+  const cutoff = new Date(Date.now() - Math.max(1, olderThanHours) * 3600 * 1000).toISOString();
+  const rows = all(
+    `SELECT id FROM auto_apply_tasks
+      WHERE state = 'queued'
+        AND scheduled_at IS NOT NULL
+        AND scheduled_at > ?          -- still deferred into the future = still walled
+        AND created_at < ?            -- and it has been that way for a full day
+      ORDER BY created_at ASC LIMIT ?`,
+    [now(), cutoff, limit]);
+  for (const r of rows) {
+    run(`UPDATE auto_apply_tasks SET state='skipped',
+           last_error='host verification wall did not lift within ' || ? || 'h — retired so it stops holding a queue slot',
+           updated_at=? WHERE id=?`,
+        [String(olderThanHours), now(), r.id]);
+  }
+  return rows.length;
+}
+
 // Repair PASSIVE-CAPTURE false submits: auto-apply-discovered jobs that the page
 // detector stamped 'submitted' even though their auto-apply task never actually
 // completed (a clicked-but-failed Easy-Apply / external flow — the "I never applied to
@@ -4742,6 +4772,7 @@ module.exports = {
   classifyQueueFailure, taskSiteKey, queueActiveSiteKeys, lastStartBySiteKey,
   setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
   setSignedOut, clearSignedOut, isSignedOut, signedOutStatus, signedOutEligible,
+  expireWalledTasks,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,
   emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching, findJobByThread, gmailStatusFromCategory, reprocessEmails, elevateJobFromEmail,

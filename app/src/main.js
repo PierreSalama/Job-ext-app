@@ -631,6 +631,16 @@ async function pipelineWatchdogTick() {
   // ready to drain whenever auto-apply is running. Environmental failures retry without
   // charging an attempt (see retryStaleQueue); a 24h ceiling retires truly-dead tasks.
   try { repaired += db.retryStaleQueue({ olderThanMinutes: 20, maxAttempts: 4, limit: 50 }); } catch {}
+  // Retire tasks a host verification wall never released. Clearing these by hand was the single
+  // most repeated manual intervention in this system (Indeed, most check-ups of 2026-08-07/08/09):
+  // they can never dispatch, they hold queue slots, and before the refill-gate fix they also
+  // starved discovery outright. A transient wall is untouched — only a full day of being
+  // un-dispatchable retires a task.
+  try {
+    const retired = db.expireWalledTasks({ olderThanHours: 24 });
+    if (retired) log.warn(`pipeline watchdog retired ${retired} task(s) stuck behind a host wall`);
+    repaired += retired;
+  } catch {}
   const health = db.pipelineHealth();
   if (repaired) {
     log.warn(`pipeline watchdog repaired ${repaired} stranded task(s)`);
