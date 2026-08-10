@@ -126,3 +126,26 @@ test('alerts are deduped, or a daily repeat trains him to ignore them', () => {
 test('the watchlist ships EMPTY — a company list is personal, not a default', () => {
   assert.deepEqual(DEFAULTS.autoApply.watchlist, []);
 });
+
+test('watchlist-sourced jobs are TAGGED, so the 12.5% claim can settle itself', () => {
+  // The case for the whole mechanism rests on a 12.5%-vs-4.5% response rate measured over 16
+  // applications, with overlapping confidence intervals. The only way to settle that is to let it
+  // generate its own evidence — and a source tag is unambiguous where a regex over titles is not.
+  // A regex over titles is precisely what produced a wrong answer the first time this was measured.
+  const src = read('app', 'src', 'server.js');
+  assert.match(src, /watchedUrls\.has\(jd\.jobUrl\) \? \['auto-apply', 'watchlist'\] : \['auto-apply'\]/,
+    'a watched-company job carries a distinct tag');
+  const i = src.indexOf('const watchedUrls = new Set()');
+  const j = src.indexOf("tags: watchedUrls.has(jd.jobUrl)");
+  assert.ok(i > -1 && i < j, 'the set is built before ingest uses it');
+});
+
+test('tagging does not change which jobs get queued — it only labels them', () => {
+  // The watchlist must never become a volume mechanism. Its value is applying EARLY to a SMALL
+  // number of well-chosen employers; if it started queueing extra work, the selection has gone
+  // wrong rather than the throughput going right.
+  const src = read('app', 'src', 'server.js');
+  const fn = src.slice(src.indexOf('function ingestDiscoveredJobs('), src.indexOf('function withinWindow('));
+  const gate = fn.slice(fn.indexOf('const verdict = jobFit(jd, s);'), fn.indexOf('ranked.push'));
+  assert.doesNotMatch(gate, /watched/, 'a watched company gets no exemption from the relevance/fit gates at ingest');
+});

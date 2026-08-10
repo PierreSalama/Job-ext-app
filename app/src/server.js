@@ -379,10 +379,12 @@ function ingestDiscoveredJobs(source, jobs, { providerName = 'browser', batchId 
   // contact's company spends the relationship instead of using it.
   const watchEntries = Array.isArray(s.watchlist) ? s.watchlist : [];
   const watchHits = [];
+  const watchedUrls = new Set();
   for (const jd of (Array.isArray(jobs) ? jobs : []).slice(0, 100)) {
     if (!jd || !jd.jobUrl) continue;
     for (const entry of watchlist.watchesFor(jd, watchEntries)) {
       watchHits.push({ jd, entry });
+      watchedUrls.add(jd.jobUrl);
     }
   }
 
@@ -408,7 +410,12 @@ function ingestDiscoveredJobs(source, jobs, { providerName = 'browser', batchId 
         title: jd.title, company: jd.company, location: jd.location,
         jobUrl: jd.jobUrl, description: jd.description || '',
         compensation: jd.salary ? JSON.stringify(jd.salary) : (jd.compensation || ''),
-        employmentType: jd.employmentType || '', status: 'started', tags: ['auto-apply'],
+        // SOURCE TAG. A watchlist-sourced application must be distinguishable from cold discovery,
+        // because the whole case for the watchlist rests on a 12.5%-vs-4.5% response rate measured
+        // over just 16 applications. A tag is unambiguous where a regex over titles is not — and a
+        // regex over titles is exactly what I got wrong when first testing this.
+        employmentType: jd.employmentType || '', status: 'started',
+        tags: watchedUrls.has(jd.jobUrl) ? ['auto-apply', 'watchlist'] : ['auto-apply'],
       });
       if (up.action === 'created') {
         db.recordEvent({ jobId: up.job.id, type: 'created', source: 'auto-apply', summary: `Discovered via ${providerName}`, data: { provider: providerName, batchId } });
