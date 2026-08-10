@@ -14,6 +14,7 @@ const { startServer, stopServer, getToken, broadcast, rescanAllFolders, startFol
 const sessionSync = require('./session-sync');
 const { createDiscoveryService } = require('./discovery');
 const { createAtsBoardsService } = require('./discovery/ats-boards');
+const { decideSchedule } = require('./schedule');
 const db = require('./db');
 const { autoUpdater } = require('electron-updater');
 const { scope, log: rootLog } = require('./logger');
@@ -56,6 +57,7 @@ let discoveryService = null;
 let atsBoardsService = null;
 let keepAwakeId = null;
 let pipelineWatchdogInterval = null;
+let scheduleInterval = null;
 
 // Industry-norm guard for BACKGROUND work (email/gmail sync): don't run while the
 // machine is asleep, optionally pause on battery, and skip if our own memory is high
@@ -665,6 +667,41 @@ function applyAppSettings() {
   } catch (e) { log.warn('keep-awake update failed', e.message); }
 }
 
+// Apply the daily schedule. All the rules live in decideSchedule() (pure, node-tested); this only
+// carries out its verdict and records the once-per-day ledger.
+//
+// It writes autoApply.enabled the same way the dashboard's Start/Stop button does, so the toggle
+// audit attributes it and `startedAt` stays correct. When the verdict is null — which is almost
+// always — it writes nothing at all. That is what lets Pierre override it: turning auto-apply off
+// inside the window is simply left alone until tomorrow's boundary.
+function scheduleTick() {
+  const s = db.getSettings().autoApply || {};
+  const sched = s.schedule || {};
+  const verdict = decideSchedule(sched, new Date());
+  if (!verdict.action) return;
+
+  const want = verdict.action === 'on';
+  const ledger = verdict.action === 'on' ? { lastOnDate: verdict.lastOnDate } : { lastOffDate: verdict.lastOffDate };
+
+  // Stamp the ledger even when auto-apply is ALREADY in the wanted state, so the boundary is
+  // consumed exactly once either way and we don't re-evaluate it every minute for the rest of the day.
+  if (!!s.enabled === want) {
+    db.patchSettings({ autoApply: { schedule: { ...sched, ...ledger } } });
+    log.info(`[schedule] ${verdict.action} boundary (${verdict.reason}) — auto-apply already ${want ? 'on' : 'off'}, nothing to change`);
+    return;
+  }
+
+  db.patchSettings({
+    autoApply: {
+      enabled: want,
+      startedAt: want ? new Date().toISOString() : '',
+      schedule: { ...sched, ...ledger },
+    },
+  });
+  log.warn(`[schedule] auto-apply turned ${want ? 'ON' : 'OFF'} by the daily schedule (${sched.onAt}–${sched.offAt}, ${verdict.reason})`);
+  broadcast('queue.updated', { action: 'schedule', to: want });
+}
+
 async function pipelineWatchdogTick() {
   if (!shouldRunBackground()) return;
   const aa = db.getSettings().autoApply || {};
@@ -887,6 +924,13 @@ app.whenReady().then(async () => {
   pipelineWatchdogInterval = setInterval(() => pipelineWatchdogTick().catch((e) => log.warn('pipeline watchdog failed', e.message)), 60000);
   setTimeout(() => pipelineWatchdogTick().catch(() => {}), 18000);
 
+  // Daily on/off schedule. Every minute, but it acts only on a boundary crossing (see schedule.js) —
+  // so a manual toggle stands until the next boundary instead of being fought every tick. Runs a few
+  // seconds after boot too, so a machine that was asleep at 04:00 catches up if it wakes inside the
+  // window.
+  scheduleInterval = setInterval(() => { try { scheduleTick(); } catch (e) { log.warn('schedule tick failed', e?.message || e); } }, 60000);
+  setTimeout(() => { try { scheduleTick(); } catch {} }, 12000);
+
   // Auto-index linked document folders: catch up on changes since last run, then
   // watch for live edits. Fire-and-forget so it never blocks startup.
   Promise.resolve()
@@ -975,6 +1019,7 @@ app.on('will-quit', () => {
   if (emailWarmup) clearTimeout(emailWarmup);
   if (maintenanceInterval) clearInterval(maintenanceInterval);
   if (pipelineWatchdogInterval) clearInterval(pipelineWatchdogInterval);
+  if (scheduleInterval) clearInterval(scheduleInterval);
   if (discoveryService) discoveryService.stop();
   if (atsBoardsService) atsBoardsService.stop();
   if (keepAwakeId != null) { try { powerSaveBlocker.stop(keepAwakeId); } catch {} keepAwakeId = null; }

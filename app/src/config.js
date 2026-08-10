@@ -165,6 +165,18 @@ const DEFAULTS = {
                                   // (a desktop video player outside the browser) is NOT detectable.
     idleThresholdSeconds: 60,     // seconds of no mouse/keyboard input before you count as "idle" (min 15 — the chrome.idle floor)
     aiAnswerConfidenceMin: 0.7,   // AI answers a screening question when reasonably confident (lower = fewer parks, more autonomy)
+    // DAILY SCHEDULE — turn auto-apply on/off by wall clock (local time), per node.
+    // Acts ONLY on boundary crossings, at most once per boundary per day: it never enforces a state
+    // continuously, so a manual toggle is respected until the next boundary instead of being fought
+    // every minute. Two instant off-switches: set enabled:false here, or just toggle auto-apply.
+    // lastOnDate/lastOffDate are the once-per-day ledger (local YYYY-MM-DD) — not user settings.
+    schedule: {
+      enabled: false,             // OFF by default: a node must never start applying on a timer nobody set
+      onAt: '04:00',              // local HH:MM — turn auto-apply ON
+      offAt: '10:00',             // local HH:MM — turn auto-apply OFF (may wrap midnight, e.g. 22:00→06:00)
+      lastOnDate: '',
+      lastOffDate: '',
+    },
     easyApplyOnly: false,         // OFF = include normal/external postings and let the runner hand off to company/ATS forms when possible
     keywords: [],                 // e.g. ['software engineer', 'data analyst']
     locations: [],                // GEOGRAPHY ONLY — e.g. ['Toronto, ON', 'Canada']. NEVER a work-mode
