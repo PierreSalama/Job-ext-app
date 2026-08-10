@@ -2237,18 +2237,30 @@ export async function run(task, context, helpers) {
   // going: hundreds of automated requests from a signed-out session, which is exactly the pattern
   // that earns an account an automated-access warning. It produced ZERO applications the whole time.
   //
-  // Two INDEPENDENT signals are required so a working node is never falsely halted:
-  //   1. a password input — a signed-IN LinkedIn job page never renders one, and no Easy-Apply form
-  //      contains one either, so this alone is already strong;
-  //   2. the sign-in copy ("Join now" / "Sign in with Email" / "New to LinkedIn").
-  // Both must hold, on a linkedin.com host, before we call it.
+  // LinkedIn has (at least) TWO logged-out presentations and the first version of this only caught
+  // one. The original outage page rendered the full login form (#csm-v2_session_key /
+  // #csm-v2_session_pas), so requiring an input[type=password] worked. But a logged-out JOB page
+  // shows only a sign-in overlay — "Join now", "Sign in", "Sign in with Email", "Continue with
+  // google" — and NO password field at all. Live 2026-08-10 the laptop sat logged out on exactly
+  // that variant with signedOut=false, i.e. the latch that exists to prevent the 31-hour outage
+  // silently missed it.
+  //
+  // The discriminator is now the right way round. A signed-IN LinkedIn page ALWAYS carries the
+  // global nav (My Network / Messaging / Notifications); its presence is the strongest possible
+  // "we are fine" signal and is what keeps this from false-positiving on, say, a feed post that
+  // happens to contain the words "join now". Only when that nav is absent do we look for a sign-in
+  // affordance — and those affordances never appear while signed in.
   function linkedInSignedOut() {
     try {
       if (!/(^|\.)linkedin\.com$/i.test(location.hostname)) return false;
-      if (!document.querySelector('input[type="password"]')) return false;
-      const t = (document.body?.innerText || '').slice(0, 4000);
-      if (!/\bsign in\b/i.test(t)) return false;
-      return /\bjoin now\b/i.test(t) || /sign in with email/i.test(t) || /new to linkedin/i.test(t);
+      const t = (document.body?.innerText || '').slice(0, 6000);
+      // Signed-in global nav present → definitively NOT signed out. Checked first, and it wins.
+      if (/\bMy Network\b|\bMessaging\b|\bNotifications\b/i.test(t)) return false;
+      // No nav — now any one of these is conclusive.
+      if (document.querySelector('input[type="password"]')) return true;   // full login form
+      if (/sign in with email/i.test(t)) return true;                      // sign-in overlay
+      if (/new to linkedin/i.test(t)) return true;
+      return /\bjoin now\b/i.test(t) && /\bsign in\b/i.test(t);
     } catch { return false; }
   }
 

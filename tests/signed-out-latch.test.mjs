@@ -25,11 +25,19 @@ const server = read('app', 'src', 'server.js');
 // ---- 1. detection -----------------------------------------------------------------------------
 
 // Reproduce the detector's decision so the intent is pinned independently of the source text.
+//
+// v2 (2026-08-10). The first version required an input[type=password], which only exists on the FULL
+// login form. A logged-out JOB page shows a sign-in overlay with no password field at all, so the
+// laptop sat logged out with signedOut=false — the latch built to prevent the 31-hour outage missed
+// the commoner variant. The discriminator is now the signed-IN global nav: its presence proves we
+// are fine, and only in its absence do we look for sign-in affordances.
 function signedOut({ host, hasPassword, text }) {
   if (!/(^|\.)linkedin\.com$/i.test(host)) return false;
-  if (!hasPassword) return false;
-  if (!/\bsign in\b/i.test(text)) return false;
-  return /\bjoin now\b/i.test(text) || /sign in with email/i.test(text) || /new to linkedin/i.test(text);
+  if (/\bMy Network\b|\bMessaging\b|\bNotifications\b/i.test(text)) return false;
+  if (hasPassword) return true;
+  if (/sign in with email/i.test(text)) return true;
+  if (/new to linkedin/i.test(text)) return true;
+  return /\bjoin now\b/i.test(text) && /\bsign in\b/i.test(text);
 }
 
 test('the live signed-out page is recognised', () => {
@@ -45,12 +53,32 @@ test('a signed-IN job page is never mistaken for signed-out', () => {
   assert.equal(signedOut({ host: 'www.linkedin.com', hasPassword: false, text: ok }), false);
 });
 
-test('BOTH signals are required — neither alone may halt a working node', () => {
-  const wall = 'Join now Sign in';
-  assert.equal(signedOut({ host: 'www.linkedin.com', hasPassword: false, text: wall }), false,
-    'sign-in copy alone (e.g. a footer link) must not trip it');
-  assert.equal(signedOut({ host: 'www.linkedin.com', hasPassword: true, text: 'Application form' }), false,
-    'a password field alone must not trip it');
+// THE VARIANT THAT WAS MISSED. Verbatim from the laptop, 2026-08-10 00:45 — a logged-out job page
+// with the sign-in overlay and NO password field. buttons were:
+//   Apply | Dismiss | Continue with google | Sign in with Email | Continue with google | Apply
+// The old detector required a password input, returned false, and the latch never fired.
+test('the logged-out JOB page (sign-in overlay, NO password field) is caught', () => {
+  const live = 'Skip to main content LinkedIn Backend Developer in North York, ON Expand search '
+    + 'Join now Sign in Backend Developer Curiosity Learning Ottawa, Ontario, Canada';
+  assert.equal(signedOut({ host: 'www.linkedin.com', hasPassword: false, text: live }), true,
+    'regression: requiring a password field misses the commoner logged-out variant');
+});
+
+test('"Sign in with Email" alone is conclusive when the signed-in nav is absent', () => {
+  assert.equal(signedOut({ host: 'www.linkedin.com', hasPassword: false, text: 'Continue with google Sign in with Email' }), true);
+});
+
+test('the signed-in nav OVERRIDES any sign-in wording on the page', () => {
+  // This is what replaces the old "two signals" guard: a real feed/job page can contain marketing
+  // copy like "join now", but it always carries the global nav, and that wins.
+  const signedInWithNoise = '0 notifications Home My Network Jobs Messaging — post text: join now sign in to our webinar';
+  assert.equal(signedOut({ host: 'www.linkedin.com', hasPassword: false, text: signedInWithNoise }), false,
+    'a working node must never be halted by page copy');
+});
+
+test('bare "sign in" with no other affordance does not trip it', () => {
+  assert.equal(signedOut({ host: 'www.linkedin.com', hasPassword: false, text: 'Please sign in to continue reading' }), false,
+    '"join now" AND "sign in" together, or an explicit affordance — not one loose phrase');
 });
 
 test('non-LinkedIn hosts are out of scope', () => {
