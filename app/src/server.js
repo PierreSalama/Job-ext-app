@@ -17,6 +17,7 @@ const path = require('path');
 const db = require('./db');
 const safety = require('./safety');
 const watchlist = require('./watchlist');
+const salary = require('./salary');
 const emailSweep = require('./email-sweep');
 const provider = require('./ai/provider');
 const prompts = require('./ai/prompts');
@@ -185,6 +186,18 @@ const ACADEMIC_RE = /\b(post-?doc|postdoctoral|post-?doctorale|ph\.?\s?d|doctora
 // front end / front-end / frontend are the same word, so normalize both before comparing.
 // French forms matter on Canadian boards — a Montreal posting reads "Développeur(euse) Front-End",
 // which is the same job as "Frontend Developer" and was being filtered out as off-target.
+// WARNING FOR THE NEXT PERSON WHO EDITS THE KEYWORD LIST.
+//
+// This table collapses role words to a canonical token, which is what makes "software engineer"
+// match "Software Developer". It also means a BARE foreign-language role word is a wildcard:
+// 'développeur' normalises to the same `developer` token, so adding it as a keyword matches
+// "Backend Engineer", "ServiceNow Developer", and essentially every engineering title. Measured
+// 2026-08-10: adding bare 'développeur' + 'programmeur' let in 156 extra jobs of .NET/ServiceNow
+// noise while looking like it had opened the Quebec market.
+//
+// So Pierre's French keywords are deliberately MULTI-WORD ONLY ('développeur full stack',
+// 'analyste programmeur', …), which stay specific because every token must match. If you are here
+// because the bare word looks "missing" — it is missing on purpose. Do not add it back.
 const ROLE_SYNONYMS = new Map([
   ['engineer', 'developer'], ['programmer', 'developer'], ['dev', 'developer'], ['coder', 'developer'],
   ['developpeur', 'developer'], ['developpeuse', 'developer'], ['programmeur', 'developer'],
@@ -276,6 +289,14 @@ function jobFit(jobOrTitle, aa) {
   // exactly why this cannot be a naive city-name blocklist.
   if (aa && aa.country && foreignLocation(location, aa.country)) {
     return { ok: false, reason: `outside ${aa.country} (${String(job.location || '').slice(0, 40)})` };
+  }
+  // SALARY FLOOR. Rejects only what is DEMONSTRABLY below the line — unknown pay always passes.
+  // Measured before enabling, on 980 real postings: only 38 (3.9%) state a salary at all, so an
+  // $80k floor rejects 5 jobs. It is correct and free, but it is NOT the lever it looks like: the
+  // $60-70k roles Pierre wants to stop applying to are overwhelmingly the ones that say nothing.
+  if (aa && Number(aa.salaryFloor) > 0) {
+    const verdict = salary.meetsFloor(job.compensation ?? job.salary, aa.salaryFloor);
+    if (!verdict.ok) return { ok: false, reason: `below your salary floor — ${verdict.reason}` };
   }
   // POSITIVE RELEVANCE GATE (opt-in via autoApply.requireKeywordMatch).
   //

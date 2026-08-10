@@ -240,6 +240,11 @@ const DEFAULTS = {
     country: 'Canada',            // hard geo-clamp for every search (JobSpy country_indeed + URL geography)
     boards: ['linkedin', 'indeed'],
     // ---- relevance / fit filters (skip jobs that don't match your level) ----
+    // Minimum acceptable pay. Rejects ONLY postings whose STATED salary tops out below this —
+    // unknown pay always passes (see app/src/salary.js for why that direction is non-negotiable).
+    // Reality check measured 2026-08-10: only 3.9% of postings state a salary at all, so this is a
+    // safety net rather than a filter. 0 = off.
+    salaryFloor: 0,
     experienceYears: 0,           // your years of experience; >0 = skip jobs that demand many more
     seniorityMax: 'any',          // 'any' | 'entry' | 'mid' | 'senior' — skip roles above this level
     // Require a discovered job's TITLE to match at least one of your keywords before applying.
