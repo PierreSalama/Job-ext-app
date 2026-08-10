@@ -15,6 +15,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const db = require('./db');
+const safety = require('./safety');
 const provider = require('./ai/provider');
 const prompts = require('./ai/prompts');
 const codexProvider = require('./ai/codex');
@@ -372,6 +373,21 @@ function withinWindow(settings) {
 // Reduce a job URL to its registrable domain, mirroring the extension's registrableDomain() so the
 // two agree on what "indeed.com" means (ca.indeed.com and smartapply.indeed.com are the same site).
 const QN_MULTI_TLDS = new Set(['co.uk', 'com.au', 'co.jp', 'co.nz', 'co.in', 'com.br', 'co.za', 'com.mx', 'org.uk', 'gov.uk']);
+// Account-budget status for every governed platform, for the dashboard and for anyone (human or
+// monitor) asking "are we anywhere near the line". Reports searches and applies side by side on
+// purpose: reading applies alone is precisely the mistake that let 281 LinkedIn scrapes a day pass
+// unnoticed while every visible counter sat at a comfortable ~40.
+function safetyStatus(settings) {
+  const sfy = (settings && settings.safety) || {};
+  const platforms = Object.keys((sfy.platforms) || {});
+  const out = { enabled: sfy.enabled !== false, platforms: {} };
+  for (const p of platforms) {
+    try { out.platforms[p] = safety.budgetSummary({ safety: sfy, platform: p, counts: db.platformTouchCounts(p) }); } catch {}
+  }
+  out.primary = platforms.filter((p) => safety.ownsPlatform(sfy, p));
+  return out;
+}
+
 function registrableDomainOf(url) {
   try {
     const h = new URL(String(url)).hostname.replace(/^www\./, '').toLowerCase();
@@ -466,6 +482,24 @@ async function queueNext(force = false, skipHosts = null) {
   let easyApplyDeferred = false;
   let signedOutDeferred = false;
   let hostDeferred = false;
+  let safetyDeferred = null;   // the first safety-governor refusal, kept so /queue/next can say WHY
+  // Memoized per call: the loop below walks EVERY queued task (300+ on a full queue) but there are
+  // only a handful of distinct platforms, and the answer cannot change mid-loop — nothing is
+  // dispatched until after it. Without this it was 2 SQL reads per queued task, per pump.
+  const safetyCache = new Map();
+  const safetyGateFor = (platform) => {
+    if (!safetyCache.has(platform)) {
+      safetyCache.set(platform, safety.decideTouch({
+        safety: s.safety,
+        platform,
+        kind: 'apply',
+        requireConfig: true,
+        counts: db.platformTouchCounts(platform),
+        lastTouchAt: db.lastPlatformTouchAt(platform, 'apply'),
+      }));
+    }
+    return safetyCache.get(platform);
+  };
   // PER-JOB PASS-OVER DIAGNOSTIC. The deferral flags below collapse into ONE reason string, so a
   // queue that looks full while nothing dispatches gives no clue which guard excluded which job
   // (live: 69 Indeed jobs silently held during an Easy-Apply cooldown, reported only as
@@ -566,6 +600,19 @@ async function queueNext(force = false, skipHosts = null) {
       const host = registrableDomainOf(j.jobUrl);
       if (host && skipHosts.has(host)) { hostDeferred = true; passOver(t, j, `host ${host} is under the extension's bot-challenge breaker — not claimed`); continue; }
     }
+    // PLATFORM SAFETY GOVERNOR — the per-account budget that covers applies AND discovery searches
+    // under one ceiling (app/src/safety.js). Deliberately NOT `force`-bypassable: a manual "run now"
+    // is still a request LinkedIn counts, and the whole point of this brake is that no path around
+    // it exists. Unconfigured platforms (Greenhouse/Lever/Ashby/company sites) are ungoverned and
+    // keep flowing — see isConfiguredPlatform for why the two call sites default opposite ways.
+    const platform = String(j.source || '').toLowerCase();
+    const safetyGate = safetyGateFor(platform);
+    if (!safetyGate.ok) {
+      safetyDeferred = safetyDeferred || safetyGate;
+      passOver(t, j, `safety-${safetyGate.reason}: ${platform} held by the account budget`
+        + (safetyGate.used !== undefined ? ` (${safetyGate.used}/${safetyGate.budget})` : ''));
+      continue;
+    }
     const siteKey = db.taskSiteKey(j);
     if (!force && concurrency > 1 && siteKey) {
       // (1) PER-SITE CAP — never run more than perSiteCap applies on one site at once.
@@ -594,6 +641,16 @@ async function queueNext(force = false, skipHosts = null) {
   if (!candidates.length && gapOnly.length) {
     gapOnly.sort((a, b) => b.order - a.order);   // oldest-first (queue list is DESC)
     candidates.push(gapOnly[0]);
+  }
+  // Idling because the account budget says so. Ranked FIRST among the deferral reasons: it is the
+  // most consequential one and the one whose invisibility caused the 2026-08-10 restriction. The
+  // pump uses retryAfterMs to sleep for real (hours, during quiet hours) instead of re-asking.
+  if (!candidates.length && safetyDeferred) {
+    return {
+      task: null, reason: `safety-${safetyDeferred.reason}`, concurrency,
+      safety: safetyDeferred, retryAfterMs: safetyDeferred.retryAfterMs,
+      passedOver: passOverSummary(),
+    };
   }
   if (!candidates.length && easyApplyDeferred) return { task: null, reason: 'easyapply-cooldown', concurrency, passedOver: passOverSummary() };
   // Idling on purpose because the browser is signed out — a distinct, actionable reason rather than
@@ -660,6 +717,11 @@ async function queueNext(force = false, skipHosts = null) {
     transcriptAppend: { note: `scheduled (mode=${mode})` },
   });
   broadcast('queue.updated', { taskId: task.id, state: 'scheduled' });
+  // Spend the budget at CLAIM time, not at submit time. An apply that fails, parks, or hits a wall
+  // still cost the platform a session's worth of page loads — that traffic is what got counted
+  // against the account, so it must be what we count too. (The old maxPerDay/dailyCap read
+  // *submissions*, which is why a day of failures looked free while LinkedIn saw a flood.)
+  try { db.recordPlatformTouch(String(job.source || '').toLowerCase(), 'apply'); } catch {}
 
   return {
     task: { ...task, mode },
@@ -1712,6 +1774,9 @@ async function handle(req, res, parsed) {
         concurrency, effectivePerHour, bindingCap, doneHour: stats.doneHour, doneDay: stats.doneDay,
         dailyCap, dispatchedDay: stats.dispatchedDay, softCapReached,
       },
+      // Where each governed platform's account budget stands right now — searches AND applies, the
+      // two numbers that had to be read together to see the 2026-08-10 restriction coming.
+      safety: safetyStatus(s),
     });
   }
   // User answers the parked questions → saved to the profile (locked) → parked

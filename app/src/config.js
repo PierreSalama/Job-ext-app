@@ -177,6 +177,60 @@ const DEFAULTS = {
       lastOnDate: '',
       lastOffDate: '',
     },
+    // PLATFORM SAFETY GOVERNOR (app/src/safety.js). One budget per platform covering EVERY touch —
+    // discovery searches AND apply dispatches — because the 2026-08-10 account restriction was
+    // caused by SEARCHES (281 LinkedIn scrapes pulling 8,627 records in one day, from each of two
+    // machines), not by the ~40 applies every cap in the system was watching.
+    //
+    // `role` is the load-bearing field: only the node whose role is 'primary' may touch that
+    // platform at all. Every other node answers 'not-this-node' locally, with no cross-node
+    // coordination — which is why two machines can no longer sum past a budget neither exceeds.
+    // Default 'none' everywhere: a freshly installed node touches LinkedIn only once a human says so.
+    safety: {
+      enabled: true,
+      platforms: {
+        linkedin: {
+          role: 'none',              // 'primary' = this node owns LinkedIn; 'none' = never touch it
+          searchesPerDay: 24,        // was effectively unbounded → 281/day observed
+          searchesPerHour: 3,
+          minSearchGapMinutes: 20,
+          appliesPerDay: 15,         // well under LinkedIn's own ~40/day Easy-Apply ceiling
+          appliesPerHour: 4,
+          minApplyGapMinutes: 4,
+          quietStart: '23:00',       // no LinkedIn traffic overnight — steady 4am scraping is a signature
+          quietEnd: '07:00',
+          jitterPct: 0.4,            // spread each gap over [base, base×1.4] so arrivals aren't a metronome
+        },
+        indeed: {
+          role: 'none',
+          searchesPerDay: 60, searchesPerHour: 8, minSearchGapMinutes: 8,
+          appliesPerDay: 40, appliesPerHour: 8, minApplyGapMinutes: 2,
+          quietStart: '23:00', quietEnd: '07:00', jitterPct: 0.4,
+        },
+        // Listed explicitly, not because they're used today, but so that a board turned on in
+        // Settings never goes silently dead: an UNLISTED platform falls back to role 'none' (the
+        // fail-safe direction), and a board that does nothing without saying why is worse than one
+        // that's visibly switched off here.
+        glassdoor: {
+          role: 'none',
+          searchesPerDay: 24, searchesPerHour: 3, minSearchGapMinutes: 20,
+          appliesPerDay: 0, appliesPerHour: 0, minApplyGapMinutes: 5,
+          quietStart: '23:00', quietEnd: '07:00', jitterPct: 0.4,
+        },
+        google: {
+          role: 'none',
+          searchesPerDay: 60, searchesPerHour: 8, minSearchGapMinutes: 8,
+          appliesPerDay: 0, appliesPerHour: 0, minApplyGapMinutes: 5,
+          quietStart: '23:00', quietEnd: '07:00', jitterPct: 0.4,
+        },
+        zip_recruiter: {
+          role: 'none',
+          searchesPerDay: 40, searchesPerHour: 6, minSearchGapMinutes: 10,
+          appliesPerDay: 0, appliesPerHour: 0, minApplyGapMinutes: 5,
+          quietStart: '23:00', quietEnd: '07:00', jitterPct: 0.4,
+        },
+      },
+    },
     easyApplyOnly: false,         // OFF = include normal/external postings and let the runner hand off to company/ATS forms when possible
     keywords: [],                 // e.g. ['software engineer', 'data analyst']
     locations: [],                // GEOGRAPHY ONLY — e.g. ['Toronto, ON', 'Canada']. NEVER a work-mode

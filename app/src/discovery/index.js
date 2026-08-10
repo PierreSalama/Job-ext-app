@@ -4,6 +4,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const db = require('../db');
+const safety = require('../safety');
 const { scope } = require('../logger');
 
 const log = scope('discovery');
@@ -381,6 +382,24 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     running = true;
     try {
       const scanCombo = async (query) => Promise.all(selectedBoards.map(async (source) => {
+        // SAFETY GOVERNOR — the brake that did not exist when LinkedIn restricted the account for
+        // "an unusually high volume of LinkedIn profile data". Asked HERE, per actual outbound
+        // search, rather than once per tick: one tick fans out over combosPerTick × selectedBoards,
+        // so a per-tick gate would have undercounted the real request volume by up to 15x — which
+        // is exactly how 281 LinkedIn scrapes happened on a day nothing looked wrong.
+        // A `force`d (manual) run still asks: the account doesn't care who pressed the button.
+        const gate = safety.decideTouch({
+          safety: aa.safety,
+          platform: source,
+          kind: 'search',
+          counts: db.platformTouchCounts(source),
+          lastTouchAt: db.lastPlatformTouchAt(source, 'search'),
+        });
+        if (!gate.ok) {
+          log.info(`skip ${source} search — ${gate.reason}`, gate.used !== undefined ? `${gate.used}/${gate.budget} today` : '');
+          return { source, status: 'skipped', safety: gate };
+        }
+        db.recordPlatformTouch(source, 'search');
         // Per-combo freshness tier: a saturated combo widens its window so it keeps surfacing
         // older, not-yet-seen postings instead of re-finding the same duplicates at a fixed 72h.
         const tierKey = `freshTier:${source}|${query.keyword}|${query.location}`;

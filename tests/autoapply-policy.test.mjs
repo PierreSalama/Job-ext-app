@@ -12,7 +12,25 @@ const db = require(path.join(here, '..', 'app', 'src', 'db.js'));
 const server = require(path.join(here, '..', 'app', 'src', 'server.js'));
 
 let dir;
-test.before(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jat-policy-')); db.open(dir); });
+
+// The platform safety governor ships with every platform UNOWNED (role 'none') so a fresh install
+// never starts scraping LinkedIn on its own — see app/src/safety.js and the 2026-08-10 account
+// restriction. These tests exercise discovery/dispatch MECHANICS, not the budget, so give this
+// temp node ownership and headroom; safety-governor.test.mjs is what pins the budget behaviour.
+function grantSafetyHeadroom() {
+  const platforms = {};
+  for (const p of ['linkedin', 'indeed', 'glassdoor', 'google', 'zip_recruiter']) {
+    platforms[p] = {
+      role: 'primary',
+      searchesPerDay: 100000, searchesPerHour: 100000, minSearchGapMinutes: 0,
+      appliesPerDay: 100000, appliesPerHour: 100000, minApplyGapMinutes: 0,
+      quietStart: '00:00', quietEnd: '00:00',
+    };
+  }
+  db.patchSettings({ autoApply: { safety: { enabled: true, platforms } } });
+}
+
+test.before(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jat-policy-')); db.open(dir); grantSafetyHeadroom(); });
 test.after(() => { try { db.close(); fs.rmSync(dir, { recursive: true, force: true }); } catch {} });
 
 function addTask({ source = 'linkedin', url, state = 'queued', lastError = '', pendingQuestions = null }) {

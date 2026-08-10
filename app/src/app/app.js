@@ -2464,6 +2464,34 @@ route('/queue', async () => {
     'hourly-cap': ['#d97706', 'Hourly limit reached — resumes next hour'],
     off: ['#9ca3af', 'Stopped'],
   };
+  // ACCOUNT BUDGET strip. Shows SEARCHES next to APPLIES for every platform this node owns -
+  // deliberately together, because reading applies alone is exactly what hid the 2026-08-10
+  // account restriction: ~40 applies/day looked fine while discovery quietly ran 281 LinkedIn
+  // searches. Platforms this node does NOT own are listed too, so "why is LinkedIn doing
+  // nothing" has a visible answer instead of looking like a bug.
+  function safetyHtml(sf) {
+    if (!sf || sf.enabled === false) {
+      return '<div class="muted" style="font-size:12px;margin-bottom:8px;color:var(--danger)">Account safety limits are OFF</div>';
+    }
+    const names = Object.keys(sf.platforms || {});
+    const owned = names.filter((n) => sf.platforms[n].role === 'primary');
+    if (!owned.length) return '';
+    const bar = (used, budget) => {
+      const pct = budget > 0 ? Math.min(100, Math.round((used / budget) * 100)) : 0;
+      const col = pct >= 90 ? 'var(--danger)' : pct >= 70 ? '#d97706' : '#16a34a';
+      return `<span style="color:${col}"><b>${used}</b>/${budget || 'no cap'}</span>`;
+    };
+    const rows = owned.map((n) => {
+      const p = sf.platforms[n];
+      return `<span style="margin-right:14px">${esc(n)}: searches ${bar(p.searches.used, p.searches.budget)}`
+        + ` | applies ${bar(p.applies.used, p.applies.budget)}`
+        + ` | quiet ${esc(p.quietHours)}</span>`;
+    }).join('');
+    const off = names.filter((n) => sf.platforms[n].role !== 'primary');
+    return `<div class="muted" style="font-size:12px;margin-bottom:8px">Account budget (24h) ${rows}`
+      + (off.length ? `<span style="opacity:.6">not on this node: ${off.map(esc).join(', ')}</span>` : '')
+      + '</div>';
+  }
   function liveHtml(d) {
     const [col, label] = AA_STATUS[d.status] || ['#9ca3af', d.status || ''];
     const p = d.pacing || {}, s = d.session || {};
@@ -2554,6 +2582,7 @@ route('/queue', async () => {
           ${stat(s.failed || 0, 'failed', '')}
           ${stat(d.queuedDepth || 0, 'in queue', '')}
         </div>
+        ${safetyHtml(d.safety)}
         <div class="muted" style="font-size:12px;margin-bottom:12px">≈ <b style="color:${slow ? 'var(--danger)' : 'inherit'}">${p.effectivePerHour || 0}</b> applications/hour at current settings${p.bindingCap ? ` (capped by ${p.bindingCap === 'hourly-cap' ? 'your hourly limit' : 'the gap between applications'})` : ''}${slow ? ` — your saved pacing predates the speed update. <button class="btn small" data-aa-maxspeed style="padding:2px 9px">⚡ Max speed</button>` : ''}</div>
         ${honest}
         ${siteSpread}

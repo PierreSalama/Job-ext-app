@@ -655,6 +655,23 @@ const MIGRATIONS = [
   // (NOT the legacy static "(confirmation)" markers). Append-only + idempotent. See
   // recoverRaceLostSubmissions / recoverVerifiedEvidenceFromTranscript.
   () => { recoverRaceLostSubmissions(); },
+
+  // PLATFORM TOUCH LEDGER — the counter that did not exist when LinkedIn restricted the account.
+  // One row per outbound touch of a rate-limited platform, of either kind: a discovery search or an
+  // apply dispatch. The safety governor (app/src/safety.js) reads rolling 24h/1h counts off this
+  // table. Insert-only telemetry, pruned to a few days by the maintenance sweep — the ledger only
+  // ever needs to answer "how much in the last day", never "what did we do last month".
+  () => {
+    exec(`
+      CREATE TABLE platform_touches (
+        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT NOT NULL,
+        kind     TEXT NOT NULL,
+        at       TEXT NOT NULL
+      );
+      CREATE INDEX idx_platform_touches ON platform_touches(platform, kind, at DESC);
+    `);
+  },
 ];
 
 // SUCCESS-TRUTH quarantine (shared by the migration above and exported for tests).
@@ -951,6 +968,9 @@ function maintenance() {
     // but this clears the backlog + any straggler beyond 6h, regardless of the retention window.
     const emptyCut = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
     discovery += run("DELETE FROM discovery_batches WHERE (found_count IS NULL OR found_count = 0) AND (accepted_count IS NULL OR accepted_count = 0) AND started_at < ?", [emptyCut])?.changes || 0;
+    // The safety governor only ever asks about the last 24h, but keep a week so a human can see the
+    // shape of a run after the fact — that history is what made the restriction diagnosable at all.
+    run('DELETE FROM platform_touches WHERE at < ?', [cut(7, 7)]);
   });
   // VACUUM must run OUTSIDE a transaction; gate it so it doesn't run every call.
   let vacuumed = false;
@@ -3823,6 +3843,54 @@ function setEasyApplyCooldown({ hours = 24 } = {}) {
   return { until, observedLimit: observed, submitted24h: submitted };
 }
 
+// ---- platform touch ledger (safety governor) ---------------------------------------------------
+// Every outbound touch of a rate-limited platform is recorded here — a discovery search and an
+// apply dispatch count the SAME, because LinkedIn counted them the same. See app/src/safety.js.
+
+function recordPlatformTouch(platform, kind, at = new Date()) {
+  const p = String(platform || '').toLowerCase();
+  const k = String(kind || '').toLowerCase() === 'apply' ? 'apply' : 'search';
+  if (!p) return null;
+  run('INSERT INTO platform_touches (platform, kind, at) VALUES (?, ?, ?)', [p, k, at.toISOString()]);
+  return { platform: p, kind: k, at: at.toISOString() };
+}
+
+// Rolling counts the governor decides on. Both windows in one pass so a decision can never be made
+// against two different "nows".
+function platformTouchCounts(platform, now = Date.now()) {
+  const p = String(platform || '').toLowerCase();
+  const dayAgo = new Date(now - 24 * 3600 * 1000).toISOString();
+  const hourAgo = new Date(now - 3600 * 1000).toISOString();
+  const out = { search: { day: 0, hour: 0 }, apply: { day: 0, hour: 0 } };
+  for (const r of all(
+    `SELECT kind,
+            COUNT(*)                                  AS day,
+            SUM(CASE WHEN at >= ? THEN 1 ELSE 0 END)  AS hour
+       FROM platform_touches
+      WHERE platform = ? AND at >= ?
+      GROUP BY kind`,
+    [hourAgo, p, dayAgo],
+  )) {
+    const k = r.kind === 'apply' ? 'apply' : 'search';
+    out[k] = { day: Number(r.day) || 0, hour: Number(r.hour) || 0 };
+  }
+  return out;
+}
+
+function lastPlatformTouchAt(platform, kind) {
+  const p = String(platform || '').toLowerCase();
+  const k = String(kind || '').toLowerCase() === 'apply' ? 'apply' : 'search';
+  const r = get('SELECT at FROM platform_touches WHERE platform = ? AND kind = ? ORDER BY at DESC LIMIT 1', [p, k]);
+  return r && r.at ? Date.parse(r.at) : 0;
+}
+
+function prunePlatformTouches(days = 7) {
+  const cutoff = new Date(Date.now() - Math.max(1, Number(days) || 7) * 86400000).toISOString();
+  const before = get('SELECT COUNT(*) AS n FROM platform_touches WHERE at < ?', [cutoff]);
+  run('DELETE FROM platform_touches WHERE at < ?', [cutoff]);
+  return (before && Number(before.n)) || 0;
+}
+
 function easyApplyCooledDown() {
   const until = kvGet('easyApplyLimitUntil');
   if (!until) return false;
@@ -4880,6 +4948,7 @@ module.exports = {
   queueList, queueGet, queueHistory, queueBreakdown, jobUrlsForAtsHarvest, summarizeRun, queueRunSummary, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, quarantineUntrustworthyDone, recoverRaceLostSubmissions, recoverVerifiedEvidenceFromTranscript, isTrustworthyEvidence, saveIntakeAnswer,
   classifyQueueFailure, taskSiteKey, queueActiveSiteKeys, lastStartBySiteKey,
   setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
+  recordPlatformTouch, platformTouchCounts, lastPlatformTouchAt, prunePlatformTouches,
   setSignedOut, clearSignedOut, isSignedOut, signedOutStatus, signedOutEligible,
   expireWalledTasks, retireUnanswerableParks,
   aiLog, aiLogList, aiUsage,
