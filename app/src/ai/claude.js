@@ -22,6 +22,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { scope } = require('../logger');
+const modelPolicy = require('./model-policy');
 
 const log = scope('ai:claude');
 const IS_WIN = process.platform === 'win32';
@@ -80,8 +81,19 @@ async function generate({ prompt, system, schema, model, timeoutMs = 120000 }) {
   const cli = discoverCli();
   if (!cli) throw Object.assign(new Error('Claude CLI not found'), { code: 'CLAUDE_MISSING' });
 
+  // SONNET-ONLY, ENFORCED AT THE BOUNDARY.
+  //
+  // Pierre's instruction (2026-08-10): the CLI runs on his subscription with "Sonnet and only
+  // Sonnet". Clamping HERE rather than at each call site means there is exactly one door, and it
+  // is closed — a caller that passes nothing, a stale `ai.claude.cliModel` setting, or a future
+  // code path that forgets, all still get Sonnet. Note the previous behaviour: `model` was allowed
+  // to be null, which means "whatever the CLI defaults to today" — the quiet way an Opus-priced
+  // sweep over 1,400 emails would have happened.
+  const picked = modelPolicy.enforce(model);
+  if (picked.overridden) log.info(picked.reason);
+
   const args = ['-p', '--output-format', 'json'];
-  if (model) args.push('--model', model);
+  args.push('--model', picked.model);
   if (system) args.push('--append-system-prompt', system);
   // When a schema is requested, steer Claude to emit ONLY JSON matching it (no --output-schema flag).
   const fullPrompt = schema

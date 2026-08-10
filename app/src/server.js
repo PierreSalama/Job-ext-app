@@ -16,6 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const db = require('./db');
 const safety = require('./safety');
+const emailSweep = require('./email-sweep');
 const provider = require('./ai/provider');
 const prompts = require('./ai/prompts');
 const codexProvider = require('./ai/codex');
@@ -2151,6 +2152,25 @@ async function handle(req, res, parsed) {
     return sendJson(res, 200, r);
   }
   // Re-run classification + matching over the already-stored inbox (one-shot after an upgrade).
+  // EMAIL TRIAGE — "did we actually look at every email?"
+  //
+  // GET returns the coverage numbers; POST runs the sweep. The rules pass always runs and always
+  // reaches every unreviewed email, so coverage cannot be held hostage by the AI provider being
+  // down. Pass ai=0 to skip the model entirely (free, offline).
+  if (pathname === '/emails/triage' && req.method === 'GET') {
+    return sendJson(res, 200, { ok: true, ...db.triageCoverage() });
+  }
+  if (pathname === '/emails/triage/run' && req.method === 'POST') {
+    const body = await readJson(req).catch(() => ({}));
+    const withAi = body.ai !== false && body.ai !== 0;
+    const result = await emailSweep.sweep({
+      withAi,
+      ruleLimit: Math.max(1, Math.min(20000, Number(body.ruleLimit) || 5000)),
+      aiLimit: Math.max(0, Math.min(500, Number(body.aiLimit) || 60)),
+    });
+    broadcast('emails.updated', { triage: result.coverage });
+    return sendJson(res, 200, { ok: true, ...result });
+  }
   if (pathname === '/emails/reprocess' && req.method === 'POST') {
     const email = require('./email');
     const r = email.reprocessStored();

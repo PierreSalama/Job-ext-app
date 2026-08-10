@@ -672,6 +672,26 @@ const MIGRATIONS = [
       CREATE INDEX idx_platform_touches ON platform_touches(platform, kind, at DESC);
     `);
   },
+
+  // EMAIL TRIAGE LEDGER — the record that makes "we considered every email" checkable.
+  // One row per email per sweep decision: which route it took, why, and who decided (rules or the
+  // model). Without this, an email the pipeline ignored and an email it examined and dismissed look
+  // identical, which is precisely how employer rejections went unnoticed for weeks.
+  () => {
+    exec(`
+      CREATE TABLE email_triage (
+        email_id   TEXT PRIMARY KEY,
+        route      TEXT NOT NULL,          -- settled | escalate | ignorable
+        category   TEXT,                   -- the category settled on
+        reason     TEXT,                   -- why this route, in words
+        decided_by TEXT NOT NULL,          -- 'rules' | 'sonnet'
+        confidence REAL DEFAULT 0,
+        at         TEXT NOT NULL,
+        FOREIGN KEY (email_id) REFERENCES emails(id) ON DELETE CASCADE
+      );
+      CREATE INDEX idx_email_triage_route ON email_triage(route, at DESC);
+    `);
+  },
 ];
 
 // SUCCESS-TRUTH quarantine (shared by the migration above and exported for tests).
@@ -3843,6 +3863,73 @@ function setEasyApplyCooldown({ hours = 24 } = {}) {
   return { until, observedLimit: observed, submitted24h: submitted };
 }
 
+// ---- email triage ledger -----------------------------------------------------------------------
+// "Did we look at this one?" must be answerable for every single email. These four functions are
+// the whole contract: record a decision, read the decisions, and — the important one — list what
+// has NO decision yet, which is the only honest definition of "not yet considered".
+
+function triageRecord({ emailId, route, category, reason, decidedBy, confidence = 0 }) {
+  if (!emailId) return null;
+  const at = new Date().toISOString();
+  run(
+    `INSERT INTO email_triage (email_id, route, category, reason, decided_by, confidence, at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(email_id) DO UPDATE SET
+       route=excluded.route, category=excluded.category, reason=excluded.reason,
+       decided_by=excluded.decided_by, confidence=excluded.confidence, at=excluded.at`,
+    [emailId, String(route), category || null, reason || null, String(decidedBy || 'rules'), Number(confidence) || 0, at],
+  );
+  return { emailId, route, category, reason, decidedBy, confidence, at };
+}
+
+// Emails with NO triage row. This is the backlog, and it is the number that says whether the
+// pipeline is actually thorough — not how many it classified, but how many it never reached.
+function triageUnreviewed({ limit = 500 } = {}) {
+  return all(
+    `SELECT e.id, e.subject, e.body, e.snippet, e.from_name AS fromName, e.from_addr AS fromAddr,
+            e.sent_at AS sentAt, e.category, e.matched_job_id AS matchedJobId
+       FROM emails e
+       LEFT JOIN email_triage t ON t.email_id = e.id
+      WHERE t.email_id IS NULL
+      ORDER BY e.sent_at DESC
+      LIMIT ?`,
+    [Math.max(1, Number(limit) || 500)],
+  );
+}
+
+// Everything routed to 'escalate' and not yet decided by the model — the queue Sonnet works through.
+function triagePendingEscalations({ limit = 200 } = {}) {
+  return all(
+    `SELECT e.id, e.subject, e.body, e.snippet, e.from_name AS fromName, e.from_addr AS fromAddr,
+            e.sent_at AS sentAt, e.category, e.matched_job_id AS matchedJobId
+       FROM emails e
+       JOIN email_triage t ON t.email_id = e.id
+      WHERE t.route = 'escalate' AND t.decided_by <> 'sonnet'
+      ORDER BY e.sent_at DESC
+      LIMIT ?`,
+    [Math.max(1, Number(limit) || 200)],
+  );
+}
+
+function triageCoverage() {
+  const total = Number(get('SELECT COUNT(*) AS n FROM emails')?.n) || 0;
+  const reviewed = Number(get('SELECT COUNT(*) AS n FROM email_triage')?.n) || 0;
+  const byRoute = {};
+  for (const r of all('SELECT route, COUNT(*) AS n FROM email_triage GROUP BY route')) byRoute[r.route] = Number(r.n) || 0;
+  const byDecider = {};
+  for (const r of all('SELECT decided_by, COUNT(*) AS n FROM email_triage GROUP BY decided_by')) byDecider[r.decided_by] = Number(r.n) || 0;
+  const pendingAi = Number(get("SELECT COUNT(*) AS n FROM email_triage WHERE route='escalate' AND decided_by<>'sonnet'")?.n) || 0;
+  return {
+    totalEmails: total,
+    reviewed,
+    unreviewed: Math.max(0, total - reviewed),
+    coveredPct: total ? Math.round((reviewed / total) * 100) : 100,
+    byRoute,
+    byDecider,
+    pendingAi,
+  };
+}
+
 // ---- platform touch ledger (safety governor) ---------------------------------------------------
 // Every outbound touch of a rate-limited platform is recorded here — a discovery search and an
 // apply dispatch count the SAME, because LinkedIn counted them the same. See app/src/safety.js.
@@ -4949,6 +5036,7 @@ module.exports = {
   classifyQueueFailure, taskSiteKey, queueActiveSiteKeys, lastStartBySiteKey,
   setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
   recordPlatformTouch, platformTouchCounts, lastPlatformTouchAt, prunePlatformTouches,
+  triageRecord, triageUnreviewed, triagePendingEscalations, triageCoverage,
   setSignedOut, clearSignedOut, isSignedOut, signedOutStatus, signedOutEligible,
   expireWalledTasks, retireUnanswerableParks,
   aiLog, aiLogList, aiUsage,
