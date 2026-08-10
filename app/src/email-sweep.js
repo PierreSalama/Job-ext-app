@@ -134,11 +134,23 @@ async function sweepAi({ limit = 60, batchSize = triage.BATCH_SIZE, generate } =
   return { decided, batches: batches.length, model, pending: pending.length, errors };
 }
 
-async function sweep({ withAi = true, ruleLimit = 2000, aiLimit = 60, generate } = {}) {
+async function sweep({ withAi = true, ruleLimit = 2000, aiLimit = 60, apply = true, generate } = {}) {
   const rules = sweepRules({ limit: ruleLimit });
   let ai = { decided: 0, batches: 0, skipped: true };
   if (withAi) ai = await sweepAi({ limit: aiLimit, generate });
-  return { rules, ai, coverage: db.triageCoverage() };
+
+  // Triage that only fills a ledger is a tidier way of missing things. Turn the verdicts into
+  // pipeline movement in the same call, so "we found a rejection" and "the application says
+  // rejected" cannot drift apart.
+  let applied = { applied: [], skipped: {} };
+  let orphans = [];
+  if (apply) {
+    const selfAddresses = db.selfEmailAddresses();
+    applied = db.applyTriageVerdicts({ selfAddresses });
+    orphans = db.triageOrphans({ selfAddresses });
+    if (applied.applied.length) log.info(`triage moved ${applied.applied.length} application(s) forward`);
+  }
+  return { rules, ai, applied, orphans, coverage: db.triageCoverage() };
 }
 
 module.exports = { sweep, sweepRules, sweepAi, promptFor, SYSTEM, SCHEMA, VALID };

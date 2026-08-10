@@ -2158,7 +2158,16 @@ async function handle(req, res, parsed) {
   // reaches every unreviewed email, so coverage cannot be held hostage by the AI provider being
   // down. Pass ai=0 to skip the model entirely (free, offline).
   if (pathname === '/emails/triage' && req.method === 'GET') {
-    return sendJson(res, 200, { ok: true, ...db.triageCoverage() });
+    const selfAddresses = db.selfEmailAddresses();
+    return sendJson(res, 200, {
+      ok: true,
+      ...db.triageCoverage(),
+      selfAddresses,
+      // High-value verdicts with no application behind them — a rejection or interview the matcher
+      // could not tie to a job. These are the ones worth a human's attention, so they ride along
+      // with the coverage numbers rather than hiding behind a separate call nobody makes.
+      orphans: db.triageOrphans({ limit: 50, selfAddresses }),
+    });
   }
   if (pathname === '/emails/triage/run' && req.method === 'POST') {
     const body = await readJson(req).catch(() => ({}));

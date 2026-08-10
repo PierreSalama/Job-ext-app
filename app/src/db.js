@@ -3863,6 +3863,30 @@ function setEasyApplyCooldown({ hours = 24 } = {}) {
   return { until, observedLimit: observed, submitted24h: submitted };
 }
 
+// Every address that IS the user, for inbound/outbound detection (see email-direction.js).
+// Sourced from what the app already knows rather than a new setting nobody would fill in: the
+// harvested profile fields (autofill has written the user's email into dozens of forms, so it is
+// reliably there) plus any connected mailbox. Deduped and canonicalised by the caller.
+function selfEmailAddresses() {
+  const out = new Set();
+  try {
+    for (const r of all(
+      `SELECT DISTINCT value FROM profile_fields
+        WHERE value LIKE '%@%.%' AND (key_norm LIKE '%email%' OR label LIKE '%email%' OR label LIKE '%mail%')`,
+    )) {
+      const v = String(r.value || '').trim().toLowerCase();
+      if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) out.add(v);
+    }
+  } catch {}
+  try {
+    for (const acct of (kvGet('emailAccounts') || [])) {
+      const v = String(acct && (acct.user || acct.email) || '').trim().toLowerCase();
+      if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) out.add(v);
+    }
+  } catch {}
+  return [...out];
+}
+
 // ---- email triage ledger -----------------------------------------------------------------------
 // "Did we look at this one?" must be answerable for every single email. These four functions are
 // the whole contract: record a decision, read the decisions, and — the important one — list what
@@ -3909,6 +3933,69 @@ function triagePendingEscalations({ limit = 200 } = {}) {
       LIMIT ?`,
     [Math.max(1, Number(limit) || 200)],
   );
+}
+
+// APPLY THE VERDICTS. Triage that only fills a ledger is a nicer way of missing things — the 12
+// rejections, 7 assessments and 6 interviews Sonnet found were still sitting in a table while every
+// one of those applications showed its old stage.
+//
+// Reuses the existing elevation rules exactly (gmailStatusFromCategory, forward-only, never touch a
+// terminal job) so an email-driven stage change means the same thing however it was classified.
+// Three things stop it doing damage:
+//   • OUTBOUND mail never elevates — Pierre replying to a rejection is not the employer rejecting
+//     him twice, and a quoted rejection in his own reply must not be read as news.
+//   • Only confident verdicts count. A model that says "rejection, 0.4" is a question, not news.
+//   • Forward-only, and terminal jobs are left alone, exactly as the Gmail path already behaves.
+function applyTriageVerdicts({ minConfidence = 0.7, selfAddresses = [] } = {}) {
+  const direction = require('./email-direction');
+  const rows = all(
+    `SELECT t.email_id, t.category, t.confidence, e.matched_job_id AS jobId, e.from_addr AS fromAddr,
+            e.subject, e.match_source AS matchSource
+       FROM email_triage t
+       JOIN emails e ON e.id = t.email_id
+      WHERE t.decided_by = 'sonnet' AND e.matched_job_id IS NOT NULL`,
+  );
+  const applied = [];
+  const skipped = { outbound: 0, lowConfidence: 0, unmatchedSource: 0, noChange: 0 };
+  for (const r of rows) {
+    if (!direction.canElevate(direction.directionOf(r, selfAddresses))) { skipped.outbound++; continue; }
+    if ((Number(r.confidence) || 0) < minConfidence) { skipped.lowConfidence++; continue; }
+    if (r.matchSource !== 'auto' && r.matchSource !== 'manual') { skipped.unmatchedSource++; continue; }
+    const st = gmailStatusFromCategory(r.category);
+    if (!st) { skipped.noChange++; continue; }
+    const job = getJob(r.jobId);
+    if (!job || TERMINAL.has(job.status)) { skipped.noChange++; continue; }
+    if ((STATUS_ORDER[st] || 0) <= (STATUS_ORDER[job.status] || 0)) { skipped.noChange++; continue; }
+    patchJob(r.jobId, { status: st });
+    recordEvent({
+      jobId: r.jobId,
+      type: 'status',
+      source: 'email-triage',
+      summary: `stage moved to ${st} — email triage read "${String(r.subject || '').slice(0, 80)}"`,
+      data: { emailId: r.email_id, category: r.category, confidence: r.confidence, from: job.status, to: st },
+    });
+    applied.push({ jobId: r.jobId, from: job.status, to: st, category: r.category, subject: r.subject });
+  }
+  return { applied, skipped };
+}
+
+// High-value verdicts with NO application behind them. A rejection or interview the matcher could
+// not tie to a job is not noise — it is the matcher missing something, and it is the one class of
+// finding that should reach a human rather than a counter.
+function triageOrphans({ limit = 100, selfAddresses = [] } = {}) {
+  const direction = require('./email-direction');
+  const rows = all(
+    `SELECT t.email_id AS id, t.category, t.confidence, t.reason,
+            e.subject, e.from_name AS fromName, e.from_addr AS fromAddr, e.sent_at AS sentAt
+       FROM email_triage t
+       JOIN emails e ON e.id = t.email_id
+      WHERE t.category IN ('offer','interview','assessment','rejection')
+        AND e.matched_job_id IS NULL
+      ORDER BY e.sent_at DESC
+      LIMIT ?`,
+    [Math.max(1, Number(limit) || 100)],
+  );
+  return rows.filter((r) => direction.canElevate(direction.directionOf(r, selfAddresses)));
 }
 
 function triageCoverage() {
@@ -5037,6 +5124,7 @@ module.exports = {
   setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
   recordPlatformTouch, platformTouchCounts, lastPlatformTouchAt, prunePlatformTouches,
   triageRecord, triageUnreviewed, triagePendingEscalations, triageCoverage,
+  applyTriageVerdicts, triageOrphans, selfEmailAddresses,
   setSignedOut, clearSignedOut, isSignedOut, signedOutStatus, signedOutEligible,
   expireWalledTasks, retireUnanswerableParks,
   aiLog, aiLogList, aiUsage,
