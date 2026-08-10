@@ -2264,6 +2264,49 @@ export async function run(task, context, helpers) {
     } catch { return false; }
   }
 
+  // ---- ACCOUNT RESTRICTION -----------------------------------------------------------------------
+  // Strictly worse than being signed out, and it needs its own detector.
+  //
+  // Live 2026-08-10 02:28: LinkedIn served Pierre a full-page checkpoint — "Your account has been
+  // temporarily restricted … we detected that over time, it has accessed an unusually high volume of
+  // LinkedIn profile data" — and JAT did not notice. It kept dispatching. He found it by looking at
+  // the screen. Nothing in the system could tell the difference between "this page failed" and "the
+  // platform has sanctioned the account".
+  //
+  // Why this cannot reuse the signed-out latch: that latch holds only LinkedIn work and CLEARS
+  // ITSELF on the next successful apply. Both behaviours are wrong here. A restriction means every
+  // further request is evidence against the account, and auto-resuming after a sanction is how a
+  // temporary restriction becomes a permanent ban. So this stops the whole engine and stays stopped
+  // until a human decides otherwise.
+  //
+  // The phrases below are specific to the restriction interstitial; ordinary job pages, feed posts
+  // and Easy-Apply forms do not contain them.
+  function linkedInRestricted() {
+    try {
+      if (!/(^|\.)linkedin\.com$/i.test(location.hostname)) return false;
+      const t = (document.body?.innerText || '').slice(0, 6000);
+      if (/your account has been (temporarily )?restricted/i.test(t)) return true;
+      if (/we (have )?restricted your account/i.test(t)) return true;
+      if (/unusually high volume of linkedin/i.test(t)) return true;
+      // A checkpoint URL alone is not enough (they are also used for benign 2FA/verification), so it
+      // only counts alongside restriction wording.
+      return /\/checkpoint\//i.test(location.pathname) && /restrict/i.test(t);
+    } catch { return false; }
+  }
+
+  // Halt everything for an account restriction. Returns true if it fired.
+  function reportIfRestricted(where) {
+    if (!linkedInRestricted()) return false;
+    logLine('err', 'LinkedIn has RESTRICTED this account — stopping auto-apply entirely');
+    report({
+      state: 'failed',
+      parkReason: 'account_restricted',
+      lastError: 'linkedin-account-restricted — LinkedIn has restricted this account; auto-apply has been STOPPED and will not resume on its own',
+      transcriptAppend: { kind: 'recovery', note: `LinkedIn account-restriction page detected (${where}) — engine stopped, no auto-resume` },
+    });
+    return true;
+  }
+
   // Report the signed-out halt from ANY terminal LinkedIn failure. Returns true if it fired, so the
   // caller stops instead of emitting a misleading reason.
   //
@@ -3105,6 +3148,10 @@ export async function run(task, context, helpers) {
       // Fronting is now a RARE last-resort safety net: only after an initial wait fails do we
       // escalate to front-until-hydrated (below). This avoids stealing the foreground on every
       // apply (the v11.26.0 disruption) while still rescuing a genuinely occluded+stuck tab.
+      // Restriction is checked FIRST: the restriction interstitial also renders "Sign in" and
+      // "Join now" in its header, so the signed-out detector fires on it too and would report the
+      // wrong — and far less serious — cause.
+      if (reportIfRestricted('before the hydrate wait')) { finalState = 'failed'; break; }
       // Before burning 30s waiting for a control that can never appear: are we simply signed out?
       if (reportIfSignedOut('before the hydrate wait')) { finalState = 'failed'; break; }
       logLine('warn', opening
@@ -3282,6 +3329,7 @@ export async function run(task, context, helpers) {
         // THE path a logged-out LinkedIn job page actually exits through. Checking here is what
         // makes the latch fire at all — "no advance button found" is the symptom, being signed out
         // is the cause, and reporting the symptom sends the task round the retry loop forever.
+        if (reportIfRestricted('terminal no-advance')) { finalState = 'failed'; break; }
         if (reportIfSignedOut('terminal no-advance')) { finalState = 'failed'; break; }
         report({
           state: 'failed',

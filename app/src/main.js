@@ -321,6 +321,14 @@ function notifyEvent(type, payload) {
   // Deliberately BOTH channels: the in-app feed for history, and a native OS popup because this
   // requires him to act. server.js fires this only on the clear→set transition, so it cannot spam
   // once per held task.
+  // ACCOUNT RESTRICTED — the loudest thing this app can say. Auto-apply and discovery are already
+  // stopped by the time this fires; the alert exists so Pierre learns within seconds rather than
+  // whenever he next glances at a screen (2026-08-10: he found the restriction himself, unaided).
+  if (type === 'accountRestricted') {
+    const msg = 'LinkedIn has restricted this account. Auto-apply and discovery are STOPPED and will not resume on their own. Do not restart until the restriction lifts.';
+    notify('autoApply', 'LinkedIn account restricted', msg, 'danger');
+    try { nativeNotify('⛔ LinkedIn account restricted', msg); } catch {}
+  }
   if (type === 'signedOut') {
     const msg = 'Auto-apply is halted: this browser is signed out of LinkedIn. Sign in and it resumes by itself.';
     notify('autoApply', 'Signed out of LinkedIn', msg, 'danger');

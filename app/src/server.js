@@ -1553,6 +1553,29 @@ async function handle(req, res, parsed) {
       try { db.setEasyApplyCooldown(); } catch {}
       broadcast('queue.updated', { action: 'easyapply-limit' });
     }
+    // ACCOUNT RESTRICTION — the hardest stop we have.
+    //
+    // Live 2026-08-10 02:28 LinkedIn restricted Pierre's account for "an unusually high volume of
+    // LinkedIn profile data" and nothing detected it; the engine kept dispatching into a sanctioned
+    // account until he happened to look at the screen.
+    //
+    // Deliberately NOT modelled on the signed-out latch. That one holds only LinkedIn work and
+    // clears itself on the next successful apply. Here both would be wrong: every further request is
+    // evidence against the account, and silently resuming after a sanction is how a temporary
+    // restriction becomes a permanent ban. So this turns the ENGINE off — all sources — and records
+    // it. Restarting is a human decision, taken with the restriction's expiry in mind.
+    if (body.parkReason === 'account_restricted' || (typeof body.lastError === 'string' && /^linkedin-account-restricted/.test(body.lastError))) {
+      const wasRestricted = !!db.kvGet('linkedInRestrictedAt');
+      try {
+        db.kvSet('linkedInRestrictedAt', Date.now());
+        db.kvSet('linkedInRestrictedReason', String(body.lastError || 'account restricted').slice(0, 300));
+        // Stop the engine itself. startedAt cleared so the "running for" timer does not lie.
+        db.patchSettings({ autoApply: { enabled: false, startedAt: '', discovery: { enabled: false } } });
+      } catch {}
+      broadcast('queue.updated', { action: 'account-restricted' });
+      log.error('[settings] LinkedIn ACCOUNT RESTRICTED — auto-apply and discovery stopped; no auto-resume');
+      if (!wasRestricted && opts.notify) { try { opts.notify('accountRestricted', task); } catch {} }
+    }
     // SIGNED-OUT LATCH. The executor saw LinkedIn's sign-in wall: stop dispatching LinkedIn work at
     // once. Latching here (rather than letting each worker rediscover it) is the whole point — the
     // 31-hour outage happened because every worker independently hit the wall, reported a generic
