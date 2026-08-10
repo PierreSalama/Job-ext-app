@@ -603,6 +603,59 @@ function scheduleGmailWatchdog() {
   gmailWatchdogInterval = setInterval(check, 60 * 60 * 1000);     // then hourly
 }
 
+// ---------- company watchlist board poller ----------
+//
+// Polls the public ATS boards of the watched companies that HAVE one — measured 2026-08-10, that
+// is two of twenty-seven (Syntronic and Kepler, both Lever). The other 25 run Workday /
+// SuccessFactors / bespoke pages with no public board, which is also why broad discovery never
+// surfaced them; those are on the manual list instead.
+//
+// Cadence is deliberately slow and jittered. Eleven days after LinkedIn restricted the account for
+// discovery volume (281 searches/day), a new poller must not become the next thing throttled. Two
+// requests, twice a day, is plenty for employers who post monthly.
+let watchlistPollInterval = null;
+const WATCHLIST_POLL_MS = 12 * 60 * 60 * 1000;   // twice a day
+
+async function pollWatchlistBoards() {
+  try {
+    const watchlist = require('./watchlist');
+    const s = db.getSettings().autoApply || {};
+    const entries = (Array.isArray(s.watchlist) ? s.watchlist : []).filter((e) => e && e.board);
+    if (!entries.length) return;
+
+    const seen = new Set(db.kvGet('watchlistBoardSeen') || []);
+    const before = seen.size;
+    const { alerts, errors } = await watchlist.pollBoards({ entries, seen });
+    // Cap the memo so it cannot grow without bound on a board that churns postings.
+    db.kvSet('watchlistBoardSeen', [...seen].slice(-2000));
+    if (errors.length) log.warn('watchlist poll errors:', errors.join('; '));
+    if (!alerts.length) { log.info(`watchlist poll: no new postings (${before} known)`); return; }
+
+    const list = db.kvGet('watchlistAlerts') || [];
+    db.kvSet('watchlistAlerts', [...alerts, ...list].slice(0, 200));
+    broadcast('watchlist.hit', { alerts });
+
+    // One notification for the batch, naming the company and the contact — a per-posting popup
+    // from a board that just opened six roles would be noise, and noise gets muted.
+    const byCompany = [...new Set(alerts.map((a) => a.company))];
+    const lead = alerts[0];
+    nativeNotify(
+      `${alerts.length} new opening${alerts.length === 1 ? '' : 's'} at ${byCompany.join(', ')}`,
+      `${lead.title} — ${lead.location || 'location n/a'}${lead.contact ? `. Contact: ${lead.contact}` : ''}`,
+    );
+    notify('status', 'Watched company posted', `${alerts.length} new opening(s) at ${byCompany.join(', ')}`, 'info');
+    log.info(`watchlist poll: ${alerts.length} new posting(s) at ${byCompany.join(', ')}`);
+  } catch (e) { log.warn('watchlist poll failed', e.message); }
+}
+
+function scheduleWatchlistPoll() {
+  if (watchlistPollInterval) clearInterval(watchlistPollInterval);
+  // Jitter both the first run and the interval so the requests do not arrive on a metronome.
+  const jitter = () => Math.round(WATCHLIST_POLL_MS * (0.85 + Math.random() * 0.3));
+  setTimeout(() => { pollWatchlistBoards(); }, 3 * 60 * 1000 + Math.round(Math.random() * 120000));
+  watchlistPollInterval = setInterval(() => { pollWatchlistBoards(); }, jitter());
+}
+
 // ---------- gmail scheduler ----------
 function scheduleGmail() {
   if (gmailInterval) clearInterval(gmailInterval);
@@ -670,6 +723,7 @@ function applyAppSettings() {
   scheduleGmail();
   scheduleEmailSync();
   scheduleGmailWatchdog();
+  scheduleWatchlistPoll();
   try {
     const aa = db.getSettings().autoApply || {};
     const shouldBlock = !!aa.enabled && aa.keepAwake !== false;
