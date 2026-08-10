@@ -88,11 +88,37 @@ test('non-LinkedIn hosts are out of scope', () => {
 
 test('the executor checks BEFORE the 30s hydrate wait, not after', () => {
   assert.match(executor, /function linkedInSignedOut\(\)/, 'detector must exist');
-  const iCheck = executor.indexOf('if (linkedInSignedOut())');
+  const iCheck = executor.indexOf("reportIfSignedOut('before the hydrate wait')");
   const iWait = executor.indexOf("'no advance button — waiting for the page (or you)'");
   assert.ok(iCheck > -1 && iWait > -1, 'both the check and the wait are present');
   assert.ok(iCheck < iWait,
     'checking after the wait would still burn 30s per job — the whole cost of the outage');
+});
+
+// EVERY terminal LinkedIn failure must consult the detector, not just one branch.
+//
+// v1 wired linkedInSignedOut() into a single path — "waiting for the page" before the hydrate wait.
+// A logged-out job page normally exits through a DIFFERENT terminal report, "no advance button
+// found — will retry", which never reached the check. Live 2026-08-10: 9 of 10 sampled pages were
+// signed out and the node produced 64 "no advance button found" + 26 "timed out" in two hours,
+// while the latch still read signedOut=false. Detection wired into the path the failure does not
+// take is not detection.
+test('the terminal no-advance path also checks — this is the path it actually takes', () => {
+  assert.match(executor, /reportIfSignedOut\('terminal no-advance'\)/,
+    'the dominant logged-out failure exits here');
+  const iCheck = executor.indexOf("reportIfSignedOut('terminal no-advance')");
+  const iReport = executor.indexOf("'no advance button found — will retry'");
+  assert.ok(iCheck > -1 && iReport > -1 && iCheck < iReport,
+    'the check must precede the misleading report, or the symptom is recorded instead of the cause');
+});
+
+test('the shared reporter halts rather than letting the task retry', () => {
+  const fn = executor.slice(executor.indexOf('function reportIfSignedOut'), executor.indexOf('// ---- BROADENED final-submit'));
+  assert.match(fn, /parkReason: 'signed_out'/, 'must set the latch key the server watches for');
+  assert.match(fn, /linkedin-signed-out/, 'must carry the greppable lastError');
+  assert.match(fn, /return true;/, 'must tell the caller it handled the failure');
+  assert.match(fn, /if \(!linkedInSignedOut\(\)\) return false;/,
+    'and must be a no-op when we are genuinely signed in');
 });
 
 // ---- 2. the latch -----------------------------------------------------------------------------

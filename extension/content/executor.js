@@ -2264,6 +2264,27 @@ export async function run(task, context, helpers) {
     } catch { return false; }
   }
 
+  // Report the signed-out halt from ANY terminal LinkedIn failure. Returns true if it fired, so the
+  // caller stops instead of emitting a misleading reason.
+  //
+  // v1 called linkedInSignedOut() from exactly ONE branch — the "waiting for the page" path before
+  // the hydrate wait. But a logged-out job page usually exits through a DIFFERENT terminal report
+  // ("no advance button found — will retry"), which never reached the check. Live 2026-08-10: the
+  // laptop was signed out on 9 of 10 sampled pages and produced 64 "no advance button found" plus 26
+  // "timed out" in two hours, while the latch still read signedOut=false. Detection is worthless if
+  // it is only wired into the path the failure does not take.
+  function reportIfSignedOut(where) {
+    if (!linkedInSignedOut()) return false;
+    logLine('err', 'LinkedIn is SIGNED OUT in this browser — halting instead of retrying');
+    report({
+      state: 'failed',
+      parkReason: 'signed_out',
+      lastError: 'linkedin-signed-out — this browser is signed out of LinkedIn; auto-apply is halted until you sign in',
+      transcriptAppend: { kind: 'recovery', note: `signed-out sign-in wall detected (${where}) — halted rather than retrying` },
+    });
+    return true;
+  }
+
   // ---- BROADENED final-submit finder for a recognised pack (BUG: BambooHR submit in footer) ----
   // A recognised account-less ATS can render its FINAL "Submit Application" button OUTSIDE the
   // field container — BambooHR puts it in a page-level footer, so the root-scoped findPackAdvance
@@ -3085,19 +3106,7 @@ export async function run(task, context, helpers) {
       // escalate to front-until-hydrated (below). This avoids stealing the foreground on every
       // apply (the v11.26.0 disruption) while still rescuing a genuinely occluded+stuck tab.
       // Before burning 30s waiting for a control that can never appear: are we simply signed out?
-      // This is the cheapest possible check and it converts the single most expensive silent
-      // failure mode into an explicit, actionable one.
-      if (linkedInSignedOut()) {
-        logLine('err', 'LinkedIn is SIGNED OUT in this browser — halting instead of retrying');
-        report({
-          state: 'failed',
-          parkReason: 'signed_out',
-          lastError: 'linkedin-signed-out — this browser is signed out of LinkedIn; auto-apply is halted until you sign in',
-          transcriptAppend: { kind: 'recovery', note: 'signed-out sign-in wall detected (password field + sign-in copy) — halted rather than retrying' },
-        });
-        finalState = 'failed';
-        break;
-      }
+      if (reportIfSignedOut('before the hydrate wait')) { finalState = 'failed'; break; }
       logLine('warn', opening
         ? (wasHidden ? 'apply tab is hidden — waiting for the application to hydrate' : 'application not open yet — waiting for it to hydrate')
         : 'no advance button — waiting for the page (or you)');
@@ -3270,6 +3279,10 @@ export async function run(task, context, helpers) {
         // gate) — fail RETRIABLY so retryStaleQueue re-attempts it later (capped). This now
         // covers: hidden/occluded tabs (opener may hydrate late once visible) and the
         // /apply/-advance case (!opening: a form WAS open and we lost the advance button).
+        // THE path a logged-out LinkedIn job page actually exits through. Checking here is what
+        // makes the latch fire at all — "no advance button found" is the symptom, being signed out
+        // is the cause, and reporting the symptom sends the task round the retry loop forever.
+        if (reportIfSignedOut('terminal no-advance')) { finalState = 'failed'; break; }
         report({
           state: 'failed',
           lastError: opening
