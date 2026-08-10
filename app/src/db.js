@@ -4642,6 +4642,16 @@ function elevateJobFromEmail(emailId) {
 // replying from a personal address, a bare "Re: your application"). We inherit ONLY from
 // confidently-matched emails (auto/manual), never from an unconfirmed 'suggested' guess, so a bad
 // guess can't propagate down a thread. Returns { jobId, via } or null.
+// Look up a stored job by its posting URL. Used by the watchlist to attach an alert to the job
+// row it just ingested; matches on the normalised URL so tracking parameters don't defeat it.
+function findJobByUrl(url) {
+  const raw = String(url || '').trim();
+  if (!raw) return null;
+  const norm = normJobUrl(raw) || raw;
+  const row = get('SELECT * FROM jobs WHERE job_url_norm = ? OR job_url = ? ORDER BY created_at DESC LIMIT 1', [norm, raw]);
+  return row ? rowToJob(row) : null;
+}
+
 function findJobByThread({ threadId, inReplyTo, references, excludeEmailId } = {}) {
   const msgIds = [];
   const push = (v) => { if (v == null) return; for (const m of String(v).split(/\s+/)) { const t = m.trim().replace(/^<|>$/g, ''); if (t) msgIds.push(t); } };
@@ -5129,7 +5139,7 @@ module.exports = {
   expireWalledTasks, retireUnanswerableParks,
   aiLog, aiLogList, aiUsage,
   exportAll, importAll, bulkImportApplications, wipeAllData,
-  emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching, findJobByThread, gmailStatusFromCategory, reprocessEmails, elevateJobFromEmail,
+  emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching, findJobByThread, gmailStatusFromCategory, reprocessEmails, elevateJobFromEmail, findJobByUrl,
   recordOutcome, creditOutcomeForEmail, emailsNeedingConfirm, confirmEmailLink, outcomesForJob,
   punish, unpunish, listPunishments, punishmentPenalty, isPunished, punishCompanyCascade,
   geoPenalty, rankJob,

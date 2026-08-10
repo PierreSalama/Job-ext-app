@@ -274,6 +274,14 @@ const DEFAULTS = {
       // keeping JobSpy running.
       atsBoardsEnabled: true,
     },
+    // COMPANY WATCHLIST — companies to flag (never auto-apply to) when they post anything.
+    // Two months of cold volume produced two interviews and no job worth taking; a warm contact is
+    // worth more than another hundred cold applications, and the value is being EARLY on the next
+    // posting with a name to reference. Each entry:
+    //   { company: 'Syntronic', contact: 'Adam Ortner <adorxb@syntronic.com>', note: '…', enabled: true }
+    // Matching is on the company (see app/src/watchlist.js), NOT the keyword list — a watched
+    // company's postings should surface even when the title sits outside the usual search.
+    watchlist: [],
     sites: {},               // per-host overrides: { 'linkedin.com': { mode: 'auto' } }
   },
 

@@ -16,6 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const db = require('./db');
 const safety = require('./safety');
+const watchlist = require('./watchlist');
 const emailSweep = require('./email-sweep');
 const provider = require('./ai/provider');
 const prompts = require('./ai/prompts');
@@ -213,6 +214,26 @@ function keywordTokensMatch(keyword, title) {
   return kt.every((x) => tt.has(x));
 }
 
+// Positive markers that a location IS in the target country, and that it is somewhere else.
+// Only Canada is modelled today because that is the only country JAT clamps to; the shape
+// generalises by adding a key.
+const HOME_MARKERS = {
+  canada: /\bcanada\b|\bontario\b|\bqu[eé]bec\b|\balberta\b|\bbritish columbia\b|\bmanitoba\b|\bsaskatchewan\b|\bnova scotia\b|\bnew brunswick\b|\bnewfoundland\b|\bprince edward\b|\byukon\b|\bnunavut\b|,\s*(on|qc|ab|bc|mb|sk|ns|nb|nl|pe|yt|nt|nu)\b|\bgta\b|\bgreater toronto\b/i,
+};
+const FOREIGN_MARKERS = /\bunited kingdom\b|\bengland\b|\bscotland\b|\bwales\b|,\s*uk\b|\(uk\)|\bunited states\b|,\s*usa?\b|\bindia\b|\baustralia\b|\bsingapore\b|\bireland\b|\bnetherlands\b|\bgermany\b|\bpoland\b|\bphilippines\b|\bpakistan\b|\bnew zealand\b|\bsouth africa\b|\bbrazil\b|\bmexico\b|\bspain\b|\bportugal\b|\bromania\b|\bukraine\b|\bnigeria\b|\bkenya\b|\bemirates\b|\bdubai\b/i;
+
+// True only when the location names a foreign place AND names nothing local. "London Area, United
+// Kingdom" is foreign; "London, Ontario" is not, because Ontario is a home marker — the ambiguity
+// that makes a city blocklist the wrong tool.
+function foreignLocation(location, country) {
+  const loc = String(location || '');
+  if (!loc.trim()) return false;                       // unknown location → never reject
+  const home = HOME_MARKERS[String(country || '').trim().toLowerCase()];
+  if (!home) return false;                             // country we don't model → never reject
+  if (home.test(loc)) return false;                    // says it's local → local wins
+  return FOREIGN_MARKERS.test(loc);
+}
+
 function jobFit(jobOrTitle, aa) {
   const job = (jobOrTitle && typeof jobOrTitle === 'object') ? jobOrTitle : { title: jobOrTitle };
   const title = job.title || '';
@@ -242,6 +263,19 @@ function jobFit(jobOrTitle, aa) {
   for (const kw of (aa && aa.excludeLocations) || []) {
     const k = String(kw || '').trim().toLowerCase();
     if (k && location.includes(k)) return { ok: false, reason: `excluded location "${k}"` };
+  }
+  // COUNTRY CLAMP. `autoApply.country` was only ever passed to JobSpy as a search hint; nothing
+  // re-checked what came back, so foreign postings walked straight through. Live 2026-08-10:
+  // 25 non-Canadian jobs discovered in 30 days and 13 APPLIED TO — a run of "London Area, United
+  // Kingdom" roles (Ventula, Few&Far, Client Server, Prism Digital), all pure waste.
+  //
+  // FAILS OPEN on purpose. A job is rejected only when its location POSITIVELY names a foreign
+  // place and names nothing Canadian. "Remote", "Toronto, ON", and an empty location all pass —
+  // over-rejecting here would silently starve the queue, which is a far worse failure than the
+  // occasional foreign posting slipping through. Note "London, Ontario" must survive, which is
+  // exactly why this cannot be a naive city-name blocklist.
+  if (aa && aa.country && foreignLocation(location, aa.country)) {
+    return { ok: false, reason: `outside ${aa.country} (${String(job.location || '').slice(0, 40)})` };
   }
   // POSITIVE RELEVANCE GATE (opt-in via autoApply.requireKeywordMatch).
   //
@@ -316,6 +350,21 @@ function ingestDiscoveredJobs(source, jobs, { providerName = 'browser', batchId 
   const easyApplyOnly = s.easyApplyOnly !== false && !db.easyApplyCooledDown();
   let enqueued = 0, rejected = 0, punished = 0, duplicates = 0;
   const ranked = [];
+  // WATCHLIST — checked BEFORE jobFit, deliberately. A watched company is one where Pierre has a
+  // relationship (Syntronic: phone screen 2026-07-23, recruiter Adam Ortner), and "anything they
+  // post" is a different question from "anything matching my keywords". A posting from them must
+  // surface even when its title sits outside the search list, so the keyword gate must not get a
+  // vote. It raises a FLAG and never queues an application — auto-applying generically to a warm
+  // contact's company spends the relationship instead of using it.
+  const watchEntries = Array.isArray(s.watchlist) ? s.watchlist : [];
+  const watchHits = [];
+  for (const jd of (Array.isArray(jobs) ? jobs : []).slice(0, 100)) {
+    if (!jd || !jd.jobUrl) continue;
+    for (const entry of watchlist.watchesFor(jd, watchEntries)) {
+      watchHits.push({ jd, entry });
+    }
+  }
+
   for (const jd of (Array.isArray(jobs) ? jobs : []).slice(0, 100)) {
     if (!jd || !jd.jobUrl) { rejected++; continue; }
     const verdict = jobFit(jd, s);
@@ -352,9 +401,37 @@ function ingestDiscoveredJobs(source, jobs, { providerName = 'browser', batchId 
     if (result.task) enqueued++;
     else duplicates++;
   }
+  // Raise the watch flags AFTER ingest, so each alert can carry the stored job id. Recorded and
+  // notified once per (job, watch) — `watchSeen` is the dedupe, because discovery re-finds the same
+  // posting on every sweep and an alert that cries wolf daily gets ignored, which defeats it.
+  const watchAlerts = [];
+  for (const { jd, entry } of watchHits) {
+    const job = db.findJobByUrl ? db.findJobByUrl(jd.jobUrl) : null;
+    const jobId = (job && job.id) || null;
+    const key = `watchSeen:${entry.company}|${jd.jobUrl}`;
+    if (db.kvGet(key)) continue;
+    db.kvSet(key, new Date().toISOString());
+    const alert = watchlist.alertFor({ ...jd, id: jobId }, entry);
+    watchAlerts.push(alert);
+    if (jobId) {
+      db.recordEvent({
+        jobId, type: 'note', source: 'watchlist',
+        summary: `WATCHED COMPANY: ${entry.company} posted "${String(jd.title || '').slice(0, 70)}"`
+          + (entry.contact ? ` — contact ${entry.contact}` : ''),
+        data: alert,
+      });
+    }
+  }
+  if (watchAlerts.length) {
+    const list = db.kvGet('watchlistAlerts') || [];
+    db.kvSet('watchlistAlerts', [...watchAlerts, ...list].slice(0, 200));
+    broadcast('watchlist.hit', { alerts: watchAlerts });
+    log.info(`watchlist: ${watchAlerts.length} posting(s) from watched companies`);
+  }
+
   broadcast('queue.updated', { action: 'discover', provider: providerName, batchId });
   broadcast('jobs.updated', { action: 'discover', provider: providerName, batchId });
-  return { enqueued, rejected, punished, duplicates };
+  return { enqueued, rejected, punished, duplicates, watchAlerts };
 }
 
 function withinWindow(settings) {
@@ -2157,6 +2234,21 @@ async function handle(req, res, parsed) {
   // GET returns the coverage numbers; POST runs the sweep. The rules pass always runs and always
   // reaches every unreviewed email, so coverage cannot be held hostage by the AI provider being
   // down. Pass ai=0 to skip the model entirely (free, offline).
+  // WATCHLIST — companies where Pierre has a relationship. Read the alerts, or manage the entries.
+  // No apply route on purpose: a watch raises a flag so he can write to a named person, which is
+  // the entire reason it is worth more than another cold application.
+  if (pathname === '/watchlist' && req.method === 'GET') {
+    const s = db.getSettings().autoApply || {};
+    return sendJson(res, 200, {
+      ok: true,
+      entries: Array.isArray(s.watchlist) ? s.watchlist : [],
+      alerts: db.kvGet('watchlistAlerts') || [],
+    });
+  }
+  if (pathname === '/watchlist/alerts/clear' && req.method === 'POST') {
+    db.kvSet('watchlistAlerts', []);
+    return sendJson(res, 200, { ok: true, alerts: [] });
+  }
   if (pathname === '/emails/triage' && req.method === 'GET') {
     const selfAddresses = db.selfEmailAddresses();
     return sendJson(res, 200, {

@@ -570,9 +570,18 @@ function warnIfGmailBroken(gmail) {
     const since = Number.isFinite(hours)
       ? `No successful sync in ${Math.floor(hours)}h.`
       : 'It has never synced successfully.';
-    const why = h.needsAuth
-      ? 'Google rejected the saved authorization — reconnect Gmail in Settings.'
-      : (h.lastError || 'Unknown error.');
+    // THE 7-DAY DEATH. Reconnecting fixes `invalid_grant` for exactly one week and then it dies
+    // again — measured: re-authorised 2026-08-01, last success 2026-08-08 14:15, a 7.6-day life.
+    // That is the signature of a Google Cloud OAuth consent screen still in TESTING status, where
+    // refresh tokens are expired after 7 days by policy. Telling the user to "reconnect" is
+    // therefore advice that guarantees a repeat, so say the actual fix here — the alert is the only
+    // place he sees this, and neither of us should have to interpret it for him next time.
+    const repeatOffender = h.needsAuth && /invalid_grant/i.test(String(h.lastError || ''));
+    const why = repeatOffender
+      ? 'Google expired the saved authorization (invalid_grant). If this keeps happening weekly, the OAuth consent screen is in "Testing" — publish it in Google Cloud Console (APIs & Services → OAuth consent screen → Publish app), then reconnect Gmail in Settings.'
+      : h.needsAuth
+        ? 'Google rejected the saved authorization — reconnect Gmail in Settings.'
+        : (h.lastError || 'Unknown error.');
 
     log.warn('gmail sync unhealthy', { hours, consecutiveFailures: h.consecutiveFailures, error: h.lastError });
     nativeNotify('JAT: email sync is not working', `${since} ${why}`);
