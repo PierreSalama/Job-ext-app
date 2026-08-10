@@ -1815,8 +1815,47 @@ async function handle(req, res, parsed) {
   // The extension polls this small queue. It only opens a browser search after the
   // primary provider produced a typed failure; normal/empty JobSpy results never cause
   // duplicate browser scans.
+  // SEARCH PERMIT — the governor's answer for the extension's OWN browser search lane.
+  //
+  // background.js `discoverTick` opens a real LinkedIn search tab in Pierre's logged-in session on
+  // every pump tick, and its own comment calls it "primary supply". It is the highest-fidelity,
+  // most attributable traffic the whole system produces — an authenticated human session loading
+  // LinkedIn's real search UI — and it was outside every counter in the app, including the JobSpy
+  // gate, because it never goes through the app at all. Of the three LinkedIn lanes (JobSpy,
+  // browser fallback, this), this is the one most likely to be what LinkedIn actually measured.
+  //
+  // The extension asks here BEFORE opening the tab; a permit spends budget immediately, because
+  // by the time we'd hear back the request has already happened.
+  if (req.method === 'GET' && pathname === '/auto-apply/search-permit') {
+    const source = String(parsed.searchParams.get('source') || '').toLowerCase();
+    const s = db.getSettings().autoApply || {};
+    const gate = safety.decideTouch({
+      safety: s.safety, platform: source, kind: 'search',
+      counts: db.platformTouchCounts(source),
+      lastTouchAt: db.lastPlatformTouchAt(source, 'search'),
+    });
+    if (gate.ok) db.recordPlatformTouch(source, 'search');
+    return sendJson(res, 200, { ok: true, allowed: !!gate.ok, reason: gate.reason || '', retryAfterMs: gate.retryAfterMs || 0, used: gate.used, budget: gate.budget });
+  }
   if (req.method === 'GET' && pathname === '/auto-apply/discovery-fallback/next') {
-    return sendJson(res, 200, { ok: true, request: db.discoveryFallbackNext() });
+    const request = db.discoveryFallbackNext();
+    // THE SECOND LINKEDIN LANE. This one opens a REAL browser search in Pierre's logged-in session,
+    // and it is queued precisely when JobSpy got rate-limited or blocked — i.e. it retries harder,
+    // in a more attributable way, at the exact moment the platform has started pushing back. It was
+    // never counted anywhere. Put it under the same budget as everything else.
+    if (request) {
+      const s = db.getSettings().autoApply || {};
+      const gate = safety.decideTouch({
+        safety: s.safety,
+        platform: String(request.source || '').toLowerCase(),
+        kind: 'search',
+        counts: db.platformTouchCounts(request.source),
+        lastTouchAt: db.lastPlatformTouchAt(request.source, 'search'),
+      });
+      if (!gate.ok) return sendJson(res, 200, { ok: true, request: null, deferred: gate });
+      db.recordPlatformTouch(request.source, 'search');
+    }
+    return sendJson(res, 200, { ok: true, request });
   }
   if (req.method === 'POST' && (jm = m(/^\/auto-apply\/discovery-fallback\/([^/]+)\/complete$/))) {
     const body = await readJson(req);

@@ -2249,6 +2249,20 @@ async function discoverTick(force = false) {
     if (boardQueued >= (aa.discovery.refillBelow || 3)) return { ok: false, note: `queue already full for ${board}` };
   }
 
+  // ACCOUNT BUDGET PERMIT. This lane opens a REAL search in the logged-in session — the most
+  // attributable traffic the system produces, and, until v11.93.0, counted nowhere. LinkedIn
+  // restricted the account on 2026-08-10 for "an unusually high volume of LinkedIn profile data"
+  // while every visible counter (applies) sat at a comfortable ~40/day.
+  //
+  // Asked BEFORE the tab is opened, and NOT bypassed by `force` — a manual "discover now" is still
+  // a request the platform counts. The permit spends the budget server-side on grant, so a crash
+  // between here and the scan costs us one slot rather than going unrecorded.
+  const permit = await api.call('GET', `/auto-apply/search-permit?source=${encodeURIComponent(board)}`, null, 6000).catch(() => null);
+  if (permit && permit.allowed === false) {
+    const mins = Math.round((permit.retryAfterMs || 0) / 60000);
+    return { ok: false, note: `account budget: ${board} search held (${permit.reason}${permit.budget ? ` ${permit.used}/${permit.budget}` : ''}${mins ? `, ~${mins}min` : ''})` };
+  }
+
   scanning = true;
   let tab = null;
   try { await chrome.storage.local.set({ [DISCOVER_IDX_KEY]: (dIdx + 1) % 1000000 }); } catch {}

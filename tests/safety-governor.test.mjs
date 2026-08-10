@@ -247,6 +247,44 @@ test('a safety deferral is reported as its own reason, with a real backoff', () 
   assert.match(body, /retryAfterMs: safetyDeferred\.retryAfterMs/, 'so the pump sleeps for hours instead of re-asking');
 });
 
+test('the extension\'s OWN browser search lane needs a permit before it opens a tab', () => {
+  // discoverTick runs on every pump tick and its own comment calls itself "primary supply". It
+  // opens a real LinkedIn search in the logged-in session and never touched the app at all, so no
+  // app-side gate could see it. Of the three LinkedIn lanes this is the most attributable one.
+  const bg = read('extension', 'background.js');
+  const fn = bg.slice(bg.indexOf('async function discoverTick('));
+  const body = fn.slice(0, fn.indexOf('\n}\n'));
+  const iPermit = body.indexOf('/auto-apply/search-permit');
+  const iTab = body.indexOf('createAaTab(url');
+  assert.ok(iPermit > -1, 'discoverTick asks for a permit');
+  assert.ok(iTab > -1 && iPermit < iTab, 'the permit is asked BEFORE the search tab is opened');
+  const permitBlock = body.slice(iPermit, iTab);
+  assert.match(permitBlock, /permit\.allowed === false/);
+  assert.doesNotMatch(permitBlock, /force/, 'a manual discover is still a request LinkedIn counts');
+});
+
+test('the permit endpoint spends the budget at grant time', () => {
+  const server = read('app', 'src', 'server.js');
+  const block = server.slice(server.indexOf("pathname === '/auto-apply/search-permit'"));
+  const body = block.slice(0, block.indexOf("pathname === '/auto-apply/discovery-fallback/next'"));
+  assert.match(body, /if \(gate\.ok\) db\.recordPlatformTouch\(source, 'search'\)/,
+    'granting is the commitment — by the time we would hear back, the request has happened');
+  assert.match(body, /allowed: !!gate\.ok/);
+});
+
+test('the browser-fallback search lane is governed too', () => {
+  // The forgotten second lane: when JobSpy is rate-limited or blocked on LinkedIn, the extension
+  // opens a REAL search in Pierre's logged-in browser — retrying harder, and more attributably,
+  // at the exact moment the platform started pushing back. It counted nowhere.
+  const server = read('app', 'src', 'server.js');
+  const block = server.slice(server.indexOf("pathname === '/auto-apply/discovery-fallback/next'"));
+  const body = block.slice(0, block.indexOf('if (req.method === \'POST\''));
+  assert.match(body, /safety\.decideTouch/);
+  assert.match(body, /kind: 'search'/);
+  assert.match(body, /db\.recordPlatformTouch\(request\.source, 'search'\)/);
+  assert.match(body, /request: null, deferred: gate/, 'a refusal hands back no work, and says why');
+});
+
 test('the safety deferral outranks the other deferral reasons', () => {
   const server = read('app', 'src', 'server.js');
   const iSafety = server.indexOf('if (!candidates.length && safetyDeferred)');
