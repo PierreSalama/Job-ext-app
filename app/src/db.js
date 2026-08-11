@@ -692,6 +692,17 @@ const MIGRATIONS = [
       CREATE INDEX idx_email_triage_route ON email_triage(route, at DESC);
     `);
   },
+
+  // RESCUE COUNTER — the bound that stops queueRetryParked looping forever.
+  // The park-rescue watchdog requeues a parked task whenever memory *could* answer its questions,
+  // and clears park_reason/pending_questions/attempts as it does. It never recorded having tried.
+  // So a task that parks for a reason memory cannot actually fix comes straight back, parks again,
+  // and is rescued again — every 60 seconds, indefinitely. Live 2026-08-11 on pierre-laptop:
+  // 2-3 rescues/minute against the same three Tenstorrent Greenhouse jobs, each of which 401s with
+  // "User is not logged in", for 24 hours. It burned the whole Indeed budget and submitted nothing.
+  () => {
+    exec('ALTER TABLE auto_apply_tasks ADD COLUMN rescue_count INTEGER NOT NULL DEFAULT 0');
+  },
 ];
 
 // SUCCESS-TRUTH quarantine (shared by the migration above and exported for tests).
@@ -2984,6 +2995,7 @@ function rowToTask(r) {
   return {
     id: r.id, jobId: r.job_id, state: r.state, mode: r.mode,
     scheduledAt: r.scheduled_at, attempts: r.attempts, lastError: r.last_error,
+    rescueCount: r.rescue_count || 0,
     transcript: safeParse(r.transcript, []),
     parkReason: r.park_reason || null,
     applyRoute: r.apply_route || null,
@@ -3394,6 +3406,11 @@ function reclaimDeadParks() {
 //     handle them, so a CAPTCHA park is dead on arrival.
 //   • Site sign-in gates — he genuinely COULD action these, so they get a generous age bound; after
 //     a week untouched on some random ATS, it is not happening and the job is stale anyway.
+// How many times the park-rescue watchdog may resurrect one task before giving up on it.
+// 3 is enough for a genuinely transient park (a page that failed to load, a question memory
+// learned between attempts) and small enough that an unfixable one stops costing budget within
+// minutes rather than never.
+const MAX_PARK_RESCUES = 3;
 const UI_NOISE_Q_RX = /results? available|use up and down|press enter to select|press escape|press tab to select/i;
 const CAPTCHA_Q_RX = /captcha|robot check|verification wall/i;
 const SITE_LOGIN_Q_RX = /sign in(to| to) this site|sign into this site|log in(to| to) this site/i;
@@ -3744,7 +3761,21 @@ function queueRetryParked() {
       && !UI_NOISE_Q_RX.test(q.question)
       && !profileFieldLookup(pid, q.question, cache) && !qaLookup(pid, q.question, cache));
     if (pend.length && stillMissing.length === 0) {
-      run("UPDATE auto_apply_tasks SET state = 'queued', park_reason = NULL, pending_questions = NULL, updated_at = ? WHERE id = ?", [now(), t.id]);
+      // BOUNDED. Without this the rescue is a hot loop: requeue clears park_reason,
+      // pending_questions AND the failure record, so the attempts cap can never bite, the task
+      // parks again on the same unfixable condition, and the watchdog rescues it 60 seconds later.
+      // Live 2026-08-11: 2-3 rescues/minute for 24h against three Greenhouse jobs that answer 401
+      // "User is not logged in" — memory could satisfy their questions, so the rescue always fired,
+      // but the questions were never why they failed. It spent the entire Indeed apply budget on
+      // claims that stranded and submitted nothing at all.
+      //
+      // After MAX_PARK_RESCUES the task STAYS parked, which is the honest outcome: it surfaces in
+      // the needs-you queue for a human instead of silently consuming the account's daily budget.
+      if ((Number(t.rescueCount) || 0) >= MAX_PARK_RESCUES) continue;
+      run(
+        "UPDATE auto_apply_tasks SET state = 'queued', park_reason = NULL, pending_questions = NULL, rescue_count = rescue_count + 1, updated_at = ? WHERE id = ?",
+        [now(), t.id],
+      );
       requeued++;
     }
   }
