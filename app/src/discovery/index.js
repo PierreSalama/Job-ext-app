@@ -275,6 +275,14 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
       // Indeed discovery that IS appliable during the cooldown (the node then idles until the cap resets).
       let cooledDownGate = false;
       try { cooledDownGate = db.easyApplyCooledDown(); } catch {}
+      // SIGNED OUT: the FOURTH member of this family, and the one that had the server dead in the
+      // water. Live 2026-08-11 on pierre-laptop: the browser had been signed out of LinkedIn for
+      // 13 hours, so all 313 queued LinkedIn tasks were undispatchable — but they still counted as
+      // "queue full" (313 >= refillBelow), so jobspy never ran, Indeed supply fell to ZERO queued,
+      // and the node sat "running" with 317 jobs it could not touch. Same rule as the cooldown and
+      // the host wall: a task that cannot be dispatched now must never gate discovery.
+      let signedOutGate = false;
+      try { signedOutGate = db.isSignedOut(); } catch {}
       // HOST-WALL DEFERRALS DON'T COUNT (same class of starvation as the two exclusions below).
       // The dispatch breaker parks a task behind a Cloudflare/verification wall by pushing
       // scheduled_at into the FUTURE and leaving it 'queued' (server.js queueNext) — deliberately,
@@ -289,6 +297,7 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
           const src = String((t.job && t.job.source) || '').toLowerCase();
           if (ATS_FEED_SOURCES.has(src)) return false;              // separate direct-ATS feed
           if (cooledDownGate && src === 'linkedin') return false;   // stuck (capped) during cooldown
+          if (signedOutGate && src === 'linkedin') return false;    // stuck (signed out of LinkedIn)
           if (t.scheduledAt && Date.parse(t.scheduledAt) > nowMs) return false;  // host wall / not due
           return true;
         }).length;
@@ -307,15 +316,24 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
     // count against LinkedIn's cap) instead of idling until the cooldown lifts. Reverts automatically.
     let cooledDown = false;
     try { cooledDown = db.easyApplyCooledDown(); } catch {}
-    const effEasyApplyOnly = aa.easyApplyOnly !== false && !cooledDown;
+    let signedOutBoards = false;
+    try { signedOutBoards = db.isSignedOut(); } catch {}
+    const effEasyApplyOnly = aa.easyApplyOnly !== false && !cooledDown && !signedOutBoards;
     if (effEasyApplyOnly) {
       const easyBoards = selectBoards(boards, true);
       if (easyBoards.length) boards = easyBoards;
       else return { ok: false, reason: 'no-easy-apply-boards' };
-    } else if (cooledDown && aa.easyApplyOnly !== false) {
+    } else if ((cooledDown || signedOutBoards) && aa.easyApplyOnly !== false) {
       // During the cooldown, focus discovery on NON-LinkedIn boards (Indeed + external) we can actually
       // apply to — searching LinkedIn would just pile up un-appliable jobs. If LinkedIn is the only
       // configured board, leave it (nothing else to search; the queued LinkedIn jobs wait out the cap).
+      const nonLi = boards.filter((b) => b !== 'linkedin');
+      if (nonLi.length) boards = nonLi;
+    }
+    // SIGNED OUT is the stronger version of the same case: not "the cap will reset in a few hours"
+    // but "nothing on LinkedIn can be applied to until a human signs in". Searching it would spend
+    // account budget piling up jobs the executor will refuse, so steer discovery elsewhere entirely.
+    if (signedOutBoards) {
       const nonLi = boards.filter((b) => b !== 'linkedin');
       if (nonLi.length) boards = nonLi;
     }
