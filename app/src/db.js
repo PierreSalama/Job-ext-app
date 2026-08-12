@@ -703,6 +703,25 @@ const MIGRATIONS = [
   () => {
     exec('ALTER TABLE auto_apply_tasks ADD COLUMN rescue_count INTEGER NOT NULL DEFAULT 0');
   },
+
+  // SELF-HEAL COUNTER — the second unbounded retry loop, on a different path from the park rescue.
+  //
+  // retryStaleQueue intends to bound itself two ways, and BOTH fail open for the one case that
+  // matters — a task that keeps failing environmentally:
+  //   1. `attemptsDelta: environmental ? 0 : 1` — an environmental failure charges no attempt, so
+  //      `attempts` stays 0 forever and the maxAttempts cap can never fire.
+  //   2. The maxAgeHours ceiling ("retires anything that has been failing for a full day, so
+  //      nothing retries forever") filters on `t.updated_at >= ageFloor` — but every retry WRITES
+  //      updated_at. A task retrying on a loop therefore always looks fresh and can never age out.
+  //      The ceiling is measuring the clock that the retry itself resets.
+  //
+  // Live 2026-08-12: the laptop's single runner sat on ONE Greenhouse posting (elastic "Java
+  // Developer II") for 14+ hours, cycling `Apply Now` → `self-heal retry after transient_page
+  // (environmental — no attempt charged)` every ~29 minutes, monopolising the only runner. The node
+  // reported dispatched=284, verified_done=0.
+  () => {
+    exec('ALTER TABLE auto_apply_tasks ADD COLUMN self_heal_count INTEGER NOT NULL DEFAULT 0');
+  },
 ];
 
 // SUCCESS-TRUTH quarantine (shared by the migration above and exported for tests).
@@ -2996,6 +3015,7 @@ function rowToTask(r) {
     id: r.id, jobId: r.job_id, state: r.state, mode: r.mode,
     scheduledAt: r.scheduled_at, attempts: r.attempts, lastError: r.last_error,
     rescueCount: r.rescue_count || 0,
+    selfHealCount: r.self_heal_count || 0,
     transcript: safeParse(r.transcript, []),
     parkReason: r.park_reason || null,
     applyRoute: r.apply_route || null,
@@ -3295,9 +3315,18 @@ function queueLive({ startedAt } = {}) {
 // Measured live on the laptop: 210 tasks failing for these reasons, 15 of them already sitting at
 // attempts=4 — permanently retired without ever having been applied to. That is the same class of
 // loss as the 2026-07-20 incident, arriving slowly instead of all at once.
+// How many times ONE task may be self-healed before it is left failed. The attempts cap cannot do
+// this job for environmental failures (they charge no attempt by design) and the maxAgeHours
+// ceiling cannot either (it filters on updated_at, which the retry rewrites). At ~29 min per
+// cycle, 4 bounds a stuck task to ~2 hours of one runner instead of the 14+ hours measured live.
+const MAX_SELF_HEALS = 4;
 const ENVIRONMENTAL_FAILURE_RX = /occlud|throttl|hydrat|page stopped advancing|backgrounded|never hydrated|timed out \/ interrupted|verification wall|host.?cooldown/i;
 function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25, maxAgeHours = 24 } = {}) {
-  const cutoff = new Date(Date.now() - Math.max(1, olderThanMinutes) * 60000).toISOString();
+  // NOT clamped to >=1. The parameter means "how old must the failure be before we retry it", so a
+  // NEGATIVE value means "no minimum age" — the only way a test can exercise this path without
+  // sleeping a real minute, since `updated_at < cutoff` is false when the failure was written in
+  // the same instant as the cutoff. Production callers pass 20-30 and are unaffected.
+  const cutoff = new Date(Date.now() - (Number(olderThanMinutes) || 0) * 60000).toISOString();
   const ageFloor = new Date(Date.now() - Math.max(1, maxAgeHours) * 3600000).toISOString();
   const rows = all(
     `SELECT t.*, j.source AS _src, j.job_url AS _url FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
@@ -3310,9 +3339,21 @@ function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25, m
     const failure = classifyQueueFailure(r);
     if (failure.action !== 'retry') continue;
     const environmental = ENVIRONMENTAL_FAILURE_RX.test(String(r.last_error || ''));
+    // HARD BOUND. An environmental failure charges no attempt (deliberately — the site being
+    // occluded says nothing about the posting), and the maxAgeHours ceiling above filters on
+    // updated_at, which this very retry rewrites. So for a task that keeps failing environmentally
+    // BOTH brakes fail open and it retries forever, holding the runner slot.
+    //
+    // Live 2026-08-12: one Greenhouse posting looped every ~29 min for 14+ hours on the laptop's
+    // only runner. attempts stayed 0 the whole time, so nothing could ever retire it.
+    //
+    // This counter is the brake that cannot be reset by the retry itself. When it is spent the task
+    // stays 'failed' and the runner moves on to the other 300+ jobs waiting behind it.
+    if ((Number(r.self_heal_count) || 0) >= MAX_SELF_HEALS) continue;
     if (queuePatch(r.id, {
       state: 'queued', lastError: null, handoffToken: null,
       attemptsDelta: environmental ? 0 : 1,
+      selfHealDelta: 1,
       transcriptAppend: { note: `self-heal retry after ${failure.failureClass}${environmental ? ' (environmental — no attempt charged)' : ''}` },
     })) n++;
   }
@@ -3526,7 +3567,7 @@ function queueAdd(jobId, { mode, force = false } = {}) {
   return rowToTask(get('SELECT * FROM auto_apply_tasks WHERE id = ?', [id]));
 }
 
-function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attemptsDelta, mode, parkReason, pendingQuestions, applyRoute, routeState, submissionEvidence, handoffToken }) {
+function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attemptsDelta, selfHealDelta, mode, parkReason, pendingQuestions, applyRoute, routeState, submissionEvidence, handoffToken }) {
   const cur = get('SELECT * FROM auto_apply_tasks WHERE id = ?', [id]);
   if (!cur) return null;
   if (state && !QUEUE_STATES.has(state)) return null;
@@ -3631,7 +3672,7 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
   let trJson = JSON.stringify(trTrim);
   while (trJson.length > 32768 && trTrim.length > 1) { trTrim = trTrim.slice(1); trJson = JSON.stringify(trTrim); }
   run(`UPDATE auto_apply_tasks SET
-       state = ?, mode = ?, scheduled_at = ?, attempts = attempts + ?, last_error = ?,
+       state = ?, mode = ?, scheduled_at = ?, attempts = attempts + ?, self_heal_count = self_heal_count + ?, last_error = ?,
        transcript = ?, park_reason = ?, pending_questions = ?, apply_route = COALESCE(?, apply_route),
        route_state = COALESCE(?, route_state), submission_evidence = ?, handoff_token = ?,
        updated_at = ? WHERE id = ?`,
@@ -3639,6 +3680,7 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
        mode || cur.mode,
        scheduledAt !== undefined ? scheduledAt : cur.scheduled_at,
        attemptsDelta || 0,
+       selfHealDelta || 0,
        nextError,
        trJson,
        nextParkReason,
