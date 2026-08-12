@@ -3389,11 +3389,43 @@ const CLICKED_FINAL_SUBMIT_RX = /isfinalsubmit\([^)]*\)=true|submitted — verif
 // (the failures are evenly spread, not clustered at deploy times) and a tab leak (renderer count
 // held steady at 13 across five minutes). Defaulting here rather than fixing three call sites means
 // a future caller cannot reintroduce it by omission.
+// A claim the executor never picked up leaves a transcript containing nothing but the dispatcher's
+// own "scheduled (mode=auto)" note — no navigation, no fill, no click. That is not a failure of the
+// job; it is a dispatch that never happened.
+function neverStarted(transcript) {
+  const raw = String(transcript || '');
+  if (!raw.trim() || raw === '[]') return true;
+  let notes = [];
+  try { notes = JSON.parse(raw); } catch { return false; }   // unparseable → treat as real activity
+  if (!Array.isArray(notes) || !notes.length) return true;
+  return notes.every((e) => {
+    const t = String((e && (e.note || e.text || e.step)) || '');
+    return !t || /^scheduled \(mode=|^self-heal retry after/i.test(t);
+  });
+}
+
 function reconcileStaleRunning({ olderThanMinutes = 8, scheduledOlderThanMinutes = 2 } = {}) {
-  const runCut = new Date(Date.now() - Math.max(1, olderThanMinutes) * 60000).toISOString();
-  const schedCut = new Date(Date.now() - Math.max(1, scheduledOlderThanMinutes) * 60000).toISOString();
-  const rows = all("SELECT id, transcript FROM auto_apply_tasks WHERE (state='running' AND updated_at < ?) OR (state='scheduled' AND updated_at < ?)", [runCut, schedCut]);
+  // Not clamped to >=1: these mean "how long must it have been idle", so a NEGATIVE value means
+  // "no minimum" and is the only way a test can drive this path without sleeping a real minute.
+  // Production callers pass 8 and 5.
+  const runCut = new Date(Date.now() - (Number(olderThanMinutes) || 0) * 60000).toISOString();
+  const schedCut = new Date(Date.now() - (Number(scheduledOlderThanMinutes) || 0) * 60000).toISOString();
+  const rows = all("SELECT id, state, transcript FROM auto_apply_tasks WHERE (state='running' AND updated_at < ?) OR (state='scheduled' AND updated_at < ?)", [runCut, schedCut]);
   for (const r of rows) {
+    // NEVER PICKED UP — put it back in the queue instead of burning it as a failure.
+    //
+    // Measured on the laptop 2026-08-12: of 185 tasks that died with "timed out / interrupted",
+    // **127 had a near-empty transcript** — the executor never ran at all. They were claimed,
+    // marked 'scheduled', and reaped 2 minutes later because the applier's Chrome had not got to
+    // them (it was busy, or the SW had been evicted). Recording those as FAILED is wrong twice
+    // over: it slanders a perfectly good posting, and it buries the real signal — that dispatches
+    // are being claimed faster than they can be executed — inside a generic timeout bucket.
+    //
+    // Back to 'queued', no attempt charged, and a distinct reason so the rate is countable.
+    if (r.state === 'scheduled' && neverStarted(r.transcript)) {
+      run("UPDATE auto_apply_tasks SET state='queued', last_error=NULL, handoff_token=NULL, updated_at=? WHERE id=?", [now(), r.id]);
+      continue;
+    }
     // DUPLICATE-APPLICATION GUARD. Flipping every stale task to retriable 'failed' assumes nothing
     // happened — but a run can die AFTER the final submit was clicked and before the confirmation
     // could be read. Live 2026-08-09, a Greenhouse task: `chose "Submit application"` →

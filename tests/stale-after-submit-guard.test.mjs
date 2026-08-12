@@ -61,7 +61,7 @@ test('an empty or missing transcript retries as before', () => {
 
 test('the reconciler reads the transcript and routes both ways', () => {
   const fn = db.slice(db.indexOf('function reconcileStaleRunning'), db.indexOf('// One-shot cleanup'));
-  assert.match(fn, /SELECT id, transcript FROM auto_apply_tasks/,
+  assert.match(fn, /SELECT [^;]*transcript[^;]*FROM auto_apply_tasks/,
     'it cannot check for a submit click without selecting the transcript');
   assert.match(fn, /CLICKED_FINAL_SUBMIT_RX\.test/, 'must consult the guard');
   assert.match(fn, /state='awaiting_review'/, 'possible-submit → confirm, never silently retry');
