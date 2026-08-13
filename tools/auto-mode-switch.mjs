@@ -45,24 +45,48 @@ const WIDE = {
 const stamp = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
 
 const main = async () => {
-  const [status, settings] = await Promise.all([
+  const [status, settings, signedOut] = await Promise.all([
     api('/auto-apply/easyapply-status'),
     api('/settings'),
+    // Whether LinkedIn is USABLE, not just whether its quota is spare. See the deadlock below.
+    api('/auto-apply/signed-out').catch(() => ({ signedOut: false })),
   ]);
   const aa = settings.settings.autoApply;
-  const mode = aa.easyApplyOnly ? 'EASY' : 'WIDE';
+  // Mode is the WHOLE config, not one flag. Inferring it from easyApplyOnly alone meant a partial
+  // state — easyApplyOnly=false but boards=[linkedin] and atsBoards=off — reported itself as
+  // already-WIDE and was never repaired, so the ATS feed stayed off while the switch said "no
+  // change needed". Measured live 2026-08-13, immediately after fixing the deadlock below.
+  const atsOn = !!(aa.discovery && aa.discovery.atsBoardsEnabled);
+  const hasIndeed = Array.isArray(aa.boards) && aa.boards.includes('indeed');
+  const fullyWide = aa.easyApplyOnly === false && atsOn && hasIndeed;
+  const mode = fullyWide ? 'WIDE' : 'EASY';
 
   const limit = Number(status.observedLimit) || 40;
   const used = Number(status.submitted24h) || 0;
   const capped = !!status.cooledDown || used >= limit;
   // Only go back to EASY with real headroom left (70% of the cap), so a single submission landing
   // right at the boundary can't flap the mode back and forth.
-  const hasHeadroom = !status.cooledDown && used < Math.floor(limit * 0.7);
+  // LINKEDIN UNUSABLE ⇒ ALWAYS WIDE. Headroom is not the same as access.
+  //
+  // The deadlock this fixes, measured live 2026-08-13. The browser had been signed out of LinkedIn
+  // for days, so the node submitted NOTHING. This switch read submitted24h=0, concluded there was
+  // maximum Easy-Apply headroom, and forced EASY mode — which is LinkedIn-only AND turns the
+  // direct-ATS feed OFF. So the one lane that could still have worked was switched off precisely
+  // because the node was failing:
+  //
+  //     0 submissions → "plenty of headroom" → LinkedIn-only → signed out → 0 submissions
+  //
+  // It ran every ~15 minutes and silently reverted every manual fix. A node that cannot reach
+  // LinkedIn must go WIDE regardless of quota, because for it the Easy-Apply cap is irrelevant.
+  const linkedInUnusable = !!(signedOut && signedOut.signedOut);
+  const hasHeadroom = !status.cooledDown && !linkedInUnusable && used < Math.floor(limit * 0.7);
 
-  console.log(`${stamp()} mode=${mode} easyApply=${used}/${limit} cooledDown=${status.cooledDown} capped=${capped}`);
+  console.log(`${stamp()} mode=${mode} easyApply=${used}/${limit} cooledDown=${status.cooledDown} capped=${capped} linkedInUnusable=${linkedInUnusable}`);
 
   let target = null;
-  if (mode === 'EASY' && capped) target = { name: 'WIDE', patch: WIDE, why: `Easy-Apply spent (${used}/${limit}) — opening up to external postings so it keeps applying` };
+  // Signed out of LinkedIn is a stronger reason to go WIDE than the quota ever is.
+  if (mode === 'EASY' && linkedInUnusable) target = { name: 'WIDE', patch: WIDE, why: 'signed out of LinkedIn — EASY mode would leave this node with no usable lane at all' };
+  else   if (mode === 'EASY' && capped) target = { name: 'WIDE', patch: WIDE, why: `Easy-Apply spent (${used}/${limit}) — opening up to external postings so it keeps applying` };
   else if (mode === 'WIDE' && hasHeadroom) target = { name: 'EASY', patch: EASY, why: `Easy-Apply available again (${used}/${limit}) — returning to the high-conversion path` };
 
   if (!target) { console.log(`${stamp()} no change needed`); return; }

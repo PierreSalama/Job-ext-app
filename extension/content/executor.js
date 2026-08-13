@@ -1085,9 +1085,60 @@ function findResumeFileInputs(root) {
 // Returns { attempted, attached }. attempted=true means there was an empty
 // resume file input on this step that we tried to fill — the caller pauses the
 // run if attempted but attached===0 rather than silently submitting without it.
+// DEFERRED-MOUNT UPLOAD WIDGETS. Modern job-boards.greenhouse.io renders "Attach / Dropbox /
+// Google Drive" affordances and only mounts the real <input type="file"> once Attach is clicked.
+// Until then there is NO file input in the DOM, so findResumeFileInputs finds nothing and the run
+// parks with "requires a résumé but none could be attached" — 9 live applications on 2026-08-13.
+//
+// Clicking the affordance is safe in a way that guessing at an existing input is not: we only click
+// something whose own text says attach/upload/résumé, we never touch a Dropbox/Drive/OneDrive
+// picker (those open third-party OAuth flows), and if nothing mounts we return [] exactly as before.
+// Word-bounded on purpose. Without \b this also matches "reattach", "download" and "added",
+// and `.*` would span a whole sentence — and this regex decides which button we CLICK on a live
+// page. Clicking the wrong one is worse than not clicking at all.
+//
+// NOTE FOR ANY SCRIPTED EDIT OF THIS LINE: writing "\\b" from a non-raw Python string
+// produces a literal BACKSPACE byte (0x08), not a word boundary. That happened here on
+// 2026-08-13 and silently killed the first two alternatives — the fixture still passed, via the
+// bare ^attach$ branch, so it looked fine. Verify with `od -c` after any such edit.
+const ATTACH_AFFORDANCE_RX = /\b(attach|upload|add)\b[^.]{0,24}(resume|résumé|cv|file|document)|(resume|résumé|cv)[^.]{0,24}\b(attach|upload)\b|^\s*(attach|upload|joindre|téléverser)\s*$/i;
+const CLOUD_PICKER_RX = /dropbox|google drive|gdrive|onedrive|\bbox\b|sharepoint/i;
+
+async function mountDeferredFileInput(root) {
+  const scope = root && root !== document ? root : document;
+  let candidates = [];
+  try {
+    candidates = qsa('button, [role="button"], a[role="button"], label', scope)
+      .filter((el) => {
+        const t = compactText(el.textContent || el.getAttribute?.('aria-label') || '');
+        if (!t || t.length > 40) return false;
+        if (CLOUD_PICKER_RX.test(t)) return false;      // never open a third-party picker
+        return ATTACH_AFFORDANCE_RX.test(t);
+      });
+  } catch { return []; }
+  if (!candidates.length) return [];
+
+  for (const el of candidates.slice(0, 2)) {
+    try {
+      logLine('info', `no résumé input yet — clicking "${compactText(el.textContent).slice(0, 30)}" to mount one`);
+      el.click();
+      // React mounts on the next tick or two; poll briefly rather than guessing a single delay.
+      for (let i = 0; i < 10; i++) {
+        await new Promise((r) => setTimeout(r, 60));
+        const found = findResumeFileInputs(root);
+        if (found.length) return found;
+      }
+    } catch { /* try the next affordance */ }
+  }
+  return [];
+}
+
 async function tryAttachResume(root, resume) {
   if (!resume?.id) return { attempted: false, attached: 0 };
-  const inputs = findResumeFileInputs(root);
+  let inputs = findResumeFileInputs(root);
+  // Nothing to fill yet — the widget may simply not have mounted its input. Try to make it appear
+  // before concluding this posting cannot take a résumé.
+  if (!inputs.length) inputs = await mountDeferredFileInput(root);
   if (!inputs.length) return { attempted: false, attached: 0 };
 
   const r = await send({ type: 'get-document', documentId: resume.id });
