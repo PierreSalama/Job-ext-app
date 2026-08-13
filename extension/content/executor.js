@@ -16,7 +16,11 @@
 import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput, isFillable, radioGroupLabel, selectGroupLabel, isSiteChromeInput, bestFuzzyIndex, isJunkQuestionKey, nearestQuestionText, UI_INSTRUCTION_RX } from './autofill.js';
 import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
-import { pageTextLooksLikeSuccess, urlLooksLikeSuccess, evaluateSubmitEvidence } from './signals/success.js';
+// SUCCESS_TEXT_RX is imported for the [TRACE 9b] reject-detail diagnostic only — it reports which
+// baseline phrase set before.successText (and so disabled the textBecameSuccess path). It must be
+// imported explicitly: that trace sits inside a try/catch, so a missing binding would be swallowed
+// and the diagnostic would silently never emit.
+import { pageTextLooksLikeSuccess, urlLooksLikeSuccess, evaluateSubmitEvidence, SUCCESS_TEXT_RX } from './signals/success.js';
 import { qsa, isProbablyVisible, compactText } from './lib/dom.js';
 import { redactValue, redactLabel } from './lib/redact.js';
 import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence, resolveLocator, recoveryFingerprint, shouldResetPageActionBreaker } from './replay.js';
@@ -4017,10 +4021,32 @@ export async function run(task, context, helpers) {
       // [TRACE 9] SUBMIT result — the settle outcome + evidence the evaluator weighed +
       // the after-snapshot diff (url move? new confirmation nodes? text became success?).
       try {
-        const newNodeCount = newConfirmationNodes(submitBaseline).length;
+        const newNodeList = newConfirmationNodes(submitBaseline);
+        const newNodeCount = newNodeList.length;
         vlog('submit', `settle=${how || 'none'} verified=${verdict.verified} reason=${verdict.reason}`
           + ` urlMoved=${beforeClickUrl !== location.href} successTextNow=${after?.successText} newNodes=${newNodeCount}`
           + ` formClosed=${formClosed}${packSignalReason ? ' ' + packSignalReason : ''} elapsed=${Date.now() - submitClickAt}ms`);
+        // [TRACE 9b] WHY the evaluator/pack rejected. Every ATS awaiting_review on the laptop ends
+        // as `static-success-text-unchanged` with newNodes>=1, and the counts alone cannot separate
+        // "submitted, confirmation rendered outside the snapshot scope" from "never submitted".
+        // These three facts do separate them, so capture them rather than guess:
+        //   • what the appeared nodes actually SAY (and whether they were flagged confirmation)
+        //   • whether the dialog-scoped `after` snapshot went stale/detached while the PAGE moved on
+        //   • which baseline phrase made before.successText true (the thing disabling textBecameSuccess)
+        // Diagnostic only — it changes no verdict.
+        if (!verdict.verified && !formClosed && !packSignalReason) {
+          const preview = newNodeList.slice(0, 3).map((n) => {
+            const t = String(n?.text || '').replace(/\s+/g, ' ').trim();
+            return `{conf=${n?.confirmation === true} len=${t.length} "${t.slice(0, 120)}"}`;
+          }).join(' ');
+          const dialogDetached = !!(submitDialog && !document.contains(submitDialog));
+          const bodyNow = (document.body?.textContent || '').replace(/\s+/g, ' ').trim();
+          const baseHit = SUCCESS_TEXT_RX.exec(String(submitBaseline?.text || ''));
+          vlog('submit', `reject-detail nodes=${preview || '(none)'}`
+            + ` dialogDetached=${dialogDetached} afterLen=${String(after?.text || '').length} bodyLen=${bodyNow.length}`
+            + ` bodySuccessNow=${SUCCESS_TEXT_RX.test(bodyNow.slice(0, 5000))}`
+            + ` baselinePhrase="${baseHit ? String(baseHit[0]).slice(0, 60) : '(none)'}"`);
+        }
       } catch {}
       if (verdict.verified || formClosed || packSignalReason) {
         const reason = verdict.verified ? verdict.reason : (packSignalReason || 'apply-form-closed');
