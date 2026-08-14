@@ -4085,28 +4085,42 @@ export async function run(task, context, helpers) {
         vlog('submit', `settle=${how || 'none'} verified=${verdict.verified} reason=${verdict.reason}`
           + ` urlMoved=${beforeClickUrl !== location.href} successTextNow=${after?.successText} newNodes=${newNodeCount}`
           + ` formClosed=${formClosed}${packSignalReason ? ' ' + packSignalReason : ''} elapsed=${Date.now() - submitClickAt}ms`);
-        // [TRACE 9b] WHY the evaluator/pack rejected. Every ATS awaiting_review on the laptop ends
-        // as `static-success-text-unchanged` with newNodes>=1, and the counts alone cannot separate
-        // "submitted, confirmation rendered outside the snapshot scope" from "never submitted".
-        // These three facts do separate them, so capture them rather than guess:
-        //   • what the appeared nodes actually SAY (and whether they were flagged confirmation)
-        //   • whether the dialog-scoped `after` snapshot went stale/detached while the PAGE moved on
-        //   • which baseline phrase made before.successText true (the thing disabling textBecameSuccess)
-        // Diagnostic only — it changes no verdict.
-        if (!verdict.verified && !formClosed && !packSignalReason) {
-          const preview = newNodeList.slice(0, 3).map((n) => {
-            const t = String(n?.text || '').replace(/\s+/g, ' ').trim();
-            return `{conf=${n?.confirmation === true} len=${t.length} "${t.slice(0, 120)}"}`;
+      } catch {}
+      // [TRACE 9b] WHY the evaluator/pack rejected. Every ATS awaiting_review on both machines ends
+      // as `static-success-text-unchanged` with newNodes>=1, and those counts alone cannot separate
+      // "submitted, confirmation rendered outside the snapshot scope" from "never submitted".
+      // These facts do separate them, so capture them rather than guess:
+      //   • what the appeared nodes actually SAY (and whether they were flagged confirmation)
+      //   • whether the dialog-scoped `after` snapshot went stale/detached while the PAGE moved on
+      //   • which baseline phrase made before.successText true (the thing disabling textBecameSuccess)
+      // Diagnostic only — it changes no verdict.
+      // Deliberately its OWN try/catch, separate from the trace above. Shipped in 11.106.0 sharing
+      // that block, it never appeared in a single live transcript while the neighbouring 11.107.0
+      // scan-skip lines did — so it was throwing and being swallowed alongside the main trace. It had
+      // also never once executed in the harness (every other fixture either verifies or never clicks),
+      // i.e. it shipped unexercised. greenhouse-unverifiable-confirm now covers this branch, and any
+      // throw here is REPORTED rather than silently losing the diagnostic.
+      if (!verdict.verified && !formClosed && !packSignalReason) {
+        try {
+          const nodes = newConfirmationNodes(submitBaseline);
+          const preview = nodes.slice(0, 3).map((n) => {
+            const t = String((n && n.text) || '').replace(/\s+/g, ' ').trim();
+            return `{conf=${!!(n && n.confirmation === true)} len=${t.length} "${t.slice(0, 120)}"}`;
           }).join(' ');
           const dialogDetached = !!(submitDialog && !document.contains(submitDialog));
           const bodyNow = (document.body?.textContent || '').replace(/\s+/g, ' ').trim();
-          const baseHit = SUCCESS_TEXT_RX.exec(String(submitBaseline?.text || ''));
+          let basePhrase = '(none)';
+          try {
+            const hit = SUCCESS_TEXT_RX.exec(String((submitBaseline && submitBaseline.text) || ''));
+            if (hit) basePhrase = String(hit[0]).slice(0, 60);
+          } catch (e) { basePhrase = `(regex-failed: ${String(e && e.message).slice(0, 40)})`; }
           vlog('submit', `reject-detail nodes=${preview || '(none)'}`
-            + ` dialogDetached=${dialogDetached} afterLen=${String(after?.text || '').length} bodyLen=${bodyNow.length}`
-            + ` bodySuccessNow=${SUCCESS_TEXT_RX.test(bodyNow.slice(0, 5000))}`
-            + ` baselinePhrase="${baseHit ? String(baseHit[0]).slice(0, 60) : '(none)'}"`);
+            + ` dialogDetached=${dialogDetached} afterLen=${String((after && after.text) || '').length} bodyLen=${bodyNow.length}`
+            + ` baselinePhrase="${basePhrase}"`);
+        } catch (e) {
+          vlog('submit', `reject-detail FAILED: ${String((e && e.message) || e).slice(0, 120)}`);
         }
-      } catch {}
+      }
       if (verdict.verified || formClosed || packSignalReason) {
         const reason = verdict.verified ? verdict.reason : (packSignalReason || 'apply-form-closed');
         // [TRACE 9] DONE — the evidence TYPE chosen for the verified submission.
