@@ -3433,7 +3433,28 @@ export async function run(task, context, helpers) {
       const blockers = nativeValidationBlockers(btn);
       if (blockers.length) {
         vlog('submit', `BLOCKED by native validation — ${blockers.length} required field(s) still invalid; not clicking`);
-        for (const b of blockers) park(b.label, 'text', null, b.message || 'required — the form will not submit until this is answered');
+        // Apply the SAME guard the AI-rescue park path applies (see the UI_INSTRUCTION_RX note there).
+        // This path parked raw labels, so it re-introduced exactly what that guard exists to prevent —
+        // just via a different route. Live 2026-08-13 on the laptop, the needs-you queue held
+        // "5 results available.Use Up and Down to choose options…", a bare "select...", "Review", and
+        // "ResumeUploading...fileuploaded.jpgUpload failed. Max size for files is 10 MB." A label that
+        // is not a question can NEVER be answered, so parking it strands that application permanently.
+        // The upload pattern is deliberately narrow (widget error chatter only) — "please upload your
+        // portfolio" is a real question and must still park.
+        const UPLOAD_CHATTER_RX = /upload failed|max size for files/i;
+        const answerable = blockers.filter((b) => b.label && b.label.trim().length > 2
+          && !UI_INSTRUCTION_RX.test(b.label) && !isJunkQuestionKey(b.label) && !UPLOAD_CHATTER_RX.test(b.label));
+        const dropped = blockers.length - answerable.length;
+        if (dropped) vlog('submit', `dropped ${dropped} unanswerable blocker label(s) (UI chrome, not questions)`);
+        if (answerable.length) {
+          for (const b of answerable) park(b.label, 'text', null, b.message || 'required — the form will not submit until this is answered');
+        } else {
+          // Every blocker was chrome. Still surface ONE honest row: the job genuinely cannot submit,
+          // and dropping it silently would let the task retry-loop invisibly (same reasoning as the
+          // AI-rescue last-resort park).
+          park('a required field on this form could not be identified', 'text', null,
+            'the form refuses to submit but its blocking field has no readable question text');
+        }
         reportParked('native-validation');
         break;
       }
