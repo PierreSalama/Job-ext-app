@@ -2826,10 +2826,17 @@ export async function run(task, context, helpers) {
       for (const s of suggestions.slice(0, 12)) {
         vlog('field', `"${redactLabel(s.label)}" type=${traceFieldType(s.input)} src=${s.source || '?'} → ${redactValue(s.value, s.label)}`);
       }
-      // NOTHING fillable but the step still won't advance — the single dominant live park
-      // ("needs N answer(s)" with fillable=0 + sawRequired=false). Say WHY each field was
-      // passed over, so the failure is diagnosable from the transcript instead of guessed at.
-      if (!suggestions.length && scanSkips.length) {
+      // Say WHY each field was passed over, so the failure is diagnosable from the transcript
+      // instead of guessed at.
+      //
+      // This used to fire ONLY when nothing at all was fillable, which blinded the exact case now
+      // blocking every Greenhouse run: live 2026-08-13 on Affirm the scan reported `fillable=1`
+      // (pronouns) out of 9 required fields, filled that one, then died on "BLOCKED by native
+      // validation — 6 required field(s) still invalid". Because suggestions.length was 1 and not 0,
+      // the reasons the other eight were skipped were never written down, and the transcript could
+      // not distinguish a label-match miss from a visibility/duplicate-node skip. A PARTIAL scan
+      // that leaves required fields behind is exactly as fatal as an empty one — log both.
+      if (scanSkips.length) {
         vlog('scan', `skipped ${scanSkips.length} field(s):`);
         for (const s of scanSkips.slice(0, 10)) vlog('scan', '  ' + s);
       }

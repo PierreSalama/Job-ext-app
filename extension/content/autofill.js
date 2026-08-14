@@ -137,7 +137,14 @@ export function nearestQuestionText(input, maxUp = 8) {
         // Widget chrome is not part of the question. react-select renders its "Select…" prompt as
         // a *div* (.select__placeholder), so element-type stripping alone leaves it glued to the
         // front of the recovered label — "select... do you now, or will you in the future, …".
-        clone.querySelectorAll?.('input, select, textarea, button, option, [role="combobox"], [role="listbox"], [role="option"], [class*="placeholder" i]')
+        // `style`/`script` are stripped for the same reason, and they are not hypothetical: modern
+        // Greenhouse (Remix) emits an inline <style> beside its hidden required-input sentinel, so
+        // the recovered "label" became a CSS RULE. Captured live 2026-08-13 on the Affirm posting,
+        // where the run parked asking the user to answer:
+        //   ".remix-css-1a0ro4n-requiredinput{opacity:0;pointer-events:none;position:absolute;…}"
+        // textContent includes stylesheet text, so this junk both inflates "needs N answer(s)" and
+        // puts unanswerable rubbish in the needs-you queue.
+        clone.querySelectorAll?.('input, select, textarea, button, option, style, script, [role="combobox"], [role="listbox"], [role="option"], [class*="placeholder" i]')
           .forEach((n) => n.remove());
         txt = String(clone.textContent || '').replace(/\s+/g, ' ').trim();
       } catch { txt = ''; }
