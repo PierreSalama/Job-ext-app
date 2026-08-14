@@ -3451,11 +3451,22 @@ export async function run(task, context, helpers) {
           let recovered = 0;
           try {
             const vform = btn.form || btn.closest?.('form') || null;
-            const r = await answerBlockingRequiredFields(vform);
-            recovered = (r && r.filled) || 0;
+            // PROFILE/LEARNED-QA ONLY — deliberately NOT the full answerBlockingRequiredFields ladder.
+            // 11.109.0 called the whole ladder here and caused a measured regression: its second stage
+            // asks /ai/answer-question per unanswered required field (150s timeout each), which blew
+            // the task budget. Timeouts went 2/23 failed BEFORE to 12/20 AFTER (9% -> 60%), and a
+            // timeout is strictly WORSE than the park it replaced — it surfaces no questions at all
+            // and just retries. The fields this path needs to clear (Location, Province, and the like)
+            // are ones the profile already knows, so the cheap synchronous stage is the whole benefit;
+            // the AI leg still runs on the advance-stall path where a longer budget is appropriate.
+            const sugg = (await engine.scanFillable(vform || undefined))
+              .filter((s) => !NEVER_AUTOFILL_RX.test(s.label || ''));
+            recovered = await engine.fill(sugg) || 0;
+            if (recovered) logLine('ok', `filled ${recovered} field(s) from profile/history to clear validation`);
           } catch { /* recovery is best-effort; fall through to the park below */ }
-          // The ladder parks anything it could not answer honestly. A parked question outranks any
-          // submit — never submit a job with an open question (same rule as the guard above).
+          // Re-check: an EARLIER step in this run may have parked a question (the fill above cannot —
+          // scanFillable/fill never park). A parked question outranks any submit, so re-assert the
+          // same rule as the guard above rather than falling through to a click.
           if (parked.length) { reportParked('final-submit'); break; }
           if (recovered) {
             blockers = nativeValidationBlockers(btn);
