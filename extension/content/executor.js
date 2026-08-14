@@ -1461,6 +1461,10 @@ export async function run(task, context, helpers) {
   let everHadForm = false;     // has the apply form/modal ever appeared this run?
   let formGrounded = false;    // SUCCESS-TRUTH: a REAL apply form was opened+interacted-with
   let submitAttempted = false; // did we click a final submit (auto mode) at least once?
+  // Have we already spent the one native-validation recovery pass this run? The recovery answers
+  // the blocking fields through the normal ladder and re-checks; without this latch a form that
+  // stays invalid would answer-and-recheck on every submit attempt.
+  let validationRecoveryTried = false;
   let noChange = 0;            // consecutive advance clicks that didn't change the page (stall)
   let lastPageAction = '';     // blocks repeated clicks on the same page-level opener
   let lastPageActionUrl = '';  // the page URL at which lastPageAction was armed — when the live
@@ -3430,9 +3434,36 @@ export async function run(task, context, helpers) {
       // SAFETY NET: never CLAIM a submit the browser is about to refuse. Park the fields it
       // is refusing on — with their real question text — so they become answerable and learned,
       // instead of clicking into a no-op and asking Pierre to confirm a phantom submission.
-      const blockers = nativeValidationBlockers(btn);
+      let blockers = nativeValidationBlockers(btn);
       if (blockers.length) {
         vlog('submit', `BLOCKED by native validation — ${blockers.length} required field(s) still invalid; not clicking`);
+        // ANSWER before giving up. answerBlockingRequiredFields is the same ladder the advance-stall
+        // path uses (profile/learned-qa → /ai/answer-question → grounded work-auth/sponsorship
+        // default, parking honestly what it cannot answer). It was only ever reachable when an
+        // advance CLICK failed to change the page — but a form that fails native validation never
+        // gets clicked, so this path short-circuited straight to park and the ladder never ran.
+        // Live 2026-08-13/14 on the laptop that was EVERY Greenhouse run: the browser told us exactly
+        // which required fields were blocking, and we parked them instead of answering them, even
+        // where the answers sat in the profile (Location/Province) or had a grounded default
+        // (sponsorship). One pass per run, latched, so a still-invalid form cannot loop.
+        if (!validationRecoveryTried) {
+          validationRecoveryTried = true;
+          let recovered = 0;
+          try {
+            const vform = btn.form || btn.closest?.('form') || null;
+            const r = await answerBlockingRequiredFields(vform);
+            recovered = (r && r.filled) || 0;
+          } catch { /* recovery is best-effort; fall through to the park below */ }
+          // The ladder parks anything it could not answer honestly. A parked question outranks any
+          // submit — never submit a job with an open question (same rule as the guard above).
+          if (parked.length) { reportParked('final-submit'); break; }
+          if (recovered) {
+            blockers = nativeValidationBlockers(btn);
+            vlog('submit', `recovery answered ${recovered} field(s) — ${blockers.length ? `${blockers.length} still invalid` : 'native validation now CLEAR, proceeding to submit'}`);
+          }
+        }
+      }
+      if (blockers.length) {
         // Apply the SAME guard the AI-rescue park path applies (see the UI_INSTRUCTION_RX note there).
         // This path parked raw labels, so it re-introduced exactly what that guard exists to prevent —
         // just via a different route. Live 2026-08-13 on the laptop, the needs-you queue held
