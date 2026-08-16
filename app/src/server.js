@@ -823,11 +823,19 @@ async function queueNext(force = false, skipHosts = null) {
     transcriptAppend: { note: `scheduled (mode=${mode})` },
   });
   broadcast('queue.updated', { taskId: task.id, state: 'scheduled' });
-  // Spend the budget at CLAIM time, not at submit time. An apply that fails, parks, or hits a wall
-  // still cost the platform a session's worth of page loads — that traffic is what got counted
-  // against the account, so it must be what we count too. (The old maxPerDay/dailyCap read
-  // *submissions*, which is why a day of failures looked free while LinkedIn saw a flood.)
-  try { db.recordPlatformTouch(String(job.source || '').toLowerCase(), 'apply'); } catch {}
+  // Budget is spent when a REAL browser session starts (the PATCH to state='running' below), NOT
+  // here at claim time.
+  //
+  // The original rule charged on claim, reasoning that an apply which fails or parks still cost the
+  // platform a session's worth of page loads. That holds when a claim always opens a browser — but
+  // it does not. Live 2026-08-14: LinkedIn tasks were claimed every ~10 min for 6+ hours, the
+  // executor NEVER launched (no "executor started in tab", attempts=0), the watchdog recycled them,
+  // and each recycle charged again. Result: 30/30 applies recorded, ZERO applications made, and the
+  // governor then hard-blocked the platform on traffic that never happened. Raising the budget only
+  // bought an hour before the phantom charges refilled it.
+  //
+  // Charging at 'running' keeps the original intent — a failed/parked apply still counts, because the
+  // browser really did load the page — while a claim that never opens a browser costs nothing.
 
   return {
     task: { ...task, mode },
@@ -1713,8 +1721,22 @@ async function handle(req, res, parsed) {
   }
   if (req.method === 'PATCH' && (jm = m(/^\/queue\/([^/]+)$/))) {
     const body = await readJson(req);
+    const wasRunning = (() => { try { return db.queueGet(jm[1])?.state === 'running'; } catch { return false; } })();
     const task = db.queuePatch(jm[1], body);
     if (!task) return sendJson(res, 404, { ok: false, error: 'not found' });
+    // SPEND THE PLATFORM BUDGET HERE — the moment a real browser session begins (see the note at the
+    // claim site). The executor PATCHes state='running' only after its tab is open, so this is the
+    // first point where page loads genuinely hit the platform. Guarded on the transition
+    // (!wasRunning) so an executor that reports progress repeatedly cannot charge more than once.
+    if (body.state === 'running' && !wasRunning) {
+      try {
+        // rowToTask returns jobId, NOT a nested job — reading task.job.source here would be
+        // undefined, the charge would never fire, and the governor would silently stop protecting
+        // the account. Resolve the job explicitly.
+        const src = String(db.getJob(task.jobId)?.source || '').toLowerCase();
+        if (src) db.recordPlatformTouch(src, 'apply');
+      } catch {}
+    }
     // LinkedIn Easy Apply daily cap hit (executor reports `easyapply-limit …`): set the
     // cooldown + learn the observed threshold, so queueNext pivots to external jobs.
     if (typeof body.lastError === 'string' && /^easyapply-limit/.test(body.lastError)) {

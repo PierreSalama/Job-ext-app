@@ -229,14 +229,35 @@ test('the apply gate is not bypassable by force', () => {
   assert.match(gate.slice(0, gate.indexOf('};')), /requireConfig: true/);
 });
 
-test('the apply budget is spent at CLAIM time, not at submit time', () => {
-  // A failed or parked apply still cost the platform a full session of page loads. Counting only
-  // submissions is why a day of failures looked free while LinkedIn saw a flood.
+test('the apply budget is spent when a browser session STARTS, not merely on claim', () => {
+  // Still not at submit time — a failed or parked apply really did cost the platform a session of
+  // page loads, and counting only submissions is why a day of failures looked free while LinkedIn
+  // saw a flood. But charging on CLAIM was wrong in the other direction: a claim does not always
+  // open a browser. Live 2026-08-14, LinkedIn tasks were claimed every ~10 min for 6+ hours with the
+  // executor NEVER launching (no "executor started in tab", attempts=0); the watchdog recycled them
+  // and every recycle charged again — 30/30 applies recorded against ZERO applications, which then
+  // hard-blocked the platform on traffic that never happened.
+  //
+  // 'running' is the honest line: the executor PATCHes it only once its tab is open.
   const server = read('app', 'src', 'server.js');
-  const i = server.indexOf("broadcast('queue.updated', { taskId: task.id, state: 'scheduled' })");
-  assert.ok(i > -1);
-  const after = server.slice(i, i + 900);
-  assert.match(after, /db\.recordPlatformTouch\(String\(job\.source \|\| ''\)\.toLowerCase\(\), 'apply'\)/);
+
+  // The claim site must NOT charge.
+  const claim = server.indexOf("broadcast('queue.updated', { taskId: task.id, state: 'scheduled' })");
+  assert.ok(claim > -1);
+  assert.doesNotMatch(server.slice(claim, claim + 900), /db\.recordPlatformTouch\([^)]*'apply'\)/,
+    'claiming a task must not spend budget — it may never open a browser');
+
+  // The running transition must charge, and only on the transition.
+  const patch = server.indexOf("if (req.method === 'PATCH' && (jm = m(/^\\/queue\\/([^/]+)$/)))");
+  assert.ok(patch > -1);
+  const body = server.slice(patch, patch + 1400);
+  assert.match(body, /body\.state === 'running' && !wasRunning/,
+    'charge on the transition only, so repeated progress reports cannot double-charge');
+  assert.match(body, /db\.recordPlatformTouch\(src, 'apply'\)/);
+  // rowToTask exposes jobId, not a nested job: reading task.job.source would be undefined and the
+  // governor would silently stop protecting the account.
+  assert.match(body, /db\.getJob\(task\.jobId\)/,
+    'resolve the job explicitly — task.job does not exist on a patched task');
 });
 
 test('a safety deferral is reported as its own reason, with a real backoff', () => {
