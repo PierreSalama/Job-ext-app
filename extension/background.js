@@ -77,6 +77,49 @@ function rebootTab(tabId, frameId, url) {
   chrome.tabs.sendMessage(tabId, { type: 'jat11.reboot', url }, { frameId }).catch(() => {});
 }
 chrome.webNavigation.onHistoryStateUpdated.addListener((d) => rebootTab(d.tabId, d.frameId, d.url));
+
+// NAVIGATION-RESUMING RUN DISPATCH — module-level so the apply pump AND the harness call the SAME
+// code (the harness used its own raw sendMessage, so it could not exercise this at all).
+//
+// sendMessage awaits the ENTIRE executor run, but an opener that NAVIGATES (stripe.com "Apply now",
+// ashby, lever - anything leaving the job page for a separate application page) destroys the
+// receiving content script mid-message. Chrome rejects with "message channel closed", the run never
+// resolves, and the task burns its full hard cap before being reaped as a timeout. Live 2026-08-14
+// that was every navigating ATS opener on both machines, and it is why the ATS lane produced 1
+// completion against LinkedIn's 141 - LinkedIn Easy Apply is a MODAL, so it never navigates.
+//
+// On that specific rejection, re-send to the NEW document. Bounded at 2 resumes so a page that
+// reloads in a loop cannot spin. Not a double-apply risk: the channel dies at the OPENER click,
+// before any submit - and if a post-submit confirmation navigation ever triggers it, the resumed
+// executor finds no form and skips rather than re-applying.
+const CHANNEL_CLOSED_RX = /message channel closed|Receiving end does not exist/i;
+const MAX_NAV_RESUMES = 2;
+async function sendRunWithNavResume(tabId, msg, opts = {}) {
+  const settleMs = opts.settleMs == null ? 2500 : opts.settleMs;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await chrome.tabs.sendMessage(
+        tabId,
+        { ...msg, resumedAfterNavigation: attempt > 0 },
+        { frameId: 0 },
+      );
+    } catch (e) {
+      const em = String((e && e.message) || e);
+      if (!CHANNEL_CLOSED_RX.test(em) || attempt >= MAX_NAV_RESUMES) throw e;
+      // Only resume if the TAB still exists - a closed/discarded tab is a real failure.
+      let live = null;
+      try { live = await chrome.tabs.get(tabId); } catch { throw e; }
+      if (!live || live.discarded) throw e;
+      try { console.log('[jat] resuming run after navigation ->', String(live.url || '').slice(0, 80)); } catch {}
+      // Let the new document finish loading, or it has no listener yet.
+      await new Promise((r) => setTimeout(r, settleMs));
+    }
+  }
+}
+// Exposed for the harness so its fixture drives the REAL dispatch path, not a copy of it.
+try { globalThis.__jatSendRunWithNavResume = sendRunWithNavResume; } catch {}
+
+
 chrome.webNavigation.onReferenceFragmentUpdated.addListener((d) => rebootTab(d.tabId, d.frameId, d.url));
 
 // ---------- Observer: always-on nav recorder (Apprenticeship Engine P2) ----------
@@ -1674,7 +1717,21 @@ async function launchOne(task, context) {
       const runType = context && context.supervised ? 'jat11.supervised-run' : 'jat11.run-task';
       // FIX 1: reset this tab's hidden-non-hydrating tracker for a fresh run.
       try { aaFrontRequested.delete(tab.id); } catch {}
-      const dispatch = chrome.tabs.sendMessage(tab.id, { type: runType, task, context }, { frameId: 0 });
+      // NAVIGATION-RESUMING DISPATCH.
+      //
+      // sendMessage awaits the ENTIRE executor run, but an opener that NAVIGATES (stripe.com
+      // "Apply now", ashby, lever — anything that leaves the job page for a separate application
+      // page) destroys the receiving content script mid-message. Chrome then rejects with "message
+      // channel closed", the run never resolves, and the task burns its full hard cap before being
+      // reaped as a timeout. Live 2026-08-14 that was every navigating ATS opener on both machines,
+      // and it is why the ATS lane produced 1 completion against LinkedIn's 141 — LinkedIn's Easy
+      // Apply is a MODAL, so it never navigates and never hit this.
+      //
+      // On that specific rejection, re-send to the NEW document instead of failing. Bounded at 2
+      // resumes so a page that reloads in a loop cannot spin. Not a double-apply risk: the channel
+      // dies at the OPENER click, before any submit — and if a post-submit confirmation navigation
+      // ever triggers it, the resumed executor finds no form and skips rather than re-applying.
+      const dispatch = sendRunWithNavResume(tab.id, { type: runType, task, context });
       if (context && context.supervised) {
         result = await dispatch;
       } else {
