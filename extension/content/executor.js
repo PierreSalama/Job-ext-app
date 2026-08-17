@@ -3614,21 +3614,35 @@ export async function run(task, context, helpers) {
       // becomes top-level and the existing site pack drives it normally.
       const atsFrame = findEmbeddedAtsFrame();
       if (atsFrame) {
-        // Report the TRUTH instead of "did not transfer": nothing was ever going to transfer,
-        // the form is one origin away and the top frame cannot drive it.
-        // NOTE: navigating the tab to atsFrame.src was tried and is NOT safe — a cross-origin
-        // navigation tears down the content script, so the executor kills its own run mid-task
-        // (harness: "message channel closed before a response was received"). Driving these
-        // needs the task to survive navigation, which is a separate change.
-        logLine('warn', `application is embedded from ${atsFrame.host} — not auto-applicable from this page`);
+        // NAVIGATE TO THE EMBEDDED FORM. This used to skip, because navigating tore down the
+        // content script and killed the run mid-task ("message channel closed"). That was true
+        // until background.js's sendRunWithNavResume (11.113.0) — the run now survives navigation
+        // and is re-dispatched on the new document, so the ATS page becomes top-level and the
+        // existing site pack drives it normally.
+        //
+        // This was ~40% of the PC's queue being discarded by policy: company career sites
+        // (app.careerpuck.com, pinterestcareers.com, samsara.com …) that host a real Greenhouse /
+        // Lever / Ashby form one origin away. The form was always right there.
+        logLine('ok', `application is embedded from ${atsFrame.host} — navigating there; the run resumes on that page`);
         report({
-          state: 'skipped',
-          lastError: `application form is embedded from ${atsFrame.host} — open that page directly to apply`,
-          applyRoute: 'external',
-          transcriptAppend: { kind: 'recovery', note: `embedded ATS iframe detected → ${atsFrame.host}`, fingerprint: pageAction },
+          transcriptAppend: { kind: 'recovery', note: `embedded ATS iframe → navigating to ${atsFrame.host}`, fingerprint: pageAction },
         });
-        finalState = 'skipped';
-        break;
+        try { location.assign(atsFrame.src); } catch {
+          // Navigation refused (sandboxed/blocked src) — fall back to the old honest skip rather
+          // than looping on a page we cannot leave.
+          report({
+            state: 'skipped',
+            lastError: `application form is embedded from ${atsFrame.host} — open that page directly to apply`,
+            applyRoute: 'external',
+            transcriptAppend: { kind: 'recovery', note: `embedded ATS iframe detected → ${atsFrame.host} (navigation refused)` },
+          });
+          finalState = 'skipped';
+          break;
+        }
+        // The document is being torn down. Park this run here — background re-dispatches onto the
+        // ATS page. Resolving instead would report a terminal state for a task that is still going.
+        await new Promise(() => {});
+        return;
       }
       logLine('warn', `same page-level action repeated — stopping before another "${label}" click`);
       report({ state: 'failed', lastError: `repeated page-level action did not transfer: ${label}`, transcriptAppend: { kind: 'recovery', note: 'duplicate opener blocked', fingerprint: pageAction } });
