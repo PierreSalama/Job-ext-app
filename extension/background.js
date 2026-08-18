@@ -1681,6 +1681,20 @@ async function launchOne(task, context) {
     }
     keepTab(tab);
 
+    // MARK RUNNING AT TAB CREATION, NOT AFTER THE PAGE SETTLES.
+    // The settle wait below can take 30s (page load) + 2.5s, and the pump may also still be busy
+    // with a previous run before reaching this point. Meanwhile reconcileStaleRunning reaps anything
+    // left in 'scheduled' after just 2 MINUTES. LinkedIn postings are the heaviest pages here, so
+    // they sat in 'scheduled' longest and were reaped first: live 2026-08-18, every LinkedIn task
+    // died "timed out / interrupted" having never logged an executor start, while lighter ATS pages
+    // through the same pump reached 'running' fine (30 reached-running vs 17 never-ran).
+    // The tab IS the browser session, which is exactly what v11.112.0 defined as the charge point
+    // ("spend the apply budget when a browser session STARTS") - so charging here is also more
+    // honest than charging after the page happens to finish loading.
+    await api.call('PATCH', '/queue/' + task.id, {
+      state: 'running', transcriptAppend: { note: `apply tab ${tab.id} opened - loading` },
+    });
+
     // Wait for the page (and content script) to settle, then hand over the task.
     await new Promise((resolve) => {
       const done = (tabId, info) => {
@@ -1694,7 +1708,8 @@ async function launchOne(task, context) {
     });
     await new Promise((r2) => setTimeout(r2, 2500));
 
-    // Mark running up front, then hand over. IMPORTANT: 'jat11.run-task' awaits
+    // Already marked running at tab creation above; this records the executor handover itself.
+    // IMPORTANT: 'jat11.run-task' awaits
     // the ENTIRE executor run, so this resolves with the run's FINAL result —
     // the executor has already report()-ed its terminal state. We reconcile to
     // that authoritative state and must NEVER clobber it back to 'running'.
