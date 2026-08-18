@@ -939,10 +939,24 @@ function responsesManagedOffLinkedInPresent() {
 // check missed it, mislabeling real submissions as awaiting_input). `applyModal`
 // must be the verified apply dialog (never a loose fallback) so an unrelated
 // modal closing — or the user X-ing the modal — can't be read as a submit.
-async function confirmSubmitted(applyModal, timeoutMs = 15000) {
+async function confirmSubmitted(applyModal, timeoutMs = 15000, baseline = null) {
   const t0 = Date.now();
+  // When the page ALREADY looked like success BEFORE the click, that text proves nothing — and
+  // early-returning on it ends the settle wait immediately (~260ms on Ashby's SPA, measured), long
+  // before an XHR submit can re-render. evaluateSubmitEvidence then correctly rejects it as
+  // `static-success-text-unchanged`, so a real submission is filed unverified. In that case keep
+  // waiting for a genuinely NEW signal instead. This never loosens R1: the evaluator still decides,
+  // and a baseline with no static success text behaves exactly as before.
+  const staticSuccess = baseline?.successText === true;
+  const urlBefore = baseline?.url != null ? baseline.url : location.href;
   while (Date.now() - t0 < timeoutMs && !S.cancelled) {
-    if (pageTextLooksLikeSuccess(8000) || urlLooksLikeSuccess()) return 'confirmation';
+    if (!staticSuccess) {
+      if (pageTextLooksLikeSuccess(8000) || urlLooksLikeSuccess()) return 'confirmation';
+    } else {
+      // Only evidence that did NOT exist pre-click can end the wait here.
+      if (urlLooksLikeSuccess() && location.href !== urlBefore) return 'confirmation';
+      if (newConfirmationNodes(baseline).length > 0) return 'confirmation';
+    }
     if (applyModal) {
       const stillOpen = document.contains(applyModal) && isProbablyVisible(applyModal);
       const anotherApplyForm = document.querySelector('.jobs-easy-apply-modal, [data-test-modal][role="dialog"], [data-testid="smartapply-container"]');
@@ -4079,7 +4093,9 @@ export async function run(task, context, helpers) {
     if (isFinal && mode !== 'review') {
       submitAttempted = true;
       setStatus('Submitting — waiting for confirmation…');
-      const how = await confirmSubmitted(submitDialog);   // settle wait (also early-true on modal close)
+      // Pass the pre-click baseline so the settle wait can tell a NEW confirmation from static
+      // success copy that was already on the page (see confirmSubmitted).
+      const how = await confirmSubmitted(submitDialog, 15000, submitBaseline);   // settle wait (also early-true on modal close)
       const after = submitSnapshot(submitDialog || findApplyDialog());
       const verdict = evaluateSubmitEvidence({
         before: submitBaseline || { url: beforeClickUrl, successText: false, text: '' },
