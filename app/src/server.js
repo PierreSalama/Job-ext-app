@@ -639,6 +639,19 @@ async function queueNext(force = false, skipHosts = null) {
     try { for (const x of db.queueActiveSiteKeys()) { if (x.siteKey) siteKeyCounts.set(x.siteKey, (siteKeyCounts.get(x.siteKey) || 0) + 1); } } catch {}
     try { siteLastStart = db.lastStartBySiteKey({ minutes: 30 }); } catch {}
   }
+  // BOUNDED SCAN — how many dispatchable candidates to collect before stopping.
+  // This loop used to walk EVERY queued task (getJob + isPunished + jobFit each), and then rankJob
+  // ran per candidate. At 321 queued that is ~1000 SQL reads per pump, and live on the laptop
+  // 2026-08-18 /queue/next simply stopped answering: 415 of 419 requests got NO response, the two
+  // that did took 3.9-5.2s, and the pump asked once a minute forever while 312 LinkedIn jobs sat
+  // queued. Budget (28/40), signed-out latch (0), Easy-Apply cooldown (expired) and the host breaker
+  // (no skipHosts sent) were all clear - the endpoint was the stall, and 44 tasks stranded in-flight
+  // because claims were made server-side that the pump never received.
+  // We only need enough candidates to rank well, not all of them. Scanning oldest-first means the
+  // window is the oldest N dispatchable jobs, so nothing starves. Every gate still runs on each
+  // scanned task; the deferral reasons below are only consulted when NO candidate was found, and we
+  // stop only AFTER finding candidates, so their meaning is unchanged.
+  const SCAN_TARGET = Math.max(25, concurrency * 8);
   const candidates = [];
   // Jobs held back ONLY by the per-site pacing gap. The gap exists to space applies within one
   // site, which is right while other sites are available — but during an Easy-Apply cooldown
@@ -739,6 +752,7 @@ async function queueNext(force = false, skipHosts = null) {
       }
     }
     candidates.push({ t, j, order: i });   // order = oldest-first index (lower = older)
+    if (candidates.length >= SCAN_TARGET) break;   // window full - rank these rather than walk the rest
   }
   // Nothing dispatchable BUT we held back LinkedIn jobs for the cooldown → tell the pump
   // why it's idling (it isn't out of work; it's waiting out the Easy-Apply cap).
