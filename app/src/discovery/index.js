@@ -236,6 +236,35 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
         status, found: jobs.length, accepted: intake.enqueued || 0, duplicates: intake.duplicates || 0,
         rejected: intake.rejected || 0, diagnostics: { engine: 'python-jobspy', normalized: jobs.length },
       });
+      // EASY-APPLY SUPPLY: under easyApplyOnly, a SUCCESSFUL JobSpy batch is still mostly unusable.
+      // JobSpy scrapes public search results, which do not expose LinkedIn/Indeed's one-click-apply
+      // badge, so every job arrives applyCapability 'unknown' and the executor only finds out after
+      // opening it. Measured live 2026-08-20 on Pierre's PC: linkedin 6 applied vs 13 skipped
+      // ("no Easy Apply on this posting"), indeed 0 applied vs 8 skipped. That is the throughput
+      // ceiling, and no dispatch-side setting can lift it - the jobs simply are not applicable.
+      // The browser lane runs the SAME keyword/location in the user's logged-in session with the
+      // platform's OWN easy-apply filter applied, so what it returns is easy-apply-dense by
+      // construction. It already exists, but only fired when JobSpy ERRORED - never when JobSpy
+      // "succeeded" with low-value results, which is the common case. Under easyApplyOnly it is not a
+      // fallback, it is the better primary, so queue it alongside.
+      // Bounded + budgeted by construction: discoveryFallbackQueue is keyed (batch_id, source) so
+      // this adds at most ONE browser search per JobSpy batch, and /auto-apply/discovery-fallback/next
+      // puts every such search through the same platform governor as any other touch.
+      // Deliberately conservative on two counts, because this opens a REAL search in the user's
+      // logged-in session against an account that has already been restricted once:
+      //   • status === 'ok' only - an EMPTY jobspy result means the combo found nothing, and a
+      //     browser search would spend account budget to re-confirm that. Only a batch that actually
+      //     returned jobs (which under easyApplyOnly are mostly unusable) is worth re-running.
+      //   • easyApplyOnly === true explicitly - an unset flag must NOT opt a user into extra traffic.
+      try {
+        const aaNow = db.getSettings().autoApply || {};
+        if (status === 'ok' && aaNow.easyApplyOnly === true && ['linkedin', 'indeed'].includes(source)) {
+          db.discoveryFallbackQueue({
+            batchId: batch.id, source, keyword, location,
+            reason: 'easy-apply supply: jobspy cannot read the one-click-apply badge',
+          });
+        }
+      } catch {}
       broadcast('discovery.updated', { batch: done });
       return done;
     } catch (e) {
