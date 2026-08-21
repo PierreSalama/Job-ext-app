@@ -4239,6 +4239,36 @@ function signedOutEligible(job) {
   return true;
 }
 
+// EASY-APPLY SUPPLY EXHAUSTION — the second reason to relax easyApplyOnly.
+//
+// easyApplyCooledDown() covers one case: LinkedIn's daily Easy-Apply CAP is spent. It does not cover
+// the case seen repeatedly in production — the cap is fine, but the queue simply holds no one-click
+// work, so every dispatch fast-skips ("no Easy Apply on this posting" / "external posting") and the
+// node produces nothing while looking busy. Measured 2026-08-20 on Pierre's PC: linkedin 6 applied
+// vs 13 skipped; his Indeed batch was 0 applied vs 8 skipped, every one external.
+//
+// Judge by OUTCOMES, not by a capability flag: JobSpy-discovered jobs are all
+// applyCapability:'unknown', so counting flagged jobs would report an exhaustion that is not real.
+// If the most recent terminal outcomes contain NO application at all and are dominated by
+// "no Easy Apply" skips, one-click supply is exhausted and holding the filter on only burns queue.
+//
+// Self-correcting by construction: the moment ONE easy-apply application lands, applied > 0 and this
+// returns false again, so easy-apply is re-prioritised automatically — no timer, no stored state.
+function easyApplySupplyExhausted({ window = 25, minSkips = 10 } = {}) {
+  let rows = [];
+  try {
+    rows = all(`SELECT state, last_error FROM auto_apply_tasks
+                 WHERE state IN ('done','verified_done','awaiting_review','skipped')
+                 ORDER BY updated_at DESC LIMIT ?`, [Math.max(1, Number(window) || 25)]);
+  } catch { return false; }
+  // Too little history to judge — never relax on a thin sample.
+  if (rows.length < minSkips) return false;
+  const applied = rows.filter((r) => ['done', 'verified_done', 'awaiting_review'].includes(String(r.state))).length;
+  if (applied > 0) return false;
+  const noEasyApply = rows.filter((r) => /no easy apply|external posting|external . apply on the company site/i.test(String(r.last_error || ''))).length;
+  return noEasyApply >= minSkips;
+}
+
 function easyApplyStatus() {
   const until = kvGet('easyApplyLimitUntil') || null;
   return {
@@ -5236,7 +5266,7 @@ module.exports = {
   discoveryFallbackQueue, discoveryFallbackNext, discoveryFallbackComplete, discoveryHealth, reconcileDiscovery, pipelineHealth,
   queueList, queueGet, queueHistory, queueBreakdown, jobUrlsForAtsHarvest, summarizeRun, queueRunSummary, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, quarantineUntrustworthyDone, recoverRaceLostSubmissions, recoverVerifiedEvidenceFromTranscript, isTrustworthyEvidence, saveIntakeAnswer,
   classifyQueueFailure, taskSiteKey, queueActiveSiteKeys, lastStartBySiteKey,
-  setEasyApplyCooldown, easyApplyCooledDown, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
+  setEasyApplyCooldown, easyApplyCooledDown, easyApplySupplyExhausted, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
   recordPlatformTouch, platformTouchCounts, lastPlatformTouchAt, prunePlatformTouches,
   triageRecord, triageUnreviewed, triagePendingEscalations, triageCoverage,
   applyTriageVerdicts, triageOrphans, selfEmailAddresses,

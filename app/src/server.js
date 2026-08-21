@@ -368,7 +368,10 @@ function ingestDiscoveredJobs(source, jobs, { providerName = 'browser', batchId 
   // COOLDOWN FALLBACK: relax easyApplyOnly while LinkedIn Easy-Apply is cooled down (daily cap hit)
   // so external/ATS postings are ingested (and then applied) instead of the queue starving until the
   // cap resets. Reverts to Easy-Apply-only automatically once the cooldown lifts.
-  const easyApplyOnly = s.easyApplyOnly !== false && !db.easyApplyCooledDown();
+  // SUPPLY FALLBACK: the cap is only one way to run out. Far more often the cap is untouched and the
+  // queue simply holds no one-click work, so every dispatch fast-skips and the node produces nothing.
+  // Ingesting external postings then is what keeps it earning at a lower rate instead of idling.
+  const easyApplyOnly = s.easyApplyOnly !== false && !db.easyApplyCooledDown() && !db.easyApplySupplyExhausted();
   let enqueued = 0, rejected = 0, punished = 0, duplicates = 0;
   const ranked = [];
   // WATCHLIST — checked BEFORE jobFit, deliberately. A watched company is one where Pierre has a
@@ -863,7 +866,10 @@ async function queueNext(force = false, skipHosts = null) {
       // COOLDOWN: relax easyApplyOnly for the EXECUTOR too, so it DRIVES external/company-site postings
       // instead of fast-skipping them ("External site skipped") while LinkedIn Easy-Apply is capped —
       // otherwise the dispatched external/Indeed jobs get skipped and the node still produces nothing.
-      easyApplyOnly: s.easyApplyOnly !== false && !db.easyApplyCooledDown(),
+      // ...and relax it for supply exhaustion too, otherwise the external jobs the ingest fallback
+      // just let in would be dispatched and then fast-skipped by the executor - producing nothing.
+      // Both flags must agree or the two halves fight each other.
+      easyApplyOnly: s.easyApplyOnly !== false && !db.easyApplyCooledDown() && !db.easyApplySupplyExhausted(),
       // One-shot "Watch & Teach the next application" armed from the dashboard → run this
       // dispatch supervised, on-screen (Step/Run + Fix-this). bringToFront so it's visible.
       ...(superviseThis ? { supervised: true, bringToFront: true } : {}),
