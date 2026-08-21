@@ -722,6 +722,20 @@ const MIGRATIONS = [
   () => {
     exec('ALTER TABLE auto_apply_tasks ADD COLUMN self_heal_count INTEGER NOT NULL DEFAULT 0');
   },
+
+  // WHICH TASK DID THIS TOUCH BELONG TO. The apply budget is charged the instant a tab opens,
+  // because that is the only moment we can honestly say "we are about to touch this platform".
+  // But a good third of those tabs turn out to hold an EXTERNAL posting with no Easy Apply — we
+  // read the page, we never fill a form, and we leave. Live 2026-08-21 the laptop spent 76 budget
+  // units to produce 12 applications; the rest went on postings that were never applyable.
+  //
+  // Without a back-reference there is no way to undo one specific charge, so the ledger could only
+  // ever grow. This column lets a terminated task point at its own row and have it reclassified
+  // from 'apply' to 'visit' — kept for forensics, no longer counted as an application.
+  () => {
+    exec('ALTER TABLE platform_touches ADD COLUMN ref TEXT');
+    exec('CREATE INDEX idx_platform_touches_ref ON platform_touches(ref)');
+  },
 ];
 
 // SUCCESS-TRUTH quarantine (shared by the migration above and exported for tests).
@@ -4126,12 +4140,31 @@ function triageCoverage() {
 // Every outbound touch of a rate-limited platform is recorded here — a discovery search and an
 // apply dispatch count the SAME, because LinkedIn counted them the same. See app/src/safety.js.
 
-function recordPlatformTouch(platform, kind, at = new Date()) {
+// 'visit' is a THIRD kind, and deliberately not a synonym for either of the other two: it is a page
+// we loaded and walked away from. It is not an application (it must not eat the apply budget) and
+// it is not a search (it scraped no result list), so it counts against neither — while still being
+// on the record, because it IS traffic the platform saw.
+const TOUCH_KINDS = new Set(['apply', 'search', 'visit']);
+
+function recordPlatformTouch(platform, kind, at = new Date(), ref = null) {
   const p = String(platform || '').toLowerCase();
-  const k = String(kind || '').toLowerCase() === 'apply' ? 'apply' : 'search';
+  let k = String(kind || '').toLowerCase();
+  if (!TOUCH_KINDS.has(k)) k = 'search';
   if (!p) return null;
-  run('INSERT INTO platform_touches (platform, kind, at) VALUES (?, ?, ?)', [p, k, at.toISOString()]);
-  return { platform: p, kind: k, at: at.toISOString() };
+  run('INSERT INTO platform_touches (platform, kind, at, ref) VALUES (?, ?, ?, ?)',
+      [p, k, at.toISOString(), ref ? String(ref) : null]);
+  return { platform: p, kind: k, at: at.toISOString(), ref: ref ? String(ref) : null };
+}
+
+// Reclassify one task's apply charge as a mere page view. Idempotent (the second call matches no
+// 'apply' row and returns 0) and scoped by ref, so it can never touch a different task's charge.
+function downgradePlatformTouch(ref) {
+  const r = String(ref || '');
+  if (!r) return 0;
+  const before = get("SELECT COUNT(*) AS n FROM platform_touches WHERE ref = ? AND kind = 'apply'", [r]);
+  const n = (before && Number(before.n)) || 0;
+  if (n) run("UPDATE platform_touches SET kind = 'visit' WHERE ref = ? AND kind = 'apply'", [r]);
+  return n;
 }
 
 // Rolling counts the governor decides on. Both windows in one pass so a decision can never be made
@@ -4140,7 +4173,7 @@ function platformTouchCounts(platform, now = Date.now()) {
   const p = String(platform || '').toLowerCase();
   const dayAgo = new Date(now - 24 * 3600 * 1000).toISOString();
   const hourAgo = new Date(now - 3600 * 1000).toISOString();
-  const out = { search: { day: 0, hour: 0 }, apply: { day: 0, hour: 0 } };
+  const out = { search: { day: 0, hour: 0 }, apply: { day: 0, hour: 0 }, visit: { day: 0, hour: 0 } };
   for (const r of all(
     `SELECT kind,
             COUNT(*)                                  AS day,
@@ -4150,16 +4183,26 @@ function platformTouchCounts(platform, now = Date.now()) {
       GROUP BY kind`,
     [hourAgo, p, dayAgo],
   )) {
-    const k = r.kind === 'apply' ? 'apply' : 'search';
-    out[k] = { day: Number(r.day) || 0, hour: Number(r.hour) || 0 };
+    // Accumulate rather than assign: an unrecognised kind folds into 'search' (fail-safe), and two
+    // kinds folding to the same bucket must SUM, not overwrite one another.
+    const k = TOUCH_KINDS.has(r.kind) ? r.kind : 'search';
+    out[k].day += Number(r.day) || 0;
+    out[k].hour += Number(r.hour) || 0;
   }
   return out;
 }
 
+// When was this platform last touched in this LANE. Asking for 'apply' includes 'visit', and that
+// asymmetry is the point: a downgraded charge stops counting against the apply BUDGET (it was never
+// an application) but it absolutely still counts for SPACING (a job page we opened is traffic the
+// platform saw). Measuring the gap from applications alone would let a run of external postings
+// arrive back-to-back with no spacing at all — the exact burst pattern the gap exists to prevent.
 function lastPlatformTouchAt(platform, kind) {
   const p = String(platform || '').toLowerCase();
-  const k = String(kind || '').toLowerCase() === 'apply' ? 'apply' : 'search';
-  const r = get('SELECT at FROM platform_touches WHERE platform = ? AND kind = ? ORDER BY at DESC LIMIT 1', [p, k]);
+  const isApply = String(kind || '').toLowerCase() === 'apply';
+  const r = isApply
+    ? get("SELECT at FROM platform_touches WHERE platform = ? AND kind IN ('apply','visit') ORDER BY at DESC LIMIT 1", [p])
+    : get("SELECT at FROM platform_touches WHERE platform = ? AND kind = 'search' ORDER BY at DESC LIMIT 1", [p]);
   return r && r.at ? Date.parse(r.at) : 0;
 }
 
@@ -5267,7 +5310,7 @@ module.exports = {
   queueList, queueGet, queueHistory, queueBreakdown, jobUrlsForAtsHarvest, summarizeRun, queueRunSummary, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, quarantineUntrustworthyDone, recoverRaceLostSubmissions, recoverVerifiedEvidenceFromTranscript, isTrustworthyEvidence, saveIntakeAnswer,
   classifyQueueFailure, taskSiteKey, queueActiveSiteKeys, lastStartBySiteKey,
   setEasyApplyCooldown, easyApplyCooledDown, easyApplySupplyExhausted, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
-  recordPlatformTouch, platformTouchCounts, lastPlatformTouchAt, prunePlatformTouches,
+  recordPlatformTouch, downgradePlatformTouch, platformTouchCounts, lastPlatformTouchAt, prunePlatformTouches,
   triageRecord, triageUnreviewed, triagePendingEscalations, triageCoverage,
   applyTriageVerdicts, triageOrphans, selfEmailAddresses,
   setSignedOut, clearSignedOut, isSignedOut, signedOutStatus, signedOutEligible,

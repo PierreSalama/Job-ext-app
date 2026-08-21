@@ -196,7 +196,11 @@ const DEFAULTS = {
           minSearchGapMinutes: 20,
           appliesPerDay: 15,         // well under LinkedIn's own ~40/day Easy-Apply ceiling
           appliesPerHour: 4,
-          minApplyGapMinutes: 4,
+          minApplyGapMinutes: 4,     // the FLOOR — never closer than this
+          maxGapMinutes: 45,         // the CEILING on the adaptive pace (safety.paceGapMs). The pace
+                                     // spreads the day's remaining applies over the active time
+                                     // remaining; without a ceiling, "2 left, 9 hours to go" computes
+                                     // a 4.5h gap and the node looks dead.
           quietStart: '23:00',       // no LinkedIn traffic overnight — steady 4am scraping is a signature
           quietEnd: '07:00',
           jitterPct: 0.4,            // spread each gap over [base, base×1.4] so arrivals aren't a metronome
@@ -204,7 +208,7 @@ const DEFAULTS = {
         indeed: {
           role: 'none',
           searchesPerDay: 60, searchesPerHour: 8, minSearchGapMinutes: 8,
-          appliesPerDay: 40, appliesPerHour: 8, minApplyGapMinutes: 2,
+          appliesPerDay: 40, appliesPerHour: 8, minApplyGapMinutes: 2, maxGapMinutes: 45,
           quietStart: '23:00', quietEnd: '07:00', jitterPct: 0.4,
         },
         // Listed explicitly, not because they're used today, but so that a board turned on in
@@ -214,19 +218,19 @@ const DEFAULTS = {
         glassdoor: {
           role: 'none',
           searchesPerDay: 24, searchesPerHour: 3, minSearchGapMinutes: 20,
-          appliesPerDay: 0, appliesPerHour: 0, minApplyGapMinutes: 5,
+          appliesPerDay: 0, appliesPerHour: 0, minApplyGapMinutes: 5, maxGapMinutes: 45,
           quietStart: '23:00', quietEnd: '07:00', jitterPct: 0.4,
         },
         google: {
           role: 'none',
           searchesPerDay: 60, searchesPerHour: 8, minSearchGapMinutes: 8,
-          appliesPerDay: 0, appliesPerHour: 0, minApplyGapMinutes: 5,
+          appliesPerDay: 0, appliesPerHour: 0, minApplyGapMinutes: 5, maxGapMinutes: 45,
           quietStart: '23:00', quietEnd: '07:00', jitterPct: 0.4,
         },
         zip_recruiter: {
           role: 'none',
           searchesPerDay: 40, searchesPerHour: 6, minSearchGapMinutes: 10,
-          appliesPerDay: 0, appliesPerHour: 0, minApplyGapMinutes: 5,
+          appliesPerDay: 0, appliesPerHour: 0, minApplyGapMinutes: 5, maxGapMinutes: 45,
           quietStart: '23:00', quietEnd: '07:00', jitterPct: 0.4,
         },
       },

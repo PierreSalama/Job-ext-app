@@ -22,7 +22,10 @@ const ago = (ms) => new Date(Date.now() - ms);
 
 test('a fresh ledger reads as zero, not as undefined', () => {
   const c = db.platformTouchCounts('linkedin');
-  assert.deepEqual(c, { search: { day: 0, hour: 0 }, apply: { day: 0, hour: 0 } },
+  // 'visit' is the third bucket: a job page we opened and walked away from, charged as an apply on
+  // dispatch and reclassified when the task ended without ever being offered a form. It is on the
+  // record but counts against NEITHER budget — see db.downgradePlatformTouch.
+  assert.deepEqual(c, { search: { day: 0, hour: 0 }, apply: { day: 0, hour: 0 }, visit: { day: 0, hour: 0 } },
     'the governor multiplies these — a missing kind must be 0, never undefined');
 });
 

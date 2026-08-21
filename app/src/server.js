@@ -16,6 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const db = require('./db');
 const safety = require('./safety');
+const { isNonAttemptSkip } = require('./apply-outcome');
 const watchlist = require('./watchlist');
 const salary = require('./salary');
 const emailSweep = require('./email-sweep');
@@ -1754,8 +1755,22 @@ async function handle(req, res, parsed) {
         // undefined, the charge would never fire, and the governor would silently stop protecting
         // the account. Resolve the job explicitly.
         const src = String(db.getJob(task.jobId)?.source || '').toLowerCase();
-        if (src) db.recordPlatformTouch(src, 'apply');
+        // Tag the charge with the task so it can be reclassified later if this session turns out
+        // never to have been offered an application form (see NON_ATTEMPT_SKIP_RX below).
+        if (src) db.recordPlatformTouch(src, 'apply', new Date(), task.id);
       } catch {}
+    }
+    // NON-ATTEMPT REFUND. We charged an application the moment the tab opened, because that is the
+    // only honest moment to charge one. These reasons all mean the same thing in hindsight: the
+    // posting had no form for us — we read the page and left. That is a page view, so reclassify
+    // the charge to 'visit' (db.downgradePlatformTouch) and give the allowance back.
+    //
+    // Deliberately narrow. A park, a mid-form failure, a CAPTCHA wall, a sign-in gate and a
+    // submission are all REAL sessions and stay charged. Under-refunding only costs throughput;
+    // over-refunding would under-count the account's real footprint, and that is the mistake that
+    // gets an account restricted.
+    if (isNonAttemptSkip(body.state, body.lastError)) {
+      try { db.downgradePlatformTouch(jm[1]); } catch {}
     }
     // LinkedIn Easy Apply daily cap hit (executor reports `easyapply-limit …`): set the
     // cooldown + learn the observed threshold, so queueNext pivots to external jobs.

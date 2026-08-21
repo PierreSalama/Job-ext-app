@@ -253,7 +253,9 @@ test('the apply budget is spent when a browser session STARTS, not merely on cla
   const body = server.slice(patch, patch + 1400);
   assert.match(body, /body\.state === 'running' && !wasRunning/,
     'charge on the transition only, so repeated progress reports cannot double-charge');
-  assert.match(body, /db\.recordPlatformTouch\(src, 'apply'\)/);
+  // The charge carries the task id so it can be reclassified as a 'visit' if this session turns
+  // out never to have been offered an application form (server.js isNonAttemptSkip).
+  assert.match(body, /db\.recordPlatformTouch\(src, 'apply', new Date\(\), task\.id\)/);
   // rowToTask exposes jobId, not a nested job: reading task.job.source would be undefined and the
   // governor would silently stop protecting the account.
   assert.match(body, /db\.getJob\(task\.jobId\)/,
