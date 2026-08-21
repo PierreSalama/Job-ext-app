@@ -605,7 +605,8 @@ async function queueNext(force = false, skipHosts = null) {
         kind: 'apply',
         requireConfig: true,
         counts: db.platformTouchCounts(platform),
-        lastTouchAt: db.lastPlatformTouchAt(platform, 'apply'),
+        lastTouchAt: db.lastPlatformTouchAt(platform, 'apply'),   // includes refunded page views — spacing
+        lastApplyAt: db.lastPlatformApplyAt(platform),            // real applications only — pacing
       }));
     }
     return safetyCache.get(platform);

@@ -142,3 +142,78 @@ test('a caller re-asking with its stored requiredGapMs gets a stable answer', ()
   const again = safety.decideTouch({ safety: s, platform: 'linkedin', kind: 'apply', counts: counts(5), lastTouchAt: now.getTime() - MIN, now, requiredGapMs: first.requiredGapMs });
   assert.equal(again.requiredGapMs, first.requiredGapMs);
 });
+
+// ---- the two clocks -------------------------------------------------------------------------
+// The floor is measured against ALL traffic (refunded page views included); the pace only against
+// real applications. Collapsing them onto one clock makes the refund cosmetic — see decideTouch.
+
+test('a refunded page view costs only the FLOOR, not a full paced gap', () => {
+  const s = { enabled: true, platforms: { linkedin: LINKEDIN } };
+  const now = at(9, 0);
+  // Last traffic 5 min ago (an external posting we peeked at and refunded); last real application
+  // 40 min ago. Floor (4 min) is satisfied, pace (~24 min) is satisfied → dispatch.
+  const d = safety.decideTouch({
+    safety: s, platform: 'linkedin', kind: 'apply', counts: counts(5),
+    lastTouchAt: now.getTime() - 5 * MIN, lastApplyAt: now.getTime() - 40 * MIN, now, rng: () => 0.5,
+  });
+  assert.equal(d.ok, true, 'a peek must not burn a whole paced interval of wall-clock');
+});
+
+test('the floor still holds against back-to-back page views', () => {
+  const s = { enabled: true, platforms: { linkedin: LINKEDIN } };
+  const now = at(9, 0);
+  const d = safety.decideTouch({
+    safety: s, platform: 'linkedin', kind: 'apply', counts: counts(5),
+    lastTouchAt: now.getTime() - 60000, lastApplyAt: now.getTime() - 40 * MIN, now, rng: () => 0.5,
+  });
+  assert.equal(d.ok, false);
+  assert.equal(d.against, 'floor', 'one minute after the last page load is too close, refunded or not');
+});
+
+test('a REAL application still costs the full paced gap', () => {
+  const s = { enabled: true, platforms: { linkedin: LINKEDIN } };
+  const now = at(9, 0);
+  const d = safety.decideTouch({
+    safety: s, platform: 'linkedin', kind: 'apply', counts: counts(5),
+    lastTouchAt: now.getTime() - 10 * MIN, lastApplyAt: now.getTime() - 10 * MIN, now, rng: () => 0.5,
+  });
+  assert.equal(d.ok, false);
+  assert.equal(d.against, 'pace', '10 min after a real application is inside the ~24-min pace');
+});
+
+test('omitting lastApplyAt reproduces the single-clock behaviour exactly', () => {
+  const s = { enabled: true, platforms: { linkedin: LINKEDIN } };
+  const now = at(9, 0);
+  const d = safety.decideTouch({
+    safety: s, platform: 'linkedin', kind: 'apply', counts: counts(5),
+    lastTouchAt: now.getTime() - 10 * MIN, now, rng: () => 0.5,
+  });
+  assert.equal(d.ok, false);
+  assert.equal(d.against, 'pace');
+});
+
+test('the whole point, as a sequence: peeks are cheap, applications are paced', () => {
+  const s = { enabled: true, platforms: { linkedin: LINKEDIN } };
+  const t0 = at(9, 0).getTime();
+  let lastTouch = t0;          // a real application just happened
+  let lastApply = t0;
+  let dispatches = 0;
+  // Walk forward a minute at a time for two hours. Two out of every three dispatches turn out to be
+  // external postings (refunded); the third is a real application.
+  for (let m = 1; m <= 120; m++) {
+    const now = new Date(t0 + m * MIN);
+    const d = safety.decideTouch({
+      safety: s, platform: 'linkedin', kind: 'apply', counts: counts(5),
+      lastTouchAt: lastTouch, lastApplyAt: lastApply, now, rng: () => 0.5,
+    });
+    if (!d.ok) continue;
+    dispatches++;
+    lastTouch = now.getTime();
+    if (dispatches % 3 === 0) lastApply = now.getTime();   // every third one really applies
+  }
+  // Under one clock this could never exceed 2h / 24min = 5 dispatches. With the clocks split, the
+  // peeks in between cost only the 4-minute floor, so the budget can actually be spent.
+  assert.ok(dispatches > 8, `expected the peeks to be cheap, got ${dispatches} dispatches in 2h`);
+  const applications = Math.floor(dispatches / 3);
+  assert.ok(applications >= 3, `and real applications still paced, got ${applications}`);
+});

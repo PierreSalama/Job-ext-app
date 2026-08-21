@@ -217,10 +217,13 @@ function jitteredPaceMs(targetMs, floorMs, jitterPct, rng = Math.random) {
 // ---- the decision ------------------------------------------------------------------------------
 
 // counts: { search: { day, hour }, apply: { day, hour } } over rolling windows
-// lastTouchAt: ms epoch of the most recent touch of THIS kind (0 = never)
+// lastTouchAt: ms epoch of the most recent touch of THIS kind (0 = never). For the apply lane this
+//              INCLUDES refunded page views, because a job page we opened is still traffic.
+// lastApplyAt: ms epoch of the most recent REAL application (0 = never; defaults to lastTouchAt).
+//              The two clocks are separate on purpose — see the note at the gap check below.
 // requiredGapMs: the jittered gap this caller already rolled (so a deferral is stable across
 //                re-asks within the same wait — the caller stores it and passes it back)
-function decideTouch({ safety, platform, kind, counts, lastTouchAt = 0, requiredGapMs = null, requireConfig = false, now = new Date(), rng = Math.random }) {
+function decideTouch({ safety, platform, kind, counts, lastTouchAt = 0, lastApplyAt = null, requiredGapMs = null, requireConfig = false, now = new Date(), rng = Math.random }) {
   const s = safety || {};
   if (s.enabled === false) return { ok: true, reason: 'safety-disabled' };
   if (requireConfig && !isConfiguredPlatform(s, platform)) return { ok: true, reason: 'ungoverned-platform', platform };
@@ -252,8 +255,17 @@ function decideTouch({ safety, platform, kind, counts, lastTouchAt = 0, required
     return { ok: false, reason: 'hourly-budget', retryAfterMs: 10 * 60000, platform, used: hour, budget: perHour };
   }
 
-  // FLOOR (never closer than this) vs PACE (how far apart we actually aim to be). The effective
-  // gap is the slower of the two, jittered — see the adaptive-pace note above.
+  // FLOOR vs PACE — measured against DIFFERENT clocks, and that distinction is what makes the
+  // refund worth anything.
+  //
+  // The floor ("never closer than this") is about traffic, so it runs off the last touch of any
+  // sort, refunded page views included. The pace ("how far apart we aim to be") is about spending
+  // the day's APPLICATION allowance evenly, so it runs off the last real application.
+  //
+  // Collapse them onto one clock and the refund becomes cosmetic: two thirds of LinkedIn dispatches
+  // turn out to be external postings, and if each of those cost a full paced gap of wall-clock the
+  // budget could never be spent — we would hand back allowance we had no time left to use. Keeping
+  // the clocks apart means a peek costs the floor (minutes) while a real application costs the pace.
   const baseGap = isApply ? cfg.minApplyGapMinutes : cfg.minSearchGapMinutes;
   const floorMs = Math.max(0, Number(baseGap) || 0) * 60000;
   const paceMs = paceGapMs({ cfg, kind, counts, now });
@@ -261,10 +273,19 @@ function decideTouch({ safety, platform, kind, counts, lastTouchAt = 0, required
   const gap = requiredGapMs == null
     ? jitteredPaceMs(targetMs, floorMs, cfg.jitterPct, rng)
     : Math.max(0, Number(requiredGapMs) || 0);
+  // Callers that do not distinguish the two (the search lane, and any older caller) fall back to
+  // the single clock, which reproduces the previous behaviour exactly.
+  const applyClock = lastApplyAt == null ? lastTouchAt : Math.max(0, Number(lastApplyAt) || 0);
   if (lastTouchAt > 0) {
-    const since = now.getTime() - lastTouchAt;
-    if (since < gap) {
-      return { ok: false, reason: 'min-gap', retryAfterMs: gap - since, requiredGapMs: gap, paceMs, floorMs, platform };
+    const sinceAny = now.getTime() - lastTouchAt;
+    if (sinceAny < floorMs) {
+      return { ok: false, reason: 'min-gap', retryAfterMs: floorMs - sinceAny, requiredGapMs: gap, paceMs, floorMs, against: 'floor', platform };
+    }
+  }
+  if (applyClock > 0 && gap > floorMs) {
+    const sinceApply = now.getTime() - applyClock;
+    if (sinceApply < gap) {
+      return { ok: false, reason: 'min-gap', retryAfterMs: gap - sinceApply, requiredGapMs: gap, paceMs, floorMs, against: 'pace', platform };
     }
   }
 

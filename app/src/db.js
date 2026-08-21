@@ -4206,6 +4206,15 @@ function lastPlatformTouchAt(platform, kind) {
   return r && r.at ? Date.parse(r.at) : 0;
 }
 
+// The REAL-application clock: 'apply' rows only, deliberately excluding the refunded 'visit' rows
+// that lastPlatformTouchAt folds in. The governor paces against this one so a run of external
+// postings costs only the minimum gap, not a full paced interval each — see safety.decideTouch.
+function lastPlatformApplyAt(platform) {
+  const r = get("SELECT at FROM platform_touches WHERE platform = ? AND kind = 'apply' ORDER BY at DESC LIMIT 1",
+                [String(platform || '').toLowerCase()]);
+  return r && r.at ? Date.parse(r.at) : 0;
+}
+
 function prunePlatformTouches(days = 7) {
   const cutoff = new Date(Date.now() - Math.max(1, Number(days) || 7) * 86400000).toISOString();
   const before = get('SELECT COUNT(*) AS n FROM platform_touches WHERE at < ?', [cutoff]);
@@ -5310,7 +5319,7 @@ module.exports = {
   queueList, queueGet, queueHistory, queueBreakdown, jobUrlsForAtsHarvest, summarizeRun, queueRunSummary, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, quarantineUntrustworthyDone, recoverRaceLostSubmissions, recoverVerifiedEvidenceFromTranscript, isTrustworthyEvidence, saveIntakeAnswer,
   classifyQueueFailure, taskSiteKey, queueActiveSiteKeys, lastStartBySiteKey,
   setEasyApplyCooldown, easyApplyCooledDown, easyApplySupplyExhausted, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
-  recordPlatformTouch, downgradePlatformTouch, platformTouchCounts, lastPlatformTouchAt, prunePlatformTouches,
+  recordPlatformTouch, downgradePlatformTouch, platformTouchCounts, lastPlatformTouchAt, lastPlatformApplyAt, prunePlatformTouches,
   triageRecord, triageUnreviewed, triagePendingEscalations, triageCoverage,
   applyTriageVerdicts, triageOrphans, selfEmailAddresses,
   setSignedOut, clearSignedOut, isSignedOut, signedOutStatus, signedOutEligible,
