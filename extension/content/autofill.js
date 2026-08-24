@@ -343,6 +343,37 @@ export function isJunkQuestionText(text) {
 // Without it a blocking checkbox group is described by its field name or by its own options
 // glued together ('0-4 / 5-10 / 10+ question_8901966005[]'), which is unanswerable. Returns
 // { label, options } — ONE question carrying the choices, or null when no clean prompt exists.
+// The sibling checkboxes that form ONE "select all that apply" question. Grouped by `name`
+// first (Greenhouse: name="question_…[]"), then by the enclosing fieldset/role=group so a
+// group whose boxes carry no shared name is still seen as a group. A LONE checkbox is never a
+// group — bare consent boxes must keep their "never auto-decide" treatment.
+export function checkboxGroupMembers(input, root) {
+  try {
+    if (!input || input.type !== 'checkbox') return [];
+    const scope = root || input.getRootNode?.() || document;
+    if (input.name) {
+      const byName = qsa(`input[type="checkbox"][name="${cssEscape(input.name)}"]`, scope);
+      if (byName.length > 1) return byName;
+    }
+    const grp = input.closest?.('fieldset, [role="group"], [class*="checkbox-group" i]');
+    if (grp) {
+      const byGroup = qsa('input[type="checkbox"]', grp);
+      if (byGroup.length > 1) return byGroup;
+    }
+    return [];
+  } catch { return []; }
+}
+
+// Some boards put `required` on EVERY option of a "select all that apply" group (measured on
+// job-boards.greenhouse.io/faire 2026-08-24: 11 boxes, all required, all 11 reported :invalid
+// until every one is ticked). The browser then only considers the group satisfied when the
+// applicant claims EVERY channel, which is not something we will ever type on Pierre's behalf.
+// Detecting the shape lets the park say what is actually wrong instead of "check this box".
+export function checkboxGroupAllRequired(input, root) {
+  const members = checkboxGroupMembers(input, root);
+  return members.length > 1 && members.every((m) => m.required);
+}
+
 export function checkboxGroupLabel(input, root) {
   try {
     if (!input || input.type !== 'checkbox') return null;
@@ -637,6 +668,40 @@ export function profileFieldFor(label, profile) {
 // `conviction` nor `criminal` and so was never blocked here. It only stayed unanswered because the
 // AI happened to decline it; the deterministic guard must not depend on that.
 export const NEVER_AUTOFILL_RX = /(ethnic|race|gender|disabilit|veteran|criminal|convict|\bcrimes?\b|background.?check|felony|sexual.?orientation|\blgbtq?)/i;
+
+// ── VOLUNTARY DEMOGRAPHIC QUESTIONS THAT ARE MARKED REQUIRED ─────────────────────────────────
+// Greenhouse's demographic section is introduced as "completely voluntary" and then ships its
+// questions with aria-required="true" + a hidden required sentinel, so the browser refuses the
+// submit until they hold a value. NEVER_AUTOFILL_RX correctly refuses to SELF-IDENTIFY — but the
+// result was a form nobody could submit, so every such posting parked.
+//
+// Declining is not self-identifying. Every one of these questions ships an explicit decline
+// option, and picking it is the neutral answer a privacy-minded person picks by hand. So: a
+// demographic field may be answered ONLY with a decline option, ONLY when it is blocking, and
+// NEVER with a substantive value.
+export const DECLINE_OPTION_RX = /((?:i )?(?:do ?n['’]?t|do not) wish to (?:answer|disclose|self[- ]?identify)|decline to (?:answer|disclose|self[- ]?identify|state)|prefer not to (?:answer|say|disclose|respond|self[- ]?identify)|choose not to (?:answer|disclose|self[- ]?identify)|(?:i )?(?:would )?rather not (?:say|answer)|no answer|opt out)/i;
+
+// Is this field part of a demographic / EEO / self-identification block? Label-based first
+// (NEVER_AUTOFILL_RX), then structural — "Which categories describe you?" names no protected
+// class at all, which is exactly how it reached the AI and got answered "Fullstack, Backend,
+// Frontend" against a list of ethnicities.
+const DEMOGRAPHIC_CONTAINER_SEL = '[id*="demographic" i],[class*="demographic" i],[id*="eeo" i],[class*="eeo" i],[id*="self-identif" i],[class*="self-identif" i],[id*="diversity" i],[class*="diversity" i]';
+export function isDemographicField(input, label) {
+  if (NEVER_AUTOFILL_RX.test(String(label || ''))) return true;
+  try { return !!input?.closest?.(DEMOGRAPHIC_CONTAINER_SEL); } catch { return false; }
+}
+
+// The decline phrasings to try, most specific first. When the field publishes its options we
+// return the site's OWN wording (so the match is exact); otherwise a short ordered list the
+// option matcher can hit by substring.
+const DECLINE_FALLBACKS = [
+  "I don't wish to answer", 'Decline to self-identify', 'Prefer not to say',
+  'Prefer not to answer', 'Decline to answer', 'I do not wish to answer',
+];
+export function declineAnswerCandidates(options) {
+  const own = (Array.isArray(options) ? options : []).filter((o) => DECLINE_OPTION_RX.test(String(o || '')));
+  return [...own, ...DECLINE_FALLBACKS];
+}
 
 // Screen-reader instructions for a combobox/listbox ("5 results available. Use Up and Down to
 // choose options, press Enter to select…") get picked up as if they were the QUESTION. The job then
@@ -987,9 +1052,25 @@ export function setNativeChecked(el, checked = true) {
 //
 // Everything in this block is PURE and exported so it is node-testable without a DOM.
 
+// A LOCATION FIELD's label is a NAME ("Location (City) *", "City", "Ville"), not a sentence.
+// Measured live on Greenhouse/faire 2026-08-24: the required screening dropdown
+//   "This role will be in-office on a hybrid schedule, can you commit to being in-office three
+//    days per week at the LOCATION where this position is posted?"
+// matched on the bare word "location", so its Yes/No answer was routed through
+// pickLocationIndex — which looks for a CITY among the options, found none, and abandoned the
+// field. The trace then blamed the widget ("typeahead no match") while the real cause was the
+// label classifier. Same shape as the Greenhouse pack's own fieldKeyFor guard: a short label is
+// a field name, a long one is a question that merely MENTIONS a place.
+const LOCATION_WORD_RX = /(\blocation\b|\bcity\b|\btown\b|\bville\b|\bciudad\b|\bstadt\b)/i;
+// Explicit location QUESTIONS, allowed at any length because they ask for a place as the answer.
+const LOCATION_PHRASE_RX = /(where are you (?:currently\s+)?(?:based|located|living)|(?:what(?:'s| is)) your (?:current\s+)?(?:location|city|city of residence)|city of residence|current city)/i;
+const LOCATION_LABEL_MAX = 60;   // "location (city) * location (city)" (a stacked label) is 33
 export function looksLikeLocationLabel(label) {
-  return /(\blocation\b|\bcity\b|\btown\b|\bville\b|\bciudad\b|\bstadt\b|where are you (?:based|located)|city of residence)/i
-    .test(String(label || ''));
+  const s = String(label || '').replace(/\s+/g, ' ').trim();
+  if (!s) return false;
+  if (LOCATION_PHRASE_RX.test(s)) return true;
+  if (!LOCATION_WORD_RX.test(s)) return false;
+  return s.length <= LOCATION_LABEL_MAX;
 }
 
 export function looksLikeSalaryLabel(label) {
@@ -1078,10 +1159,26 @@ function canonCountryFromOptionTail(s) {
 // rather than guessing, which is what the old first-match-wins pick did.
 export function pickLocationIndex(optionTexts, hint) {
   const list = Array.isArray(optionTexts) ? optionTexts : [];
-  const city = normLoc(hint?.city);
+  // The hint's "city" is whatever the user typed into a City box, and on the live profile that
+  // is literally "Toronto, ON" — a city PLUS its region. normLoc keeps the comma, so the head
+  // test below ("toronto" !== "toronto, on") vetoed EVERY option and the field was left blank on
+  // every Greenhouse/Lever/Ashby posting (trace: `left-empty (typeahead no match)`). Split the
+  // hint the same way the options are split: the leading component is the city, the rest is
+  // extra region/country evidence — used only to FILL IN what the profile didn't state, never
+  // to override it (an explicit state stays authoritative, so "Toronto, CA" can't invent
+  // California for someone whose profile says Ontario).
+  const hintParts = normLoc(hint?.city).split(',').map((p) => p.trim()).filter(Boolean);
+  const city = hintParts[0] || '';
   if (!city || !list.length) return -1;
   const wantRegion = regionKeys(hint?.state);
-  const wantCountry = canonCountryFromProfile(hint?.country);
+  if (!wantRegion.size) {
+    for (const extra of hintParts.slice(1)) for (const k of regionKeys(extra)) wantRegion.add(k);
+  }
+  // Full spellings only from the suffix (canonCountryFromOptionTail, not …FromProfile): "CA" in
+  // a city string is California as often as Canada, and guessing there is how the wrong country
+  // gets picked. An explicit profile country always wins.
+  const wantCountry = canonCountryFromProfile(hint?.country)
+    || (hintParts.length > 1 ? canonCountryFromOptionTail(hintParts[hintParts.length - 1]) : null);
 
   let best = -1, bestTier = -1, bestCount = 0;
   for (let i = 0; i < list.length; i++) {
@@ -1352,10 +1449,154 @@ export function comboboxCommitted(el) {
   } catch { return false; }
 }
 
+// ── OPTION-LIST HYGIENE (2026-08-24) ─────────────────────────────────────────────────────────
+// The option selector below carries `[class*="-option"]`, which is a SUBSTRING match on the whole
+// class attribute. react-select renders its empty state as
+//     <div class="select__menu-notice select__menu-notice--no-options …">No options</div>
+// and "--no-optionS" contains "-option", so the notice counted as an option. Measured live on
+// Greenhouse/faire: the wait loop saw 1 "option" at iteration 0, stopped waiting immediately,
+// matched nothing, and reported "typeahead no match". A notice is not an option.
+const OPTION_SEL = '[role="option"], [role="listbox"] li, [class*="typeahead"] [role="option"], [class*="typeahead-result"], .basic-typeahead__selectable, [class*="select__option"], [class*="-option"], li[role="option"]';
+const NOT_AN_OPTION_SEL = '[class*="menu-notice"],[class*="no-options"],[class*="noOptions"],[class*="loadingMessage"],[class*="loading-message"],[class*="placeholder"],[class*="indicator"]';
+const EMPTY_NOTICE_RX = /^(no options?|no results?( found)?|loading[.…]*|aucun r[ée]sultat|type to search|start typing)/i;
+function realOptions(nodes) {
+  return nodes.filter((o) => {
+    try {
+      if (!o || o.offsetParent === null) return false;
+      const t = String(o.textContent || '').trim();
+      if (!t) return false;
+      if (o.matches?.(NOT_AN_OPTION_SEL)) return false;
+      if (EMPTY_NOTICE_RX.test(t)) return false;
+      return true;
+    } catch { return false; }
+  });
+}
+
+// WHERE this control's own option list lives. Searching the whole document is why an async
+// typeahead never waited: any other widget's open menu (or the page's own hidden 244-item phone
+// country list) satisfied "options exist" on the first tick. Prefer the listbox the control
+// itself points at (react-select sets aria-controls once open), then its shell; only fall back
+// to the document, and only after a real wait, for widgets that portal their menu to <body>.
+const OPTION_SCOPE_SEL = '[class*="select-shell"],[class*="select__container"],[class*="react-select__container"],[data-select]';
+function optionScopeFor(el) {
+  try {
+    const ref = el.getAttribute?.('aria-controls') || el.getAttribute?.('aria-owns') || '';
+    for (const id of ref.split(/\s+/).filter(Boolean)) {
+      const lb = el.ownerDocument?.getElementById?.(id);
+      if (lb && realOptions(qsa(OPTION_SEL, lb)).length) return lb;
+    }
+    return el.closest?.(OPTION_SCOPE_SEL) || null;
+  } catch { return null; }
+}
+
+// A "Select all that apply" react-select. Its committed values render as .select__multi-value
+// chips and its value container is tagged --is-multi; the listbox may also say so via ARIA.
+export function isMultiCombobox(el) {
+  try {
+    const ctrl = el?.closest?.(REACT_SELECT_SEL) || el?.closest?.(OPTION_SCOPE_SEL);
+    if (ctrl && ctrl.querySelector?.('[class*="value-container--is-multi"],[class*="valueContainer--is-multi"],[class*="multi-value"],[class*="multiValue"]')) return true;
+    if (el?.getAttribute?.('aria-multiselectable') === 'true') return true;
+    const ref = el?.getAttribute?.('aria-controls') || '';
+    const lb = ref ? el.ownerDocument?.getElementById?.(ref.split(/\s+/)[0]) : null;
+    return lb?.getAttribute?.('aria-multiselectable') === 'true';
+  } catch { return false; }
+}
+function committedChips(el) {
+  try {
+    const ctrl = el?.closest?.(REACT_SELECT_SEL) || el?.closest?.(OPTION_SCOPE_SEL);
+    if (!ctrl) return [];
+    return Array.from(ctrl.querySelectorAll('[class*="multi-value"],[class*="multiValue"]'))
+      .map((n) => String(n.textContent || '').trim()).filter(Boolean);
+  } catch { return []; }
+}
+
+// A multi answer arrives as one string ("Fullstack, Backend, Frontend"). Split it into the values
+// the widget is actually asked to hold. Deliberately conservative: an option text may itself
+// contain a comma ("Toronto, Ontario, Canada"), so a single value that matches an option whole
+// is never split — the caller tries the WHOLE string first.
+export function splitMultiValue(v) {
+  return String(v == null ? '' : v)
+    .split(/\s*(?:[;|/]|,| and )\s*/i)
+    .map((s) => s.trim()).filter((s) => s.length > 1);
+}
+
+// The pointer sequence that OPENS a react widget. A bare .click() leaves aria-expanded="false"
+// on Indeed's smartapply country dropdown (measured 2026-07-20) — React binds pointer events.
+function openWidget(el) {
+  try {
+    ['pointerover', 'mouseover', 'mousemove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']
+      .forEach((ev) => el.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, view: window })));
+  } catch {
+    try { el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch {}
+    try { el.click?.(); } catch {}
+  }
+}
+function typeInto(el, v) {
+  try { setNativeValue(el, v); } catch {}
+  try { el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: v.slice(-1) })); } catch {}
+  try { el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: v.slice(-1) })); } catch {}
+}
+
+// WAIT for THIS control's option list to actually populate (async typeaheads fetch remotely).
+// Scoped-first: only after 5 ticks (~1.25s) of our own menu staying empty do we consider a
+// document-wide list, which is the portalled-menu case.
+const OPTION_WAIT_TICKS = 14;         // ~3.5s total, unchanged
+const SCOPE_FALLBACK_AFTER = 5;       // ~1.25s before a document-wide list may be trusted
+async function waitForOptions(el, ticks = OPTION_WAIT_TICKS) {
+  let opts = [];
+  for (let i = 0; i < ticks; i++) {
+    const scope = optionScopeFor(el);
+    opts = realOptions(qsa(OPTION_SEL, scope || document));
+    if (opts.length) return opts;
+    if (scope && i >= SCOPE_FALLBACK_AFTER) {
+      const portalled = realOptions(qsa(OPTION_SEL, document));
+      if (portalled.length) return portalled;
+    }
+    await sleepMs(250);
+  }
+  return opts;
+}
+
+// Choose the option this value means, or null. Location resolves by region+country (rule 2) and
+// AMBIGUITY ABANDONS; everything else is exact → prefix → contains → numeric-range.
+function bestOptionFor(opts, v, hint) {
+  const txt = (o) => (o.textContent || '').trim().toLowerCase();
+  const vl = String(v).trim().toLowerCase();
+  if (hint && hint.city) {
+    const li = pickLocationIndex(opts.map(txt), hint);
+    return li < 0 ? null : opts[li];
+  }
+  let pick = opts.find((o) => txt(o) === vl)
+    || opts.find((o) => txt(o).startsWith(vl) && vl.length > 1)
+    || opts.find((o) => vl.startsWith(txt(o)) && txt(o).length > 2)
+    || opts.find((o) => txt(o).includes(vl) && vl.length > 2);
+  // A numeric answer against RANGE options ("6" vs "5-10 years") matches nothing textually —
+  // resolve it by arithmetic instead, else the widget stays unselected and the form won't advance.
+  if (!pick) {
+    const ri = matchNumericRangeOption(v, opts.map((o) => txt(o)));
+    if (ri >= 0) pick = opts[ri];
+  }
+  return pick || null;
+}
+function clickOption(pick) {
+  try { pick.scrollIntoView?.({ block: 'nearest' }); } catch {}
+  try { pick.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch {}
+  try { pick.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch {}
+  try { pick.click?.(); } catch {}
+}
+function pressEnter(el) {
+  for (const type of ['keydown', 'keyup']) {
+    try { el.dispatchEvent(new KeyboardEvent(type, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true })); } catch {}
+  }
+}
+
 // fillCombobox(el, value, cfg?)
 //   cfg.locationHint  { city, state, country } — when present the option pick is resolved by
 //                     pickLocationIndex (region/country qualified) instead of first-prefix-wins,
 //                     and AMBIGUITY ABANDONS rather than guesses.
+//   cfg.trace         optional (reason) => void — observability only. The old code returned a
+//                     bare false, so every abandonment was logged as "typeahead no match" even
+//                     when the options were right there and the LABEL had been misclassified.
 //
 // RULE 1 (2026-08-23): every abandoned path now RESTORES the field to exactly what it was found
 // as. Previously the value was typed in first and the failure path returned false without
@@ -1363,7 +1604,9 @@ export function comboboxCommitted(el) {
 // value — the form looked filled and submitted wrong. A blank required field is honest.
 export async function fillCombobox(el, value, cfg) {
   let typed = false, before = '';
-  const revert = () => {
+  const trace = (cfg && typeof cfg.trace === 'function') ? cfg.trace : () => {};
+  const revert = (why) => {
+    try { trace(why || 'no-match'); } catch {}
     try { el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); } catch {}
     if (typed) {
       // A contentEditable combobox holds its text in the node, not in .value — restoring it
@@ -1382,68 +1625,65 @@ export async function fillCombobox(el, value, cfg) {
     if (isSiteChromeInput(el)) return false;   // never type into the global search typeahead
     const v = String(value == null ? '' : value).trim();
     if (!v) return false;
-    const vl = v.toLowerCase();
-    el.focus?.();
-    // Open with the FULL pointer sequence, not just mousedown+click. Measured live on Indeed
-    // smartapply 2026-07-20: the required country dropdown is a <div role="combobox"
-    // aria-haspopup="dialog">, and a bare .click() left aria-expanded="false" (no option list
-    // rendered at all) while the pointerover/pointerdown/pointerup/click sequence flipped it to
-    // "true" and rendered 242 options. React widgets bind pointer events, so a control that never
-    // opens yields no options, no pick, and a required field left silently empty.
-    try {
-      ['pointerover', 'mouseover', 'mousemove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']
-        .forEach((ev) => el.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, view: window })));
-    } catch {
-      try { el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch {}
-      try { el.click?.(); } catch {}
+    const hint = cfg && typeof cfg === 'object' ? cfg.locationHint : null;
+    const typeable = el.tagName === 'INPUT' || el.isContentEditable;
+    if (typeable) before = el.isContentEditable ? String(el.textContent || '') : String(el.value == null ? '' : el.value);
+
+    // ── MULTI ("Select all that apply") ──────────────────────────────────────────────────────
+    // One answer string holds several values. Typing the whole thing filters the menu to
+    // nothing ("No options") — which is exactly what the live Greenhouse trace reported as an
+    // "un-pickable widget". Commit each value in turn instead.
+    if (isMultiCombobox(el)) {
+      const startedWith = committedChips(el).length;
+      // Try the WHOLE string first: an option may legitimately contain a comma.
+      const wanted = [v, ...splitMultiValue(v).filter((s) => s.toLowerCase() !== v.toLowerCase())];
+      const taken = new Set();
+      let first = true;
+      for (const want of wanted) {
+        if (committedChips(el).length > startedWith && want === v) continue;   // whole-string already took
+        el.focus?.();
+        openWidget(el);
+        typed = typeable;
+        typeInto(el, want);
+        // The FIRST attempt gets the full async budget; once the widget has proven it renders a
+        // menu at all, later values need a short wait, not another 3.5s each (a 3-value answer
+        // that matches nothing took 14s before this).
+        const opts = await waitForOptions(el, first ? OPTION_WAIT_TICKS : 4);
+        first = false;
+        if (!opts.length) continue;
+        const pick = bestOptionFor(opts.filter((o) => !taken.has((o.textContent || '').trim())), want, null);
+        if (!pick) continue;
+        taken.add((pick.textContent || '').trim());
+        clickOption(pick);
+        await sleepMs(150);
+        if (committedChips(el).length <= startedWith + taken.size - 1) { pressEnter(el); await sleepMs(150); }
+        if (want === v && committedChips(el).length > startedWith) break;      // whole string was one option
+      }
+      const gained = committedChips(el).length - startedWith;
+      // PARTIAL SUCCESS IS SUCCESS HERE. A required "select all that apply" is satisfied by one
+      // real selection; leaving it blank because two of three values had no matching option is a
+      // guaranteed park. Nothing committed at all → rule 1: put the field back the way it was.
+      if (gained <= 0) return revert('multi: no value matched an option');
+      typed = false;                       // react-select clears its own input on each commit
+      try { el.blur?.(); } catch {}
+      trace(gained < wanted.length - 1 ? `multi: committed ${gained} of ${splitMultiValue(v).length}` : `multi: committed ${gained}`);
+      return true;
     }
+
+    // ── SINGLE ───────────────────────────────────────────────────────────────────────────────
+    el.focus?.();
+    openWidget(el);
     // Typeable combobox/typeahead (location, etc.): type the value to trigger suggestions.
     // Remember what was there first — every failure path below puts it back.
-    if (el.tagName === 'INPUT' || el.isContentEditable) {
-      before = el.isContentEditable ? String(el.textContent || '') : String(el.value == null ? '' : el.value);
-      typed = true;
-      try { setNativeValue(el, v); } catch {}
-      try { el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: v.slice(-1) })); } catch {}
-      try { el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: v.slice(-1) })); } catch {}
-    }
-    // WAIT (up to ~3.5s) for the option list to render — async typeaheads need this.
-    const SEL = '[role="option"], [role="listbox"] li, [class*="typeahead"] [role="option"], [class*="typeahead-result"], .basic-typeahead__selectable, [class*="select__option"], [class*="-option"], li[role="option"]';
-    let opts = [];
-    for (let i = 0; i < 14; i++) {
-      opts = qsa(SEL, document).filter((o) => o && o.offsetParent !== null && (o.textContent || '').trim());
-      if (opts.length) break;
-      await sleepMs(250);
-    }
-    const txt = (o) => (o.textContent || '').trim().toLowerCase();
-    let pick;
-    const hint = cfg && typeof cfg === 'object' ? cfg.locationHint : null;
-    if (hint && hint.city) {
-      // LOCATION: first-prefix-wins picked "Toronto, Ohio, United States" over
-      // "Toronto, Ontario, Canada" purely because Ohio sorts first. Resolve by region+country,
-      // and treat "cannot be sure" as a reason to leave the field ALONE (rule 1), not to guess.
-      const li = pickLocationIndex(opts.map(txt), hint);
-      if (li < 0) return revert();
-      pick = opts[li];
-    } else {
-      // exact → the typed text is a prefix of the option (LinkedIn location: "Toronto, ON"
-      // → "Toronto, Ontario, Canada") → substring. NO blind first-option pick (would mis-fill
-      // a real dropdown like years-of-experience).
-      pick = opts.find((o) => txt(o) === vl)
-        || opts.find((o) => txt(o).startsWith(vl) && vl.length > 1)
-        || opts.find((o) => vl.startsWith(txt(o)) && txt(o).length > 2)
-        || opts.find((o) => txt(o).includes(vl) && vl.length > 2);
-      // A numeric answer against RANGE options ("6" vs "5-10 years") matches nothing textually —
-      // resolve it by arithmetic instead, else the widget stays unselected and the form won't advance.
-      if (!pick) {
-        const ri = matchNumericRangeOption(v, opts.map((o) => txt(o)));
-        if (ri >= 0) pick = opts[ri];
-      }
-    }
-    if (!pick) return revert();
-    try { pick.scrollIntoView?.({ block: 'nearest' }); } catch {}
-    try { pick.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch {}
-    try { pick.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch {}
-    try { pick.click?.(); } catch {}
+    if (typeable) { typed = true; typeInto(el, v); }
+    const opts = await waitForOptions(el);
+    if (!opts.length) return revert('no options rendered');
+    // LOCATION: first-prefix-wins picked "Toronto, Ohio, United States" over
+    // "Toronto, Ontario, Canada" purely because Ohio sorts first. Resolve by region+country,
+    // and treat "cannot be sure" as a reason to leave the field ALONE (rule 1), not to guess.
+    const pick = bestOptionFor(opts, v, hint);
+    if (!pick) return revert(hint && hint.city ? 'location: no option is the profile city' : 'no matching option');
+    clickOption(pick);
     await sleepMs(150);
     // VERIFY THE COMMIT — react-select only. The click may highlight without selecting; the input
     // still shows the typed text either way, so trusting it is what produced a form that looked
@@ -1451,15 +1691,11 @@ export async function fillCombobox(el, value, cfg) {
     // click didn't take, press Enter on the focused option (the react-select keyboard commit)
     // before giving up. Non-react-select widgets keep the original, proven behaviour.
     if (isReactSelect(el)) {
-      if (!comboboxCommitted(el)) {
-        try { el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true })); } catch {}
-        try { el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true })); } catch {}
-        await sleepMs(150);
-      }
-      if (!comboboxCommitted(el)) return revert();   // could not commit → leave it untouched
+      if (!comboboxCommitted(el)) { pressEnter(el); await sleepMs(150); }
+      if (!comboboxCommitted(el)) return revert('option clicked but nothing committed');
     }
     return true;
-  } catch { return revert(); }
+  } catch { return revert('error'); }
 }
 
 export class AutofillEngine {
@@ -1523,6 +1759,7 @@ export class AutofillEngine {
     const profile = await this.getProfile();
     const out = [];
     const seenRadioGroups = new Set();
+    const seenCheckboxGroups = new Set();
     for (const input of this.fields(rootEl)) {
       if (!isFillable(input)) continue;
       if (isSiteChromeInput(input)) continue;   // never surface the global search bar / header chrome
@@ -1535,7 +1772,17 @@ export class AutofillEngine {
           : input.checked;
         if (groupChecked) continue;
       } else if (input.type === 'checkbox') {
-        continue;   // never auto-decide bare checkboxes (consents etc.)
+        // A LONE checkbox is a consent box — never auto-decided (unchanged). A checkbox GROUP
+        // ("How did you hear about us? Select all that apply") is a real screening QUESTION, and
+        // skipping it outright is why Greenhouse's required group was invisible to the scan and
+        // only ever surfaced as an unanswerable park at native validation. Surface the group
+        // ONCE, with its legend as the question and its boxes as the options.
+        const members = checkboxGroupMembers(input, rootEl);
+        if (members.length < 2) continue;
+        const gid = input.name || members[0]?.id || '';
+        if (seenCheckboxGroups.has(gid)) continue;
+        seenCheckboxGroups.add(gid);
+        if (members.some((m) => m.checked)) continue;
       } else if (input.tagName === 'SELECT') {
         if (input.selectedIndex > 0 && input.value) continue;
       } else if (input.value && String(input.value).trim() && !looksPrefilledPlaceholder(input)) {
@@ -1548,8 +1795,13 @@ export class AutofillEngine {
       // resolver (id-shaped names → heading walk-up). A radio with no recoverable prompt is
       // skipped (length<4 below) rather than asked with garbage.
       let label;
+      let groupOptions = null;
       if (input.type === 'radio') label = radioGroupLabel(input);
-      else if (input.tagName === 'SELECT') label = selectGroupLabel(input);
+      else if (input.type === 'checkbox') {
+        const g = checkboxGroupLabel(input, rootEl);
+        label = g?.label || '';
+        groupOptions = g?.options || null;
+      } else if (input.tagName === 'SELECT') label = selectGroupLabel(input);
       else label = fieldLabel(input);
       if (!label || label.length < 4) continue;
       // Not a question → never ask it. Covers combobox screen-reader help, validation words,
@@ -1580,6 +1832,8 @@ export class AutofillEngine {
       } else if (input.type === 'radio' && input.name) {
         options = qsa(`input[type="radio"][name="${cssEscape(input.name)}"]`, rootEl || document)
           .map((r) => optionLabelText(r)).filter(Boolean).slice(0, 12);
+      } else if (input.type === 'checkbox') {
+        options = groupOptions;
       }
       out.push({ input, label: label.slice(0, 250), required, fieldType: input.type || input.tagName.toLowerCase(), options });
     }
@@ -1654,14 +1908,16 @@ export class AutofillEngine {
           // custom dropdown / typeahead (Workday/Greenhouse/Lever/LinkedIn location) — async.
           // RULE 2 — a location is resolved by region+country, never by "first option that starts
           // with the typed city" (that is how "Toronto" became Toronto, OHIO).
-          const cfg = (s.field === 'city' || looksLikeLocationLabel(s.label)) ? { locationHint } : undefined;
+          let why = '';
+          const cfg = { trace: (r) => { why = r; } };
+          if (s.field === 'city' || looksLikeLocationLabel(s.label)) cfg.locationHint = locationHint;
           if (!(await fillCombobox(s.input, v, cfg))) {
             // RULE 1 — a react-select we could not COMMIT is left untouched. Typing into it makes
             // the field look answered while its value is empty, which submits wrong; blank is honest.
-            if (!isSearchableSelect || isReactSelect(s.input)) { emit(s, 'skipped-combobox-miss'); continue; }
+            if (!isSearchableSelect || isReactSelect(s.input)) { emit(s, 'skipped-combobox-miss', why); continue; }
             setNativeValue(s.input, v);          // no options appeared → it really was free text
             emit(s, 'filled');
-          } else emit(s, 'filled');
+          } else emit(s, 'filled', why || undefined);
         } else if (s.input.type === 'radio') {
           // Radio GROUPS (years-of-experience, work-authorization, salary band) are
           // not yes/no — pick the option in the group whose label best matches the
@@ -1674,6 +1930,34 @@ export class AutofillEngine {
           if (!setNativeChecked(target, true)) { emit(s, 'skipped-radio-uncommitted'); continue; }
           emit(s, 'filled');
         } else if (s.input.type === 'checkbox') {
+          // A checkbox GROUP is a "select all that apply" question, not a yes/no consent: the
+          // answer names one or more OPTIONS ("Job posting on LinkedIn, Indeed, or other job
+          // board"). Tick every box whose label the answer names. Partial is still an answer —
+          // the group is satisfied by one real tick, and a blank required group is a park.
+          const members = checkboxGroupMembers(s.input, null);
+          if (members.length > 1) {
+            const labels = members.map((m) => normForFuzzy(optionLabelText(m)));
+            // Tick AT MOST ONE box per named value. The whole answer is tried first, loosely
+            // (an option is often worded differently); the comma-split parts are then tried
+            // EXACT-only. Loose matching on the parts is how "Job posting on LinkedIn, Indeed,
+            // or other job board" also ticked "Other" — two channels claimed from one answer.
+            const tick = (want, loose) => {
+              const w = normForFuzzy(want);
+              if (!w || w.length < 2) return false;
+              let idx = labels.findIndex((l, k) => l && l === w && !members[k].checked);
+              if (idx < 0 && loose) idx = labels.findIndex((l, k) => l && (l.includes(w) || w.includes(l)) && !members[k].checked);
+              if (idx < 0 && loose) idx = bestFuzzyIndex(labels.map((l, k) => (members[k].checked ? '' : l)), want);
+              if (idx < 0 || !members[idx] || members[idx].checked) return false;
+              return setNativeChecked(members[idx], true);
+            };
+            let ticked = 0;
+            if (tick(v, true)) ticked++;
+            for (const part of splitMultiValue(v)) if (tick(part, false)) ticked++;
+            if (!ticked) { emit(s, 'skipped-no-option'); continue; }
+            emit(s, 'filled', ticked > 1 ? `${ticked} boxes` : undefined);
+            n++;
+            continue;
+          }
           const yes = /^(yes|true|y|oui|sí|si|ja|1)$/i.test(v);
           if (!yes) { emit(s, 'skipped-not-yes'); continue; }
           if (!setNativeChecked(s.input, true)) { emit(s, 'skipped-checkbox-uncommitted'); continue; }

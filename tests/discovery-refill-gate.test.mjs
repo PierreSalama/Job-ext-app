@@ -105,3 +105,69 @@ test('a gated tick does not consume a rotation slot', () => {
   assert.ok(peek < gate, 'the combo must be peeked before the per-board gate reads its board');
   assert.ok(gate < persist, 'the rotation index must only be persisted after the gate is passed');
 });
+
+// --- Fourth instance of the same invariant, live 2026-08-24 -------------------------------------
+// The gate excluded four classes of un-dispatchable queued tasks (other feeds' ATS jobs,
+// cooldown-blocked LinkedIn, signed-out LinkedIn, and host-wall deferrals) but not the fifth and
+// most absolute: tasks for a platform THIS NODE DOES NOT OWN. safety.decideTouch refuses those
+// with reason 'not-this-node' and retryAfterMs = a full DAY — they are not slow, capped or walled,
+// they can never be dispatched here at all, and only a human changing the role frees them.
+// Live on pierre-pc: 59 queued = 33 linkedin + 26 indeed, every one blocked by role:'none' (the PC
+// owns no platform, which is precisely what keeps it off Pierre's rate-limited LinkedIn account),
+// holding the count at 59 >= refillBelow 40. jobspy had not run since 2026-08-20 — 3.5 days — so
+// the queue could neither drain nor refill while the node reported 'pacing'.
+test('tasks for a platform this node does not own do not count toward "queue full"', () => {
+  const safetyCfg = {
+    enabled: true,
+    platforms: {
+      linkedin: { role: 'none' },
+      indeed: { role: 'none' },
+    },
+  };
+  // Mirrors the gate's predicate: configured AND role != primary ⇒ permanently undispatchable.
+  const notThisNode = (src) => {
+    if (!safetyCfg || safetyCfg.enabled === false) return false;
+    if (!Object.prototype.hasOwnProperty.call(safetyCfg.platforms, src)) return false;
+    return String(safetyCfg.platforms[src].role).toLowerCase() !== 'primary';
+  };
+  const queued = [
+    ...Array.from({ length: 33 }, () => ({ source: 'linkedin' })),
+    ...Array.from({ length: 26 }, () => ({ source: 'indeed' })),
+  ];
+  const refillBelow = 40;
+
+  assert.equal(queued.length >= refillBelow, true, 'precondition: raw depth exceeds the threshold');
+  const dispatchable = queued.filter((t) => !notThisNode(t.source));
+  assert.equal(dispatchable.length, 0, 'role:none makes every one of them undispatchable here');
+  assert.equal(dispatchable.length >= refillBelow, false, 'so the gate must let discovery run');
+
+  // The exclusion must NOT swallow a platform the node genuinely owns.
+  const owned = { enabled: true, platforms: { linkedin: { role: 'primary' } } };
+  const ownedBlocked = String(owned.platforms.linkedin.role).toLowerCase() !== 'primary';
+  assert.equal(ownedBlocked, false, 'a primary platform is dispatchable and must still gate');
+});
+
+test('an UNCONFIGURED platform stays dispatchable (the ungoverned ATS lane)', () => {
+  // decideTouch returns ok:'ungoverned-platform' for a platform absent from safety.platforms, so
+  // greenhouse/lever/ashby must never be excluded by the role rule — they are excluded by
+  // ATS_FEED_SOURCES instead, for the separate reason that they belong to another feed.
+  const safetyCfg = { enabled: true, platforms: { linkedin: { role: 'none' } } };
+  const notThisNode = (src) => {
+    if (!safetyCfg || safetyCfg.enabled === false) return false;
+    if (!Object.prototype.hasOwnProperty.call(safetyCfg.platforms, src)) return false;
+    return String(safetyCfg.platforms[src].role).toLowerCase() !== 'primary';
+  };
+  assert.equal(notThisNode('greenhouse'), false, 'unconfigured ⇒ ungoverned ⇒ dispatchable');
+  assert.equal(notThisNode('linkedin'), true, 'configured with role:none ⇒ undispatchable');
+});
+
+test('the app-side gate implements the not-this-node exclusion', () => {
+  const src = read('app', 'src', 'discovery', 'index.js');
+  const gate = src.slice(src.indexOf('SOURCE-AWARE refill gate'), src.indexOf('jobspyQueued >='));
+  assert.match(gate, /notThisNode/,
+    'the gate must exclude tasks for platforms this node does not own');
+  assert.match(gate, /isConfiguredPlatform/,
+    'it must defer to safety.isConfiguredPlatform so the ungoverned ATS lane is not excluded by it');
+  assert.match(gate, /!==\s*'primary'/,
+    "'primary' is what marks a platform as owned by this node (cf. safety.decideTouch)");
+});

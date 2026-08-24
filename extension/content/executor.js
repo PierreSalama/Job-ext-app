@@ -13,7 +13,7 @@
 // questions only ever come from the profile, never the AI (enforced by the
 // prompt server-side AND a local guard here).
 
-import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput, isFillable, radioGroupLabel, selectGroupLabel, isSiteChromeInput, bestFuzzyIndex, isJunkQuestionKey, isJunkQuestionText, checkboxGroupLabel, resumeUploadRefusal, nearestQuestionText, UI_INSTRUCTION_RX, isReactSelect, looksLikeLocationLabel, looksLikeSalaryLabel, salaryWouldUndercut, findPostedSalaryRange } from './autofill.js';
+import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput, isFillable, radioGroupLabel, selectGroupLabel, isSiteChromeInput, bestFuzzyIndex, isJunkQuestionKey, isJunkQuestionText, checkboxGroupLabel, checkboxGroupAllRequired, resumeUploadRefusal, nearestQuestionText, UI_INSTRUCTION_RX, isReactSelect, looksLikeLocationLabel, looksLikeSalaryLabel, salaryWouldUndercut, findPostedSalaryRange, isDemographicField, declineAnswerCandidates } from './autofill.js';
 import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
 // SUCCESS_TEXT_RX is imported for the [TRACE 9b] reject-detail diagnostic only — it reports which
@@ -1677,6 +1677,26 @@ export async function run(task, context, helpers) {
     finalState = 'parked';
   };
 
+  // DECLINE a blocking voluntary demographic question, rather than park the whole application on
+  // it. Greenhouse ships its "completely voluntary" demographic block with aria-required="true",
+  // so the browser refuses the submit until every one holds a value; measured live on faire,
+  // 2 of the 5 blockers were exactly this. We NEVER self-identify — we pick the site's OWN
+  // decline option and nothing else. Returns the wording used, or null when the field offers no
+  // way to decline (then it parks, as before).
+  async function declineDemographic(u) {
+    if (!u || !isDemographicField(u.input, u.label)) return null;
+    for (const cand of declineAnswerCandidates(u.options)) {
+      try {
+        if (await engine.fill([{ input: u.input, value: cand }])) {
+          vlog('screen', `demographic "${redactLabel(u.label)}" → declined ("${cand}") — voluntary but required`);
+          logLine('ok', `declined to answer "${u.label.slice(0, 40)}" (voluntary demographic question, marked required)`);
+          return cand;
+        }
+      } catch {}
+    }
+    return null;
+  }
+
   // ============================================================
   // FIX 1 — advance-blocked → re-scan → answer the unanswered REQUIRED field(s).
   // ============================================================
@@ -1716,6 +1736,12 @@ export async function run(task, context, helpers) {
     for (const u of unknown.slice(0, 6)) {
       if (S.cancelled) break;
       // EEO / criminal-history fields are NEVER auto-answered — they must be parked for the user.
+      // The one exception: a VOLUNTARY demographic question the site nonetheless marks required.
+      // Declining is not answering, and it is the only way the form can ever be submitted.
+      if (isDemographicField(u.input, u.label)) {
+        const declined = await declineDemographic(u);
+        if (declined) { out.filled++; continue; }
+      }
       if (NEVER_AUTOFILL_RX.test(u.label)) { decided.push({ ...u, answer: null, parkable: true, reason: 'sensitive — needs your answer' }); continue; }
       let answer = null;
       // a) AI ladder (skips legal/eligibility — those are grounded from profile below, never AI'd).
@@ -1836,7 +1862,14 @@ export async function run(task, context, helpers) {
             const grp = checkboxGroupLabel(el, form);
             if (!grp) { out.push({ label: '', message: String(el.validationMessage || '').slice(0, 120) }); continue; }
             if (out.some((o) => o.label === grp.label)) continue;   // one row per group, not one per box
-            out.push({ label: grp.label.slice(0, 200), options: grp.options, message: String(el.validationMessage || '').slice(0, 120) });
+            // "Please check this box if you want to proceed" is useless when the box is one of
+            // eleven options and the site marked ALL of them required — the browser is demanding
+            // the applicant claim every option. Say that, so the park is actionable instead of
+            // looking like a fill that failed.
+            const message = checkboxGroupAllRequired(el, form)
+              ? 'this posting marks EVERY option of this question required, so it only submits if you tick all of them — answer it yourself with the ones that are true'
+              : String(el.validationMessage || '').slice(0, 120);
+            out.push({ label: grp.label.slice(0, 200), options: grp.options, message });
             continue;
           }
           // el.name / el.id / the literal 'a required field' were the last three fallbacks here.
@@ -2944,7 +2977,11 @@ export async function run(task, context, helpers) {
         }
       }
       else if (outcome === 'skipped-no-option' || outcome === 'skipped-combobox-miss') {
-        const how = outcome === 'skipped-no-option' ? 'no matching option' : 'typeahead no match';
+        // `detail` is fillCombobox's own reason. The flat "typeahead no match" text sent a whole
+        // debugging session after the widget when the real cause was the LABEL classifier routing
+        // a Yes/No question through the location matcher — say which, always.
+        const how = String(detail || '').trim()
+          || (outcome === 'skipped-no-option' ? 'no matching option' : 'typeahead no match');
         vlog('fill', `"${lbl}" → left-empty (${how})`);
         if (suggestion.required) {
           park(suggestion.label, suggestion.fieldType || 'select', suggestion.options || null,
@@ -3073,6 +3110,17 @@ export async function run(task, context, helpers) {
     }
     for (const u of unknown) {
       if (S.cancelled) break;
+      // VOLUNTARY DEMOGRAPHIC, MARKED REQUIRED → decline, never self-identify and never guess.
+      // "Which categories describe you? Select all that apply to you:" names no protected class,
+      // so it slipped past NEVER_AUTOFILL_RX and the AI answered a list of ETHNICITIES with
+      // "Fullstack, Backend, Frontend" (conf 0.83) — which then could not be filled, and blocked
+      // the submit. Structural detection (it lives in #demographic-section) catches it.
+      if (isDemographicField(u.input, u.label)) {
+        if (u.required && await declineDemographic(u)) continue;
+        vlog('screen', `demographic "${redactLabel(u.label)}" → left blank (voluntary)`);
+        if (u.required) park(u.label, u.fieldType, u.options, 'voluntary demographic question with no decline option — your call');
+        continue;
+      }
       // GROUNDED ELIGIBILITY FIRST (any language), BEFORE the LEGAL_RX gate. LEGAL_RX's
       // "work.*authoriz" misses the common "authorized to work" word order (and all French/Spanish
       // phrasings), so those eligibility Qs used to fall through to the AI. isEligibilityScreeningQuestion

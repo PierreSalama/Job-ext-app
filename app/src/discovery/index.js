@@ -312,6 +312,34 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
       // the host wall: a task that cannot be dispatched now must never gate discovery.
       let signedOutGate = false;
       try { signedOutGate = db.isSignedOut(); } catch {}
+      // NOT THIS NODE: the FIFTH member of this family, and the most absolute of them. A platform
+      // this node does not own (safety.platforms[src].role !== 'primary') is refused by
+      // decideTouch with reason 'not-this-node' and retryAfterMs = a full DAY — deliberately, so
+      // nothing spins re-asking. Those tasks are not slow, capped or walled: they are PERMANENTLY
+      // undispatchable here, and only a human changing the role can free them. They still counted
+      // as "queue full". Live 2026-08-24 on pierre-pc: 59 queued = 33 linkedin + 26 indeed, every
+      // one blocked by role:'none' (the PC owns no platform, which is exactly what stops it from
+      // re-triggering the 2026-08-10 LinkedIn restriction), pinning the count at 59 >= refillBelow
+      // 40. jobspy had not run since 2026-08-20 — 3.5 days — so the queue could neither drain nor
+      // refill while the node reported 'pacing'. Same rule as the four other exclusions: a task
+      // that cannot be dispatched now must never gate discovery.
+      // Memoized — the filter runs per queued task (300+ on a full queue) but there are only a
+      // handful of distinct sources and the answer cannot change mid-loop (cf. safetyGateFor).
+      const roleCache = new Map();
+      const notThisNode = (src) => {
+        if (!roleCache.has(src)) {
+          let blocked = false;
+          try {
+            const sf = aa.safety;
+            // Unconfigured ⇒ ungoverned ⇒ dispatchable (the ATS lane) — mirrors decideTouch.
+            if (sf && sf.enabled !== false && safety.isConfiguredPlatform(sf, src)) {
+              blocked = String(safety.platformConfig(sf, src).role).toLowerCase() !== 'primary';
+            }
+          } catch { blocked = false; }
+          roleCache.set(src, blocked);
+        }
+        return roleCache.get(src);
+      };
       // HOST-WALL DEFERRALS DON'T COUNT (same class of starvation as the two exclusions below).
       // The dispatch breaker parks a task behind a Cloudflare/verification wall by pushing
       // scheduled_at into the FUTURE and leaving it 'queued' (server.js queueNext) — deliberately,
@@ -327,6 +355,7 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
           if (ATS_FEED_SOURCES.has(src)) return false;              // separate direct-ATS feed
           if (cooledDownGate && src === 'linkedin') return false;   // stuck (capped) during cooldown
           if (signedOutGate && src === 'linkedin') return false;    // stuck (signed out of LinkedIn)
+          if (notThisNode(src)) return false;                       // role != primary — never dispatchable here
           if (t.scheduledAt && Date.parse(t.scheduledAt) > nowMs) return false;  // host wall / not due
           return true;
         }).length;

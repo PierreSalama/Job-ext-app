@@ -22,11 +22,12 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const src = fs.readFileSync(path.join(here, '..', 'app', 'src', 'discovery', 'index.js'), 'utf8');
 const gate = src.slice(src.indexOf('const ATS_FEED_SOURCES'), src.indexOf("return { ok: false, reason: 'queue-full' }"));
 
-test('the refill gate excludes ALL FOUR kinds of undispatchable task', () => {
+test('the refill gate excludes ALL FIVE kinds of undispatchable task', () => {
   assert.match(gate, /ATS_FEED_SOURCES\.has\(src\)/, '1. the separate direct-ATS feed');
   assert.match(gate, /cooledDownGate && src === 'linkedin'/, '2. LinkedIn during the Easy-Apply cooldown');
   assert.match(gate, /signedOutGate && src === 'linkedin'/, '3. LinkedIn while signed out — THE FIX');
   assert.match(gate, /Date\.parse\(t\.scheduledAt\) > nowMs/, '4. tasks deferred behind a host wall');
+  assert.match(gate, /notThisNode\(src\)/, '5. platforms this node does not own (role != primary)');
 });
 
 test('the signed-out check is read from the latch, defensively', () => {

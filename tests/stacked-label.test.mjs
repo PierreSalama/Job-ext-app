@@ -81,8 +81,13 @@ test('label sources are read with innerText, not textContent', () => {
 });
 
 test('the combobox is opened with pointer events', () => {
-  // Live, a bare .click() left aria-expanded="false" and rendered zero options.
-  const combo = src.slice(src.indexOf('export async function fillCombobox'));
-  assert.match(combo.slice(0, combo.indexOf('const SEL')), /pointerdown/,
+  // Live, a bare .click() left aria-expanded="false" and rendered zero options. The sequence
+  // moved into openWidget() when multi-select filling was added (it opens the widget once per
+  // value); assert the opener itself, and that fillCombobox is what calls it.
+  const opener = src.slice(src.indexOf('function openWidget('), src.indexOf('function typeInto('));
+  assert.match(opener, /pointerdown/,
     'React comboboxes bind pointer events; mousedown+click alone never opens them');
+  assert.match(opener, /pointerup/, 'the full sequence, not just the down half');
+  const combo = src.slice(src.indexOf('export async function fillCombobox'));
+  assert.match(combo, /openWidget\(el\)/, 'and fillCombobox must actually use it');
 });
