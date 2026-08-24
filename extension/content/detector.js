@@ -943,6 +943,11 @@ async function runProfileAutofill(reason) {
     const root = detectApplyForm()?.form || document.body || document;
     const engine = new mod.AutofillEngine({});
     const filled = [];
+    // Read once per pass. `posted` is the JOB'S OWN stated pay band; `locationHint` is the
+    // profile's real city/region/country. Both exist because this passive path — the one that
+    // runs while Pierre fills a form BY HAND — damaged three live applications on 2026-08-22/23.
+    const posted = mod.findPostedSalaryRange(null);
+    const locationHint = { city: profile.city, state: profile.state, country: profile.country };
     for (const input of engine.fields(root)) {
       if (!mod.isFillable(input)) continue;
       if (input.tagName === 'SELECT') { if (input.selectedIndex > 0) continue; }
@@ -954,11 +959,24 @@ async function runProfileAutofill(reason) {
       let value = (af.fillProfile !== false) ? matchStructured(label, profile, mod.PROFILE_PATTERNS) : null;
       if (value == null && af.fillLearned !== false) value = matchHarvested(label, fields, af.minConfidence);
       if (value == null || value === '') continue;
+      // RULE 3 — never write an ask that sits at or below the posting's own stated floor.
+      if (mod.looksLikeSalaryLabel(label) && mod.salaryWouldUndercut(String(value), posted)) continue;
       try {
         if (input.tagName === 'SELECT') {
           const opt = mod.matchOption(input, String(value));
           if (!opt) continue;
           mod.setNativeValue(input, opt.value);
+        } else if (input.getAttribute?.('role') === 'combobox'
+          || input.closest?.('[class*="select__control"],[class*="react-select"],[class*="-control"],[class*="basic-typeahead"]')
+          || mod.looksLikeSearchableSelect(input)) {
+          // RULE 1 — this branch did not exist. Every custom dropdown (react-select country,
+          // location typeahead, yes/no screening combobox) fell through to the plain
+          // setNativeValue below, which types text the widget never commits: the field LOOKS
+          // answered, its value is empty, and submit bounces "Select a country". Drive it
+          // properly, and if it cannot be committed leave it ALONE — blank is honest.
+          // RULE 2 — a location is resolved by region+country, never first-prefix-wins.
+          const cfg = mod.looksLikeLocationLabel(label) ? { locationHint } : undefined;
+          if (!(await mod.fillCombobox(input, String(value), cfg))) continue;
         } else {
           mod.setNativeValue(input, String(value));
         }

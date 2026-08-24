@@ -173,6 +173,9 @@ chrome.alarms.onAlarm.addListener(async (a) => {
   if (a.name === 'jat11-flush') {
     const h = await api.health();
     if (h?.ok && await api.isPaired()) await api.flushQueue();
+    // The app can ask this extension to reload itself; the request rides the health probe it
+    // already makes every minute. NEVER reloads mid-application — see handleExtReload.
+    if (h?.extReload) await handleExtReload(h.extReload).catch(() => {});
     await paintBadge();
   }
   if (a.name === 'jat11-autoapply') {
@@ -1300,6 +1303,82 @@ async function reconcileAaTabsAndSlots() {
   const busy = inFlight != null ? inFlight : live.length;
   activeCount = Math.max(0, Math.min(busy, live.length, Math.max(1, currentConcurrency)));
   return live.length;
+}
+
+// ============================================================================================
+// REMOTE SELF-RELOAD — the app asks, this extension decides when it is SAFE.
+// ============================================================================================
+// The applier laptop's Chrome is launched with no --remote-debugging-port and no
+// --load-extension, so there is no CDP way in, and restarting that Chrome is off-limits (it
+// holds the real logged-in LinkedIn session). Without this the only way to pick up a code change
+// is a human clicking Reload on that specific machine — which is how it ended up three versions
+// behind for three days.
+//
+// THE HARD RULE: never reload while an application is in flight. chrome.runtime.reload() tears
+// down the service worker AND every content script instantly; doing that mid-submit loses a real
+// application to a real employer. So a reload request is DEFERRED while anything is applying, and
+// the deferral is reported back on every poll — visible in /auto-apply/live, not silent.
+const EXT_RELOAD_ACTED_KEY = 'jat11.extReloadActed';   // token(s) already handled — idempotency
+const EXT_RELOAD_MIN_GAP_MS = 5 * 60 * 1000;           // client-side rate limit, independent of the server's
+const EXT_RELOAD_LAST_KEY = 'jat11.extReloadLastAt';
+
+async function extReloadInFlightCount() {
+  // Prefer the app's authoritative in-flight count (active + scheduled); fall back to our own
+  // tracked apply tabs when the app cannot answer. Fail SAFE: unknown ⇒ assume busy.
+  try {
+    const r = await api.call('GET', '/auto-apply/live', null, 5000);
+    if (r && (Number.isFinite(r.active) || Number.isFinite(r.scheduled))) {
+      return (Number(r.active) || 0) + (Number(r.scheduled) || 0);
+    }
+  } catch {}
+  try { return Object.keys(aaTabs || {}).length; } catch {}
+  return 1;   // cannot tell → treat as busy and defer
+}
+
+async function ackExtReload(token, state, detail) {
+  try { await api.call('POST', '/ext/reload-ack', { token, state, detail: detail || '' }, 5000); } catch {}
+}
+
+async function handleExtReload(req) {
+  const token = String(req && req.token || '');
+  if (!token) return;
+
+  // IDEMPOTENT: never act twice on the same token, even across service-worker evictions.
+  let acted = [];
+  try { acted = (await chrome.storage.local.get(EXT_RELOAD_ACTED_KEY))[EXT_RELOAD_ACTED_KEY] || []; } catch {}
+  if (acted.includes(token)) return;
+
+  // RATE LIMIT: a stuck caller must not be able to reload-loop us, whatever the server says.
+  let lastAt = 0;
+  try { lastAt = (await chrome.storage.local.get(EXT_RELOAD_LAST_KEY))[EXT_RELOAD_LAST_KEY] || 0; } catch {}
+  const since = Date.now() - lastAt;
+  if (lastAt && since < EXT_RELOAD_MIN_GAP_MS) {
+    await ackExtReload(token, 'refused', `rate-limited — last reload ${Math.round(since / 1000)}s ago`);
+    return;
+  }
+
+  // THE GUARD: an application in flight outranks any reload request.
+  const busy = await extReloadInFlightCount();
+  if (busy > 0) {
+    // Deliberately NOT recorded as acted: the token stays armed server-side and we re-report
+    // every minute until the node goes idle, so a pending reload is never lost or silent.
+    await ackExtReload(token, 'deferred', `${busy} application(s) in flight — will reload when idle`);
+    return;
+  }
+
+  acted.push(token);
+  try {
+    await chrome.storage.local.set({
+      [EXT_RELOAD_ACTED_KEY]: acted.slice(-20),   // bounded
+      [EXT_RELOAD_LAST_KEY]: Date.now(),
+    });
+  } catch {}
+  // Tell the app BEFORE reloading — chrome.runtime.reload() kills this worker immediately and
+  // any in-flight fetch with it, so an ack sent after the call would never arrive.
+  await ackExtReload(token, 'reloading', 'idle — reloading now');
+  try { chrome.runtime.reload(); } catch (e) {
+    await ackExtReload(token, 'refused', `reload failed: ${e?.message || e}`);
+  }
 }
 
 // MV3 evicts the service worker after ~30s idle, which would wipe aaGroupId and make

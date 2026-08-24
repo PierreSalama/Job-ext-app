@@ -3828,6 +3828,7 @@ route('/settings', async () => {
     return { useSubscription: cg.useSubscription, apiKey: cg.apiKey || old.apiKey || '', model: cg.model || old.model || 'gpt-5.4' };
   })();
   const localAi = s.ai.local || {};
+  const remoteAi = s.ai.remote || {};
 
   const row = (label, html, hint = '') =>
     `<div class="form-row"><div class="form-label">${esc(label)}${hint ? `<div class="form-hint">${esc(hint)}</div>` : ''}</div><div class="form-control">${html}</div></div>`;
@@ -3890,6 +3891,26 @@ route('/settings', async () => {
         ${row('Structured model', `<input class="input" id="ai-local-structured" value="${esc(localAi.structuredModel || '')}" placeholder="(use recommendation)" />`, 'blank = recommended')}
         ${row('Prose model', `<input class="input" id="ai-local-prose" value="${esc(localAi.proseModel || '')}" placeholder="(use recommendation)" />`, 'blank = recommended')}
         <div class="section-body"><button class="btn small" data-test="local">Test local</button></div>
+        </div>
+      </div>
+
+      <div class="ai-prov">
+        <div class="ai-prov-head">Another computer (AI relay) ${aiDot(aiSt?.remote)}</div>
+        <div class="section-body"><div class="muted" style="line-height:1.6;font-size:13px">
+          Borrow a working model from another JAT machine on your network. This computer still builds
+          the question from <b>its own</b> profile, résumé and learned answers — only the model runs
+          over there. No keys, profile or memory leave this computer. When it's on it is tried first;
+          if the other machine is off, slow or unreachable, JAT falls straight through to the
+          providers below and then to the built-in rules.
+        </div></div>
+        ${row('Use another computer', toggle('ai-remote-enabled', !!remoteAi.enabled), 'off = nothing changes on this machine')}
+        <div id="ai-remote-body" ${remoteAi.enabled ? '' : 'hidden'}>
+        ${row('Address', `<input class="input" id="ai-remote-url" value="${esc(remoteAi.url || '')}" placeholder="http://100.93.122.106:7744" />`, "the other machine's dashboard address — it must have Remote access on")}
+        ${row('Its token', `<input class="input" id="ai-remote-token" type="password" placeholder="${state.secretsPresent && state.secretsPresent.relayToken ? 'saved — leave blank to keep current' : 'the other machine’s X-JAT-Token'}" value="" />`, 'Settings ▸ Remote access on that machine shows it')}
+        ${row('Give up after', `<input class="input" id="ai-remote-timeout" type="number" min="5" max="120" value="${esc(Math.round((remoteAi.timeoutMs || 90000) / 1000))}" />`, 'seconds — then fall through to the next provider (the applier allows 150s in total)')}
+        ${row('Name', `<input class="input" id="ai-remote-label" value="${esc(remoteAi.label || '')}" placeholder="e.g. Pierre’s PC" />`, 'cosmetic')}
+        ${aiSt?.remote?.peer ? row('Peer', `<span class="muted mono">${esc(aiSt.remote.peer)}${aiSt.remote.ms != null ? ' · ' + esc(String(aiSt.remote.ms)) + 'ms' : ''}</span>`, aiSt.remote.reason || '') : ''}
+        <div class="section-body"><button class="btn small" data-test="remote">Test the other computer</button></div>
         </div>
       </div>`;
 
@@ -4200,6 +4221,15 @@ route('/settings', async () => {
           structuredModel: v.querySelector('#ai-local-structured').value.trim(),
           proseModel: v.querySelector('#ai-local-prose').value.trim(),
         },
+        // AI relay. The token field is deliberately sent blank-when-untouched: patchSettings
+        // preserves the stored secret on a blank string, so saving this page can never wipe it.
+        remote: {
+          enabled: v.querySelector('#ai-remote-enabled').checked,
+          url: v.querySelector('#ai-remote-url').value.trim(),
+          token: v.querySelector('#ai-remote-token').value.trim(),
+          timeoutMs: Math.min(120000, Math.max(5000, (Number(v.querySelector('#ai-remote-timeout').value) || 90) * 1000)),
+          label: v.querySelector('#ai-remote-label').value.trim(),
+        },
       } };
     },
     capture: () => ({ capture: {
@@ -4279,6 +4309,11 @@ route('/settings', async () => {
   // Local-AI master: reveal/hide the card body immediately (saving still requires Save)
   v.querySelector('#ai-local-enabled')?.addEventListener('change', (e) => {
     const body = v.querySelector('#ai-local-body');
+    if (body) body.hidden = !e.target.checked;
+  });
+  // AI relay master: same reveal/hide behaviour as the local card.
+  v.querySelector('#ai-remote-enabled')?.addEventListener('change', (e) => {
+    const body = v.querySelector('#ai-remote-body');
     if (body) body.hidden = !e.target.checked;
   });
   v.querySelector('[data-setup-local]')?.addEventListener('click', async (e) => {

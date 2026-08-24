@@ -55,9 +55,35 @@ function discoverCli() {
   return null;
 }
 
-// Status probe: binary present + (best-effort) responds. We avoid a paid round-trip — binary +
-// `--version` success means it's installed and runnable; auth is validated on the first real
-// generate() call and surfaced as a CLAUDE_AUTH error (which the UI turns into a "sign in" prompt).
+// CHEAP AUTH PROBE — the half `--version` cannot see.
+//
+// The server laptop reported "● ready" for weeks: `claude --version` printed 2.1.220 and exited 0
+// while every real call died CLAUDE_RESULT_ERR. Its ~/.claude/.credentials.json held
+// { claudeAiOauth: { accessToken: '', refreshToken: '', expiresAt: 0 } } — signed out, binary fine.
+//
+// Read the file the CLI owns (never the token itself — only whether one exists) and report the
+// truth. Deliberately NARROW: we downgrade ONLY when the credentials object exists and both tokens
+// are empty, which is unambiguous. An EXPIRED access token with a refresh token present is normal
+// and healthy — that is the state of a working machine between refreshes, and calling it dead would
+// be a worse lie than the one we're fixing. A missing file is also not evidence: other platforms
+// keep credentials in an OS keychain.
+function credentialsCheck(file) {
+  let raw;
+  try { raw = fs.readFileSync(file || path.join(os.homedir(), '.claude', '.credentials.json'), 'utf8'); }
+  catch { return null; }                                   // no file → no opinion
+  let j;
+  try { j = JSON.parse(raw); } catch { return null; }      // unreadable → no opinion
+  const o = j && j.claudeAiOauth;
+  if (!o || typeof o !== 'object') return null;            // different shape → no opinion
+  const hasAccess = typeof o.accessToken === 'string' && o.accessToken.length > 0;
+  const hasRefresh = typeof o.refreshToken === 'string' && o.refreshToken.length > 0;
+  if (hasAccess || hasRefresh) return { signedIn: true };
+  return { signedIn: false, reason: 'the Claude CLI is installed but signed out (no token in ~/.claude/.credentials.json) — run `claude` on that machine and sign in' };
+}
+
+// Status probe: binary present, runnable, AND holding a credential. We still avoid a paid
+// round-trip; a live auth failure is surfaced on the first real generate() as CLAUDE_AUTH, and
+// provider.js remembers that outcome so the status stops claiming ready afterwards.
 async function status() {
   const cli = discoverCli();
   if (!cli) return { available: false, reason: 'Claude CLI not found', needsInstall: true };
@@ -70,7 +96,11 @@ async function status() {
     child.on('close', (code) => {
       clearTimeout(timer);
       const ok = code === 0;
-      resolve({ available: ok, cli, version: out.trim().slice(0, 60) || null, reason: ok ? null : (out.trim().slice(0, 200) || `exit ${code}`) });
+      const version = out.trim().slice(0, 60) || null;
+      if (!ok) return resolve({ available: false, cli, version, reason: out.trim().slice(0, 200) || `exit ${code}` });
+      const cred = credentialsCheck();
+      if (cred && !cred.signedIn) return resolve({ available: false, cli, version, reason: cred.reason, needsLogin: true });
+      resolve({ available: true, cli, version, reason: null });
     });
     child.on('error', (e) => { clearTimeout(timer); resolve({ available: false, reason: e.message }); });
   });
@@ -156,4 +186,4 @@ function login() {
   return { ok: true, message: 'Open a terminal, run `claude`, and sign in once. Then click Re-check.' };
 }
 
-module.exports = { discoverCli, status, generate, login, name: 'claude-cli' };
+module.exports = { discoverCli, status, generate, login, credentialsCheck, name: 'claude-cli' };

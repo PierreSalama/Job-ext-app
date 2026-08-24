@@ -14,13 +14,14 @@ const claudeCli = require('./claude');
 const ollama = require('./ollama');
 const anthropic = require('./anthropic');
 const openai = require('./openai');
+const remote = require('./remote');
 const deterministic = require('./deterministic');
 const db = require('../db');
 const { scope } = require('../logger');
 
 const log = scope('ai');
 
-const KNOWN = ['claude', 'chatgpt', 'local', 'ollama', 'codex'];
+const KNOWN = ['claude', 'chatgpt', 'local', 'ollama', 'codex', 'remote'];
 function resolveOrder(order) {
   if (Array.isArray(order)) {
     const out = order.map((k) => (k === 'ollama' ? 'local' : k === 'codex' ? 'chatgpt' : k)).filter((k) => KNOWN.includes(k));
@@ -60,12 +61,33 @@ function localRecommend() {
 }
 function clearHwCache() { hwCache = null; }
 
+// Is a peer relay configured AND legal for this call? Legal means: switched on, has an address,
+// and we are NOT ourselves servicing a relayed request — a relayed request must be a leaf, or two
+// nodes pointed at each other would bounce a prompt back and forth until something gave out.
+function remoteUsable(s) {
+  const cfg = s.remote || {};
+  return !!(cfg.enabled && String(cfg.url || '').trim()) && !remote.isRelayed();
+}
+
 // Build the ordered list of concrete attempts for this call.
 function buildAttempts(s, { prose, modelOverride, providerOverride }) {
-  const order = providerOverride ? resolveOrder([providerOverride]) : resolveOrder(s.order);
+  let order = providerOverride ? resolveOrder([providerOverride]) : resolveOrder(s.order);
+  // Turning the relay ON is the whole intent — you configure a peer precisely because the local
+  // models can't answer — so it leads the chain without needing a second setting to be reordered
+  // too. An explicit order that already names 'remote' is respected as written, and a
+  // providerOverride is never second-guessed.
+  if (!providerOverride && !order.includes('remote') && remoteUsable(s)) order = ['remote', ...order];
   const attempts = [];
   for (const key of order) {
-    if (key === 'claude') {
+    if (key === 'remote') {
+      const cfg = s.remote || {};
+      if (!remoteUsable(s)) continue;   // off, no address, or we are already a relay → not in the chain
+      attempts.push({
+        name: 'remote',
+        model: cfg.model || 'peer',
+        run: (a) => remote.generate({ ...a, prose, cfg, timeoutMs: cfg.timeoutMs }),
+      });
+    } else if (key === 'claude') {
       const cfg = s.claude || {};
       // SUBSCRIPTION via the official Claude CLI (subprocess) FIRST — identical secure pattern to
       // chatgpt→codex: the CLI owns its own credentials + refresh in ~/.claude; we never read,
@@ -101,6 +123,63 @@ function buildAttempts(s, { prose, modelOverride, providerOverride }) {
 
 let lastStatus = { checkedAt: 0, valid: false };
 
+// ---------------------------------------------------------------------------
+// GROUND TRUTH: what actually happened on the last REAL call, per attempt.
+//
+// Every status() above answers a weaker question than the one the dashboard asks. claude.status()
+// runs `claude --version`; codex.status() runs `codex login status`. Both passed on the server
+// laptop for weeks while every real call returned CLAUDE_RESULT_ERR / CODEX_AUTH — /ai/status said
+// "● ready", auto-apply charged full budget, and 38 applications parked on questions no model ever
+// saw. "The binary runs" is not "it can answer".
+//
+// So the chain now remembers its own outcomes and statusAll() reports THOSE. A probe may say
+// available; one real hard failure since overrides it. This costs nothing (no extra call, no
+// spawn) and cannot be fooled by a healthy binary with dead credentials.
+// ---------------------------------------------------------------------------
+const lastOutcome = new Map();   // attempt name → { ok, at, code, message }
+
+// Failures that mean "this provider cannot answer until a human fixes it". Everything else
+// (timeouts, empty output, transient CLI exits, a peer that was briefly unreachable) is noise
+// that should NOT flip a working provider to unavailable.
+const HARD_FAIL = new Set([
+  'CLAUDE_AUTH', 'CLAUDE_MISSING', 'CLAUDE_RESULT_ERR',
+  'CODEX_AUTH', 'CODEX_MISSING',
+  'ANTHROPIC_AUTH', 'ANTHROPIC_NOKEY',
+  'OPENAI_AUTH', 'OPENAI_NOKEY',
+  'REMOTE_AUTH', 'REMOTE_NO_URL', 'REMOTE_SELF', 'REMOTE_LOOP', 'REMOTE_OFF',
+]);
+
+// Which attempt names feed which status card.
+const CARD_OF = { 'claude-cli': 'claudeSub', claude: 'claudeKey', codex: 'chatgptSub', openai: 'chatgptKey', ollama: 'local', remote: 'remote' };
+
+function noteOutcome(name, ok, e) {
+  const prev = lastOutcome.get(name);
+  const code = ok ? null : (e && e.code) || 'ERR';
+  lastOutcome.set(name, { ok, at: Date.now(), code, message: ok ? null : String((e && e.message) || e || '').slice(0, 200) });
+  // A flip in provable capability must not sit behind the 30s status cache — the dashboard should
+  // show a provider going dead on the call that proved it, not half a minute later.
+  if (!prev || prev.ok !== ok || prev.code !== code) lastStatus.valid = false;
+}
+function outcomes() { return Object.fromEntries(lastOutcome); }
+function _clearOutcomes() { lastOutcome.clear(); lastStatus = { checkedAt: 0, valid: false }; }
+
+// Fold the last real outcome into an optimistic probe result.
+function honest(st, card) {
+  const names = Object.keys(CARD_OF).filter((n) => CARD_OF[n] === card);
+  let best = null;
+  for (const n of names) { const o = lastOutcome.get(n); if (o && (!best || o.at > best.at)) best = o; }
+  if (!best) return st;
+  if (best.ok) return { ...st, proven: true, provenAt: best.at };
+  if (!st.available) return { ...st, lastError: best.code, lastErrorAt: best.at };
+  if (!HARD_FAIL.has(best.code)) return { ...st, lastError: best.code, lastErrorAt: best.at };   // transient → still available
+  return {
+    ...st,
+    available: false, proven: false,
+    code: best.code, lastError: best.code, lastErrorAt: best.at,
+    reason: `installed, but the last real request failed: ${best.message || best.code}`,
+  };
+}
+
 // The disabled shape: everything unavailable with ONE consistent human reason. No probe,
 // no spawn — codex/claude-cli/ollama status checks all launch child processes, and on a
 // machine with none of them installed those probes are pure noise (and were Dad's crash source).
@@ -111,7 +190,8 @@ function disabledStatus() {
     disabled: true,
     claude: { available: false, subscription: off, apiKey: off, useSubscription: false },
     chatgpt: { available: false, subscription: off, apiKey: off, useSubscription: false },
-    local: off, codex: off, ollama: off,
+    local: off, codex: off, ollama: off, remote: off,
+    canAnswer: false,
     order: [], checkedAt: Date.now(), valid: true,
   };
 }
@@ -125,13 +205,22 @@ async function statusAll(force = false) {
   // Local off → don't even ping Ollama's port; report one clear reason instead.
   const localCfg = s.local || {};
   const localOff = { available: false, reason: 'Local AI is turned off — enable it in Settings to use Ollama.', disabled: true };
-  const [cx, claudeCliSt, ol, claudeApiSt, openaiSt] = await Promise.all([
+  const remoteCfg = s.remote || {};
+  const [cxRaw, claudeCliRaw, olRaw, claudeApiRaw, openaiRaw, remoteRaw] = await Promise.all([
     codex.status().catch((e) => ({ available: false, reason: e.message })),
     claudeCli.status().catch((e) => ({ available: false, reason: e.message })),
     localCfg.enabled ? ollama.status(localCfg).catch((e) => ({ available: false, reason: e.message })) : Promise.resolve(localOff),
     anthropic.status(claudeCfg).catch((e) => ({ available: false, reason: e.message })),
     openai.status(chatgptCfg).catch((e) => ({ available: false, reason: e.message })),
+    remote.status(remoteCfg).catch((e) => ({ available: false, reason: e.message })),
   ]);
+  // Every card below is the PROBE result reconciled with the last real call (see `honest`).
+  const cx = honest(cxRaw, 'chatgptSub');
+  const claudeCliSt = honest(claudeCliRaw, 'claudeSub');
+  const ol = honest(olRaw, 'local');
+  const claudeApiSt = honest(claudeApiRaw, 'claudeKey');
+  const openaiSt = honest(openaiRaw, 'chatgptKey');
+  const rm = honest(remoteRaw, 'remote');
   const chatgpt = {
     available: (chatgptCfg.useSubscription !== false && cx.available) || openaiSt.available,
     subscription: cx, apiKey: openaiSt, useSubscription: chatgptCfg.useSubscription !== false,
@@ -142,8 +231,13 @@ async function statusAll(force = false) {
     subscription: claudeCliSt, apiKey: claudeApiSt, useSubscription: claudeCfg.useSubscription !== false,
   };
   lastStatus = {
-    claude, chatgpt, local: ol,
+    claude, chatgpt, local: ol, remote: rm,
     codex: cx, ollama: ol,                 // legacy keys
+    // THE honest headline. "Can this computer answer a screening question with a model right
+    // now?" — not "is a binary installed". Peers read this over the relay, and the dashboard
+    // shows it, so a dead AI cannot hide behind three green probes again.
+    canAnswer: !!(claude.available || chatgpt.available || ol.available || rm.available),
+    nodeId: remote.selfId(),
     order: resolveOrder(s.order), checkedAt: Date.now(), valid: true,
   };
   return lastStatus;
@@ -202,13 +296,15 @@ async function run({ kind, prompt, system, schema, prose = false, modelOverride 
     const started = Date.now();
     try {
       const result = await att.run({ prompt, system, schema });
+      noteOutcome(att.name, true);
       db.aiLog({ provider: att.name, model: att.model, kind, ms: Date.now() - started, ok: true, promptChars: prompt.length, responseChars: result.text.length });
       return { ...result, provider: att.name, model: att.model };
     } catch (e) {
+      // Record the REAL outcome before anything else — this is what makes /ai/status honest.
+      noteOutcome(att.name, false, e);
       db.aiLog({ provider: att.name, model: att.model, kind, ms: Date.now() - started, ok: false, error: String(e.message || e).slice(0, 300), promptChars: prompt.length });
       log.warn(`${att.name} failed for ${kind}:`, e.code || '', e.message);
       errors.push({ provider: att.name, code: e.code, message: e.message });
-      if (e.code === 'CODEX_AUTH') { lastStatus.valid = false; }
     }
   }
   // Every provider (incl. local) errored — drop to the deterministic floor for the
@@ -221,4 +317,4 @@ async function run({ kind, prompt, system, schema, prose = false, modelOverride 
   throw err;
 }
 
-module.exports = { run, statusAll, resolveOrder, buildAttempts, clearHwCache };
+module.exports = { run, statusAll, resolveOrder, buildAttempts, clearHwCache, noteOutcome, outcomes, honest, remoteUsable, HARD_FAIL, _clearOutcomes };

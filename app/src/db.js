@@ -23,6 +23,7 @@ const crypto = require('crypto');
 const { DEFAULTS } = require('./config');
 const { scope } = require('./logger');
 const { score: fitScore } = require('./fit');   // P7: deterministic fit baseline for rankJob
+const answerShape = require('./answer-shape');  // recall gates: same-company + sane answer shape
 
 const log = scope('db');
 
@@ -1082,6 +1083,7 @@ const secrets = require('./secretstore');
 const SECRET_SETTINGS = [
   ['ai', 'claude.apiKey'],
   ['ai', 'chatgpt.apiKey'],
+  ['ai', 'remote.token'],           // AI relay peer's node token — sealed at rest, redacted to clients
   ['gmail', 'clientSecret'],
   ['sessionSync', 'sourceToken'],   // Dad's node token — sealed at rest, redacted to clients
 ];
@@ -1458,7 +1460,14 @@ function upsertJob(input, opts = {}) {
     status: STATUS_ORDER[input.status] ? input.status : 'started',
     submittedAt: (() => { const d = input.submittedAt ? Date.parse(input.submittedAt) : NaN; return Number.isNaN(d) ? null : new Date(d).toISOString(); })(),
     attachments: Array.isArray(input.attachments) ? input.attachments : null,
-    answers: (input.answers && typeof input.answers === 'object') ? input.answers : null,
+    // WRITE BOUNDARY for a job's captured answers. `isPlaceholderAnswer` already guards the
+    // learned-answer stores, but nothing guarded the job's own answers blob — so "Select an
+    // option" was recorded as the submitted answer on 5 live jobs (ALTEN, Aptino ×4, NLB ×2,
+    // BuzzClan ×2, Astra-North). A placeholder means the dropdown was NEVER SET: recording it
+    // claims an answer that was not given, and it later reads back as though the field was
+    // handled. Strip them here so no client version — including builds already deployed — can
+    // persist one.
+    answers: stripPlaceholderAnswers(input.answers),
     notes: input.notes !== undefined ? String(input.notes || '') : undefined,
     nextAction: input.nextAction !== undefined ? String(input.nextAction || '') : undefined,
     dueAt: input.dueAt !== undefined ? (input.dueAt || null) : undefined,
@@ -1786,6 +1795,24 @@ function isPlaceholderAnswer(v) {
   return !s || PLACEHOLDER_ANSWER_RX.test(s);
 }
 
+// Drop every placeholder-valued entry from a job's captured answers. Returns null when nothing
+// real is left, so a job whose only "answers" were unset dropdowns is honestly recorded as
+// having none. Array values are filtered member-wise (multi-selects).
+function stripPlaceholderAnswers(answers) {
+  if (!answers || typeof answers !== 'object') return null;
+  const out = {};
+  for (const [k, v] of Object.entries(answers)) {
+    if (Array.isArray(v)) {
+      const kept = v.filter((x) => !isPlaceholderAnswer(x));
+      if (kept.length) out[k] = kept;
+      continue;
+    }
+    if (isPlaceholderAnswer(v)) continue;
+    out[k] = v;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 // Would this string pollute the store if kept as a QUESTION? Measured on the live DB:
 // 231 of 2,641 qa rows (9%) are keyed by junk rather than a question — React element ids
 // ("rn", "r1s", "r20"), bare field names ("name", "email", "city") and option/UI text
@@ -1854,12 +1881,29 @@ function qaRecord({ profileId, question, answer, source, fieldType, lineageSourc
 // lookup — critical for queueParkedQuestions/queueNeedsYou which call this once PER pending question
 // across dozens of tasks, and every unanswered question falls to the fuzzy scan below (which
 // otherwise re-reads all of a profile's qa rows from the DB each time).
-function qaLookup(profileId, question, cache) {
+// RECALL GATE (see ai/answer-shape.js for the live evidence). Two questions that differ only
+// in the company name score 0.83 under the bag-of-words overlap below, so Geotab's and
+// Robinhood's screening answers were served on a 1Password application. And an answer whose
+// SHAPE does not fit the question ("Toronto, ON" for a yes/no compliance disclosure) is wrong
+// even when the words line up. Both checks apply to the EXACT match too: memory already holds
+// rows poisoned by the profile-string bug, and gating on read repairs them without touching
+// the live store. `opts.options` — when the caller knows the field's own option list — lets a
+// verbatim option through regardless of shape.
+function recallOk(asked, row, opts) {
+  try {
+    return answerShape.recallAllowed(asked, row.question || row.label || '', row.answer != null ? row.answer : row.value, opts && opts.options);
+  } catch { return true; }   // a guard must never take down the lookup
+}
+
+function qaLookup(profileId, question, cache, opts) {
   const qn = normalizeQuestion(question);
   if (!qn || !profileId) return null;
   const c = cache ? cache.qa(profileId) : null;
+  const gate = !(opts && opts.ungated);
   const exact = c ? c.byNorm.get(qn) : get('SELECT * FROM qa WHERE profile_id = ? AND question_norm = ?', [profileId, qn]);
-  if (exact && !isPlaceholderAnswer(exact.answer)) return { ...exact, match: 'exact', score: 1 };
+  if (exact && !isPlaceholderAnswer(exact.answer) && (!gate || recallOk(question, exact, opts))) {
+    return { ...exact, match: 'exact', score: 1 };
+  }
   const want = new Set(qn.split(' ').filter(Boolean));
   if (!want.size) return null;
   let best = null;
@@ -1874,7 +1918,9 @@ function qaLookup(profileId, question, cache) {
     const coverage = hit / want.size;
     const symmetric = hit / Math.max(want.size, have.size);
     const score = (hit >= 2 && coverage >= 0.75) ? coverage : symmetric;
-    if (score >= 0.6 && (!best || score > best.score)) best = { ...row, match: 'fuzzy', score };
+    if (score < 0.6) continue;
+    if (gate && !recallOk(question, row, opts)) continue;
+    if (!best || score > best.score) best = { ...row, match: 'fuzzy', score };
   }
   return best;
 }
@@ -1888,15 +1934,25 @@ function qaList(profileId, limit = 500) {
 // gave — French level, contractor rate, .NET years…), so those saved answers were never reused and
 // the same question kept parking. This surfaces BOTH, profile-fields first (highest trust: locked,
 // user-given), deduped by normalized question. Returns [{question, answer}].
-function answerMemory(profileId, limit = 16) {
+// `opts.question` — the question currently being asked, when the caller knows it. Memory rows
+// naming a DIFFERENT company are dropped from the prompt entirely. Without this the recall gate
+// in qaLookup is only half the fix: the AI path does not call qaLookup at all, it is handed this
+// list verbatim, and a model shown "How did you hear about Geotab? → LinkedIn" while answering a
+// 1Password form will happily copy it across. Same rule, applied one layer up.
+function answerMemory(profileId, limit = 16, opts = {}) {
   if (!profileId) return [];
+  const asked = opts && opts.question ? String(opts.question) : '';
+  const crossCompany = (q) => {
+    if (!asked) return false;
+    try { return answerShape.brandConflict(asked, q); } catch { return false; }
+  };
   const out = [];
   for (const f of profileFieldList(profileId)) {
     const q = f.label || ''; const a = f.value || '';
-    if (q && a && !isPlaceholderAnswer(a)) out.push({ question: q, answer: a });   // never feed a placeholder back to the AI
+    if (q && a && !isPlaceholderAnswer(a) && !crossCompany(q)) out.push({ question: q, answer: a });   // never feed a placeholder back to the AI
   }
   for (const r of qaList(profileId, 60)) {
-    if (r.question && r.answer != null && r.answer !== '' && !isPlaceholderAnswer(r.answer)) out.push({ question: r.question, answer: r.answer });
+    if (r.question && r.answer != null && r.answer !== '' && !isPlaceholderAnswer(r.answer) && !crossCompany(r.question)) out.push({ question: r.question, answer: r.answer });
   }
   const seen = new Set(); const dedup = [];
   for (const x of out) { const k = normalizeQuestion(x.question); if (k && !seen.has(k)) { seen.add(k); dedup.push(x); } }
@@ -1982,12 +2038,19 @@ function profileFieldSet(id, { value, locked, label }) {
 }
 function profileFieldDelete(id) { return (run('DELETE FROM profile_fields WHERE id = ?', [id])?.changes ?? 0) > 0; }
 
-function profileFieldLookup(profileId, question, cache) {
+function profileFieldLookup(profileId, question, cache, opts) {
   const qn = normalizeQuestion(question);
   if (!qn || !profileId) return null;
   const c = cache ? cache.pf(profileId) : null;
+  const gate = !(opts && opts.ungated);
+  // Same two gates as qaLookup — this is the OTHER half of the recall path, and it is the half
+  // that answered "are there any post-employment restrictions from your current employer?" with
+  // the stored employer name "Tacel". `label`/`value` are its column names for question/answer.
+  const fits = (r) => recallOk(question, { question: r.label, answer: r.value }, opts);
   const exact = c ? c.byNorm.get(qn) : get('SELECT * FROM profile_fields WHERE profile_id = ? AND key_norm = ?', [profileId, qn]);
-  if (exact && !isPlaceholderAnswer(exact.value)) return { ...pfRow(exact), match: 'exact', score: 1 };
+  if (exact && !isPlaceholderAnswer(exact.value) && (!gate || fits(exact))) {
+    return { ...pfRow(exact), match: 'exact', score: 1 };
+  }
   const want = new Set(qn.split(' ').filter(Boolean));
   if (!want.size) return null;
   let best = null;
@@ -1998,7 +2061,9 @@ function profileFieldLookup(profileId, question, cache) {
     const coverage = hit / want.size;
     const symmetric = hit / Math.max(want.size, have.size);
     const score = (hit >= 2 && coverage >= 0.75) ? coverage : symmetric;
-    if (score >= 0.6 && (!best || score > best.score)) best = { ...pfRow(r), match: 'fuzzy', score };
+    if (score < 0.6) continue;
+    if (gate && !fits(r)) continue;
+    if (!best || score > best.score) best = { ...pfRow(r), match: 'fuzzy', score };
   }
   return best;
 }
@@ -3499,6 +3564,36 @@ function reclaimDeadParks() {
 // minutes rather than never.
 const MAX_PARK_RESCUES = 3;
 const UI_NOISE_Q_RX = /results? available|use up and down|press enter to select|press escape|press tab to select/i;
+
+// SERVER-SIDE BACKSTOP for "this is not a question".
+//
+// The extension has its own guard (autofill.js isJunkQuestionText), but the applier laptop runs
+// whatever build is deployed there — it was three versions behind when this was written — so a
+// client-only fix does not reach the live queue. Anything that reaches the server is filtered
+// here too, which also releases junk ALREADY parked in the store rather than only stopping new
+// junk. Real strings from the live needs-you queue:
+//     'required' ×9 · 'a required field' ×9 · 'select...' · 'Review'
+//     '.remix-css-1a0ro4n-requiredinput{opacity:0;…}'
+//     '5 results available. Use Up and Down to choose options…'
+//     '0-4 / 5-10 / 10+ question_8901966005[]'
+const JUNK_Q_VALIDATION_RX = /^\s*(?:a|this|the)?\s*(?:required|mandatory|requis|obligatoire|champ\s+obligatoire|this\s+field\s+is\s+required|required\s+field|field\s+is\s+required)\s*[.*:!]?\s*$/i;
+const JUNK_Q_BUTTON_RX = /^\s*(?:review|next|continue|submit|submit\s+application|save|back|done|apply|apply\s+now|easy\s+apply|close|cancel|edit|previous|skip)\s*$/i;
+const JUNK_Q_PLACEHOLDER_RX = /^\s*(?:(?:please\s+)?(?:select|choose|pick|s[ée]lectionne[rz]|choisir)(?:\s+(?:an?|one|your|votre|une?)?\s*(?:option|answer|value|choice|one|r[ée]ponse|valeur)?)?|[-–—.·•\s]+|n\/?a|none\s+selected|start\s+typing)\s*[.…]{0,3}\s*$/i;
+const JUNK_Q_CSS_RX = /[.#][\w-]+\s*\{|\{[^}]{0,200}[\w-]+\s*:\s*[^;}]+[;}]|!important|@media\b|opacity\s*:\s*\d/i;
+const JUNK_Q_FIELDNAME_RX = /(?:^|\s)(?:question_\d{4,}|[A-Za-z_][\w-]*)\[\]\s*$|^\s*question_\d{4,}\s*$|\bq_[0-9a-f]{12,}\b/i;
+function isJunkQuestionText(text) {
+  const t = String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
+  if (!t) return true;
+  if (!/[a-z]/i.test(t)) return true;
+  if (UI_NOISE_Q_RX.test(t)) return true;
+  if (JUNK_Q_VALIDATION_RX.test(t)) return true;
+  if (JUNK_Q_BUTTON_RX.test(t)) return true;
+  if (JUNK_Q_PLACEHOLDER_RX.test(t)) return true;
+  if (JUNK_Q_CSS_RX.test(t)) return true;
+  if (JUNK_Q_FIELDNAME_RX.test(t)) return true;
+  if (isJunkQuestionKey(t)) return true;   // ids, single tokens, bare option words
+  return false;
+}
 const CAPTCHA_Q_RX = /captcha|robot check|verification wall/i;
 const SITE_LOGIN_Q_RX = /sign in(to| to) this site|sign into this site|log in(to| to) this site/i;
 
@@ -3518,7 +3613,7 @@ function retireUnanswerableParks({ loginAfterDays = 7, limit = 500 } = {}) {
     const texts = qs.map((q) => String((q && q.question) || ''));
     // EVERY question must be unactionable — one real question keeps the whole park alive, because
     // answering it is what unblocks the application.
-    const allNoise = texts.every((t) => UI_NOISE_Q_RX.test(t));
+    const allNoise = texts.every((t) => isJunkQuestionText(t));
     const allCaptcha = texts.every((t) => CAPTCHA_Q_RX.test(t));
     const allLogin = texts.every((t) => SITE_LOGIN_Q_RX.test(t));
     let why = null;
@@ -3791,6 +3886,7 @@ function queueParkedQuestions() {
     const pid = resolveProfileId(srcByJob[t.jobId]);   // check against THIS job's profile memory
     for (const q of t.pendingQuestions || []) {
       if (!q || !q.question) continue;
+      if (isJunkQuestionText(q.question)) continue;   // not a question — never ask it (see isJunkQuestionText)
       const key = normalizeQuestion(q.question);
       if (!key || seen.has(key)) continue;
       // already learned it (for this job's profile)? then it's not outstanding.
@@ -3818,6 +3914,7 @@ function queueNeedsYou() {
     const tk = rowToTask(r);
     const pid = resolveProfileId(r._src);
     const questions = (tk.pendingQuestions || []).filter((q) => q && q.question
+      && !isJunkQuestionText(q.question)     // not a question — never put it in the needs-you queue
       && !profileFieldLookup(pid, q.question, cache) && !qaLookup(pid, q.question, cache));
     return {
       taskId: tk.id, jobId: tk.jobId, state: tk.state, route: tk.applyRoute || null,
@@ -3846,7 +3943,7 @@ function queueRetryParked() {
     // four and the fifth was scraped screen-reader text. Those are recoverable applications, not
     // questions for Pierre. New junk stopped at source in v11.90.12; this releases the backlog.
     const stillMissing = pend.filter((q) => q && q.question
-      && !UI_NOISE_Q_RX.test(q.question)
+      && !isJunkQuestionText(q.question)
       && !profileFieldLookup(pid, q.question, cache) && !qaLookup(pid, q.question, cache));
     if (pend.length && stillMissing.length === 0) {
       // BOUNDED. Without this the rescue is a hot loop: requeue clears park_reason,
@@ -4641,7 +4738,10 @@ function recordOutcome({ jobId, profileId, recipeId, ats, companyKey, reward, re
     // (a) the qa answers used in this application — located by the job's answer labels.
     for (const label of Object.keys(job.answers || {})) {
       if (!label || isSensitiveKey(label)) continue;
-      const hit = qaLookup(pid, label);
+      // UNGATED on purpose: this is credit assignment for an application that already went
+      // out, so it must find the row that was actually used — including rows the recall gate
+      // would now refuse to serve again.
+      const hit = qaLookup(pid, label, null, { ungated: true });
       if (hit && hit.id && !creditOut.qa_ids.includes(hit.id)) {
         if (bumpQaReward(hit.id, effective)) creditOut.qa_ids.push(hit.id);
       }
@@ -5303,6 +5403,8 @@ module.exports = {
   listJobs, getJob, upsertJob, patchJob, deleteJob, sweepGhosted, stats, activityTrend,
   listEvents, listRecentEvents, recordEvent,
   qaRecord, qaLookup, qaList, answerMemory, qaDelete, normalizeQuestion, guessLocale,
+  answerShape,   // re-exported so callers that already hold `db` can reach the recall gates
+  isPlaceholderAnswer, stripPlaceholderAnswers, isJunkQuestionText,
   profileFieldUpsert, profileFieldList, profileFieldSet, profileFieldDelete,
   profileFieldLookup, profileAutofillBundle, harvestAnswersToProfile, backfillProfileFromJobs, deriveProfileFromLearned,
   memoryToProfileData, pushProfileDataToMemory, ensureDefaultProfileId, resolveProfileId,

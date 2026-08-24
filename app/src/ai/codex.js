@@ -54,7 +54,39 @@ function discoverCli() {
   return null;
 }
 
-// Status probe: binary found + logged in?
+// CHEAP AUTH PROBE — `codex login status` is not a freshness check.
+//
+// On the server laptop it printed "Logged in" while the stored access token had expired on
+// 2026-08-01 and `codex exec` hung instead of refreshing. Every real call returned CODEX_AUTH,
+// and /ai/status kept saying ready.
+//
+// The access token is a JWT; its `exp` claim is exact, local, and free to read. If it is in the
+// past the CLI has had every opportunity to refresh and hasn't, so it cannot answer. We read only
+// the expiry claim — never the token, never the refresh token.
+function tokenExpiry(file) {
+  let j;
+  try { j = JSON.parse(fs.readFileSync(file || path.join(CODEX_HOME, 'auth.json'), 'utf8')); }
+  catch { return null; }                                    // no file → no opinion
+  if (j && typeof j.OPENAI_API_KEY === 'string' && j.OPENAI_API_KEY) return { ok: true };   // key mode: no expiry
+  const tok = j && j.tokens && j.tokens.access_token;
+  if (typeof tok !== 'string' || !tok) return null;
+  const parts = tok.split('.');
+  if (parts.length < 2) return null;                        // not a JWT → no opinion
+  let claims;
+  try {
+    const b = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    claims = JSON.parse(Buffer.from(b + '='.repeat((4 - b.length % 4) % 4), 'base64').toString('utf8'));
+  } catch { return null; }
+  const exp = Number(claims && claims.exp);
+  if (!Number.isFinite(exp) || exp <= 0) return null;
+  if (exp * 1000 > Date.now()) return { ok: true, expiresAt: exp * 1000 };
+  return {
+    ok: false, expiresAt: exp * 1000,
+    reason: `the Codex CLI token expired on ${new Date(exp * 1000).toISOString().slice(0, 10)} and has not refreshed — run \`codex login\` on that machine`,
+  };
+}
+
+// Status probe: binary found, logged in, AND holding an unexpired token.
 async function status() {
   const cli = discoverCli();
   if (!cli) return { available: false, reason: 'codex CLI not found' };
@@ -70,12 +102,12 @@ async function status() {
     child.on('close', (code) => {
       clearTimeout(timer);
       const loggedIn = code === 0 && /logged in/i.test(out);
-      resolve({
-        available: loggedIn,
-        cli,
-        reason: loggedIn ? null : (out.trim().slice(0, 200) || `exit ${code}`),
-        needsLogin: !loggedIn,
-      });
+      if (!loggedIn) {
+        return resolve({ available: false, cli, reason: out.trim().slice(0, 200) || `exit ${code}`, needsLogin: true });
+      }
+      const exp = tokenExpiry();
+      if (exp && !exp.ok) return resolve({ available: false, cli, reason: exp.reason, needsLogin: true, expiredAt: exp.expiresAt });
+      resolve({ available: true, cli, reason: null, needsLogin: false, ...(exp && exp.expiresAt ? { expiresAt: exp.expiresAt } : {}) });
     });
     child.on('error', (e) => { clearTimeout(timer); resolve({ available: false, reason: e.message }); });
   });
@@ -196,4 +228,4 @@ function login() {
   } catch (e) { return { ok: false, error: e.message }; }
 }
 
-module.exports = { discoverCli, status, generate, login, name: 'codex' };
+module.exports = { discoverCli, status, generate, login, tokenExpiry, name: 'codex' };

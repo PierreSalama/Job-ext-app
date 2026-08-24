@@ -13,7 +13,7 @@
 // questions only ever come from the profile, never the AI (enforced by the
 // prompt server-side AND a local guard here).
 
-import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput, isFillable, radioGroupLabel, selectGroupLabel, isSiteChromeInput, bestFuzzyIndex, isJunkQuestionKey, nearestQuestionText, UI_INSTRUCTION_RX } from './autofill.js';
+import { AutofillEngine, setNativeValue, fieldLabel, fillCombobox, pickRadioInGroup, matchOption, isResumeFileInput, isFillable, radioGroupLabel, selectGroupLabel, isSiteChromeInput, bestFuzzyIndex, isJunkQuestionKey, isJunkQuestionText, checkboxGroupLabel, resumeUploadRefusal, nearestQuestionText, UI_INSTRUCTION_RX, isReactSelect, looksLikeLocationLabel, looksLikeSalaryLabel, salaryWouldUndercut, findPostedSalaryRange } from './autofill.js';
 import { detectApplyForm } from './signals/forms.js';
 import { isSubmitClick } from './signals/intent.js';
 // SUCCESS_TEXT_RX is imported for the [TRACE 9b] reject-detail diagnostic only — it reports which
@@ -1162,10 +1162,28 @@ async function tryAttachResume(root, resume) {
   const r = await send({ type: 'get-document', documentId: resume.id });
   if (!r?.ok || !r.dataBase64) { logLine('warn', 'could not fetch resume bytes from app'); return { attempted: true, attached: 0 }; }
 
+  // WHAT WE ARE ABOUT TO UPLOAD MUST ACTUALLY BE A RÉSUMÉ.
+  //
+  // There was no check here at all: whatever bytes the default 'resume' document holds were
+  // attached, under whatever name and mime it carried, at whatever size. A screenshot or a photo
+  // stored as the résumé document would be uploaded to a real employer as the applicant's résumé,
+  // and an oversized file is rejected by the ATS with a message the run then has to interpret.
+  // Both now fail LOUDLY and park, rather than proceeding as if the attach had worked.
+  const fileName = String(r.name || resume.name || 'resume.pdf');
+  const mime = String(r.mime || '');
+  // Base64 → bytes is 3/4 of the encoded length; good enough to catch an oversized file
+  // before the ATS does.
+  const approxBytes = Math.floor(String(r.dataBase64).length * 0.75);
+  const refusal = resumeUploadRefusal({ name: fileName, mime, bytes: approxBytes });
+  if (refusal) {
+    logLine('err', `refusing to upload: ${refusal}. Upload a PDF/DOC/DOCX in Documents.`);
+    return { attempted: true, attached: 0, reason: refusal };
+  }
+
   let file;
   try {
     const bytes = Uint8Array.from(atob(r.dataBase64), (c) => c.charCodeAt(0));
-    file = new File([bytes], r.name || resume.name || 'resume.pdf', { type: r.mime || 'application/pdf' });
+    file = new File([bytes], fileName, { type: mime || 'application/pdf' });
   } catch (e) {
     logLine('err', `could not build resume file (${e.message}) — your browser may block programmatic uploads here`);
     return { attempted: true, attached: 0 };
@@ -1806,8 +1824,30 @@ export async function run(task, context, helpers) {
           // from and returns the surrounding widget chrome instead. For that shape go straight to
           // the ancestor question block; only fall back to fieldLabel for normally-labelled fields.
           const unlabelled = el.getAttribute('aria-hidden') === 'true' || (!el.id && !el.name);
-          const label = (unlabelled ? nearestQuestionText(el) : '')
-            || (fieldLabel(el) || '').trim() || nearestQuestionText(el) || el.name || el.id || 'a required field';
+          // A CHECKBOX GROUP is ONE question with options, not one blocker per box and never
+          // its own option list glued together. Live junk this produced:
+          //   '0-4 / 5-10 / 10+ question_8901966005[]'
+          //   'terraform / pulumi / cloudformation / none / aws question_31344737003[]'
+          // NOTE: an unrecoverable label is reported as an EMPTY label, never dropped. The
+          // caller gates the whole submit on blockers.length, so dropping a row would let an
+          // invalid form be submitted; it already has an honest last-resort park for the
+          // "blocked but no readable question" case, and an empty label routes there.
+          if (el.type === 'checkbox') {
+            const grp = checkboxGroupLabel(el, form);
+            if (!grp) { out.push({ label: '', message: String(el.validationMessage || '').slice(0, 120) }); continue; }
+            if (out.some((o) => o.label === grp.label)) continue;   // one row per group, not one per box
+            out.push({ label: grp.label.slice(0, 200), options: grp.options, message: String(el.validationMessage || '').slice(0, 120) });
+            continue;
+          }
+          // el.name / el.id / the literal 'a required field' were the last three fallbacks here.
+          // They are the direct source of the ×9 'a required field' and the raw-field-name rows
+          // in the needs-you queue: none of the three is a question, so parking one strands the
+          // application forever. When no real prompt can be recovered, report NO blocker label —
+          // the caller already has an honest last-resort park for "the form refuses to submit
+          // but its blocking field has no readable question text".
+          let label = ((unlabelled ? nearestQuestionText(el) : '')
+            || (fieldLabel(el) || '').trim() || nearestQuestionText(el) || '').trim();
+          if (!label || isJunkQuestionText(label)) label = '';
           out.push({ label: String(label).slice(0, 200), message: String(el.validationMessage || '').slice(0, 120) });
         } catch { /* skip this element */ }
       }
@@ -2048,7 +2088,15 @@ export async function run(task, context, helpers) {
         setNativeValue(input, opt.value);
         return true;
       }
-      if (isCombo) return await fillCombobox(input, v);
+      if (isCombo) {
+        // A location must be resolved by region+country (rule 2) and anything that cannot be
+        // COMMITTED is left untouched (rule 1) — both enforced inside fillCombobox.
+        const lbl = (() => { try { return fieldLabel(input) || ''; } catch { return ''; } })();
+        const cfg = looksLikeLocationLabel(lbl)
+          ? { locationHint: { city: profileData.city, state: profileData.state, country: profileData.country } }
+          : undefined;
+        return await fillCombobox(input, v, cfg);
+      }
       if (input.type === 'radio') {
         const picked = pickRadioInGroup(input, v) || (/^(yes|true|y|oui|sí|si|ja|1)$/i.test(v) ? input : null);
         if (!picked) return false;
@@ -2064,6 +2112,11 @@ export async function run(task, context, helpers) {
         input.dispatchEvent(new Event('change', { bubbles: true }));
         return true;
       }
+      // RULE 3 — never anchor at or below the posting's own stated floor, even on the rescue path.
+      try {
+        const lbl2 = fieldLabel(input) || '';
+        if (looksLikeSalaryLabel(lbl2) && salaryWouldUndercut(v, findPostedSalaryRange(null))) return false;
+      } catch {}
       setNativeValue(input, v);
       return true;
     } catch { return false; }
@@ -2875,6 +2928,21 @@ export async function run(task, context, helpers) {
       // Parking it instead does two things: the existing `if (parked.length) reportParked(); break;`
       // checks short-circuit the loop immediately, and the question surfaces WITH ITS REAL OPTIONS,
       // so it is answerable once and then learned — the next posting fills it automatically.
+      // A salary we refused to write is a DELIBERATE skip, not a failure to match — it must park
+      // with its own reason so Pierre sets the number himself against the posted band, rather than
+      // being told "none of the options match".
+      else if (outcome === 'skipped-salary-undercut') {
+        vlog('fill', `"${lbl}" → left-empty (would anchor at/below the posting's stated range)`);
+        // Park ONLY when the field is required. A posting that pays MORE than the saved
+        // expectation is a job Pierre WANTS — parking every one of them would quietly gut the
+        // pipeline, which is the same shape of failure as a salary floor that rejects on unknown.
+        // Optional field → leave it blank and let the application go through.
+        if (suggestion.required) {
+          park(suggestion.label, suggestion.fieldType || 'text', suggestion.options || null,
+            `this posting states a pay range at or above your saved expectation — answer this one yourself so it is not anchored low`);
+          vlog('fill', `"${lbl}" is REQUIRED — parking so you set the number against their stated band`);
+        }
+      }
       else if (outcome === 'skipped-no-option' || outcome === 'skipped-combobox-miss') {
         const how = outcome === 'skipped-no-option' ? 'no matching option' : 'typeahead no match';
         vlog('fill', `"${lbl}" → left-empty (${how})`);
@@ -3499,7 +3567,7 @@ export async function run(task, context, helpers) {
         // portfolio" is a real question and must still park.
         const UPLOAD_CHATTER_RX = /upload failed|max size for files/i;
         const answerable = blockers.filter((b) => b.label && b.label.trim().length > 2
-          && !UI_INSTRUCTION_RX.test(b.label) && !isJunkQuestionKey(b.label) && !UPLOAD_CHATTER_RX.test(b.label));
+          && !isJunkQuestionText(b.label) && !UPLOAD_CHATTER_RX.test(b.label));
         const dropped = blockers.length - answerable.length;
         if (dropped) vlog('submit', `dropped ${dropped} unanswerable blocker label(s) (UI chrome, not questions)`);
         if (answerable.length) {

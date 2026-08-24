@@ -97,6 +97,36 @@ const DEFAULTS = {
       trySpawn: false,              // (requires enabled) try `ollama serve` if it's down
       exePath: '',                  // '' = resolve from PATH
     },
+
+    // AI RELAY — borrow ANOTHER JAT node's model over the tailnet/LAN.
+    //
+    // For a machine whose own providers are dead and cannot be re-authenticated: the server
+    // laptop passed every status probe (`claude --version` runs, `codex login status` says
+    // "logged in") while every real call failed CLAUDE_RESULT_ERR / CODEX_AUTH, so unfamiliar
+    // screening questions parked instead of being answered. Rather than move credentials
+    // between machines, this sends the already-built prompt to a peer's /ai/generate and uses
+    // its answer. No key, no profile, and no learned memory leave this computer.
+    //
+    // OFF by default and empty by default — a node with no peer builds exactly the attempt
+    // chain it built before this existed. When enabled it is tried FIRST (a peer is configured
+    // precisely because the local models can't answer), and it fails soft: unreachable, slow,
+    // or malformed falls straight through to the next provider and then the deterministic floor.
+    remote: {
+      enabled: false,
+      url: '',                      // e.g. 'http://100.93.122.106:7744' — the peer node's base URL
+      token: '',                    // that node's X-JAT-Token (sealed at rest, redacted to clients)
+      // Hard ceiling on ONE relayed call. The arithmetic that bounds it: the executor gives
+      // /ai/answer-question 150s. A relay timeout is followed by the local providers (a dead
+      // chain fails in ~4s) and then the deterministic floor, so 90s leaves ~55s of headroom
+      // while still allowing a real answer — a peer needs ~12s for a trivial prompt over the
+      // tailnet and can need 30-60s for a screening question with a résumé attached. Raise this
+      // only if you also raise the executor's timeout.
+      timeoutMs: 90000,
+      probeTimeoutMs: 6000,         // status/capability probe only
+      peerProvider: '',             // '' = let the peer use its own order; or pin 'chatgpt' / 'claude'
+      model: '',                    // '' = the peer's own default model
+      label: '',                    // cosmetic name for the dashboard ("Pierre's PC")
+    },
   },
 
   capture: {

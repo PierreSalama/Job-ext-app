@@ -97,7 +97,17 @@ const LAST_HEALTHY_KEY = 'jat11.lastHealthyAt';
 // last time the app answered, so the popup can ride through a brief stall.
 export async function health() {
   try {
-    const r = await fetch(BASE + '/health', { signal: AbortSignal.timeout(2500) });
+    // Report the LOADED manifest version on every probe. The applier laptop runs an UNPACKED
+    // copy that nothing updates automatically, and until this existed the app had no way to know
+    // which build was live — it sat three versions behind for three days, unnoticed, because
+    // extVersion on /auto-apply/live was always empty. This is also the carrier for the app's
+    // reload request coming back (see background.js handleExtReload).
+    let ident = '';
+    try {
+      const m = chrome.runtime.getManifest();
+      ident = `?extVersion=${encodeURIComponent(m.version || '')}&extId=${encodeURIComponent(chrome.runtime.id || '')}`;
+    } catch { ident = ''; }
+    const r = await fetch(BASE + '/health' + ident, { signal: AbortSignal.timeout(2500) });
     if (!r.ok) return null;
     const body = await r.json();
     try { await chrome.storage.local.set({ [LAST_HEALTHY_KEY]: Date.now() }); } catch {}

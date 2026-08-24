@@ -301,6 +301,87 @@ export function isJunkQuestionKey(text) {
   return false;
 }
 
+// Is this string something we must NEVER surface to Pierre as a question?
+//
+// ~30 rows in the live needs-you queue are not questions. Every one strands an application
+// permanently, because a string that is not a question can never be answered:
+//
+//   'required'                        ×9   ← a validation word
+//   'a required field'                ×9   ← nativeValidationBlockers' own literal fallback
+//   'select...'                            ← a dropdown placeholder used as the label
+//   'Review'                               ← a button
+//   '.remix-css-1a0ro4n-requiredinput{opacity:0;…}'   ← a raw CSS rule read out of a <style>
+//   '5 results available. Use Up and Down to choose options…'  ← a screen-reader announcement
+//   '0-4 / 5-10 / 10+ question_8901966005[]'          ← a checkbox group's options + field name
+//   'terraform / pulumi / cloudformation / none / aws question_31344737003[]'
+//
+// This is DISTINCT from isJunkQuestionKey (which guards what we LEARN). This guards what we
+// ASK. It is deliberately allowed to be stricter: the cost of wrongly rejecting a real
+// question is one unasked field; the cost of accepting junk is a permanently stranded job.
+const VALIDATION_WORD_RX = /^\s*(?:a|this|the)?\s*(?:required|mandatory|requis|obligatoire|champ\s+obligatoire|this\s+field\s+is\s+required|required\s+field|field\s+is\s+required)\s*[.*:!]?\s*$/i;
+const UI_BUTTON_RX = /^\s*(?:review|next|continue|submit|submit\s+application|save|back|done|apply|apply\s+now|easy\s+apply|close|cancel|edit|previous|skip)\s*$/i;
+// A CSS rule that leaked out of a <style> element and into a label.
+const CSS_SOURCE_RX = /[.#][\w-]+\s*\{|\{[^}]{0,200}[\w-]+\s*:\s*[^;}]+[;}]|!important|@media\b|opacity\s*:\s*\d/i;
+// A field NAME, not a question: Greenhouse's checkbox arrays (question_8901966005[]), any
+// trailing name[] , smartapply's q_<hex>, uuids, React-generated ids.
+const FIELD_NAME_RX = /(?:^|\s)(?:question_\d{4,}|[A-Za-z_][\w-]*)\[\]\s*$|^\s*question_\d{4,}\s*$|\bq_[0-9a-f]{12,}\b|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i;
+export function isJunkQuestionText(text) {
+  const t = String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
+  if (!t) return true;
+  if (!/[a-z]/i.test(t)) return true;                 // no letters at all — punctuation/ids
+  if (VALIDATION_WORD_RX.test(t)) return true;
+  if (UI_BUTTON_RX.test(t)) return true;
+  if (isPlaceholderOptionText(t)) return true;        // 'select...', 'Choose…', '--'
+  if (CSS_SOURCE_RX.test(t)) return true;
+  if (UI_INSTRUCTION_RX.test(t)) return true;         // screen-reader combobox help
+  if (FIELD_NAME_RX.test(t)) return true;             // ends in a raw field name / name[]
+  if (isJunkQuestionKey(t)) return true;              // ids, single tokens, bare option words
+  return false;
+}
+
+// The QUESTION for a CHECKBOX group — the same problem radioGroupLabel solves for radios.
+// Without it a blocking checkbox group is described by its field name or by its own options
+// glued together ('0-4 / 5-10 / 10+ question_8901966005[]'), which is unanswerable. Returns
+// { label, options } — ONE question carrying the choices, or null when no clean prompt exists.
+export function checkboxGroupLabel(input, root) {
+  try {
+    if (!input || input.type !== 'checkbox') return null;
+    const scope = root || input.getRootNode?.() || document;
+    const name = input.name || '';
+    const members = name
+      ? qsa(`input[type="checkbox"][name="${cssEscape(name)}"]`, scope)
+      : [input];
+    const options = members.map((m) => optionLabelText(m)).filter(Boolean).slice(0, 24);
+    const optSet = new Set(options.map((o) => o.toLowerCase()));
+    // Structured sources first (same order radioGroupLabel uses), then the generic walk-up.
+    const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    let label = '';
+    const fs = input.closest?.('fieldset');
+    if (fs) { const lg = norm(fs.querySelector?.('legend')?.textContent); if (lg.length >= 4 && !isLikelyOptionOrId(lg, optSet)) label = lg; }
+    if (!label) {
+      const grp = input.closest?.('[role="group"], [class*="checkbox-group" i], [class*="question" i]');
+      if (grp) {
+        const al = norm(grp.getAttribute?.('aria-label'));
+        if (al.length >= 4 && !isLikelyOptionOrId(al, optSet)) label = al;
+        if (!label) {
+          const lb = grp.getAttribute?.('aria-labelledby');
+          if (lb) { const t = norm(idRefText(scope.getRootNode ? scope : document, lb)); if (t.length >= 4 && !isLikelyOptionOrId(t, optSet)) label = t; }
+        }
+        if (!label) {
+          const lab = norm(grp.querySelector?.('legend, label, [class*="label" i]')?.textContent);
+          if (lab.length >= 4 && !isLikelyOptionOrId(lab, optSet)) label = lab;
+        }
+      }
+    }
+    if (!label) label = promptWalkUp(input, optSet);
+    label = norm(label);
+    // A recovered "label" that is really the option list (or a field name) is not a question.
+    if (!label || label.length < 4 || isJunkQuestionText(label)) return null;
+    for (const o of options) if (o.length > 2 && label.toLowerCase() === o.toLowerCase()) return null;
+    return { label: label.slice(0, 250), options };
+  } catch { return null; }
+}
+
 // The visible option text of a single radio (its <label> text minus the input, id-stripped).
 // Used both to build the AI's option list and as the prompt-walk-up blacklist.
 // The visible choice text for ONE radio. Order matters: every DOM-authored source is tried
@@ -480,7 +561,49 @@ export function isSiteChromeInput(input) {
   } catch { return false; }
 }
 
-function profileFieldFor(label, profile) {
+// Does this label want a BOOLEAN answer?
+//
+// PROFILE_PATTERNS below matches on any incidental word in a label, and a screening question
+// is a whole sentence, so the incidental word wins constantly. Live consequences, all real
+// stored answers:
+//
+//   "…require sponsorship … in the COUNTRY where you're applying"  → profile.country  "Canada"
+//   "do you have the unrestricted right to work in the COUNTRY …"  → profile.country  "Canada"
+//   "are you legally AUTHORIZED to work in the region…"            → the whole workAuthorization
+//                                                sentence "Authorized to work in Canada (…)"
+//
+// Every one of those fields wanted Yes or No. A profile string typed into a boolean field is
+// not a partial answer, it is a wrong one — so the profile ladder declines and the field
+// falls through to the answer path (learned memory → deterministic floor → AI), which knows
+// how to produce a boolean with the right polarity.
+//
+// DUPLICATION NOTE: app/src/answer-shape.js is the canonical implementation of this
+// classification; it cannot be imported here (CommonJS, and this file is an ES module content
+// script). tests/answer-shape-parity.test.mjs asserts the two agree on a shared corpus so
+// they cannot drift apart silently.
+const YESNO_AUX_RX = /^(?:do|does|did|are|is|was|were|have|has|had|will|would|can|could|should|shall|may|must|am|any)\b/i;
+const YESNO_PHRASE_RX = /\b(?:do you|does your|did you|are you|is your|are there|is there|have you|has your|had you|will you|would you|can you|could you|should you|may we|are we|do we|would your)\b/i;
+const WH_LEAD_RX = /^(?:what|which|where|when|who|whom|whose|how|why)\b/i;
+export function expectsYesNo(label) {
+  const s = String(label == null ? '' : label).replace(/\s+/g, ' ').trim();
+  if (!s) return false;
+  if (/\(\s*y(?:es)?\s*\/\s*n(?:o)?\s*\)/i.test(s)) return true;
+  // The operative clause is the LAST sentence — ATS prompts lead with statements
+  // ("This is a remote position. Where are you currently located?").
+  const parts = s.split(/(?<=[.!?])\s+/).map((p) => p.trim()).filter(Boolean);
+  let clause = parts[parts.length - 1] || s;
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (/\?$/.test(parts[i]) || WH_LEAD_RX.test(parts[i]) || YESNO_PHRASE_RX.test(parts[i]) || YESNO_AUX_RX.test(parts[i])) { clause = parts[i]; break; }
+  }
+  if (WH_LEAD_RX.test(clause)) return false;         // "where are you located?" is not boolean
+  return YESNO_AUX_RX.test(clause) || YESNO_PHRASE_RX.test(clause);
+}
+
+// A yes/no-shaped VALUE (so a profile field that genuinely holds "Yes"/"No" still fills a
+// boolean field — only non-boolean strings are withheld).
+const YESNO_VALUE_RX = /^\s*(?:yes|y|true|oui|si|sí|ja|no|n|false|non|nein|n\/a)\b/i;
+
+export function profileFieldFor(label, profile) {
   // Match against both the raw and accent-folded label so French fields (e.g.
   // "prénom") still hit patterns even where only the unaccented form is listed.
   const folded = stripAccents(label);
@@ -489,11 +612,14 @@ function profileFieldFor(label, profile) {
   // experience with GitHub" was grabbing the GitHub URL → "Invalid input"). Skip URL
   // fields for these; the AI estimates the years from the resume instead.
   const wantsQuantity = /\b(how many|how long|years?|number of|combien|nombre d)\b/i.test(label) || /\byears?\b/i.test(folded);
+  // A boolean field only accepts a boolean value — see expectsYesNo above.
+  const wantsBoolean = expectsYesNo(label);
   for (const [rx, field] of PROFILE_PATTERNS) {
     if (wantsQuantity && /Url$/.test(field)) continue;
     // Only scalar profile values are fillable — never stringify an array/object
     // (e.g. workHistory) into a form field.
     if ((rx.test(label) || rx.test(folded)) && profile[field] != null && profile[field] !== '' && typeof profile[field] !== 'object') {
+      if (wantsBoolean && !YESNO_VALUE_RX.test(String(profile[field]))) continue;   // never paste a profile string into a Yes/No field
       return { field, value: profile[field] };
     }
   }
@@ -679,8 +805,37 @@ export function bestFuzzyIndex(labels, value, min = FUZZY_SNAP_MIN) {
 // Pick the best <option> for a value, preferring exactness over substring so
 // '5' selects '5+ years' / '5-10 years' (longest containing match), never the
 // first DOM-order option that merely contains the digit ('3-5 years').
+// Is this <option> the dropdown's PLACEHOLDER rather than a real choice?
+//
+// A placeholder is the unset state. Selecting one sets nothing, but every layer downstream
+// reads it as an answer: it was recorded as the submitted answer ("Select an option") on 5
+// live jobs, and it was learned into memory until isPlaceholderAnswer started rejecting it.
+// Three independent tells, any one of which is enough:
+//   • the text says select/choose/please select
+//   • the text is only punctuation ("--", "—", "…") or empty
+//   • the value attribute is empty — the canonical HTML "nothing chosen" encoding
+export function isPlaceholderOption(opt) {
+  try {
+    if (!opt) return true;
+    const text = String(opt.text == null ? (opt.textContent || '') : opt.text).trim();
+    const value = String(opt.value == null ? '' : opt.value).trim();
+    if (!value && !/^(?:no|non|false|0)$/i.test(text)) return true;   // empty value = nothing chosen
+    return isPlaceholderOptionText(text);
+  } catch { return false; }
+}
+const PLACEHOLDER_OPTION_TEXT_RX = /^\s*(?:(?:please\s+)?(?:select|choose|pick|s[ée]lectionne[rz]|choisir|veuillez\s+(?:s[ée]lectionner|choisir))(?:\s+(?:an?|one|your|votre|une?)?\s*(?:option|answer|value|choice|one|r[ée]ponse|valeur)?)?|[-–—.·•\s]+|n\/?a|none\s+selected|click\s+to\s+select|start\s+typing|search)\s*[.…]{0,3}\s*$/i;
+export function isPlaceholderOptionText(text) {
+  const t = String(text == null ? '' : text).trim();
+  if (!t) return true;
+  return PLACEHOLDER_OPTION_TEXT_RX.test(t);
+}
+
 export function matchOption(select, v) {
-  const opts = Array.from(select.options);
+  // A placeholder is never a legal match — not in the exact tier, not in the substring tier,
+  // not in the fuzzy tier. (Only the fuzzy tier used to exclude it, so a poisoned learned
+  // answer of literally "Select an option" matched the placeholder EXACTLY and "committed".)
+  const opts = Array.from(select.options).filter((o) => !isPlaceholderOption(o));
+  if (!opts.length) return null;
   const vl = String(v).toLowerCase();
   const exact = opts.find((o) => o.value === v || o.text === v)
     || opts.find((o) => o.value.toLowerCase() === vl || o.text.toLowerCase().trim() === vl);
@@ -756,7 +911,10 @@ export function pickRadioInGroup(input, v) {
 }
 
 // React-proof value injection.
-export function setNativeValue(el, value) {
+// Split into a raw writer + the marking wrapper so an ABANDONED combobox attempt can put the
+// field back exactly as it was found without also claiming "we answered this" — see revertTyped()
+// in fillCombobox. Event/marking order is unchanged from the single-function version.
+function setValueRaw(el, value, mark) {
   try {
     const proto = Object.getPrototypeOf(el);
     const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set
@@ -764,9 +922,406 @@ export function setNativeValue(el, value) {
     if (setter) setter.call(el, value);
     else el.value = value;
   } catch { el.value = value; }
-  try { _jatFilledFields.add(el); } catch {}   // mark as answered-by-us (see looksPrefilledPlaceholder)
+  if (mark) { try { _jatFilledFields.add(el); } catch {} }   // answered-by-us (see looksPrefilledPlaceholder)
   el.dispatchEvent(new Event('input', { bubbles: true }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+export function setNativeValue(el, value) { setValueRaw(el, value, true); }
+
+// React-proof CHECKED injection — the radio/checkbox counterpart of setValueRaw.
+//
+// setValueRaw goes through the native `value` setter precisely so React's change tracker sees
+// the write. The radio and checkbox branches of fill() did NOT: they assigned `el.checked = true`
+// directly, which bypasses React's `checked` tracker, so React re-renders its own (unchanged)
+// state and the selection silently reverts. The form then still reports the group unanswered —
+// the live "blocked the application — could not fill the answer" park, on tasks whose answers
+// memory already holds. Re-posting the same answers cannot fix that: the failure is mechanical.
+//
+// Additive and self-verifying: set through the native setter, CHECK whether it stuck, and only
+// if it did not, fall back to a real click (on the styled <label> when the input itself is the
+// 0×0 / opacity:0 box many ATSs render — the same shape isControlOrLabelVisible exists for).
+export function setNativeChecked(el, checked = true) {
+  try {
+    const proto = Object.getPrototypeOf(el);
+    const setter = Object.getOwnPropertyDescriptor(proto, 'checked')?.set
+      || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked')?.set;
+    if (setter) setter.call(el, checked); else el.checked = checked;
+  } catch { try { el.checked = checked; } catch {} }
+  try {
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  } catch {}
+  if (el.checked === checked) return true;
+
+  // Did not stick → drive it the way a person would.
+  const targets = [];
+  try {
+    const doc = el.ownerDocument || document;
+    if (el.id) { const l = doc.querySelector(`label[for="${cssEscape(el.id)}"]`); if (l) targets.push(l); }
+    const wrap = el.closest?.('label, [role="radio"], [role="checkbox"], [data-test-text-selectable-option]');
+    if (wrap) targets.push(wrap);
+  } catch {}
+  targets.push(el);
+  for (const t of targets) {
+    try { t.click(); } catch { continue; }
+    if (el.checked === checked) return true;
+  }
+  return el.checked === checked;
+}
+
+// ── LOCATION + SALARY SAFETY ──────────────────────────────────────────────────────────────
+// Added 2026-08-23 after autofill DAMAGED three real applications Pierre was making BY HAND:
+//   1. react-selects were given the typed text but never a committed selection, so the field
+//      LOOKED filled while its value was empty and submit bounced "Select a country" /
+//      "This field is required";
+//   2. a bare "Toronto" resolved to "Toronto, Ohio, United States" on a Faire Greenhouse form —
+//      the pick was simply the FIRST option starting with the typed city (Ohio sorts before
+//      Ontario) and the profile's own province/country were never consulted;
+//   3. a stored salary expectation was written into an AutoTrader posting whose own stated band
+//      was HIGHER, anchoring the negotiation below the range before a human read a word.
+//
+// THE GOVERNING RULE, in priority order: a value we cannot COMMIT, cannot resolve UNAMBIGUOUSLY,
+// or that would UNDERCUT the posting is NOT WRITTEN AT ALL. A blank required field is honest and
+// the form catches it; a filled-looking empty one gets submitted wrong.
+//
+// Everything in this block is PURE and exported so it is node-testable without a DOM.
+
+export function looksLikeLocationLabel(label) {
+  return /(\blocation\b|\bcity\b|\btown\b|\bville\b|\bciudad\b|\bstadt\b|where are you (?:based|located)|city of residence)/i
+    .test(String(label || ''));
+}
+
+export function looksLikeSalaryLabel(label) {
+  return /(salary|compensation|remuneration|salaire|salario|(?:desired|expected|target|base)\s*(?:pay|comp)|pay\s*(?:rate|range|expectation))/i
+    .test(String(label || ''));
+}
+
+function normLoc(s) {
+  return stripAccents(String(s == null ? '' : s))
+    .toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim();
+}
+
+// Region names ⇄ abbreviations, both directions, so a profile holding "ON" and an option saying
+// "Ontario" (or the reverse) still agree. Canada and the US are listed in full because the live
+// failure was precisely a Canada/US collision on an identically-named city.
+const REGION_ABBR = {
+  alberta: 'ab', 'british columbia': 'bc', manitoba: 'mb', 'new brunswick': 'nb',
+  'newfoundland and labrador': 'nl', 'northwest territories': 'nt', 'nova scotia': 'ns',
+  nunavut: 'nu', ontario: 'on', 'prince edward island': 'pe', quebec: 'qc',
+  saskatchewan: 'sk', yukon: 'yt',
+  alabama: 'al', alaska: 'ak', arizona: 'az', arkansas: 'ar', california: 'ca', colorado: 'co',
+  connecticut: 'ct', delaware: 'de', florida: 'fl', georgia: 'ga', hawaii: 'hi', idaho: 'id',
+  illinois: 'il', indiana: 'in', iowa: 'ia', kansas: 'ks', kentucky: 'ky', louisiana: 'la',
+  maine: 'me', maryland: 'md', massachusetts: 'ma', michigan: 'mi', minnesota: 'mn',
+  mississippi: 'ms', missouri: 'mo', montana: 'mt', nebraska: 'ne', nevada: 'nv',
+  'new hampshire': 'nh', 'new jersey': 'nj', 'new mexico': 'nm', 'new york': 'ny',
+  'north carolina': 'nc', 'north dakota': 'nd', ohio: 'oh', oklahoma: 'ok', oregon: 'or',
+  pennsylvania: 'pa', 'rhode island': 'ri', 'south carolina': 'sc', 'south dakota': 'sd',
+  tennessee: 'tn', texas: 'tx', utah: 'ut', vermont: 'vt', virginia: 'va', washington: 'wa',
+  'west virginia': 'wv', wisconsin: 'wi', wyoming: 'wy',
+};
+const KNOWN_REGIONS = new Set([...Object.keys(REGION_ABBR), ...Object.values(REGION_ABBR)]);
+
+// Every spelling of a region, so "ON" and "Ontario" compare equal.
+function regionKeys(state) {
+  const out = new Set();
+  const s = normLoc(state);
+  if (!s) return out;
+  out.add(s);
+  if (REGION_ABBR[s]) out.add(REGION_ABBR[s]);
+  for (const [full, abbr] of Object.entries(REGION_ABBR)) if (abbr === s) out.add(full);
+  return out;
+}
+
+// Country canonicalisation. Deliberately split in two: a COUNTRY FIELD may safely be a bare ISO2
+// code, but a trailing option component may NOT — "CA" is California as often as Canada, "IN" is
+// Indiana, "DE" is Delaware. Reading ISO2 out of an option tail is how a matcher talks itself into
+// the wrong country, so the option side accepts only unambiguous spellings.
+const COUNTRY_FULL = {
+  canada: 'canada',
+  'united states': 'united states', 'united states of america': 'united states',
+  usa: 'united states', 'u s a': 'united states', 'u s': 'united states', america: 'united states',
+  'united kingdom': 'united kingdom', uk: 'united kingdom', 'u k': 'united kingdom',
+  'great britain': 'united kingdom', britain: 'united kingdom', england: 'united kingdom',
+  scotland: 'united kingdom', wales: 'united kingdom',
+  australia: 'australia', india: 'india', ireland: 'ireland', germany: 'germany',
+  deutschland: 'germany', france: 'france', netherlands: 'netherlands', holland: 'netherlands',
+  spain: 'spain', espana: 'spain', mexico: 'mexico', brazil: 'brazil', brasil: 'brazil',
+  'new zealand': 'new zealand', singapore: 'singapore',
+};
+const COUNTRY_ISO2 = {
+  ca: 'canada', us: 'united states', gb: 'united kingdom', au: 'australia', in: 'india',
+  ie: 'ireland', de: 'germany', fr: 'france', nl: 'netherlands', es: 'spain', mx: 'mexico',
+  br: 'brazil', nz: 'new zealand', sg: 'singapore',
+};
+function canonCountryFromProfile(s) {
+  const n = normLoc(s);
+  if (!n) return null;
+  return COUNTRY_FULL[n] || COUNTRY_ISO2[n] || null;
+}
+function canonCountryFromOptionTail(s) {
+  const n = normLoc(s);
+  if (!n) return null;
+  return COUNTRY_FULL[n] || null;      // never ISO2 here — see the note above
+}
+
+// Choose the option that is the profile's OWN city, or refuse.
+//
+// `optionTexts` are the visible option strings ("Toronto, Ontario, Canada"); `hint` is
+// { city, state, country } straight off the profile. Returns an index, or -1 meaning
+// "not sure — leave the field alone" (rule 1).
+//
+// A wrong country or a wrong province is a HARD VETO, never merely a lower score: no amount of
+// prefix similarity makes Toronto/Ohio the right answer for someone in Toronto/Ontario. Among the
+// survivors the best evidence tier wins, and a TIE AT THE BEST TIER IS AMBIGUOUS — it returns -1
+// rather than guessing, which is what the old first-match-wins pick did.
+export function pickLocationIndex(optionTexts, hint) {
+  const list = Array.isArray(optionTexts) ? optionTexts : [];
+  const city = normLoc(hint?.city);
+  if (!city || !list.length) return -1;
+  const wantRegion = regionKeys(hint?.state);
+  const wantCountry = canonCountryFromProfile(hint?.country);
+
+  let best = -1, bestTier = -1, bestCount = 0;
+  for (let i = 0; i < list.length; i++) {
+    const parts = normLoc(list[i]).split(',').map((p) => p.trim()).filter(Boolean);
+    if (!parts.length) continue;
+    const head = parts[0];
+    // The city must BE the option's leading component, not merely appear somewhere in it.
+    if (head !== city && !head.startsWith(city + ' ')) continue;
+
+    const tail = parts.length > 1 ? parts[parts.length - 1] : '';
+    const optCountry = canonCountryFromOptionTail(tail);
+    if (wantCountry && optCountry && optCountry !== wantCountry) continue;     // VETO: wrong country
+
+    // Region candidates: everything between the city and the country, plus the tail itself when
+    // the option is the two-part "City, Region" shape.
+    const mids = parts.slice(1, Math.max(1, parts.length - 1));
+    const regionCands = parts.length === 2 ? [tail] : mids;
+    let regionHit = false, regionConflict = false;
+    for (const r of regionCands) {
+      if (wantRegion.has(r)) { regionHit = true; break; }
+      if (KNOWN_REGIONS.has(r)) regionConflict = true;
+    }
+    if (wantRegion.size && regionConflict && !regionHit) continue;             // VETO: wrong region
+
+    const tier = (regionHit ? 2 : 0) + (wantCountry && optCountry === wantCountry ? 1 : 0);
+    if (tier > bestTier) { bestTier = tier; best = i; bestCount = 1; }
+    else if (tier === bestTier) bestCount++;
+  }
+  if (best < 0 || bestCount !== 1) return -1;     // nothing survived, or the best tier is a tie
+  return best;
+}
+
+// Parse a money range out of free text: "CAD 110,000-140,000", "$85,000 – $110,000 a year",
+// "110k-140k", "$60/hr". Returns { min, max, currency, interval, known } with everything
+// ANNUALISED, because comparing a raw 60 against 110000 would be nonsense.
+// `known:false` is the honest answer whenever we cannot be sure — and nothing ever blocks on an
+// unknown (the same one-directional rule app/src/salary.js is built around).
+export function parseMoneyRange(text) {
+  const miss = { min: null, max: null, currency: null, interval: null, known: false };
+  let s = String(text == null ? '' : text);
+  if (!s.trim()) return miss;
+  s = s.replace(/[‒-―−]/g, '-');        // en/em dashes → hyphen
+
+  const code = (s.match(/\b(CAD|USD|EUR|GBP|AUD)\b/i) || [])[1];
+  const sym = (s.match(/(C\$|US\$|£|€)/) || [])[1];
+  const SYM = { 'C$': 'CAD', 'US$': 'USD', '£': 'GBP', '€': 'EUR' };
+  const currency = code ? code.toUpperCase() : (sym ? SYM[sym] : null);
+
+  const interval = /(per\s*hour|hourly|\/\s*hr\b|\ban?\s*hour\b|\bhr\b)/i.test(s) ? 'hour'
+    : /(per\s*month|monthly|\/\s*mo\b|\ba\s*month\b)/i.test(s) ? 'month'
+      : /(per\s*year|per\s*annum|annually|annual|\/\s*yr\b|\ba\s*year\b)/i.test(s) ? 'year' : null;
+
+  const nums = [];
+  const rx = /(\d[\d,]*(?:\.\d+)?)\s*(k\b)?/gi;
+  let m;
+  while ((m = rx.exec(s))) {
+    let n = Number(String(m[1]).replace(/,/g, ''));
+    if (!Number.isFinite(n) || n <= 0) continue;
+    if (m[2]) n *= 1000;
+    nums.push(n);
+  }
+  if (!nums.length) return miss;
+
+  // A bare small number carrying NO currency and NO interval is not evidence of a salary — "2026"
+  // would otherwise infer as a monthly rate and annualise to six figures. Require one real signal.
+  const top = Math.max(...nums);
+  if (!currency && !interval && top < 10000) return miss;
+
+  // Annualise. An explicit interval wins; otherwise infer from magnitude, with wide bands
+  // chosen so a misread errs HIGH (i.e. toward not blocking).
+  const eff = interval || (top < 500 ? 'hour' : top < 25000 ? 'month' : 'year');
+  const mul = eff === 'hour' ? 2080 : eff === 'month' ? 12 : 1;
+  const scaled = nums.map((n) => n * mul);
+  const min = Math.min(...scaled), max = Math.max(...scaled);
+  if (max < 10000) return miss;               // not a salary — a price, a year, a count
+  return { min, max, currency, interval: eff, known: true };
+}
+
+// Would writing `profileValue` into this posting anchor BELOW what the posting itself offers?
+// True only when both sides parse AND the top of the profile's own ask is no better than the
+// bottom of the posted band — i.e. the entire ask sits at or under the posting's floor. That is
+// the exact live shape: asking "CAD 85,000–110,000" on a posting that opens at CAD 110,000.
+// Unknown, unparseable, or different-currency → FALSE (never block on a guess).
+export function salaryWouldUndercut(profileValue, postedText) {
+  const mine = parseMoneyRange(profileValue);
+  const posted = postedText && typeof postedText === 'object' && postedText.known
+    ? postedText : parseMoneyRange(postedText);
+  if (!mine.known || !posted.known) return false;
+  if (mine.currency && posted.currency && mine.currency !== posted.currency) return false;
+  const myTop = mine.max != null ? mine.max : mine.min;
+  if (myTop == null || posted.min == null) return false;
+  return myTop <= posted.min;
+}
+
+// SHOULD WE REFUSE TO UPLOAD THIS FILE AS A RÉSUMÉ?
+//
+// The attach path had NO check: whatever bytes the default 'resume' document holds were sent to
+// the employer under whatever name, type and size they carried. A photo stored as the résumé
+// document would be uploaded to a real employer as the applicant's résumé, and an oversized file
+// is rejected by the ATS with a message the run then has to interpret.
+//
+// Returns a human-readable reason to refuse, or null to proceed. Pure, so it is testable without
+// a browser (executor.js cannot be imported under node).
+//
+// NOTE ON THE REPORTED SYMPTOM: the queue row reading
+//     "Resume Uploading... fileuploaded.jpg Upload failed. Max size for files is 10 MB."
+// is the upload widget's OWN on-screen chatter scraped as a question label — 'fileuploaded.jpg'
+// is the site's placeholder text, not a file JAT chose. That is a label-scraping bug (see
+// isJunkQuestionText / UPLOAD_CHATTER_RX), not proof that an image was ever attached. This guard
+// exists because nothing prevented it, not because it was observed.
+const RESUME_DOC_EXT = new Set(['pdf', 'doc', 'docx', 'rtf', 'txt', 'odt', 'pages']);
+const IMAGE_EXT = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'heic', 'tif', 'tiff', 'svg'];
+export const MAX_RESUME_UPLOAD_BYTES = 10 * 1024 * 1024;   // the limit the live failure reported
+export function resumeUploadRefusal({ name, mime, bytes } = {}) {
+  const fileName = String(name || '');
+  const type = String(mime || '');
+  const ext = (fileName.match(/\.([a-z0-9]+)\s*$/i) || [, ''])[1].toLowerCase();
+  const isImage = /^image\//i.test(type) || IMAGE_EXT.includes(ext);
+  if (isImage) return `the résumé on file is "${fileName || 'unnamed'}" (${type || 'image'}) — an image, not a résumé document`;
+  if (ext && !RESUME_DOC_EXT.has(ext)) return `the résumé on file is "${fileName}" (.${ext}) — not a résumé document`;
+  if (!ext && type && !/pdf|word|officedocument|rtf|text|opendocument/i.test(type)) {
+    return `the résumé on file has an unusable type (${type})`;
+  }
+  const n = Number(bytes);
+  if (Number.isFinite(n) && n > MAX_RESUME_UPLOAD_BYTES) {
+    return `the résumé on file is ~${(n / 1048576).toFixed(1)} MB — over the 10 MB limit most ATSs enforce`;
+  }
+  return null;
+}
+
+// Does this control demand a plain NUMBER rather than free text?
+//
+// Live block reason: "Enter a decimal number larger than 0.0". A range string
+// ("CAD 115,000–140,000") in a numeric field never validates, so the field stays blocking and
+// the task re-parks on every retry — one of the jobs in the queue is stuck on exactly this.
+export function isNumericField(input) {
+  try {
+    if (!input) return false;
+    if (String(input.type || '').toLowerCase() === 'number') return true;
+    const im = String(input.getAttribute?.('inputmode') || '').toLowerCase();
+    if (im === 'numeric' || im === 'decimal') return true;
+    const pat = String(input.getAttribute?.('pattern') || '');
+    if (pat && /^\^?\[?\\?d|\\d[*+{]/.test(pat) && !/[a-z]/i.test(pat.replace(/\\d/g, ''))) return true;
+    return false;
+  } catch { return false; }
+}
+
+// DERIVE THE SALARY ASK FOR *THIS* POSTING.
+//
+// The profile holds one static band (CAD 115,000–140,000) and it was written verbatim into every
+// salary field. Pierre asked for this to depend on the job: "you can set it to whatever amount you
+// want… wherever it depends really on the job. So try to make it more dynamic than just hard."
+//
+// RULES, in order:
+//   1. Posting states a range  → ask within its UPPER HALF, never below its floor. (There is
+//      already logic refusing to write BELOW a posted range — salaryWouldUndercut; this replaces
+//      "skip" with "ask properly".)
+//   2. Posting states nothing  → fall back to the profile band.
+//   3. Never below the profile band's own floor, whatever the posting says.
+//   4. Respect the FIELD SHAPE — a numeric field gets ONE number, never a range string.
+//
+// Intervals are preserved: parseMoneyRange annualises internally, so an hourly posting is
+// de-annualised before it is written back, or an hourly field would receive a yearly figure.
+// Returns null when there is nothing honest to say (no profile band and no posted range).
+const PER_YEAR = { hour: 2080, month: 12, year: 1 };
+function roundMoney(n, interval) {
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (interval === 'hour') return Math.round(n);              // $/hr — whole dollars
+  if (interval === 'month') return Math.round(n / 100) * 100; // $/mo — nearest hundred
+  return Math.round(n / 1000) * 1000;                         // $/yr — nearest thousand
+}
+export function deriveSalaryAsk(profileValue, posted, opts = {}) {
+  const numeric = !!opts.numeric;
+  const mine = parseMoneyRange(profileValue);
+  const post = (posted && typeof posted === 'object' && posted.known)
+    ? posted : parseMoneyRange(posted);
+
+  // Everything below is in ANNUALISED money; `interval` decides how it is written back.
+  const myFloor = mine.known ? (mine.min != null ? mine.min : mine.max) : null;
+  const myTop = mine.known ? (mine.max != null ? mine.max : mine.min) : null;
+
+  let low, high, interval, currency;
+  if (post.known && post.min != null && post.max != null) {
+    // RULE 1 — the upper half of the posting's own band.
+    const mid = (post.min + post.max) / 2;
+    low = Math.max(mid, post.min);
+    high = Math.max(post.max, low);
+    interval = post.interval || 'year';
+    currency = post.currency || mine.currency || null;
+    // RULE 3 — never below his own floor, even if the posting pays less.
+    if (myFloor != null && low < myFloor) { low = myFloor; high = Math.max(high, myFloor); }
+  } else if (mine.known) {
+    // RULE 2 — no posted range: the profile band, unchanged.
+    low = myFloor; high = myTop != null ? myTop : myFloor;
+    interval = mine.interval || 'year';
+    currency = mine.currency || null;
+  } else {
+    return null;   // nothing stated anywhere — say nothing
+  }
+  if (!Number.isFinite(low) || low <= 0) return null;
+
+  const div = PER_YEAR[interval] || 1;
+  const lo = roundMoney(low / div, interval);
+  const hi = roundMoney(high / div, interval);
+  if (lo == null) return null;
+
+  // RULE 4 — one number for a numeric field. The LOW end of the derived ask: it is the minimum
+  // being asked for, and by construction it is below neither the posted floor nor the profile floor.
+  if (numeric) return String(lo);
+  const fmt = (n) => n.toLocaleString('en-CA');
+  const suffix = interval === 'hour' ? ' / hour' : interval === 'month' ? ' / month' : '';
+  const cur = currency ? `${currency} ` : '';
+  if (hi == null || hi <= lo) return `${cur}${fmt(lo)}${suffix}`;
+  return `${cur}${fmt(lo)}–${fmt(hi)}${suffix}`;
+}
+
+// Read the posting's OWN stated pay band off the page. DOM-touching (so not pure), bounded, and
+// failure-tolerant: null simply means "no stated range", which never blocks a write.
+export function findPostedSalaryRange(root) {
+  try {
+    const doc = root && root.body ? root : (typeof document !== 'undefined' ? document : null);
+    const body = doc?.body || doc;
+    if (!body) return null;
+    const text = String(body.innerText || body.textContent || '').slice(0, 40000);
+    if (!text) return null;
+    const RANGE = /(?:[$£€]|\b(?:CAD|USD|EUR|GBP|AUD)\b)[^\n]{0,40}?\d[\d,.]*\s*k?\s*(?:-|to)\s*[^\n]{0,20}?\d[\d,.]*\s*k?/i;
+    const CONTEXT = /(salary|compensation|pay\s*range|pay\s*band|base\s*pay|hiring\s*range|remuneration|per\s*year|per\s*annum|annually|a\s*year)/i;
+    for (const raw of text.replace(/[‒-―−]/g, '-').split(/\n+/)) {
+      const line = raw.trim();
+      if (!line || line.length > 300) continue;
+      if (!RANGE.test(line)) continue;
+      const parsed = parseMoneyRange(line);
+      if (!parsed.known || parsed.min == null) continue;
+      // Require either salary wording nearby or a magnitude only a salary reaches, so a price
+      // list can never masquerade as the posted band.
+      if (!CONTEXT.test(line) && parsed.min < 30000) continue;
+      return parsed;
+    }
+    return null;
+  } catch { return null; }
 }
 
 // Fill custom comboboxes / typeaheads / react-selects (Workday, Greenhouse, Lever, and
@@ -775,7 +1330,54 @@ export function setNativeValue(el, value) {
 // renders ASYNC after typing — so we type, WAIT for the options, then click the match.
 // FULLY wrapped: any failure is a no-op (field left for the AI/park path) — never regresses.
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
-export async function fillCombobox(el, value) {
+
+// A react-select is the widget class that DISPLAYS typed text while holding no value — the exact
+// shape behind the "Select a country" bounce. LinkedIn's .basic-typeahead is deliberately NOT in
+// here: it stores its value on the input itself, so it keeps the original, proven behaviour.
+const REACT_SELECT_SEL = '[class*="select__control"],[class*="react-select"],[class*="-control"]';
+export function isReactSelect(el) {
+  try { return !!el?.closest?.(REACT_SELECT_SEL); } catch { return false; }
+}
+
+// Did the widget actually COMMIT a selection? react-select renders the committed choice as
+// .select__single-value / .select__multi-value (emotion builds spell it singleValue/multiValue).
+// The typed text living in the input proves nothing — on commit the input goes back to empty.
+export function comboboxCommitted(el) {
+  try {
+    const ctrl = el?.closest?.(REACT_SELECT_SEL);
+    if (!ctrl) return false;
+    const sv = ctrl.querySelector?.(
+      '[class*="single-value"],[class*="singleValue"],[class*="multi-value"],[class*="multiValue"]');
+    return !!(sv && String(sv.textContent || '').trim());
+  } catch { return false; }
+}
+
+// fillCombobox(el, value, cfg?)
+//   cfg.locationHint  { city, state, country } — when present the option pick is resolved by
+//                     pickLocationIndex (region/country qualified) instead of first-prefix-wins,
+//                     and AMBIGUITY ABANDONS rather than guesses.
+//
+// RULE 1 (2026-08-23): every abandoned path now RESTORES the field to exactly what it was found
+// as. Previously the value was typed in first and the failure path returned false without
+// clearing it, so a react-select was left displaying "Toronto" / "Canada" with no committed
+// value — the form looked filled and submitted wrong. A blank required field is honest.
+export async function fillCombobox(el, value, cfg) {
+  let typed = false, before = '';
+  const revert = () => {
+    try { el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); } catch {}
+    if (typed) {
+      // A contentEditable combobox holds its text in the node, not in .value — restoring it
+      // through the input setter would leave the typed text on screen.
+      if (el.isContentEditable) {
+        try { el.textContent = before; el.dispatchEvent(new Event('input', { bubbles: true })); } catch {}
+      } else {
+        try { setValueRaw(el, before, false); } catch {}
+      }
+      try { _jatFilledFields.delete(el); } catch {}   // we did NOT answer it — don't claim we did
+    }
+    try { el.blur?.(); } catch {}
+    return false;
+  };
   try {
     if (isSiteChromeInput(el)) return false;   // never type into the global search typeahead
     const v = String(value == null ? '' : value).trim();
@@ -796,7 +1398,10 @@ export async function fillCombobox(el, value) {
       try { el.click?.(); } catch {}
     }
     // Typeable combobox/typeahead (location, etc.): type the value to trigger suggestions.
+    // Remember what was there first — every failure path below puts it back.
     if (el.tagName === 'INPUT' || el.isContentEditable) {
+      before = el.isContentEditable ? String(el.textContent || '') : String(el.value == null ? '' : el.value);
+      typed = true;
       try { setNativeValue(el, v); } catch {}
       try { el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: v.slice(-1) })); } catch {}
       try { el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: v.slice(-1) })); } catch {}
@@ -810,30 +1415,51 @@ export async function fillCombobox(el, value) {
       await sleepMs(250);
     }
     const txt = (o) => (o.textContent || '').trim().toLowerCase();
-    // exact → the typed text is a prefix of the option (LinkedIn location: "Toronto, ON"
-    // → "Toronto, Ontario, Canada") → substring. NO blind first-option pick (would mis-fill
-    // a real dropdown like years-of-experience).
-    let pick = opts.find((o) => txt(o) === vl)
-      || opts.find((o) => txt(o).startsWith(vl) && vl.length > 1)
-      || opts.find((o) => vl.startsWith(txt(o)) && txt(o).length > 2)
-      || opts.find((o) => txt(o).includes(vl) && vl.length > 2);
-    // A numeric answer against RANGE options ("6" vs "5-10 years") matches nothing textually —
-    // resolve it by arithmetic instead, else the widget stays unselected and the form won't advance.
-    if (!pick) {
-      const ri = matchNumericRangeOption(v, opts.map((o) => txt(o)));
-      if (ri >= 0) pick = opts[ri];
+    let pick;
+    const hint = cfg && typeof cfg === 'object' ? cfg.locationHint : null;
+    if (hint && hint.city) {
+      // LOCATION: first-prefix-wins picked "Toronto, Ohio, United States" over
+      // "Toronto, Ontario, Canada" purely because Ohio sorts first. Resolve by region+country,
+      // and treat "cannot be sure" as a reason to leave the field ALONE (rule 1), not to guess.
+      const li = pickLocationIndex(opts.map(txt), hint);
+      if (li < 0) return revert();
+      pick = opts[li];
+    } else {
+      // exact → the typed text is a prefix of the option (LinkedIn location: "Toronto, ON"
+      // → "Toronto, Ontario, Canada") → substring. NO blind first-option pick (would mis-fill
+      // a real dropdown like years-of-experience).
+      pick = opts.find((o) => txt(o) === vl)
+        || opts.find((o) => txt(o).startsWith(vl) && vl.length > 1)
+        || opts.find((o) => vl.startsWith(txt(o)) && txt(o).length > 2)
+        || opts.find((o) => txt(o).includes(vl) && vl.length > 2);
+      // A numeric answer against RANGE options ("6" vs "5-10 years") matches nothing textually —
+      // resolve it by arithmetic instead, else the widget stays unselected and the form won't advance.
+      if (!pick) {
+        const ri = matchNumericRangeOption(v, opts.map((o) => txt(o)));
+        if (ri >= 0) pick = opts[ri];
+      }
     }
-    if (!pick) {
-      try { el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); } catch {}
-      return false;
-    }
+    if (!pick) return revert();
     try { pick.scrollIntoView?.({ block: 'nearest' }); } catch {}
     try { pick.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch {}
     try { pick.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch {}
     try { pick.click?.(); } catch {}
     await sleepMs(150);
+    // VERIFY THE COMMIT — react-select only. The click may highlight without selecting; the input
+    // still shows the typed text either way, so trusting it is what produced a form that looked
+    // filled and submitted empty. Read the control's own committed value instead, and if the
+    // click didn't take, press Enter on the focused option (the react-select keyboard commit)
+    // before giving up. Non-react-select widgets keep the original, proven behaviour.
+    if (isReactSelect(el)) {
+      if (!comboboxCommitted(el)) {
+        try { el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true })); } catch {}
+        try { el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true })); } catch {}
+        await sleepMs(150);
+      }
+      if (!comboboxCommitted(el)) return revert();   // could not commit → leave it untouched
+    }
     return true;
-  } catch { return false; }
+  } catch { return revert(); }
 }
 
 export class AutofillEngine {
@@ -926,7 +1552,9 @@ export class AutofillEngine {
       else if (input.tagName === 'SELECT') label = selectGroupLabel(input);
       else label = fieldLabel(input);
       if (!label || label.length < 4) continue;
-      if (UI_INSTRUCTION_RX.test(label)) continue;   // combobox screen-reader help, not a question
+      // Not a question → never ask it. Covers combobox screen-reader help, validation words,
+      // button text, dropdown placeholders, leaked CSS and raw field names in one place.
+      if (isJunkQuestionText(label)) continue;
       if (NEVER_AUTOFILL_RX.test(label)) continue;
       // (Generic site-search / global-search typeahead inputs are already skipped above
       // via isSiteChromeInput — they're never a real application question and would
@@ -964,16 +1592,23 @@ export class AutofillEngine {
   // return value is ignored. It NEVER changes what gets filled or the returned count —
   // it only observes (so the executor can write a per-field FILL-OUTCOME trace line).
   // outcome ∈ filled | fuzzy-snapped | skipped-no-option | skipped-not-yes |
-  //          skipped-site-chrome | skipped-combobox-miss | error.
+  //          skipped-site-chrome | skipped-combobox-miss | skipped-salary-undercut | error.
   async fill(suggestions, onOutcome) {
     const emit = typeof onOutcome === 'function'
       ? (suggestion, outcome, detail) => { try { onOutcome({ suggestion, outcome, detail }); } catch {} }
       : () => {};
+    // Read once per pass: the profile (to qualify a location by region+country) and the posting's
+    // OWN stated pay band (so the profile's ask can never anchor below it). Both are best-effort —
+    // a missing profile or an unstated range simply leaves the old behaviour in place.
+    let profile = {};
+    try { profile = (await this.getProfile?.()) || {}; } catch {}
+    const locationHint = { city: profile.city, state: profile.state, country: profile.country };
+    const posted = findPostedSalaryRange(null);
     let n = 0;
     for (const s of suggestions) {
       try {
         if (isSiteChromeInput(s.input)) { emit(s, 'skipped-site-chrome'); continue; }   // belt-and-suspenders: never fill site chrome
-        const v = String(s.value);
+        let v = String(s.value);
         const isCombo = s.input.getAttribute && (s.input.getAttribute('role') === 'combobox'
           || (s.input.closest && s.input.closest('[class*="select__control"],[class*="react-select"],[class*="-control"],[class*="basic-typeahead"]')));
         // Indeed's searchable dropdown is a PLAIN <input type=text> — no role="combobox", no
@@ -983,9 +1618,32 @@ export class AutofillEngine {
         // driven through the combobox path, with a fall-back to plain typing if no option list
         // ever appears, so a genuinely-free-text field can never regress.
         const isSearchableSelect = !isCombo && looksLikeSearchableSelect(s.input);
+        // SALARY — derive the ask from THIS posting instead of writing the static profile band.
+        // The old behaviour had two failure modes: it wrote the same band everywhere, and when
+        // that band would undercut the posting it wrote NOTHING (leaving a required field empty).
+        // deriveSalaryAsk keeps the anti-undercut guarantee — its floor is the posting's own —
+        // while actually answering the field, and it emits a single number in a numeric field.
+        if (s.field === 'salaryExpectation' || looksLikeSalaryLabel(s.label)) {
+          const numeric = isNumericField(s.input);
+          // Derive ONLY when there is something to derive FROM: a posted band, or a numeric
+          // field that cannot take the band's range string. With neither, the profile value is
+          // written verbatim exactly as before — no cosmetic reformatting of what Pierre typed.
+          const ask = ((posted && posted.known) || numeric) ? deriveSalaryAsk(v, posted, { numeric }) : null;
+          if (ask) { v = ask; emit(s, 'salary-derived', ask); }
+          else if (salaryWouldUndercut(v, posted)) { emit(s, 'skipped-salary-undercut'); continue; }
+          else if (numeric && !/^\d+(?:\.\d+)?$/.test(v.replace(/[,\s]/g, ''))) {
+            // A numeric field with an unparseable band: writing a range string here can never
+            // validate ("Enter a decimal number larger than 0.0") and re-parks the task forever.
+            emit(s, 'skipped-salary-shape'); continue;
+          }
+        }
         if (s.input.tagName === 'SELECT') {
           const opt = matchOption(s.input, v);
           if (!opt) { emit(s, 'skipped-no-option'); continue; }
+          // Committing a placeholder is a FAILURE, not a success: it sets nothing while the
+          // field reports as answered. Same rule fillCombobox already applies to a react-select
+          // it cannot commit — blank is honest, "Select an option" is a lie.
+          if (isPlaceholderOption(opt)) { emit(s, 'skipped-placeholder-option'); continue; }
           setNativeValue(s.input, opt.value);
           // Detect a fuzzy snap: the chosen option text isn't an exact/substring of the value.
           const snapped = !(opt.value === v || opt.text === v
@@ -993,9 +1651,14 @@ export class AutofillEngine {
             || String(opt.text).toLowerCase().trim() === v.toLowerCase().trim());
           emit(s, snapped ? 'fuzzy-snapped' : 'filled', snapped ? (opt.text || opt.value) : undefined);
         } else if (isCombo || isSearchableSelect) {
-          // custom dropdown / typeahead (Workday/Greenhouse/Lever/LinkedIn location) — async
-          if (!(await fillCombobox(s.input, v))) {
-            if (!isSearchableSelect) { emit(s, 'skipped-combobox-miss'); continue; }
+          // custom dropdown / typeahead (Workday/Greenhouse/Lever/LinkedIn location) — async.
+          // RULE 2 — a location is resolved by region+country, never by "first option that starts
+          // with the typed city" (that is how "Toronto" became Toronto, OHIO).
+          const cfg = (s.field === 'city' || looksLikeLocationLabel(s.label)) ? { locationHint } : undefined;
+          if (!(await fillCombobox(s.input, v, cfg))) {
+            // RULE 1 — a react-select we could not COMMIT is left untouched. Typing into it makes
+            // the field look answered while its value is empty, which submits wrong; blank is honest.
+            if (!isSearchableSelect || isReactSelect(s.input)) { emit(s, 'skipped-combobox-miss'); continue; }
             setNativeValue(s.input, v);          // no options appeared → it really was free text
             emit(s, 'filled');
           } else emit(s, 'filled');
@@ -1006,16 +1669,14 @@ export class AutofillEngine {
           const picked = pickRadioInGroup(s.input, v);
           const target = picked || (/^(yes|true|y|oui|sí|si|ja|1)$/i.test(v) ? s.input : null);
           if (!target) { emit(s, 'skipped-no-option'); continue; }
-          target.checked = true;
-          target.dispatchEvent(new Event('input', { bubbles: true }));
-          target.dispatchEvent(new Event('change', { bubbles: true }));
+          // Through the native setter, verified, with a real click as fallback — a direct
+          // `.checked = true` is invisible to React and silently reverts (see setNativeChecked).
+          if (!setNativeChecked(target, true)) { emit(s, 'skipped-radio-uncommitted'); continue; }
           emit(s, 'filled');
         } else if (s.input.type === 'checkbox') {
           const yes = /^(yes|true|y|oui|sí|si|ja|1)$/i.test(v);
           if (!yes) { emit(s, 'skipped-not-yes'); continue; }
-          s.input.checked = true;
-          s.input.dispatchEvent(new Event('input', { bubbles: true }));
-          s.input.dispatchEvent(new Event('change', { bubbles: true }));
+          if (!setNativeChecked(s.input, true)) { emit(s, 'skipped-checkbox-uncommitted'); continue; }
           emit(s, 'filled');
         } else {
           setNativeValue(s.input, v);
@@ -1044,7 +1705,11 @@ export class AutofillEngine {
       let value = '';
       if (input.tagName === 'SELECT') {
         const opt = input.options[input.selectedIndex];
-        value = opt ? (opt.text || opt.value) : '';
+        // An unset dropdown must not be captured as an answer. This is where "Select an option"
+        // entered the record: the placeholder is options[0] and it is what a never-touched
+        // select reports, so every untouched dropdown was captured as though it were answered.
+        if (!opt || isPlaceholderOption(opt)) continue;
+        value = opt.text || opt.value;
       } else if (input.type === 'checkbox' || input.type === 'radio') {
         if (!input.checked) continue;
         value = input.value || 'Yes';
@@ -1052,6 +1717,7 @@ export class AutofillEngine {
         value = String(input.value || '').trim();
       }
       if (!value || /^(\*+|•+)$/.test(value) || value.length > 1500) continue;
+      if (isPlaceholderOptionText(value)) continue;   // belt-and-braces: never learn a placeholder as an answer
       const key = `${source || 'any'}::${label}`;
       if (this.recordedKeys.has(key)) continue;
       this.recordedKeys.add(key);

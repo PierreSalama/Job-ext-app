@@ -19,6 +19,7 @@
 
 const db = require('../db');
 const fit = require('../fit');
+const shape = require('../answer-shape');
 
 // ---- profile field access (mirror prompts.js profileBlock's d = profile.data || profile) ----
 function pdata(profile) {
@@ -129,6 +130,74 @@ function estimateYears(profile, resume) {
   return null;
 }
 
+// ---- WORK AUTHORIZATION / SPONSORSHIP, and the polarity trap ----------------------
+//
+// These two questions are logical INVERSES of each other and the live store got both wrong:
+//
+//   "will you now or in the future require sponsorship…"   stored "Canada"        → must be No
+//   "do you have the unrestricted right to work…"          stored "Canada"        → must be Yes
+//   "are you legally authorized to work in the region…"    stored the whole
+//                                     profile sentence "Authorized to work in Canada
+//                                     (no sponsorship required)"                  → must be Yes
+//   "will you… require visa sponsorship to work in Canada" same sentence           → must be No
+//
+// Answering "Yes" to *will you require sponsorship* is exactly as damaging as answering "No"
+// to *are you authorized* — the applicant is screened out either way, on a false statement.
+//
+// The old rule ALSO had a live negation bug: it decided "not authorized" from
+// /\b(not authorized|no\b|require|need.*visa|sponsor)\b/ tested against the profile string.
+// Pierre's own value — "Authorized to work in Canada (no sponsorship required)" — trips
+// `\bno\b` AND `require` AND `sponsor`, so the profile that says he IS authorized was read
+// as saying he is NOT. Parse the sentence properly instead of pattern-sniffing it.
+
+// "no sponsorship required" / "without sponsorship" / "does not require a visa"
+const NO_SPONSOR_RX = /\b(?:no|not|without|never|don'?t|doesn'?t|do not|does not)\b[^.)]{0,28}\b(?:sponsor\w*|visa|work permit)\b|\b(?:sponsor\w*|visa|work permit)\b[^.)]{0,28}\b(?:not required|not needed|isn'?t required|is not required|unnecessary)\b/i;
+// "requires sponsorship" / "will need a visa" / "sponsorship required"
+const NEEDS_SPONSOR_RX = /\b(?:require|requires|requiring|need|needs|needing|request|seeking)\b[^.)]{0,28}\b(?:sponsor\w*|visa|work permit)\b|\bsponsorship\s+(?:is\s+)?(?:required|needed)\b/i;
+// a stated, positive authorization
+const AUTHORIZED_RX = /\b(?:authoriz\w*|authoris\w*|eligible|permitted|legally able|legally entitled|citizen|citizenship|permanent resident|\bpr\b|landed immigrant|work permit holder|open work permit|unrestricted)\b/i;
+const NOT_AUTHORIZED_RX = /\b(?:not|never|un)\s*(?:authoriz\w*|authoris\w*|eligible|permitted)\b|\bnot\s+(?:a\s+)?(?:citizen|permanent resident)\b/i;
+
+// → { authorized: true|false|null, needsSponsorship: true|false|null }
+// null means "the profile does not say" — the caller must then park, never guess.
+function parseAuthorization(profile) {
+  const d = pdata(profile);
+  const sponsorField = firstNonEmpty(d.sponsorshipRequired);
+  const authField = firstNonEmpty(d.workAuthorization, d.citizenship);
+  const blob = `${sponsorField} ${authField}`.trim();
+
+  let needsSponsorship = null;
+  if (blob) {
+    // ORDER MATTERS: "no sponsorship required" contains "sponsorship required", so the
+    // negative form must be tested first or every negative reads as a positive.
+    if (NO_SPONSOR_RX.test(blob)) needsSponsorship = false;
+    else if (NEEDS_SPONSOR_RX.test(blob)) needsSponsorship = true;
+  }
+  // A bare yes/no in the dedicated sponsorship field is unambiguous.
+  if (needsSponsorship == null && sponsorField) {
+    if (/^\s*(?:no|non|false|n)\b/i.test(sponsorField)) needsSponsorship = false;
+    else if (/^\s*(?:yes|oui|true|y)\b/i.test(sponsorField)) needsSponsorship = true;
+  }
+
+  let authorized = null;
+  if (authField) {
+    if (NOT_AUTHORIZED_RX.test(authField)) authorized = false;
+    else if (AUTHORIZED_RX.test(authField)) authorized = true;
+  }
+  // The two facts imply each other: needing no sponsorship means being authorized, and
+  // being authorized (with nothing said about sponsorship) means none is required.
+  if (authorized == null && needsSponsorship === false) authorized = true;
+  // …and needing sponsorship means NOT having an unrestricted right to work there.
+  if (authorized == null && needsSponsorship === true) authorized = false;
+  if (needsSponsorship == null && authorized === true) needsSponsorship = false;
+  if (needsSponsorship == null && authorized === false) needsSponsorship = true;
+  return { authorized, needsSponsorship };
+}
+
+const SPONSOR_TOPIC_RX = /\b(?:sponsor\w*|visa|work permit|h-?1b|h1b|employment authorization document|ead)\b/i;
+const ASKS_NEED_RX = /\b(?:require|requires|requiring|need|needs|request|sponsorship)\b/i;
+const ASKS_HAVE_RX = /\b(?:authoriz\w*|authoris\w*|eligible|legally|right to work|permitted|able to work|entitled|valid|hold|possess|unrestricted)\b/i;
+
 // ---- education level ordering (hold-this-or-higher → Yes) ----
 const EDU_RANK = [
   { rx: /\b(ph\.?d|doctorate|doctoral)\b/i, rank: 5 },
@@ -148,7 +217,28 @@ function profileEduRank(profile, resume) {
 }
 
 // ---- the floor: answer(question, ctx) ----
+// PUBLIC entry point. `answerRaw` holds the rules; this wrapper enforces ANSWER SHAPE on
+// everything they produce. A yes/no question may only ever be answered Yes or No — never a
+// profile string. That inversion is the whole of the live defect table:
+//     "will you now or in the future require sponsorship…"  →  "Canada"
+//     "are you currently located in Canada"                 →  "Toronto, Canada"
+//     "…where are you currently located"                    →  "Yes"
+// A rule that produces the wrong SHAPE is not a near-miss, it is a wrong answer, so the
+// floor withholds it and the question parks for Pierre.
 function answer(question, ctx = {}) {
+  const out = answerRaw(question, ctx);
+  if (!out || out.answer == null) return null;
+  // An answer that is verbatim one of the field's own options is always allowed — the form
+  // itself defined that vocabulary (a "Yes, I am authorized" option, a country dropdown…).
+  const opts = ctx.options;
+  if (Array.isArray(opts) && opts.some((o) => String(o).trim().toLowerCase() === String(out.answer).trim().toLowerCase())) return out;
+  try {
+    if (!shape.answerFitsQuestion(question, out.answer, opts)) return null;
+  } catch { /* a guard must never take down the floor */ }
+  return out;
+}
+
+function answerRaw(question, ctx = {}) {
   const q = String(question || '');
   if (!q.trim()) return null;
   const profile = ctx.profile;
@@ -185,24 +275,48 @@ function answer(question, ctx = {}) {
     return null;
   }
 
-  // ---------- AUTHORIZED TO WORK ----------
-  if (/\b(authori[sz]ed|eligible|legally|right to work|permitted)\b/.test(lc) && /\b(work|employ)\b/.test(lc)) {
-    const d = pdata(profile);
-    const wa = firstNonEmpty(d.workAuthorization, d.citizenship);
-    if (wa) {
-      if (/\b(not authorized|no\b|require|need.*visa|sponsor)\b/i.test(wa)) return result('No', 0.85, options);
-      return result('Yes', 0.85, options); // a stated authorization (citizen/PR/authorized) → Yes
+  // ---------- SPONSORSHIP (polarity-aware — runs BEFORE plain work-authorization) ----------
+  // Any question naming sponsorship/visa/work-permit is answered from the PARSED profile
+  // facts, with the sign chosen by what the question actually asks:
+  //   asks "do you REQUIRE sponsorship"  → Yes iff he needs it        (he does not → No)
+  //   asks "are you AUTHORIZED / do you HOLD"   → Yes iff authorized  (he is → Yes)
+  if (SPONSOR_TOPIC_RX.test(lc)) {
+    const { authorized, needsSponsorship } = parseAuthorization(profile);
+    const asksHave = ASKS_HAVE_RX.test(lc);
+    const asksNeed = ASKS_NEED_RX.test(lc);
+    // "authorized to work WITHOUT sponsorship?" asks about HAVING, not NEEDING.
+    if (asksHave && (!asksNeed || /\bwithout\b/.test(lc))) {
+      if (authorized == null) return null;
+      return result(authorized ? 'Yes' : 'No', 0.9, options);
     }
-    return null; // legal/work-auth: answer ONLY from profile, else park
+    if (asksNeed) {
+      if (needsSponsorship == null) return null;
+      return result(needsSponsorship ? 'Yes' : 'No', 0.9, options);
+    }
+    return null;   // names sponsorship but asks neither → park rather than guess the sign
+  }
+
+  // ---------- AUTHORIZED TO WORK ----------
+  if (/\b(authori[sz]ed|eligible|legally|right to work|permitted|unrestricted)\b/.test(lc) && /\b(work|employ)\b/.test(lc)) {
+    const { authorized } = parseAuthorization(profile);
+    if (authorized == null) return null;   // legal/work-auth: answer ONLY from profile, else park
+    return result(authorized ? 'Yes' : 'No', 0.85, options);
   }
 
   // A which/what/where interrogative is a FILL-IN location question, not a yes/no
   // residency one — route it to WHICH-LOCATION first so "what city are you based in?"
   // returns the city, not a null residency.
   const isInterrogative = /\b(what|which|where)\b/.test(lc);
+  // A prompt can ASK FOR A PLACE without a wh-word ("Please provide your current location",
+  // "Your city of residence"). Those used to fall past this block and get swallowed by the
+  // RELOCATION rule below, whose catch-all default is "Yes" — which is how the live store
+  // ended up with "This is a remote position…Where are you currently located?" = 'Yes'.
+  const asksForPlace = isInterrogative
+    || /\b(?:your|current)\s+(?:current\s+)?(?:city|province|state|country|location|address|region)\b/.test(lc)
+    || /\b(?:please\s+)?(?:confirm|provide|enter|specify|indicate|list)\b[^.]{0,30}\b(?:city|province|state|country|location|address)\b/.test(lc);
 
   // ---------- WHICH-LOCATION (fill-in / choice: country / province / city) ----------
-  if (isInterrogative && /\b(country|province|state|city|located|based|location|region|reside|live)\b/.test(lc)) {
+  if (asksForPlace && /\b(country|province|state|city|located|based|location|region|reside|live)\b/.test(lc)) {
     const loc = profileLocation(profile);
     if (/\bcountry\b/.test(lc) && loc.country) return result(loc.country, 0.9, options);
     if (/\b(province|state|region)\b/.test(lc) && loc.province) return result(loc.province, 0.9, options);

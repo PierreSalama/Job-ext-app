@@ -23,6 +23,7 @@ const emailSweep = require('./email-sweep');
 const provider = require('./ai/provider');
 const prompts = require('./ai/prompts');
 const codexProvider = require('./ai/codex');
+const remoteAi = require('./ai/remote');
 const { extractText } = require('./ai/extract');
 const hardware = require('./hardware');
 const localsetup = require('./localsetup');
@@ -47,6 +48,45 @@ function hostAllowed(hostHeader) {
 let server = null;
 let sseClients = new Set();
 let pairAttempts = new Map();   // origin → { count, firstAt } for the /pair rate-limit
+
+// ---- LIVE EXTENSION LINK -------------------------------------------------------------------
+// What extension build is ACTUALLY running, and a pending request for it to reload itself.
+//
+// Why this exists: the applier laptop loads the extension UNPACKED from
+// C:\ProgramData\JAT-Remote\chrome-extension-pierre. That copy sat at 11.118.0 while the working
+// tree was on 11.121.0 — three versions of fixes were never live — and nothing surfaced it,
+// because `extVersion` on /auto-apply/live was always empty. Reporting the loaded
+// manifest.version is the more valuable half of this: a silent version gap is the failure that
+// hides every other fix.
+//
+// In-memory on purpose: it describes a LIVE connection, so it should not survive an app restart.
+// The extension re-reports within 60s (the jat11-flush alarm), and until it does the dashboard
+// honestly shows "unknown" rather than a stale version.
+const extLink = {
+  version: '',          // manifest.version last reported by the running extension
+  id: '',               // chrome.runtime.id (which unpacked copy is loaded)
+  seenAt: 0,            // ms epoch of the last report
+  reloadToken: '',      // armed, unacknowledged reload request (idempotency key)
+  reloadArmedAt: 0,
+  lastReloadAt: 0,      // last time a reload was ARMED — drives the rate limit
+  ack: null,            // { token, state, detail, at } — what the extension did with it
+};
+// A stuck caller must not be able to reload-loop the extension.
+const EXT_RELOAD_MIN_INTERVAL_MS = 5 * 60 * 1000;
+// An extension that has not polled in this long is not connected any more.
+const EXT_STALE_MS = 3 * 60 * 1000;
+function extLinkPublic() {
+  const stale = !extLink.seenAt || (Date.now() - extLink.seenAt) > EXT_STALE_MS;
+  return {
+    version: extLink.version || '',
+    id: extLink.id || '',
+    seenAt: extLink.seenAt ? new Date(extLink.seenAt).toISOString() : '',
+    connected: !!extLink.version && !stale,
+    reloadPending: !!extLink.reloadToken,
+    reloadArmedAt: extLink.reloadArmedAt ? new Date(extLink.reloadArmedAt).toISOString() : '',
+    lastAck: extLink.ack ? { state: extLink.ack.state, detail: extLink.ack.detail, at: new Date(extLink.ack.at).toISOString() } : null,
+  };
+}
 // Recently paired clients (in-memory, newest-first, capped) — lets the setup script confirm the
 // Firefox extension actually connected (a moz-extension:// origin shows up here after it loads).
 let pairedClients = [];
@@ -143,6 +183,7 @@ function pairOriginAllowed(origin) {
 function stripSettingSecrets(s) {
   if (s && s.ai && s.ai.claude) s.ai.claude.apiKey = '';
   if (s && s.ai && s.ai.chatgpt) s.ai.chatgpt.apiKey = '';
+  if (s && s.ai && s.ai.remote) s.ai.remote.token = '';
   if (s && s.gmail) s.gmail.clientSecret = '';
   return s;
 }
@@ -151,6 +192,7 @@ function publicSettings() {
   const secretsPresent = {
     claudeKey: !!(s.ai && s.ai.claude && s.ai.claude.apiKey),
     chatgptKey: !!(s.ai && s.ai.chatgpt && s.ai.chatgpt.apiKey),
+    relayToken: !!(s.ai && s.ai.remote && s.ai.remote.token),
     gmailSecret: !!(s.gmail && s.gmail.clientSecret),
   };
   return { settings: stripSettingSecrets(s), secretsPresent };
@@ -1053,9 +1095,26 @@ async function handle(req, res, parsed) {
 
   // ---- unauthenticated ----
   if (req.method === 'GET' && pathname === '/health') {
+    // EXTENSION IDENTITY + REMOTE SELF-RELOAD ride this probe.
+    //
+    // Why /health and not /queue/next: /health is polled every minute by the jat11-flush alarm
+    // UNCONDITIONALLY, while /queue/next only runs while auto-apply is ENABLED. A reload channel
+    // that only works on a busy node is the wrong way round — an idle node is exactly when it is
+    // safe to reload. No new transport is introduced either way.
+    try {
+      const v = String(parsed.searchParams.get('extVersion') || '').slice(0, 32);
+      if (v) {
+        extLink.version = v;
+        extLink.id = String(parsed.searchParams.get('extId') || '').slice(0, 64) || extLink.id;
+        extLink.seenAt = Date.now();
+      }
+    } catch {}
     return sendJson(res, 200, {
       ok: true, version: opts.getVersion(), ts: Date.now(),
       requiresAuth: true,
+      // Present ONLY while a reload is armed and unacknowledged. The token makes the request
+      // idempotent: the extension records the token it acted on and ignores a repeat.
+      ...(extLink.reloadToken ? { extReload: { token: extLink.reloadToken, armedAt: extLink.reloadArmedAt } } : {}),
     });
   }
   if (req.method === 'POST' && pathname === '/pair') {
@@ -1941,8 +2000,66 @@ async function handle(req, res, parsed) {
       // Where each governed platform's account budget stands right now — searches AND applies, the
       // two numbers that had to be read together to see the 2026-08-10 restriction coming.
       safety: safetyStatus(s),
+      // WHICH EXTENSION BUILD IS ACTUALLY RUNNING. This was always empty, which is exactly why
+      // nobody noticed the applier was three versions behind for three days.
+      extVersion: extLink.version || '',
+      extLink: extLinkPublic(),
     });
   }
+  // ---- EXTENSION SELF-RELOAD -----------------------------------------------------------------
+  // Ask the running extension to reload itself (chrome.runtime.reload). The applier laptop's
+  // Chrome is launched with no --remote-debugging-port and no --load-extension, so there is no
+  // CDP path in, and restarting that Chrome is off-limits — it holds the real logged-in LinkedIn
+  // session. Without this the only way to pick up a code change is a human clicking Reload on
+  // that specific machine.
+  //
+  // ARMING IS NOT RELOADING. This only sets a token; the extension decides when to act, and it
+  // MUST NOT act mid-application (see background.js). The response says which it will be.
+  if (req.method === 'POST' && pathname === '/ext/reload') {
+    const now = Date.now();
+    if (!extLink.version) {
+      return sendJson(res, 409, { ok: false, error: 'no extension has reported in yet — cannot target a reload', extLink: extLinkPublic() });
+    }
+    if (extLink.reloadToken) {
+      // Idempotent: a second call while one is still pending returns the SAME token.
+      return sendJson(res, 200, { ok: true, already: true, token: extLink.reloadToken, extLink: extLinkPublic() });
+    }
+    const since = now - (extLink.lastReloadAt || 0);
+    if (extLink.lastReloadAt && since < EXT_RELOAD_MIN_INTERVAL_MS) {
+      return sendJson(res, 429, {
+        ok: false, error: 'rate-limited',
+        retryAfterMs: EXT_RELOAD_MIN_INTERVAL_MS - since,
+        extLink: extLinkPublic(),
+      });
+    }
+    extLink.reloadToken = `rl_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    extLink.reloadArmedAt = now;
+    extLink.lastReloadAt = now;
+    extLink.ack = null;
+    log.info(`ext reload armed (token ${extLink.reloadToken}) for extension ${extLink.version}`);
+    return sendJson(res, 200, { ok: true, token: extLink.reloadToken, extLink: extLinkPublic() });
+  }
+  // The extension reports what it DID with an armed token. This is what makes a deferral
+  // observable instead of silent: 'deferred' means it saw the request and is waiting for the
+  // in-flight application(s) to finish, and it keeps saying so on every poll until it acts.
+  if (req.method === 'POST' && pathname === '/ext/reload-ack') {
+    const body = await readJson(req);
+    const token = String(body.token || '');
+    if (!token || token !== extLink.reloadToken) {
+      return sendJson(res, 200, { ok: true, stale: true });   // an old token: nothing to do
+    }
+    const state = String(body.state || '').slice(0, 24);
+    extLink.ack = { token, state, detail: String(body.detail || '').slice(0, 200), at: Date.now() };
+    // 'deferred' keeps the token ARMED so the extension is asked again next poll. Anything
+    // terminal ('reloading' / 'refused') clears it so the request cannot repeat.
+    if (state !== 'deferred') { extLink.reloadToken = ''; extLink.reloadArmedAt = 0; }
+    log.info(`ext reload ack: ${state}${extLink.ack.detail ? ' — ' + extLink.ack.detail : ''}`);
+    return sendJson(res, 200, { ok: true });
+  }
+  if (req.method === 'GET' && pathname === '/ext/link') {
+    return sendJson(res, 200, { ok: true, extLink: extLinkPublic() });
+  }
+
   // User answers the parked questions → saved to the profile (locked) → parked
   // jobs whose questions are now all answerable flip back to 'queued'.
   if (req.method === 'POST' && pathname === '/auto-apply/intake') {
@@ -2190,7 +2307,9 @@ async function handle(req, res, parsed) {
     const job = body.jobId ? db.getJob(body.jobId) : (body.job || {});
     const profile = db.profileForSource(job?.source);
     const resume = db.defaultDocument('resume');
-    const qaHistory = db.answerMemory(body.profileId || db.resolveProfileId(job?.source), 16);
+    // Pass the asked question so cross-company memory rows are withheld from the prompt
+    // (a Geotab answer must never be offered to the model while it answers a 1Password form).
+    const qaHistory = db.answerMemory(body.profileId || db.resolveProfileId(job?.source), 16, { question: body.question });
     // Graceful: if AI is unavailable, return no answer (the executor parks the question
     // for the user) instead of a 500 — keeps the run clean on Dad's no-AI machine.
     try {
@@ -2203,7 +2322,9 @@ async function handle(req, res, parsed) {
         // still ground location/education/years/relocation/… so the run keeps applying.
         deterministic: { question: body.question, options: body.options, profile, resume: resume?.textContent || '' },
       });
-      return sendJson(res, 200, { ok: true, result: r.json, provider: r.provider });
+      // peerProvider: which model actually produced this when the answer came over the AI relay.
+      // Without it a relayed answer is indistinguishable from a local one in the logs.
+      return sendJson(res, 200, { ok: true, result: r.json, provider: r.provider, ...(r.peerProvider ? { peerProvider: r.peerProvider } : {}) });
     } catch (e) {
       return sendJson(res, 200, { ok: true, result: null, aiUnavailable: true, reason: String(e?.message || e) });
     }
@@ -2451,12 +2572,31 @@ function startServer(port, options) {
         res.setHeader('Vary', 'Origin');
       }
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-JAT-Token');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-JAT-Token, X-JAT-AI-Hop, X-JAT-AI-Origin');
       if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+      // AI RELAY LOOP GUARD — before any work, and before auth, because a loop is a loop
+      // regardless of whether the token is right. The relay POSTs to an endpoint that itself runs
+      // the provider chain, so a node addressed at itself (or two nodes addressed at each other)
+      // would bounce a prompt until something gave out. Two independent brakes:
+      //   • the request carries OUR node id  → it left this machine and came back
+      //   • the hop count is past the maximum → someone is building a relay chain
+      // 508 Loop Detected is the honest status; remote.js maps it to REMOTE_LOOP and falls through
+      // to the next provider, so the caller degrades instead of hanging.
+      const selfLoop = remoteAi.isSelfOrigin(req.headers);
+      if (selfLoop || remoteAi.hopExceeded(req.headers)) {
+        const why = selfLoop
+          ? 'AI relay loop: this request originated from this node'
+          : `AI relay loop: hop count past the maximum of ${remoteAi.MAX_HOPS} — relays may not be chained`;
+        log.warn(why, '— refused from', req.socket.remoteAddress || '?');
+        return sendJson(res, 508, { ok: false, code: 'AI_LOOP', error: why });
+      }
 
       const parsed = new URL(req.url, `http://${req.headers.host}`);
       try {
-        await handle(req, res, parsed);
+        // Everything downstream runs inside the relay context, so provider.buildAttempts can see
+        // "this call is already a relay" without threading a flag through every AI endpoint.
+        await remoteAi.withInbound(req.headers, () => handle(req, res, parsed));
       } catch (e) {
         // User-facing conditions surface their real message; only unexpected throws hide behind
         // 'internal error'. AI_DISABLED is the Dad's-laptop master switch; the others are the
@@ -2475,6 +2615,10 @@ function startServer(port, options) {
     let host = '127.0.0.1';
     try { if (db.getSettings().server.remoteAccess) host = '0.0.0.0'; } catch {}
     server.listen(port, host, () => {
+      // The relay's self-URL brake compares against the port we ACTUALLY bound, which can differ
+      // from the configured one; without this, a peer address of http://127.0.0.1:<real port>
+      // would not be recognised as ourselves.
+      try { remoteAi.setSelfPort(server.address()?.port || port); } catch {}
       log.info(`listening on ${host}:${port}${host === '0.0.0.0' ? ' (LAN remote access ENABLED)' : ''}`);
       resolve(server);
     });

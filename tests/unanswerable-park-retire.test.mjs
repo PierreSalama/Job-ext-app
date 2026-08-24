@@ -133,7 +133,12 @@ test('queueRetryParked runs on a schedule, not only when Pierre types an answer'
 test('queueRetryParked filters junk out of stillMissing', () => {
   const fn = db.slice(db.indexOf('function queueRetryParked'), db.indexOf('function saveIntakeAnswer'));
   assert.ok(fn.length, 'queueRetryParked must exist');
-  assert.match(fn, /UI_NOISE_Q_RX\.test\(q\.question\)/,
+  // Was pinned to `UI_NOISE_Q_RX.test(q.question)` (combobox screen-reader text only). That check
+  // is now isJunkQuestionText(), a strict SUPERSET: it still runs UI_NOISE_Q_RX first and adds
+  // validation words ('required', 'a required field'), button text ('Review'), dropdown
+  // placeholders ('select...'), leaked CSS rules and raw field names ('question_8901966005[]') —
+  // all real strings that were pinning live tasks. Either spelling satisfies the intent.
+  assert.match(fn, /(?:UI_NOISE_Q_RX|isJunkQuestionText)\.?\(?\.?test\(q\.question\)|isJunkQuestionText\(q\.question\)/,
     'junk must be excluded from stillMissing or one junk string pins the task forever');
   assert.match(fn, /stillMissing\.length === 0/, 'the zero-missing requeue condition is preserved');
 });
