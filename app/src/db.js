@@ -737,6 +737,28 @@ const MIGRATIONS = [
     exec('ALTER TABLE platform_touches ADD COLUMN ref TEXT');
     exec('CREATE INDEX idx_platform_touches_ref ON platform_touches(ref)');
   },
+
+  // PURGE URL-POISONED LEARNED ANSWERS. isMisattributedUrlAnswer now refuses these on write, but
+  // the write guard cannot help rows already in the store — and recall matches profile_fields on
+  // an EXACT key, so a poisoned row NEVER self-heals: the same wrong answer is served to the same
+  // question forever. Live on pierre-laptop 2026-08-24, one BambooHR posting's "link to this job"
+  // value had been mis-attributed onto reddit's consent checkbox, faire's "how familiar were you
+  // with faire as a company", and "how did you find this job posting url". Sweep both halves of
+  // memory (profile_fields + qa) with the same predicate the write boundary uses.
+  () => { purgeMisattributedUrlAnswers(); },
+
+  // CREDIT THE BACKLOG OF RACE-LOST SUBMISSIONS.
+  // reconcileStaleRunning now stamps `probable` evidence as it files a race-loss, but it only ever
+  // looks at rows still in 'running'/'scheduled' — the ones already sitting in awaiting_review were
+  // filed by the old code and carry no evidence at all. They are the whole reason the ATS lane
+  // looked like it had never submitted anything: the "0 of 137" figure was a `done` count, and
+  // these rows are exactly what was missing from it.
+  //
+  // Same predicate as the live path, applied retroactively, and only where the transcript carries a
+  // GROUNDED pre-click marker. Rows without one keep saying they do not know, because they do not.
+  // Idempotent: it only fills evidence that is absent, and never changes state — `done` still
+  // requires proof.
+  () => { creditRaceLostBacklog(); },
 ];
 
 // SUCCESS-TRUTH quarantine (shared by the migration above and exported for tests).
@@ -780,6 +802,11 @@ function isTrustworthyEvidence(evidence) {
   if (typeof e !== 'object') return false;
   const type = String(e.type || '').toLowerCase();
   if (!type || type === 'success-signal') return false;
+  // `probable` is the OPPOSITE of a proof — it is the honest label reconcileStaleRunning stamps on
+  // a submit whose confirmation the navigation destroyed. It exists so counting can separate
+  // "probably went through" from "no idea", and must never be mistaken for the evidence that lets
+  // a row hold `done` or have its failure text cleared.
+  if (type === 'probable') return false;
   const detail = String(e.detail || '').toLowerCase();
   if (/confirmation text/.test(detail)) return false;
   return true;
@@ -804,8 +831,14 @@ function isTrustworthyEvidence(evidence) {
 //     accepts live, but an adversarial audit flagged it as borderline when the evidence object
 //     is GONE; rather than risk telling the user they applied when they may not have, those
 //     stay in awaiting_review for human confirmation. (Trustworthiness > recall here.)
+// `post-nav-confirmation` is the marker detector.js writes when it reads a confirmation on the
+// document a submit NAVIGATED to (see claimRaceLostSubmit). It belongs in this set for the same
+// reason the others do — it is a POST-CLICK signal on evidence that did not exist before the click,
+// and it carries a strictly STRONGER guarantee than an in-document DOM diff: the document itself
+// is new. It is written from a different content world than the executor's, so its state PATCH and
+// its evidence can be lost independently; this is what recovers the latter.
 const R1_TRUSTWORTHY_TRANSCRIPT_RX =
-  /evidence=verified:(text-became-success|new-confirmation-node|confirm-signal[^\s|]*)|(?:application submitted|submitted — verified) \((text-became-success|new-confirmation-node|confirm-signal[^)]*)\)/i;
+  /evidence=verified:(text-became-success|new-confirmation-node|confirm-signal[^\s|]*|post-nav-confirmation)|(?:application submitted|submitted — verified) \((text-became-success|new-confirmation-node|confirm-signal[^)]*|post-nav-confirmation)\)/i;
 function recoverVerifiedEvidenceFromTranscript(transcript) {
   let steps = transcript;
   if (typeof steps === 'string') steps = safeParse(steps, []);
@@ -838,6 +871,7 @@ function recoverRaceLostSubmissions() {
            OR transcript LIKE '%application submitted (text-became-success%'
            OR transcript LIKE '%application submitted (new-confirmation-node%'
            OR transcript LIKE '%application submitted (apply-form-closed%'
+           OR transcript LIKE '%post-nav-confirmation%'
            OR transcript LIKE '%application submitted (confirm-signal%' )`);
   let n = 0;
   for (const r of rows) {
@@ -849,6 +883,34 @@ function recoverRaceLostSubmissions() {
           WHERE id = ?`, [JSON.stringify(ev), now(), r.id]);
     n++;
   }
+  return n;
+}
+
+// Stamp `probable` evidence on awaiting_review rows that were filed as race-losses BEFORE the
+// evidence existed. Never changes state, never invents a proof — it only says WHICH KIND of unknown
+// each row is, so counting can separate "probably went through" from "no idea". Returns the count.
+function creditRaceLostBacklog() {
+  const rows = all(
+    `SELECT id, transcript FROM auto_apply_tasks
+      WHERE state = 'awaiting_review'
+        AND (submission_evidence IS NULL OR TRIM(submission_evidence) = '')
+        AND last_error LIKE '%AFTER the final submit was clicked%'`);
+  let n = 0;
+  for (const r of rows) {
+    if (!SUBMIT_INTENT_GROUNDED_RX.test(String(r.transcript || ''))) continue;
+    run(`UPDATE auto_apply_tasks
+            SET submission_evidence = ?,
+                last_error = 'probably submitted — the submit was clicked on a verified form and the confirmation navigation ended the run before it could be read (not retried, to avoid a duplicate application)'
+          WHERE id = ?`,
+    [JSON.stringify({
+      type: 'probable',
+      reason: 'race-lost-after-submit-click',
+      detail: 'recovered from a grounded pre-click marker in the transcript',
+      at: now(),
+    }), r.id]);
+    n++;
+  }
+  if (n) log.info(`credited ${n} race-lost submission(s) as probable`);
   return n;
 }
 
@@ -1478,6 +1540,17 @@ function upsertJob(input, opts = {}) {
   const existing = opts.manual ? null : findExisting(incoming);
   const ts = now();
 
+  // A JOB WITH NO TITLE IS NOT A JOB — never CREATE one.
+  // Updating a known row with an empty title is fine and deliberate (the title falls back to the
+  // row's own below), and it is how the post-submit confirmation page credits a submission without
+  // renaming the job. But a capture that matches NOTHING and carries no title has no identity at
+  // all: minting a row for it puts an untitled ghost in the application history. Refused with a
+  // well-formed result so every caller's `action`/`statusChanged` branches simply do not fire.
+  if (!existing && !incoming.title) {
+    log.warn(`upsertJob: refusing to create an untitled job (${incoming.jobUrl || 'no url'})`);
+    return { job: null, action: 'rejected', previousStatus: null, statusChanged: false };
+  }
+
   if (!existing) {
     const id = uid('job');
     run(`INSERT INTO jobs (
@@ -1795,6 +1868,49 @@ function isPlaceholderAnswer(v) {
   return !s || PLACEHOLDER_ANSWER_RX.test(s);
 }
 
+// ── A BARE URL IS ALMOST NEVER THE ANSWER TO A SCREENING QUESTION ────────────────────────────
+// Live 2026-08-24, four rows in profile_fields carried the value
+// `https://birdseyeaccount.bamboohr.com/careers/280` — ONE BambooHR posting's "link to this job"
+// field, mis-attributed onto three unrelated questions:
+//     • "…by selecting I agree… processed in accordance with reddit's candidate privacy policy"
+//     • "before seeing this job posting, how familiar were you with faire as a company"
+//     • "how did you find this job posting url"
+// Recall matches profile_fields on an EXACT key, so reddit's consent question could never
+// self-heal: every future reddit application would answer a consent checkbox with a careers URL.
+//
+// Two classes are rejected here, at the write boundary, so no client version — including builds
+// already deployed to the laptop — can persist one:
+//   1. a bare URL answering a question that does not ask for a URL at all;
+//   2. a bare URL answering a question that asks for THIS POSTING's own link ("link to this job",
+//      "how did you find this job posting url"). Those are answerable only per-job, so a stored
+//      value is guaranteed to be another job's URL — which is exactly how the BambooHR link
+//      escaped its posting in the first place.
+// Genuinely reusable URL answers — LinkedIn profile, GitHub, portfolio, personal website, "other
+// links" — ask for a URL and are not self-referential, so they are untouched.
+const BARE_URL_ANSWER_RX = /^(?:https?:\/\/|www\.)\S+$/i;
+const URL_ASKING_Q_RX = /\b(url|urls|links?|website|websites|web\s?site|homepage|home\s?page|profile|portfolio|linkedin|github|gitlab|bitbucket|twitter|dribbble|behance|stack\s?overflow|blog|repo|repository)\b/i;
+const SELF_REFERENTIAL_JOB_Q_RX = /\b(?:this|the|current)\s+(?:job|posting|position|role|opening|vacancy|req|requisition|listing|application)\b/i;
+function isMisattributedUrlAnswer(question, value) {
+  if (!BARE_URL_ANSWER_RX.test(String(value == null ? '' : value).trim())) return false;
+  const q = String(question == null ? '' : question);
+  if (!URL_ASKING_Q_RX.test(q)) return true;              // (1) the question never asked for a link
+  return SELF_REFERENTIAL_JOB_Q_RX.test(q);              // (2) asks for THIS posting's own link
+}
+
+// Sweep both halves of learned memory for rows the write boundary would now refuse. Idempotent —
+// once deleted a row cannot match again. Returns the counts so the migration + tests can assert.
+function purgeMisattributedUrlAnswers() {
+  let pf = 0, qa = 0;
+  for (const r of all('SELECT id, label, value FROM profile_fields')) {
+    if (isMisattributedUrlAnswer(r.label, r.value)) { run('DELETE FROM profile_fields WHERE id = ?', [r.id]); pf++; }
+  }
+  for (const r of all('SELECT id, question, answer FROM qa')) {
+    if (isMisattributedUrlAnswer(r.question, r.answer)) { run('DELETE FROM qa WHERE id = ?', [r.id]); qa++; }
+  }
+  if (pf || qa) log.info(`purged URL-poisoned learned answers: ${pf} profile_field(s), ${qa} qa row(s)`);
+  return { profileFields: pf, qa };
+}
+
 // Drop every placeholder-valued entry from a job's captured answers. Returns null when nothing
 // real is left, so a job whose only "answers" were unset dropdowns is honestly recorded as
 // having none. Array values are filtered member-wise (multi-selects).
@@ -1843,6 +1959,7 @@ function qaRecord({ profileId, question, answer, source, fieldType, lineageSourc
   const qn = normalizeQuestion(question);
   if (!qn || answer == null || answer === '') return null;
   if (isPlaceholderAnswer(answer)) return null;   // never store a dropdown placeholder as an answer
+  if (isMisattributedUrlAnswer(question, answer)) return null;   // the OTHER half of the memory pair — see profileFieldUpsert
   // Never AUTO-LEARN an id / field-name / option word AS the question. Scoped to machine-
   // captured writes on purpose: a user-entered profile field is high-trust and mirrors here
   // with lineageSource 'user', and the user is allowed a terse label. The junk comes from the
@@ -1992,6 +2109,12 @@ function profileFieldUpsert({ profileId, question, value, locale, fieldType, sou
   const val = value == null ? '' : String(value).trim().slice(0, 2000);
   if (!keyNorm || !val) return null;
   if (isPlaceholderAnswer(val)) return null;   // never store a dropdown placeholder ("Select an option") as a learned answer
+  // A URL captured against a question that never asked for one (or asks for THIS job's own link)
+  // is a mis-attribution, not an answer — see isMisattributedUrlAnswer.
+  if (isMisattributedUrlAnswer(label, val)) {
+    log.warn(`profileFieldUpsert: refusing a bare URL as the answer to "${label.slice(0, 80)}"`);
+    return null;
+  }
   if (!profileId) { log.warn('profileFieldUpsert: missing profileId — answer not saved:', label); return null; }
   const ts = now();
   const loc = locale || guessLocale(label) || 'en';
@@ -3454,7 +3577,23 @@ function retryStaleQueue({ olderThanMinutes = 30, maxAttempts = 3, limit = 25, m
 // The click is recorded as `isFinalSubmit("…")=true` immediately before the click, and a verified
 // completion as `submitted — verified`. If the run then dies (tab hung, MV3 evicted the SW) the
 // executor never gets to report, so the only surviving evidence is the transcript.
-const CLICKED_FINAL_SUBMIT_RX = /isfinalsubmit\([^)]*\)=true|submitted — verified|clicking final submit/i;
+const CLICKED_FINAL_SUBMIT_RX = /isfinalsubmit\([^)]*\)=true|submitted — verified|clicking final submit|submit-intent /i;
+
+// The PRE-CLICK markers that say a grounded final submit was about to happen.
+//
+//   • `submit-intent … grounded=true` — written and AWAITED by executor.js immediately before the
+//     click, precisely so a teardown cannot erase it. It means strictly more than
+//     `isFinalSubmit(...)=true` (which only says a button was RECOGNISED as final): the run had
+//     already cleared every safety net — no parked questions, no native-validation blockers, no
+//     CAPTCHA gate — and was one statement away from clicking.
+//   • `trace:submit baseline … formGrounded=true` — the success-truth baseline snapshot, taken in
+//     the same pre-click breath and already present on rows written by earlier versions. Including
+//     it is what lets the EXISTING backlog be judged by the same rule as new runs, instead of the
+//     fix only helping from today onwards.
+//
+// `grounded` is R1's own gate: it means the form was the verified apply surface, not a loose
+// fallback. Without it we make no claim at all.
+const SUBMIT_INTENT_GROUNDED_RX = /submit-intent [^\n]*grounded=true|trace:submit baseline [^\n]*formGrounded=true/i;
 
 // `scheduledOlderThanMinutes` DEFAULTS TO 2, not to olderThanMinutes. The comment above explains
 // why a stranded 'scheduled' row must be reclaimed far sooner than a genuinely 'running' one — but
@@ -3516,10 +3655,33 @@ function reconcileStaleRunning({ olderThanMinutes = 8, scheduledOlderThanMinutes
     // We cannot prove it submitted (that is why the verified-evidence rule exists), so we do not
     // claim it did. We route it to awaiting_review — the state that already means "submit was
     // clicked, outcome unknown, confirm it" — instead of quietly doing it again.
-    if (CLICKED_FINAL_SUBMIT_RX.test(String(r.transcript || ''))) {
+    const tx = String(r.transcript || '');
+    if (CLICKED_FINAL_SUBMIT_RX.test(tx)) {
+      // DEGRADE TO "PROBABLY SUBMITTED", NOT TO "UNKNOWN".
+      // A row carrying the grounded submit-intent marker was one statement away from the click on
+      // a verified apply surface, having cleared every guard that exists to stop a doomed submit.
+      // Recording that as an outcome we know nothing about is what made the ATS lane look like it
+      // had never submitted anything: all 7 of its real 2026-08-24 applications were filed this
+      // way, and the "0 of 137" conclusion was drawn from the `done` count they were missing from.
+      //
+      // It stays awaiting_review — `done` still requires proof, and that invariant is not for
+      // sale — but it now carries evidence saying WHICH KIND of unknown it is, so counting can
+      // tell "probably went through" apart from "we have no idea".
+      const grounded = SUBMIT_INTENT_GROUNDED_RX.test(tx);
+      const ev = grounded ? JSON.stringify({
+        type: 'probable',
+        reason: 'race-lost-after-submit-click',
+        detail: 'the submit was clicked on a grounded form; the confirmation navigation ended the run before it could be read',
+        at: now(),
+      }) : null;
       run(`UPDATE auto_apply_tasks SET state='awaiting_review',
-             last_error='interrupted AFTER the final submit was clicked — confirm whether this went through (not retried, to avoid a duplicate application)',
-             updated_at=? WHERE id=?`, [now(), r.id]);
+             last_error=?,
+             submission_evidence=COALESCE(?, submission_evidence),
+             updated_at=? WHERE id=?`,
+      [grounded
+        ? 'probably submitted — the submit was clicked on a verified form and the confirmation navigation ended the run before it could be read (not retried, to avoid a duplicate application)'
+        : 'interrupted AFTER the final submit was clicked — confirm whether this went through (not retried, to avoid a duplicate application)',
+      ev, now(), r.id]);
       continue;
     }
     run("UPDATE auto_apply_tasks SET state='failed', last_error=COALESCE(NULLIF(last_error,''),'timed out / interrupted — will retry'), updated_at=? WHERE id=?", [now(), r.id]);
@@ -5405,6 +5567,7 @@ module.exports = {
   qaRecord, qaLookup, qaList, answerMemory, qaDelete, normalizeQuestion, guessLocale,
   answerShape,   // re-exported so callers that already hold `db` can reach the recall gates
   isPlaceholderAnswer, stripPlaceholderAnswers, isJunkQuestionText,
+  isMisattributedUrlAnswer, purgeMisattributedUrlAnswers,
   profileFieldUpsert, profileFieldList, profileFieldSet, profileFieldDelete,
   profileFieldLookup, profileAutofillBundle, harvestAnswersToProfile, backfillProfileFromJobs, deriveProfileFromLearned,
   memoryToProfileData, pushProfileDataToMemory, ensureDefaultProfileId, resolveProfileId,
@@ -5418,7 +5581,7 @@ module.exports = {
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
   discoveryBatchStart, discoveryBatchGet, discoveryBatchComplete, discoveryBatchList, discoveryRecordJob,
   discoveryFallbackQueue, discoveryFallbackNext, discoveryFallbackComplete, discoveryHealth, reconcileDiscovery, pipelineHealth,
-  queueList, queueGet, queueHistory, queueBreakdown, jobUrlsForAtsHarvest, summarizeRun, queueRunSummary, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, quarantineUntrustworthyDone, recoverRaceLostSubmissions, recoverVerifiedEvidenceFromTranscript, isTrustworthyEvidence, saveIntakeAnswer,
+  queueList, queueGet, queueHistory, queueBreakdown, jobUrlsForAtsHarvest, summarizeRun, queueRunSummary, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, quarantineUntrustworthyDone, recoverRaceLostSubmissions, recoverVerifiedEvidenceFromTranscript, creditRaceLostBacklog, isTrustworthyEvidence, saveIntakeAnswer,
   classifyQueueFailure, taskSiteKey, queueActiveSiteKeys, lastStartBySiteKey,
   setEasyApplyCooldown, easyApplyCooledDown, easyApplySupplyExhausted, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
   recordPlatformTouch, downgradePlatformTouch, platformTouchCounts, lastPlatformTouchAt, lastPlatformApplyAt, prunePlatformTouches,

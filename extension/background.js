@@ -94,8 +94,23 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((d) => rebootTab(d.tabId,
 // executor finds no form and skips rather than re-applying.
 const CHANNEL_CLOSED_RX = /message channel closed|Receiving end does not exist/i;
 const MAX_NAV_RESUMES = 2;
+// WHICH DISPATCH OWNS THIS TAB. In serial mode ONE warm apply tab is navigated from job to job
+// (see `reuse` in the dispatcher), so "the tab is still alive" does NOT mean "the tab is still
+// working on my task". A run whose channel closed can therefore be re-sent into a document that
+// now belongs to a DIFFERENT job, and the resumed executor drives the new page while reporting
+// against the OLD task id. Live 2026-08-24 that is how task_63a857f4 — a faire posting — came to
+// hold GitLab's five screening questions.
+//
+// Every dispatch stamps the tab with its own token before sending; a resume re-reads the stamp and
+// gives up if the pump has since re-tasked the tab. Cheap, exact, and it cannot be got wrong by
+// omission: the token is issued inside sendRunWithNavResume itself.
+const aaTabDispatch = new Map();   // tabId -> token of the dispatch that currently owns the tab
+let aaDispatchSeq = 0;
+
 async function sendRunWithNavResume(tabId, msg, opts = {}) {
   const settleMs = opts.settleMs == null ? 2500 : opts.settleMs;
+  const token = `d${++aaDispatchSeq}`;
+  aaTabDispatch.set(tabId, token);
   for (let attempt = 0; ; attempt++) {
     try {
       return await chrome.tabs.sendMessage(
@@ -110,12 +125,21 @@ async function sendRunWithNavResume(tabId, msg, opts = {}) {
       let live = null;
       try { live = await chrome.tabs.get(tabId); } catch { throw e; }
       if (!live || live.discarded) throw e;
+      // ...and only if this dispatch still OWNS the tab. If the pump reused it for another job,
+      // resuming would drive that job's page while reporting against this task.
+      if (aaTabDispatch.get(tabId) !== token) {
+        try { console.log('[jat] NOT resuming - tab', tabId, 'was re-tasked by a newer dispatch'); } catch {}
+        throw e;
+      }
       try { console.log('[jat] resuming run after navigation ->', String(live.url || '').slice(0, 80)); } catch {}
       // Let the new document finish loading, or it has no listener yet.
       await new Promise((r) => setTimeout(r, settleMs));
+      if (aaTabDispatch.get(tabId) !== token) throw e;   // re-check across the settle wait
     }
   }
 }
+// Drop a closed tab's ownership stamp so the map cannot grow unbounded.
+try { chrome.tabs.onRemoved.addListener((tabId) => { aaTabDispatch.delete(tabId); }); } catch {}
 // Exposed for the harness so its fixture drives the REAL dispatch path, not a copy of it.
 try { globalThis.__jatSendRunWithNavResume = sendRunWithNavResume; } catch {}
 

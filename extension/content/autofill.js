@@ -686,8 +686,34 @@ export const DECLINE_OPTION_RX = /((?:i )?(?:do ?n['’]?t|do not) wish to (?:an
 // class at all, which is exactly how it reached the AI and got answered "Fullstack, Backend,
 // Frontend" against a list of ethnicities.
 const DEMOGRAPHIC_CONTAINER_SEL = '[id*="demographic" i],[class*="demographic" i],[id*="eeo" i],[class*="eeo" i],[id*="self-identif" i],[class*="self-identif" i],[id*="diversity" i],[class*="diversity" i]';
+
+// A CONSENT / ACKNOWLEDGEMENT statement is NOT a demographic question, even when the ATS renders
+// it inside the demographic block.
+//
+// The structural test above asks "what container is this field in", which is the right question for
+// "Which categories describe you?" (it names no protected class, so only its container gives it
+// away) and the WRONG question for the privacy consent checkbox that many ATS ship in that same
+// section. Live 2026-08-24, hootsuite parked on "I have read the privacy notice and consent to the
+// processing of my personal data" with the reason "voluntary demographic question with no decline
+// option" — a checkbox that has no decline option because it is not a question, and which blocked
+// the whole application.
+//
+// The discriminator is linguistic and reliable: a consent statement asserts that the CANDIDATE has
+// read / agrees to / acknowledges a NOTICE, POLICY or TERMS. A demographic question asks what the
+// candidate IS. Checked AFTER NEVER_AUTOFILL_RX, so a label that names a protected class is still
+// demographic no matter how it is phrased — the escape can only ever release a field the LABEL
+// gives no protected-class reason to hold.
+export const CONSENT_ACK_RX = new RegExp(
+  '(privacy (?:notice|policy|statement|agreement)|candidate privacy|data protection|'
+  + 'terms (?:of|and)\\b|processing of my (?:personal )?data|'
+  + 'i (?:have )?(?:read|reviewed|understand|acknowledge|consent|agree|accept)\\b|'
+  + 'by (?:selecting|checking|clicking|submitting)\\b|'
+  + 'acknowledge(?:ment)?\\b|consent to\\b|agree to\\b|gdpr|ccpa)', 'i');
+
 export function isDemographicField(input, label) {
-  if (NEVER_AUTOFILL_RX.test(String(label || ''))) return true;
+  const text = String(label || '');
+  if (NEVER_AUTOFILL_RX.test(text)) return true;      // names a protected class — always demographic
+  if (CONSENT_ACK_RX.test(text)) return false;        // a privacy notice is not a demographic question
   try { return !!input?.closest?.(DEMOGRAPHIC_CONTAINER_SEL); } catch { return false; }
 }
 
@@ -895,6 +921,59 @@ export function isPlaceholderOptionText(text) {
   return PLACEHOLDER_OPTION_TEXT_RX.test(t);
 }
 
+// ── A YES/NO ANSWER AGAINST PROSE OPTIONS ────────────────────────────────────────────────────
+// Greenhouse lets a company write a yes/no question whose OPTIONS are full sentences instead of
+// "Yes"/"No". Affirm's "Have you previously been employed at Affirm for any length of time?*"
+// offers:
+//     I have not previously been employed at Affirm
+//     I have been employed at Affirm as a full-time employee
+//     I have been employed at Affirm as a part-time employee
+//     I have been employed at Affirm as an intern
+//     I have been employed at Affirm as a contractor
+// The learned answer is "No". Every textual tier misses it: it is not exact, not a prefix, and the
+// substring tier is switched off for a 2-character value (`vl.length > 2`), so the field filled
+// `left-empty (no matching option)` and 9 Tier A Affirm tasks parked on it. GitLab's identically
+// SHAPED question ("Have you previously worked at or consulted for GitLab?") filled fine only
+// because its options are the literal words Yes and No — the difference was never the widget.
+//
+// Resolve by POLARITY instead, and only when it is unambiguous:
+//   • the answer must be a bare yes/no token (a prose answer is not a polarity claim),
+//   • no option may itself be a bare yes/no token (if one is, the exact tier already had it),
+//   • exactly ONE option may carry the wanted polarity.
+// Affirm + "No" → the single negated option. Affirm + "Yes" → four affirmatives, so this returns
+// nothing and the field parks WITH its real options, which is the honest outcome: the four are
+// materially different answers and guessing between them would put a false employment history on
+// an application.
+const YES_TOKEN_RX = /^(?:yes|y|true|1|oui|s[ií]|ja|sim)$/i;
+const NO_TOKEN_RX = /^(?:no|n|false|0|non|nein|n[aã]o)$/i;
+
+// Negation carried by an option's own words. `(^|\W)…(\W|$)` keeps this to whole words, so
+// "non-employee" / "nothing" / "Norway" are not read as negative.
+export function isNegativeOptionText(text) {
+  const t = String(text == null ? '' : text).toLowerCase();
+  if (/\w['’]t(\W|$)/.test(t)) return true;                     // haven't / don't / didn't / cannot→can't
+  return /(^|\W)(no|not|never|none|neither|nor|negative)(\W|$)/.test(t);
+}
+
+// Index of the one option whose polarity matches a bare yes/no answer, or -1.
+export function matchPolarityOption(labels, value) {
+  // NO minimum option count. A typeahead FILTERS as we type, so by the time this runs the Affirm
+  // menu is showing exactly one row — the negated one, because "I have not…" is the only option
+  // containing the letters the answer typed. Requiring two options would leave the very case this
+  // exists for unmatched.
+  const opts = (Array.isArray(labels) ? labels : []).map((l) => String(l == null ? '' : l).trim());
+  if (!opts.length) return -1;
+  const v = String(value == null ? '' : value).trim();
+  const wantNo = NO_TOKEN_RX.test(v);
+  const wantYes = YES_TOKEN_RX.test(v);
+  if (!wantNo && !wantYes) return -1;                           // not a polarity answer
+  // If the widget offers a literal Yes/No the plain tiers own this field — never second-guess them.
+  if (opts.some((o) => YES_TOKEN_RX.test(o) || NO_TOKEN_RX.test(o))) return -1;
+  const wanted = [];
+  opts.forEach((o, i) => { if (o && isNegativeOptionText(o) === wantNo) wanted.push(i); });
+  return wanted.length === 1 ? wanted[0] : -1;                  // ambiguous → park, never guess
+}
+
 export function matchOption(select, v) {
   // A placeholder is never a legal match — not in the exact tier, not in the substring tier,
   // not in the fuzzy tier. (Only the fuzzy tier used to exclude it, so a poisoned learned
@@ -909,6 +988,12 @@ export function matchOption(select, v) {
   // contains it, so '6' selects '5-10 years' not '16+ years' by accidental substring.
   const ni = numericMatch(opts.map((o) => o.text), v);
   if (ni != null) return opts[ni];
+  // A yes/no answer against prose options — resolved by polarity, only when unambiguous. Placed
+  // BEFORE the substring tier deliberately: "No" would otherwise be matched by any option merely
+  // CONTAINING the letters "no" ("I have not…" happens to be right here, "I know the team" would
+  // not be), which is an accident rather than a rule.
+  const pi = matchPolarityOption(opts.map((o) => o.text), v);
+  if (pi >= 0) return opts[pi];
   const sub = opts
     .filter((o) => o.text.toLowerCase().includes(vl) || o.value.toLowerCase().includes(vl))
     .sort((a, b) => b.text.length - a.text.length)[0];
@@ -1570,6 +1655,14 @@ function bestOptionFor(opts, v, hint) {
     || opts.find((o) => txt(o).startsWith(vl) && vl.length > 1)
     || opts.find((o) => vl.startsWith(txt(o)) && txt(o).length > 2)
     || opts.find((o) => txt(o).includes(vl) && vl.length > 2);
+  // A yes/no answer against PROSE options (Affirm's "I have not previously been employed at
+  // Affirm" / "I have been employed at Affirm as …"). None of the tiers above can reach it — the
+  // substring tier is switched off for a 2-character value — so resolve it by polarity, and only
+  // when exactly one option carries the wanted polarity. See matchPolarityOption.
+  if (!pick) {
+    const pi = matchPolarityOption(opts.map(txt), v);
+    if (pi >= 0) pick = opts[pi];
+  }
   // A numeric answer against RANGE options ("6" vs "5-10 years") matches nothing textually —
   // resolve it by arithmetic instead, else the widget stays unselected and the form won't advance.
   if (!pick) {

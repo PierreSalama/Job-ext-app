@@ -463,6 +463,7 @@ function ingestDiscoveredJobs(source, jobs, { providerName = 'browser', batchId 
         employmentType: jd.employmentType || '', status: 'started',
         tags: watchedUrls.has(jd.jobUrl) ? ['auto-apply', 'watchlist'] : ['auto-apply'],
       });
+      if (!up.job) return up;   // refused (untitled) — a discovery row without a title is not a job
       if (up.action === 'created') {
         db.recordEvent({ jobId: up.job.id, type: 'created', source: 'auto-apply', summary: `Discovered via ${providerName}`, data: { provider: providerName, batchId } });
       }
@@ -1326,6 +1327,7 @@ async function handle(req, res, parsed) {
     // its creation/status event, nor an orphan event.
     const result = db.transaction(() => {
       const r = db.upsertJob(body, { manual: !!body._manual });
+      if (!r.job) return r;   // refused (see upsertJob: never CREATE an untitled job)
       if (r.statusChanged || r.action === 'created' || r.action === 'reopened') {
         db.recordEvent({
           jobId: r.job.id,
@@ -1340,6 +1342,7 @@ async function handle(req, res, parsed) {
       }
       return r;
     });
+    if (!result.job) return sendJson(res, 200, { ok: true, ...result });
     if (result.statusChanged || result.action === 'created' || result.action === 'reopened') {
       if (opts.notify) opts.notify('status', result);
     }

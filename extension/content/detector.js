@@ -38,7 +38,12 @@ const SUPPRESS_KEY = 'jat11.suppressHosts';
 // company/title is usually the VENDOR (or a tenant alias), not the employer —
 // so the job identity carried over from the board (the handoff) is canonical.
 const ATS_HOST_RX = /(myworkdayjobs|myworkdaysite|greenhouse\.io|boards\.greenhouse|lever\.co|ashbyhq|smartrecruiters|workable|bamboohr|icims|taleo|jobvite|breezy\.hr|recruitee|teamtailor|jazzhr|paylocity|dayforcehcm|successfactors|brassring|avature|eightfold|phenom|oraclecloud|wd\d?\.myworkday)/i;
-const PLATFORM_LABEL_RX = /^(linkedin|indeed|glassdoor|greenhouse|lever|workday|myworkdayjobs|ashby|workable|bamboohr|smartrecruiters|ziprecruiter|talentmanagementsolution|workforcenow|icims|taleo)$/i;
+// A "company" that is really the ATS vendor, or the routing label of an ATS host. hostCompanyFallback
+// takes the first label of the hostname, which on Greenhouse's current board host
+// (job-boards.greenhouse.io) is literally "job-boards" — and that was written as the EMPLOYER onto
+// every job the ATS lane submitted. None of these are ever a company name; treating them as platform
+// labels makes the company fall back to the value already on the row.
+const PLATFORM_LABEL_RX = /^(linkedin|indeed|glassdoor|greenhouse|lever|workday|myworkdayjobs|ashby|workable|bamboohr|smartrecruiters|ziprecruiter|talentmanagementsolution|workforcenow|icims|taleo|job-?boards?|boards?|jobs?|apply|applications?|careers?|recruiting|recruitment|hiring|talent|www|app|apps|secure|my)$/i;
 const JOB_HEADING_RX = /\b(engineer|developer|designer|manager|analyst|specialist|coordinator|director|administrator|consultant|architect|scientist|recruiter|writer|producer|lead|intern|associate|technician|job|position|role|opening)\b/i;
 const JOB_DETAIL_TEXT_RX = /\b(job description|responsibilit(?:y|ies)|qualifications?|requirements?|preferred qualifications|benefits|compensation|salary|pay range|employment type|work authorization|visa sponsorship|remote|hybrid|on-site|hours per week|description du poste|exigences)\b/i;
 // URL shapes that mean "this is an application page" (vs. a job posting).
@@ -249,13 +254,30 @@ function stripEmpty(obj) {
   return out;
 }
 
-function ctxFromMeta() {
+// The heading of a POST-SUBMIT CONFIRMATION page is never a job title. Greenhouse renders
+// "Thank you for applying" at the same URL the posting was served from, so the passive capture that
+// fires there re-identified the job from the confirmation chrome and overwrote it: live
+// 2026-08-24, six of the seven jobs the ATS lane genuinely submitted ended up TITLED "Thank you for
+// applying", at company "job-boards". Refusing the title here is enough on its own — upsertJob
+// keeps the previous title when the incoming one is empty, so the row keeps its real identity while
+// still being elevated to `submitted`.
+const CONFIRMATION_TITLE_RX = /^\s*(?:thanks?\b|thank you\b|merci\b|application (?:submitted|received|complete|confirmation|sent)|your application\b|submission (?:received|complete)|congratulations\b|we(?:'| ha)ve received)/i;
+
+export function ctxFromMeta() {
   const og = (p) => document.querySelector(`meta[property="og:${p}"]`)?.content || '';
   const meta = (n) => document.querySelector(`meta[name="${n}"]`)?.content || '';
   const rawTitle = og('title') || meta('twitter:title') || document.title || '';
-  const title = cleanTitle(rawTitle.split(/[|·•]/)[0].trim() || rawTitle);
+  let title = cleanTitle(rawTitle.split(/[|·•]/)[0].trim() || rawTitle);
+  if (CONFIRMATION_TITLE_RX.test(title)) title = '';
   const companyCandidate = compactText(og('site_name') || meta('application-name') || meta('author') || '');
-  const company = companyCandidate && !isPlatformLabel(companyCandidate) ? companyCandidate : hostCompanyFallback();
+  // The host fallback was applied UNFILTERED — isPlatformLabel guarded only the metadata candidate.
+  // So on job-boards.greenhouse.io the employer became the literal string "job-boards", and it was
+  // written onto every job the ATS lane touched. Filter the fallback by the same rule; an empty
+  // company is harmless (upsertJob keeps the row's existing one) where a wrong one is not.
+  const hostFallback = hostCompanyFallback();
+  const company = companyCandidate && !isPlatformLabel(companyCandidate)
+    ? companyCandidate
+    : (isPlatformLabel(hostFallback) ? '' : hostFallback);
   const description = (og('description') || meta('description') || '').slice(0, 4000);
   return { title, company, location: '', description, compensation: '', workMode: '', employmentType: '' };
 }
@@ -280,7 +302,7 @@ function readPrimaryHeading() {
 function hostCompanyFallback() {
   return location.hostname.replace(/^www\./, '').split('.')[0];
 }
-function isPlatformLabel(value) { return PLATFORM_LABEL_RX.test(compactText(value)); }
+export function isPlatformLabel(value) { return PLATFORM_LABEL_RX.test(compactText(value)); }
 function isGenericTitle(value) {
   return /^(jobs?|careers?|apply|application|job application)$/i.test(compactText(value));
 }
@@ -311,13 +333,49 @@ async function storeHandoff() {
   } catch {}
 }
 
+// Is a stored handoff about THE JOB THIS DOCUMENT IS SHOWING?
+//
+// chrome.storage.local is shared by every tab in the profile, and loadHandoff used to return the
+// newest fresh entry from ANY of them — it never consulted handoffKey(), which storeHandoff goes
+// to the trouble of computing. So any page whose own identity looked weak adopted whatever job was
+// last seen anywhere in the browser. With a warm apply tab cycling jobs seconds apart (and a
+// parallel pool running several at once) that is a coin flip: live 2026-08-24 the GitLab posting
+// 8682707002 ended up titled "Sr. Software Engineer (Hardware)", a DIALPAD role whose tab finished
+// six seconds later, and a faire task ended up holding GitLab's screening questions.
+//
+// A handoff may only be adopted when this document can be shown to descend from it:
+//   • its externalId appears in our URL — the same posting, e.g. the post-submit confirmation
+//     rendered at .../jobs/8682707002; or
+//   • our referrer is the host the handoff was stored on — the genuine board → ATS handoff
+//     (LinkedIn "Apply" → greenhouse), which is the whole reason a cross-tab lookup exists; or
+//   • it was stored on this very host+path (a same-page SPA step).
+// Nothing else is relevant, and an irrelevant handoff is strictly worse than none — it does not
+// merely fail to identify the job, it identifies the WRONG one.
+export function handoffIsRelevant(h) {
+  if (!h || !h.url) return false;
+  try {
+    const here = location.href;
+    const ext = String(h.externalId || '').replace(/^[a-z-]+:/i, '').trim();
+    if (ext && ext.length >= 4 && here.includes(ext)) return true;
+    const from = new URL(h.url);
+    if (from.hostname === location.hostname && from.pathname === location.pathname) return true;
+    const ref = document.referrer ? new URL(document.referrer).hostname : '';
+    if (ref && ref === from.hostname) return true;
+  } catch { return false; }
+  return false;
+}
+
 async function loadHandoff() {
   try {
     const cur = (await chrome.storage.local.get(HANDOFF_KEY))[HANDOFF_KEY] || {};
     const fresh = Object.values(cur)
       .filter((v) => Date.now() - v.ts < HANDOFF_TTL_MS)
       .sort((a, b) => b.ts - a.ts);
-    return fresh[0] || null;
+    // Our OWN key first (exact source|externalId), then the newest handoff that this document can
+    // be shown to descend from. Never "whatever was newest anywhere".
+    const mine = cur[handoffKey()];
+    if (mine && Date.now() - mine.ts < HANDOFF_TTL_MS) return mine;
+    return fresh.find(handoffIsRelevant) || null;
   } catch { return null; }
 }
 
@@ -1224,10 +1282,80 @@ function onUrlChanged() {
 // ============================================================
 // Public API (used by loader.js)
 // ============================================================
+// ============================================================
+// Race-lost submissions — claim the confirmation the executor never got to read
+// ============================================================
+// executor.js writes a submit-intent sentinel into sessionStorage IMMEDIATELY before it clicks a
+// final submit. When that click navigates, the executor's content world dies before its own
+// confirmation wait can run, and the submission is only ever recorded as "interrupted AFTER the
+// final submit was clicked". This runs in the world the navigation CREATED, which is the only one
+// still alive to see the confirmation.
+//
+// Reaching this code with a sentinel present is itself the proof that a new document loaded after
+// the click: init() runs once per document, and in the document that did the clicking it had
+// already run long before the sentinel existed. So a success signal here is a POST-CLICK,
+// NEW-DOCUMENT signal — strictly stronger than the in-document DOM diff R1 accepts — and it is
+// gated on the same formGrounded flag R1 requires, so an ungrounded submit can never mint a done.
+const SUBMIT_INTENT_KEY = 'jat11.submitIntent';
+const SUBMIT_INTENT_TTL_MS = 5 * 60 * 1000;
+
+function readSubmitIntent() {
+  try {
+    const raw = sessionStorage.getItem(SUBMIT_INTENT_KEY);
+    if (!raw) return null;
+    const it = JSON.parse(raw);
+    if (!it || !it.taskId || !it.at) return null;
+    if (Date.now() - Number(it.at) > SUBMIT_INTENT_TTL_MS) { sessionStorage.removeItem(SUBMIT_INTENT_KEY); return null; }
+    return it;
+  } catch { return null; }
+}
+
+export async function claimRaceLostSubmit() {
+  if (!IS_TOP) return false;
+  const intent = readSubmitIntent();
+  if (!intent) return false;
+  if (!intent.formGrounded) return false;                    // R1's gate — never a done from an ungrounded form
+  if (!(pageTextLooksLikeSuccess() || urlLooksLikeSuccess())) return false;
+  // Clear FIRST: the retry ladder below calls this several times, and a double-claim would be a
+  // duplicate report. Clearing is idempotent; the PATCH must not be.
+  try { sessionStorage.removeItem(SUBMIT_INTENT_KEY); } catch {}
+  const evidence = {
+    type: 'verified',
+    reason: 'post-nav-confirmation',
+    detail: 'confirmation page loaded after the submit navigation',
+    url: location.href,
+    at: new Date().toISOString(),
+  };
+  log('claiming race-lost submit for', intent.taskId, '@', location.href);
+  try {
+    await new Promise((res) => {
+      chrome.runtime.sendMessage({
+        type: 'task-progress',
+        taskId: intent.taskId,
+        patch: {
+          state: 'done',
+          lastError: null,
+          parkReason: null,
+          pendingQuestions: [],
+          submissionEvidence: evidence,
+          transcriptAppend: { kind: 'submit-confirmed', note: 'submitted — verified (post-nav-confirmation) — confirmation read on the page the submit navigated to' },
+        },
+      }, () => { void chrome.runtime.lastError; res(); });
+    });
+  } catch { /* the app may be down; the transcript's submit-intent marker still degrades honestly */ }
+  // The JOB is submitted too. Suppress the passive path's own duplicate stamp.
+  state.fired.submitted = true;
+  state.stage = 'submitted';
+  return true;
+}
+
 export async function init() {
   if (state.initialized) return;
   state.initialized = true;
   log('engine init @', location.href, IS_TOP ? '(top)' : '(frame)');
+  // BEFORE anything else: a confirmation this document is showing may be the only surviving
+  // evidence of a submit whose executor was torn down by the navigation that produced it.
+  await claimRaceLostSubmit();
   await loadSettings();
   installWatchers();
   // Teach Mode pill: show it as soon as the engine boots on a plausible job page (the
@@ -1250,6 +1378,13 @@ export async function init() {
       state.recognitionAttempts++;
       evaluate('retry');
     }, delay));
+  }
+  // A confirmation is commonly rendered a beat after load (SPA route, async fetch), so the
+  // one-shot claim above can be too early. Re-check on its own short ladder — independent of the
+  // recognition ladder, which stops as soon as the page is classified. claimRaceLostSubmit clears
+  // the sentinel on its first success, so this cannot double-report.
+  for (const delay of [800, 2000, 4000, 8000, 15000]) {
+    retryTimers.push(setTimeout(() => { claimRaceLostSubmit().catch(() => {}); }, delay));
   }
 }
 

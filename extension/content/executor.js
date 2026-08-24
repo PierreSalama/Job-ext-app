@@ -435,6 +435,39 @@ function report(patch) {
   reportQueue = reportQueue.then(() =>
     send({ type: 'task-progress', taskId: S.task.id, patch })).catch(() => {});
 }
+
+// report(), but AWAITABLE — the caller needs the PATCH on the wire before it does something that
+// can end this document (the final-submit click). Ordinary report() is deliberately
+// fire-and-forget; this shares its queue so ordering is preserved.
+//
+// BOUNDED, and that bound matters. `send` gives every message a 35s budget (SEND_TIMEOUT_MS + 5s)
+// and reportQueue is a SHARED chain, so awaiting it outright would park the run in front of the
+// submit button for the better part of a minute whenever the desktop app is unreachable — a
+// throughput regression traded for a marker that is only ever the SECOND line of defence anyway
+// (the sessionStorage sentinel is written synchronously and needs nobody). Wait a beat for the
+// flush; if it has not gone out by then, click regardless.
+const REPORT_FLUSH_MS = 4000;
+async function reportNow(patch) {
+  report(patch);
+  const flushed = reportQueue;
+  try {
+    await Promise.race([flushed, new Promise((r) => setTimeout(r, REPORT_FLUSH_MS))]);
+  } catch {}
+}
+
+// ---- submit-intent sentinel (shared with detector.js) ----
+// sessionStorage, not chrome.storage: writing it must be SYNCHRONOUS (a promise would be lost to
+// the very navigation this exists to survive) and it must be scoped to this tab (chrome.storage is
+// profile-wide, and a warm apply tab cycling jobs would let one job's sentinel be read on another
+// job's page — the same class of bug as the handoff store). sessionStorage is exactly per-tab,
+// per-origin, and dies with the tab.
+const SUBMIT_INTENT_KEY = 'jat11.submitIntent';
+function writeSubmitIntent(intent) {
+  try { sessionStorage.setItem(SUBMIT_INTENT_KEY, JSON.stringify(intent)); } catch {}
+}
+function clearSubmitIntent() {
+  try { sessionStorage.removeItem(SUBMIT_INTENT_KEY); } catch {}
+}
 // 'skipped' is included so a skip that omits an explicit applyRoute still gets a route stamped
 // (→ 'unknown' rather than NULL) and never lands as the server's synthesized "skipped without a
 // diagnostic". An explicit applyRoute on the patch (e.g. the relevance gate's 'relevance', or the
@@ -3854,6 +3887,43 @@ export async function run(task, context, helpers) {
     // success? + confirmation-node signature count) so the post-click diff is auditable.
     if (submitBaseline) vlog('submit', `baseline url=${pagePathOf()} successTextAlready=${submitBaseline.successText} nodeSig=${submitBaseline.nodeSig?.size ?? 0} formGrounded=${formGrounded}`);
     const submitClickAt = Date.now();
+    // ---- SUBMIT INTENT, WRITTEN BEFORE THE CLICK (race-lost submissions) ----
+    // Everything that PROVES a submit lives after the click: confirmSubmitted waits up to 15s for
+    // the confirmation to settle, and only then does report() send the evidence. But a submit that
+    // NAVIGATES destroys this content world the instant it lands, so on every ATS whose
+    // confirmation is a new document, that entire block is unreachable — the run's last written
+    // word is the pre-click `isFinalSubmit(...)=true`, and 8 minutes later the server's stale-run
+    // reconciler files it as "interrupted AFTER the final submit was clicked". All 7 applications
+    // the ATS lane genuinely submitted on 2026-08-24 landed that way, five of them with a visible
+    // "Thank you for applying" on screen that nothing was left alive to read.
+    //
+    // So record the intent BEFORE the click, where nothing can tear it down:
+    //   • sessionStorage — SYNCHRONOUS (no promise to lose to the navigation) and scoped to this
+    //     tab, so the NEXT document in this tab inherits it. detector.js reads it on load and, if
+    //     that document is a confirmation, PATCHes the evidence itself. That is what actually wins
+    //     the race: the capture runs in a world the navigation created rather than destroyed.
+    //   • the transcript — a durable, machine-readable marker so a run that dies with no confirming
+    //     document still degrades to "probably submitted" instead of "unknown" (db.js
+    //     reconcileStaleRunning), and so recoverRaceLostSubmissions has pre-navigation evidence to
+    //     reason about.
+    if (isFinal && mode !== 'review') {
+      writeSubmitIntent({
+        taskId: S.task?.id || null,
+        jobId: job?.id || null,
+        url: beforeClickUrl,
+        formGrounded,
+        pack: driveablePack?.id || null,
+        at: submitClickAt,
+      });
+      // AWAITED on purpose: the click below can end this world, and an unflushed PATCH is exactly
+      // the evidence we are trying not to lose.
+      await reportNow({
+        transcriptAppend: {
+          kind: 'submit-intent',
+          note: `submit-intent url=${pagePathOf()} grounded=${formGrounded}${driveablePack ? ' pack=' + driveablePack.id : ''}`,
+        },
+      });
+    }
     // POPUP-BLOCKED-HANDOFF FIX: clear any stale captured URL before clicking. The SW's
     // MAIN-world hook (installed at arm) records the opener's window.open()/target=_blank URL
     // onto data-jat-exturl when our synthetic click fires the page's handler.
@@ -4294,6 +4364,9 @@ export async function run(task, context, helpers) {
         // SOURCE so a real, verified submission never LOOKS unconfirmed. (db.js queuePatch also
         // nulls these defensively when a done carries trustworthy evidence.)
         report({ state: 'done', lastError: null, parkReason: null, pendingQuestions: [], submissionEvidence: { type: 'verified', reason, detail: how || reason, url: location.href, at: new Date().toISOString() }, transcriptAppend: { note: `submitted — verified (${reason})` } });
+        // We survived the submit and reported the outcome ourselves — the sentinel has done its
+        // job and must not be left for some later document in this tab to act on again.
+        clearSubmitIntent();
         finalState = 'done';
         finished = true;
         continue;
@@ -4305,6 +4378,7 @@ export async function run(task, context, helpers) {
       logLine('warn', `submit not verified (${verdict.reason}) — flagged for your review`);
       setStatus('Submitted — awaiting your confirmation');
       report({ state: 'awaiting_review', lastError: `submit was clicked but could not be verified (${verdict.reason}) — please confirm`, transcriptAppend: { note: `submit unverified — ${verdict.reason}` } });
+      clearSubmitIntent();   // this run reached a verdict — the sentinel is spent
       finalState = 'awaiting_review';
       finished = true;
       continue;
