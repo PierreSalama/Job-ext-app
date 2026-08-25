@@ -977,6 +977,7 @@ function open(userDataDir) {
   migrateGmailQuery();
   migrateGmailBackfill();
   migrateMemoryPlaceholders();
+  migrateImplausibleCompanies();
   migrateForceVacuumOnce();
   log.info('opened', file);
   return db;
@@ -1295,6 +1296,18 @@ function migrateMemoryPlaceholders() {
 // deletes a large backlog on the first maintenance() run, but VACUUM is gated to once/7d — so clear
 // the gate ONCE here so the next maintenance tick compacts the freed pages back to the OS. Guarded by
 // a kv flag so it only happens on the upgrade, not every boot.
+// One-shot repair of the rows written before the company write boundary existed (v11.126.0).
+// Same shape as migrateMemoryPlaceholders: gated by a kv flag so it runs once on the upgrade,
+// never every boot. repairImplausibleCompanies is itself idempotent, so a re-run is harmless.
+function migrateImplausibleCompanies() {
+  if (!db) return;
+  try {
+    if (kvGet('companyGuardRepairV1')) return;
+    repairImplausibleCompanies();
+    kvSet('companyGuardRepairV1', 1);
+  } catch (e) { log.warn && log.warn('company repair migration skipped:', e.message); }
+}
+
 function migrateForceVacuumOnce() {
   if (!db) return;
   try {
@@ -1304,6 +1317,104 @@ function migrateForceVacuumOnce() {
     kvSet('lastVacuumAt', '');   // falsy → next maintenance() VACUUMs regardless of the day gate
     kvSet('forceVacuumV1185', 1);
   } catch (e) { log.warn && log.warn('force-vacuum migration skipped:', e.message); }
+}
+
+
+// A POST-SUBMIT CONFIRMATION HEADING IS NOT A JOB TITLE.
+// v11.125.0 refused one in the extension's ctxFromMeta, but probePage's very next step is
+// readPrimaryHeading(), which is reached BECAUSE the refusal emptied the title — so the heading
+// came back in through the side door. Live 2026-08-24, after that release, a VERIFIED Affirm
+// submission (job_84e2b208, job-boards.greenhouse.io/affirm/jobs/7663436003) still renamed its job
+// to "Thank you for applying to Affirm.". The extension side is closed too, but this copy is what
+// protects the store from a build already deployed. Byte-identical to detector.js's
+// CONFIRMATION_TITLE_RX; tests/company-guard.test.mjs asserts they stay that way.
+//
+// Blanking the title is the whole fix: upsertJob keeps `prev.title` on update, and refuses to
+// CREATE an untitled job — which is exactly how a confirmation credits a submission against the
+// row it belongs to without renaming it.
+const CONFIRMATION_TITLE_RX = /^\s*(?:thanks?\b|thank you\b|merci\b|application (?:submitted|received|complete|confirmation|sent)|your application\b|submission (?:received|complete)|congratulations\b|we(?:'| ha)ve received)/i;
+function isConfirmationTitle(value) {
+  return CONFIRMATION_TITLE_RX.test(String(value == null ? '' : value));
+}
+
+// ── AN EMPLOYER IS A NAME, NOT PROSE ─────────────────────────────────────────────────────────
+// The other half of the v11.125.0 cross-contamination fix (defect 3b). That release stopped a
+// post-submit confirmation heading from being accepted as a TITLE, and stopped the ATS routing
+// label from being accepted as an EMPLOYER — but only the exact routing labels. Nothing stopped
+// an arbitrary heading lifted off the job description from landing in `company`, and inferring a
+// company from a heading is exactly what detector.js does when the page carries no employer of
+// its own (job-boards.greenhouse.io never does). Live 2026-08-24, on the first two Affirm runs
+// after that release:
+//     task_58b8b766   company: "affirm" → "What You'll Do"
+//     task_3f9cf09d   company: "affirm" → "What you’ll do"
+// and a third, task_b7c16686, took "Growth)" — the tail of its own title
+// "Senior Software Engineer, Backend (PBA - Growth)" split on the " - " separator.
+//
+// Four classes are refused, each one measured on a real corrupted row:
+//   1. ROUTING LABEL — "job-boards", "boards", "apply", "smartapply", "embed", an ATS brand.
+//   2. UNBALANCED FRAGMENT — "Growth)". A name never carries one half of a bracket pair; that
+//      is the signature of a string that was cut out of a longer one.
+//   3. JD SECTION HEADING — "What You'll Do", "About Tailscale", "Back to jobs",
+//      "Team Member Resource Groups". Enumerable, and no employer is called any of them.
+//   4. SENTENCE — "We champion every identity." Marketing copy: a sentence opener plus three or
+//      more words, or an internal ". " sentence break ("Learn. Develop. Succeed").
+//
+// The failure mode of a false positive is deliberately harmless: upsertJob falls back to
+// `prev.company`, so a rejected value means the row KEEPS THE EMPLOYER IT ALREADY HAD, and a
+// brand-new row is simply created without one. A blank company is honest; a wrong one is not.
+// Enforced HERE, at the storage boundary, so no client version — including the extension build
+// already loaded in the applier's Chrome — can write one.
+const COMPANY_ROUTING_RX = /^(?:job-?boards?|boards?|jobs?|apply|applications?|smart-?apply|embed|careers?|recruiting|recruitment|hiring|talent|greenhouse|lever|ashby|ashbyhq|workday|myworkdayjobs|workable|bamboohr|smartrecruiters|zip-?recruiter|icims|taleo|linkedin|indeed|glassdoor|www|app|apps|secure|my)$/i;
+const JD_SECTION_HEADING_RX = /^(?:what\s+(?:you|we|to)\b|who\s+(?:you|we)\b|about\b|the\s+role\b|your\s+(?:role|impact|team|day)\b|responsibilities\b|requirements\b|qualifications\b|benefits\b|perks\b|why\s+(?:join|us|work)\b|how\s+(?:we|you)\b|our\s+(?:team|stack|values|mission|culture|process)\b|back\s+to\s+jobs?\b|job\s+description\b|role\s+overview\b|nice\s+to\s+have\b|must\s+have\b|equal\s+(?:opportunity|employment)\b|thank\s+you\b|apply\s+(?:now|for)\b)|\bresource\s+groups?$/i;
+const SENTENCE_OPENER_RX = /^(?:we|our|us|i|you|your|it|its|they|their|this|that|these|those|here|there|come|join|build|help|let|meet|discover|learn|imagine|ready)\b/i;
+const INTERNAL_SENTENCE_BREAK_RX = /\w\.\s+[A-Z]/;
+function isImplausibleCompany(value) {
+  const s = String(value == null ? '' : value).trim();
+  if (!s) return false;                                    // empty is not "implausible", just absent
+  if (COMPANY_ROUTING_RX.test(s)) return true;             // (1)
+  const open = (s.match(/[([]/g) || []).length;
+  const close = (s.match(/[)\]]/g) || []).length;
+  if (open !== close) return true;                         // (2)
+  if (JD_SECTION_HEADING_RX.test(s)) return true;          // (3)
+  const words = s.split(/\s+/).filter(Boolean);
+  if (SENTENCE_OPENER_RX.test(s) && words.length >= 3) return true;   // (4a)
+  if (INTERNAL_SENTENCE_BREAK_RX.test(s)) return true;               // (4b)
+  return false;
+}
+
+// The employer an ATS board URL states in its own path — `job-boards.greenhouse.io/<token>/…`,
+// `jobs.lever.co/<token>/…`, `jobs.ashbyhq.com/<token>/…`. That token is what the healthy rows
+// already store (lowercase: "affirm", "gitlab", "faire"), which is what makes it a safe repair
+// value rather than a guess. `embed` is Greenhouse's iframe route, not a company.
+const ATS_BOARD_TOKEN_RX = /^https?:\/\/(?:(?:job-boards|boards)\.greenhouse\.io|jobs\.lever\.co|jobs\.ashbyhq\.com)\/([^/?#]+)/i;
+function atsCompanyFromUrl(url) {
+  const m = ATS_BOARD_TOKEN_RX.exec(String(url || ''));
+  if (!m) return '';
+  let token = '';
+  try { token = decodeURIComponent(m[1]); } catch { token = m[1]; }
+  token = token.trim();
+  if (!token || COMPANY_ROUTING_RX.test(token)) return '';
+  return token;
+}
+
+// Repair the rows the missing guard already wrote. UNAMBIGUOUS ONLY: the job must be hosted on an
+// ATS board whose URL names the employer, and the stored company must be one the guard above now
+// refuses. Anything else is left alone — a company that merely looks odd is not evidence of
+// corruption, and overwriting it would be the same mistake in the other direction. Idempotent:
+// once repaired the row no longer matches. Returns the rows changed so the migration + tests can
+// assert on it.
+function repairImplausibleCompanies() {
+  const fixed = [];
+  for (const r of all('SELECT id, company, job_url, title FROM jobs')) {
+    if (!isImplausibleCompany(r.company)) continue;
+    const token = atsCompanyFromUrl(r.job_url);
+    if (!token) continue;
+    run('UPDATE jobs SET company = ?, norm_key = ?, updated_at = ? WHERE id = ?',
+        [token, r.title ? normKey(r.title) + '|' + normKey(token) : null, now(), r.id]);
+    fixed.push({ id: r.id, from: r.company, to: token });
+  }
+  if (fixed.length) log.info(`repaired ${fixed.length} job(s) whose company had been overwritten with page text`);
+  return fixed;
 }
 
 // ---- kv ----
@@ -1511,8 +1622,13 @@ function upsertJob(input, opts = {}) {
   const incoming = {
     externalId: input.externalId || null,
     source: input.source || null,
-    title: String(input.title || '').slice(0, 300),
-    company: String(input.company || '').slice(0, 300),
+    // WRITE BOUNDARY for the title — see isConfirmationTitle. Blanked rather than rejected so a
+    // confirmation still credits the submission against the row it belongs to.
+    title: isConfirmationTitle(input.title) ? '' : String(input.title || '').slice(0, 300),
+    // WRITE BOUNDARY for the employer. A heading scraped off the job description is not one —
+    // see isImplausibleCompany. Refusing it here means the update below falls back to
+    // `prev.company` and the row keeps the employer it already had.
+    company: isImplausibleCompany(input.company) ? '' : String(input.company || '').slice(0, 300),
     location: String(input.location || '').slice(0, 300),
     jobUrl: String(input.jobUrl || '').slice(0, 2000),
     description: String(input.description || '').slice(0, 16000),
@@ -1897,6 +2013,24 @@ function isMisattributedUrlAnswer(question, value) {
   return SELF_REFERENTIAL_JOB_Q_RX.test(q);              // (2) asks for THIS posting's own link
 }
 
+// ── A SITE-INTERNAL IDENTIFIER IS NOT AN ANSWER ──────────────────────────────────────────────
+// LinkedIn's Easy Apply options are scraped WITH their form-element URN attached, so a parked
+// task's option list reads, verbatim:
+//     "no no urn:li:fsd_formelement:urn:li:jobs_applyformcommon_easyapplyformelement:(4440016720,34185170082,multiplechoice)"
+// The AI-answer pass is told to reply with one of the given options, so it did — measured
+// 2026-08-24 on the first run of "JAT AI Answers" that ever got past its HTTP 500. Its JUDGEMENT
+// was right ("no" — 2 years' experience, no Salesforce); the VALUE was a job-specific identifier
+// carrying posting id 4440016720.
+//
+// Storing it would have been permanent: recall is keyed on the question, so every future
+// Salesforce screening question would be answered with one dead posting's internal id, matching no
+// option on any form. The live store had ZERO of these when this guard was written — this job was
+// about to write the first. Refused at both halves of memory, like the URL guard above.
+const OPAQUE_TOKEN_ANSWER_RX = /\burn:[a-z0-9][\w.-]*:/i;
+function isOpaqueTokenAnswer(value) {
+  return OPAQUE_TOKEN_ANSWER_RX.test(String(value == null ? '' : value));
+}
+
 // Sweep both halves of learned memory for rows the write boundary would now refuse. Idempotent —
 // once deleted a row cannot match again. Returns the counts so the migration + tests can assert.
 function purgeMisattributedUrlAnswers() {
@@ -1960,6 +2094,7 @@ function qaRecord({ profileId, question, answer, source, fieldType, lineageSourc
   if (!qn || answer == null || answer === '') return null;
   if (isPlaceholderAnswer(answer)) return null;   // never store a dropdown placeholder as an answer
   if (isMisattributedUrlAnswer(question, answer)) return null;   // the OTHER half of the memory pair — see profileFieldUpsert
+  if (isOpaqueTokenAnswer(answer)) return null;                  // …and the same for a scraped widget URN
   // Never AUTO-LEARN an id / field-name / option word AS the question. Scoped to machine-
   // captured writes on purpose: a user-entered profile field is high-trust and mirrors here
   // with lineageSource 'user', and the user is allowed a terse label. The junk comes from the
@@ -2113,6 +2248,11 @@ function profileFieldUpsert({ profileId, question, value, locale, fieldType, sou
   // is a mis-attribution, not an answer — see isMisattributedUrlAnswer.
   if (isMisattributedUrlAnswer(label, val)) {
     log.warn(`profileFieldUpsert: refusing a bare URL as the answer to "${label.slice(0, 80)}"`);
+    return null;
+  }
+  // A scraped widget identifier is not an answer either — see isOpaqueTokenAnswer.
+  if (isOpaqueTokenAnswer(val)) {
+    log.warn(`profileFieldUpsert: refusing a site-internal identifier as the answer to "${label.slice(0, 80)}"`);
     return null;
   }
   if (!profileId) { log.warn('profileFieldUpsert: missing profileId — answer not saved:', label); return null; }
@@ -5568,6 +5708,9 @@ module.exports = {
   answerShape,   // re-exported so callers that already hold `db` can reach the recall gates
   isPlaceholderAnswer, stripPlaceholderAnswers, isJunkQuestionText,
   isMisattributedUrlAnswer, purgeMisattributedUrlAnswers,
+  isImplausibleCompany, atsCompanyFromUrl, repairImplausibleCompanies,
+  isOpaqueTokenAnswer,
+  isConfirmationTitle,
   profileFieldUpsert, profileFieldList, profileFieldSet, profileFieldDelete,
   profileFieldLookup, profileAutofillBundle, harvestAnswersToProfile, backfillProfileFromJobs, deriveProfileFromLearned,
   memoryToProfileData, pushProfileDataToMemory, ensureDefaultProfileId, resolveProfileId,

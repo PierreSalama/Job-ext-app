@@ -18,7 +18,10 @@
  */
 const args = process.argv.slice(2);
 const arg = (k, d = null) => { const i = args.indexOf('--' + k); return i >= 0 ? args[i + 1] : d; };
-const BASE = arg('base', 'http://127.0.0.1:7746').replace(/\/$/, '');
+// 7744 is the app's real port (config.js server.port); the 7746 this defaulted to was never
+// listening anywhere. The scheduled task passes --base explicitly, so the default only ever bit
+// somebody running this by hand — with a connection error that looks like "the app is down".
+const BASE = arg('base', 'http://127.0.0.1:7744').replace(/\/$/, '');
 const TOKEN = arg('token', '');
 const MIN = Number(arg('min', '0.8'));
 const DRY = args.includes('--dry');
@@ -86,8 +89,18 @@ const main = async () => {
     + 'Match the expected field type: for radio/select answer with one of the given options '
     + '(or exactly "Yes"/"No"); for numbers answer with digits only; keep text answers under 40 words.';
 
+  // `additionalProperties: false` is NOT optional. OpenAI structured outputs reject an object
+  // schema without it, so /ai/generate answered HTTP 500 for every question — this job had never
+  // produced a single answer in its life: ~23 questions x 500, every 30 minutes, since it was
+  // written. Verified on the live laptop 2026-08-24: the identical request with this one line
+  // added returns 200 and a correct answer. Every schema in app/src/ai/prompts.js already carries
+  // it; this script was the one that did not.
+  //
+  // The paired trap (see prompts.js): with additionalProperties:false, EVERY declared property
+  // must also be listed in `required` — an optional one makes the provider exit non-zero instead.
   const schema = {
     type: 'object',
+    additionalProperties: false,
     properties: {
       answer: { type: 'string' },
       confidence: { type: 'number' },
@@ -120,7 +133,19 @@ const main = async () => {
     const ans = String(out?.answer ?? '').trim();
     const label = `${[...companies].slice(0, 2).join(',')} | ${String(q.question).slice(0, 58)}`;
     if (!ans || conf < MIN) { console.log(`  LOW  (${conf.toFixed(2)}) ${label}`); continue; }
-    console.log(`  OK   (${conf.toFixed(2)}) ${label} → "${ans.slice(0, 40)}"  [${String(out.evidence).slice(0, 50)}]`);
+    // LinkedIn ships its Easy Apply options with the form-element URN glued on, so "answer with
+    // one of the given options" yields a job-specific identifier. The server refuses these at the
+    // write boundary (db.isOpaqueTokenAnswer); refusing here too means the run REPORTS it as junk
+    // instead of announcing a save the store then silently drops.
+    if (/\burn:[a-z0-9][\w.-]*:/i.test(ans)) {
+      console.log(`  JUNK (${conf.toFixed(2)}) ${label}\n         a scraped widget identifier, not an answer: ${JSON.stringify(ans.slice(0, 120))}`);
+      continue;
+    }
+    // Print the answer IN FULL. This line is the only record of what goes into Pierre's permanent
+    // answer memory, and it used to truncate at 40 characters — so the one thing a reviewer needs
+    // to check was the one thing they could not see. Rejected answers stay short; accepted ones
+    // are the ones that matter.
+    console.log(`  OK   (${conf.toFixed(2)}) ${label}\n         ANSWER: ${JSON.stringify(ans)}\n         EVIDENCE: ${String(out.evidence).slice(0, 200)}`);
     accepted.push({ question: q.question, value: ans, fieldType: q.fieldType || 'text' });
   }
 

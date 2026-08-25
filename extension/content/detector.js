@@ -20,7 +20,7 @@
 //    unrelated signup forms.
 
 import { readJsonLdJobPosting } from './signals/json-ld.js';
-import { detectApplyForm, detectAttachments, snapshotAnswers, findCompanyLink, findResumeFilename, inferFromApplyHeader } from './signals/forms.js';
+import { detectApplyForm, detectAttachments, snapshotAnswers, findCompanyLink, findResumeFilename, inferFromApplyHeader, isImplausibleCompany } from './signals/forms.js';
 import { isApplyClick, isSubmitClick, isStepAdvanceClick, hasApplyAction } from './signals/intent.js';
 import { pageTextLooksLikeSuccess, urlLooksLikeSuccess, nodeLooksLikeSuccess } from './signals/success.js';
 import { sitePack, detectSource } from './sites/index.js';
@@ -294,6 +294,12 @@ function readPrimaryHeading() {
     const text = cleanTitle((h.textContent || '').slice(0, 200));
     if (!text) continue;
     if (/^(jobs?|careers?|apply|application)$/i.test(text)) continue;
+    // v11.125.0 refused a confirmation heading as a title in ctxFromMeta — and then probePage
+    // immediately called THIS function, because that refusal is what left ctx.title empty. So the
+    // heading came straight back in through the side door: live 2026-08-24, a verified Affirm
+    // submission still renamed its job to "Thank you for applying to Affirm.". Same rule, same
+    // reason, applied here too.
+    if (CONFIRMATION_TITLE_RX.test(text)) continue;
     return text;
   }
   return '';
@@ -302,6 +308,13 @@ function readPrimaryHeading() {
 function hostCompanyFallback() {
   return location.hostname.replace(/^www\./, '').split('.')[0];
 }
+// First candidate that is a plausible employer name, or '' — so a merge never adopts prose just
+// because it happens to be the first non-empty value in the chain.
+function plausibleCompany(...candidates) {
+  for (const c of candidates) if (c && !isImplausibleCompany(c)) return c;
+  return '';
+}
+export { isImplausibleCompany };
 export function isPlatformLabel(value) { return PLATFORM_LABEL_RX.test(compactText(value)); }
 function isGenericTitle(value) {
   return /^(jobs?|careers?|apply|application|job application)$/i.test(compactText(value));
@@ -636,13 +649,13 @@ async function evaluate(reason) {
             ...(probe?.ctx || ctxFromMeta()),
             ...handoff.ctx,
             title: handoff.ctx.title || probe?.ctx?.title || header?.title || '',
-            company: handoff.ctx.company || probe?.ctx?.company || header?.company || '',
+            company: plausibleCompany(handoff.ctx.company, probe?.ctx?.company, header?.company),
             jobUrl: handoff.ctx.jobUrl || probe?.ctx?.jobUrl || location.href,
           }
         : {
             ...handoff.ctx,
             title: probe?.ctx?.title || header?.title || handoff.ctx.title,
-            company: probe?.ctx?.company || header?.company || handoff.ctx.company,
+            company: plausibleCompany(probe?.ctx?.company, header?.company, handoff.ctx.company),
           };
       probe = { score: 0.6, ctx: enriched };
       state.source = handoff.source;
@@ -651,7 +664,7 @@ async function evaluate(reason) {
     } else if (!probe) {
       const header = inferFromApplyHeader();
       if (header?.title) {
-        probe = { score: 0.5, ctx: { ...ctxFromMeta(), title: header.title, company: header.company || ctxFromMeta().company } };
+        probe = { score: 0.5, ctx: { ...ctxFromMeta(), title: header.title, company: plausibleCompany(header.company, ctxFromMeta().company) } };
       }
     }
   }

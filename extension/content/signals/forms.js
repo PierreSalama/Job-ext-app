@@ -383,6 +383,7 @@ export function findCompanyLink(root = document) {
     if (!text) continue;
     if (/^(view|about|see|more|explore|follow)\b/i.test(text)) continue;
     if (text.length > 120) continue;
+    if (isImplausibleCompany(text)) continue;   // a "company" link whose text is page chrome
     return text;
   }
   return '';
@@ -517,22 +518,76 @@ function matchFilenameInAttrs(el) {
 }
 
 // ----- Title/company from apply-form headers -----
+// ── AN EMPLOYER IS A NAME, NOT PROSE ─────────────────────────────────────────────────────────
+// The other half of the v11.125.0 cross-contamination fix (defect 3b). That release stopped a
+// post-submit confirmation heading from being accepted as a TITLE, and stopped the ATS routing
+// label from being accepted as an EMPLOYER — but only the exact routing labels. Nothing stopped
+// an arbitrary heading lifted off the job description from landing in `company`, and inferring a
+// company from a heading is exactly what detector.js does when the page carries no employer of
+// its own (job-boards.greenhouse.io never does). Live 2026-08-24, on the first two Affirm runs
+// after that release:
+//     task_58b8b766   company: "affirm" → "What You'll Do"
+//     task_3f9cf09d   company: "affirm" → "What you’ll do"
+// and a third, task_b7c16686, took "Growth)" — the tail of its own title
+// "Senior Software Engineer, Backend (PBA - Growth)" split on the " - " separator.
+//
+// Four classes are refused, each one measured on a real corrupted row:
+//   1. ROUTING LABEL — "job-boards", "boards", "apply", "smartapply", "embed", an ATS brand.
+//   2. UNBALANCED FRAGMENT — "Growth)". A name never carries one half of a bracket pair; that
+//      is the signature of a string that was cut out of a longer one.
+//   3. JD SECTION HEADING — "What You'll Do", "About Tailscale", "Back to jobs",
+//      "Team Member Resource Groups". Enumerable, and no employer is called any of them.
+//   4. SENTENCE — "We champion every identity." Marketing copy: a sentence opener plus three or
+//      more words, or an internal ". " sentence break ("Learn. Develop. Succeed").
+//
+// The failure mode of a false positive is deliberately harmless: upsertJob falls back to
+// `prev.company`, so a rejected value means the row KEEPS THE EMPLOYER IT ALREADY HAD, and a
+// brand-new row is simply created without one. A blank company is honest; a wrong one is not.
+// This is the EXTENSION copy: it stops the value at the source, before the capture is even sent.
+// db.js carries the identical rules at the storage boundary — that copy is the authoritative one
+// (it also covers extension builds already deployed). tests/company-guard.test.mjs asserts the two
+// definitions stay byte-identical, so neither side can drift.
+const COMPANY_ROUTING_RX = /^(?:job-?boards?|boards?|jobs?|apply|applications?|smart-?apply|embed|careers?|recruiting|recruitment|hiring|talent|greenhouse|lever|ashby|ashbyhq|workday|myworkdayjobs|workable|bamboohr|smartrecruiters|zip-?recruiter|icims|taleo|linkedin|indeed|glassdoor|www|app|apps|secure|my)$/i;
+const JD_SECTION_HEADING_RX = /^(?:what\s+(?:you|we|to)\b|who\s+(?:you|we)\b|about\b|the\s+role\b|your\s+(?:role|impact|team|day)\b|responsibilities\b|requirements\b|qualifications\b|benefits\b|perks\b|why\s+(?:join|us|work)\b|how\s+(?:we|you)\b|our\s+(?:team|stack|values|mission|culture|process)\b|back\s+to\s+jobs?\b|job\s+description\b|role\s+overview\b|nice\s+to\s+have\b|must\s+have\b|equal\s+(?:opportunity|employment)\b|thank\s+you\b|apply\s+(?:now|for)\b)|\bresource\s+groups?$/i;
+const SENTENCE_OPENER_RX = /^(?:we|our|us|i|you|your|it|its|they|their|this|that|these|those|here|there|come|join|build|help|let|meet|discover|learn|imagine|ready)\b/i;
+const INTERNAL_SENTENCE_BREAK_RX = /\w\.\s+[A-Z]/;
+export function isImplausibleCompany(value) {
+  const s = String(value == null ? '' : value).trim();
+  if (!s) return false;                                    // empty is not "implausible", just absent
+  if (COMPANY_ROUTING_RX.test(s)) return true;             // (1)
+  const open = (s.match(/[([]/g) || []).length;
+  const close = (s.match(/[)\]]/g) || []).length;
+  if (open !== close) return true;                         // (2)
+  if (JD_SECTION_HEADING_RX.test(s)) return true;          // (3)
+  const words = s.split(/\s+/).filter(Boolean);
+  if (SENTENCE_OPENER_RX.test(s) && words.length >= 3) return true;   // (4a)
+  if (INTERNAL_SENTENCE_BREAK_RX.test(s)) return true;               // (4b)
+  return false;
+}
+
 const APPLY_HEADER_RX = /apply(?:ing)?\s+(?:for|to)\s+(.+?)(?:\s+at\s+(.+?))?(?:\s+on\s+\w+)?$/i;
 const GENERIC_HEADING_RX = /^(apply|application|job application|candidate details|resume|cv|review|submit|postuler|candidature)$/i;
+// Every employer this function can produce is guessed from page text, so every one of them goes
+// through the guard: a heading fragment ("Growth)"), a JD section title ("What You'll Do") and a
+// marketing line ("We champion every identity.") were all written into `company` from here.
+const keepCompany = (v) => {
+  const s = String(v == null ? '' : v).trim();
+  return s && !isImplausibleCompany(s) ? s : '';
+};
 export function inferFromApplyHeader() {
   for (const h of qsa('h1, h2, [role="heading"]')) {
     const text = collectText(h, 200);
     if (!text || text.length > 200) continue;
     const match = text.match(APPLY_HEADER_RX);
-    if (match) return { title: match[1]?.trim() || '', company: match[2]?.trim() || '' };
+    if (match) return { title: match[1]?.trim() || '', company: keepCompany(match[2]) };
 
     const parts = text.split(/\s+[·•|—-]\s+/);
     if (parts.length >= 2 && parts[0].length < 80 && parts[1].length < 80) {
-      return { title: parts[0].trim(), company: parts[1].trim() };
+      return { title: parts[0].trim(), company: keepCompany(parts[1]) };
     }
 
     if (!GENERIC_HEADING_RX.test(text) && text.length < 120) {
-      const company = findNearbyCompanyText(h);
+      const company = keepCompany(findNearbyCompanyText(h));
       if (company) return { title: text, company };
     }
   }
