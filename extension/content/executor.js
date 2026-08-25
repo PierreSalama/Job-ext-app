@@ -26,7 +26,7 @@ import { redactValue, redactLabel } from './lib/redact.js';
 import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence, resolveLocator, recoveryFingerprint, shouldResetPageActionBreaker } from './replay.js';
 import { classifyApplyControl, observeRoute, applyRouteForState } from './route.js';
 import { classifyInterstitial } from './lib/interstitial.js';
-import { shouldFrontOnOpenerStall, classifyNoChangeRoute } from './lib/opener-stall.js';
+import { shouldFrontOnOpenerStall, classifyNoChangeRoute, isPostingClosed } from './lib/opener-stall.js';
 import { detectBotChallenge, botChallengeLastError } from './lib/challenge.js';
 import { ADVANCE_KEYWORDS, isAdvanceLabel, stripLoadingPrefix } from './lib/advance.js';
 import { isLinkedInEasyApplyApplyUrl, isLinkedInApplyAdvanceLabel, deriveApplyRootFromAdvanceButton, shouldUseGenericOpenFallback, detectLinkedInExternalPosting, decideResumePage, isUploadResumeAffordanceLabel, pageRequiresResume, groundedEligibilityAnswer, isEligibilityScreeningQuestion, isReferralQuestion, referralDefaultAnswer, decideAnswerOrPark } from './lib/linkedin-apply.js';
@@ -4064,13 +4064,32 @@ export async function run(task, context, helpers) {
       // a mid-flow advance click goes straight to the answer-rescan below.
       if (noChangeRoute.route === 'opener-stall') {
         const modalMounted = !!findApplyDialog();
+        // A CLOSED posting explains this stall completely: LinkedIn leaves the Easy Apply button
+        // on the page after a job stops accepting applications, and clicking it does nothing.
+        // Read the page's own words (never a selector — markup changes must not silently
+        // disable this) so the decision below can terminate instead of spending a fronted retry.
+        let pageSaysClosed = false;
+        try { pageSaysClosed = isPostingClosed(document.body?.innerText || ''); } catch {}
         const stallDecision = shouldFrontOnOpenerStall({
           haveForm,
           isExternalClick: externalClick,
           changed,
           modalMounted,
           alreadyFronted: openerStallFronted,
+          postingClosed: pageSaysClosed,
         });
+        if (stallDecision.terminal) {
+          // Terminal and honest. NOT 'failed': nothing here needs inspecting and nothing will
+          // change on a retry, so skip it and free the worker.
+          logLine('warn', 'this posting is no longer accepting applications — skipping');
+          report({
+            state: 'skipped',
+            lastError: 'posting is no longer accepting applications (LinkedIn still shows the button)',
+            transcriptAppend: { note: 'opener clicked, no mount; page states the posting is closed' },
+          });
+          finalState = 'skipped';
+          break;
+        }
         if (stallDecision.front) {
           openerStallFronted = true;
           logLine('warn', 'apply opener clicked but the modal did not mount — fronting the apply window and waiting for it to hydrate');
@@ -4095,7 +4114,30 @@ export async function run(task, context, helpers) {
           // Fronted retry still produced no modal — release the front and fall through to the
           // honest stall/breaker handling below (it will fail RETRIABLY, classified as transient).
           signalHydrated();
+          // OBSERVABILITY, not a guess. Two of six sampled stalls were closed postings; the rest
+          // are still unexplained, and the transcript recorded nothing about the button that was
+          // clicked. Capture the few facts that discriminate the remaining causes — a disabled or
+          // detached node, a duplicate opener where the wrong one was chosen, or a real handoff to
+          // an /apply/ page — so the NEXT one of these arrives with evidence attached.
+          let stallDiag = null;
+          try {
+            const openers = [...document.querySelectorAll('button,a[role="button"]')]
+              .filter((b) => /easy apply/i.test(b.innerText || b.getAttribute('aria-label') || ''));
+            const chosen = openers[0] || null;
+            const r = chosen ? chosen.getBoundingClientRect() : null;
+            stallDiag = {
+              openerCount: openers.length,
+              tag: chosen ? chosen.tagName : null,
+              disabled: chosen ? (chosen.disabled === true || chosen.getAttribute('aria-disabled') === 'true') : null,
+              visible: chosen ? !!chosen.offsetParent : null,
+              size: r ? Math.round(r.width) + 'x' + Math.round(r.height) : null,
+              dialogs: document.querySelectorAll('dialog,[role="dialog"]').length,
+              applyHref: !!document.querySelector('a[href*="/apply/"]'),
+              closedText: pageSaysClosed,
+            };
+          } catch {}
           logLine('warn', 'apply modal still did not mount after fronting — treating as a genuine stall');
+          if (stallDiag) report({ transcriptAppend: { kind: 'diagnostic', note: 'opener stall unexplained', diag: stallDiag } });
         }
       }
       // ---- FIX 1 KEYSTONE: advance BLOCKED on a form → re-scan, ANSWER, RETRY (before give-up) ----

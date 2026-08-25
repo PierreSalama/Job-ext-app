@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { shouldFrontOnOpenerStall, classifyNoChangeRoute } from '../extension/content/lib/opener-stall.js';
+import { shouldFrontOnOpenerStall, classifyNoChangeRoute, isPostingClosed } from '../extension/content/lib/opener-stall.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -119,4 +119,82 @@ test('external click → external route (its own handoff + no-progress cap own i
 test('classifyNoChangeRoute: missing args default to the opening case (never a blind rescan)', () => {
   assert.equal(classifyNoChangeRoute().route, 'opener-stall');
   assert.equal(classifyNoChangeRoute({}).route, 'opener-stall');
+});
+
+// ---------------------------------------------------------------------------
+// CLOSED POSTING (live data, 2026-08-25).
+//
+// Every LinkedIn failure across three days had one shape: opener found, opener clicked, modal
+// never mounted, fronted retry spent, task failed as "repeated page-level action did not
+// transfer" — a verdict that says "needs inspection" about a posting where nothing is wrong
+// with the code. Fetching six of them showed two were simply closed; LinkedIn leaves the Easy
+// Apply button on a closed posting and clicking it does nothing.
+// ---------------------------------------------------------------------------
+test('a closed posting is recognised from the page\'s own words', () => {
+  // LinkedIn's exact wording, and the surrounding text it really appears in.
+  assert.equal(isPostingClosed('No longer accepting applications'), true);
+  assert.equal(isPostingClosed('Full Stack Engineer\nPaymentus\nNo longer accepting applications\nSee who they hired'), true);
+  assert.equal(isPostingClosed('this job is no longer available'), true);
+  assert.equal(isPostingClosed('The position has been filled'), true);
+
+  // A live posting must never be read as closed — this is the expensive direction to get wrong,
+  // because it would silently skip jobs Pierre can still apply to.
+  for (const t of [
+    'Be among the first 25 applicants',
+    'Easy Apply to this job',
+    'We are no longer accepting paper resumes, please apply online',
+    'Applications open until December',
+    'Accepting applications on a rolling basis',
+    '',
+  ]) {
+    assert.equal(isPostingClosed(t), false, `must not read as closed: ${JSON.stringify(t)}`);
+  }
+  assert.equal(isPostingClosed(null), false);
+  assert.equal(isPostingClosed(undefined), false);
+});
+
+test('a closed posting terminates the stall instead of spending a fronted retry', () => {
+  const d = shouldFrontOnOpenerStall({
+    haveForm: false, isExternalClick: false, changed: false, modalMounted: false,
+    alreadyFronted: false, postingClosed: true,
+  });
+  assert.equal(d.front, false, 'fronting a closed posting cannot help');
+  assert.equal(d.terminal, true, 'and it must be terminal, not a retriable failure');
+  assert.equal(d.reason, 'posting-closed');
+});
+
+test('the closed check is evaluated before every other branch', () => {
+  // Whatever else is true, a closed posting is the whole explanation. This guards the ORDER of
+  // the checks: if the closed test ever moves below these, each returns its own non-terminal
+  // reason and the dead posting goes back to burning a worker slot.
+  for (const extra of [
+    { haveForm: true },
+    { isExternalClick: true },
+    { changed: true },
+    { modalMounted: true },
+    { alreadyFronted: true },
+  ]) {
+    const d = shouldFrontOnOpenerStall({
+      haveForm: false, isExternalClick: false, changed: false, modalMounted: false,
+      alreadyFronted: false, postingClosed: true, ...extra,
+    });
+    assert.equal(d.terminal, true, `closed must win over ${JSON.stringify(extra)}`);
+    assert.equal(d.reason, 'posting-closed');
+  }
+});
+
+test('an OPEN posting behaves exactly as it did before the closed check existed', () => {
+  // The regression guard. Every pre-existing decision must be byte-identical when the posting
+  // is open, whether the caller passes postingClosed:false or omits it entirely.
+  for (const closed of [false, undefined]) {
+    assert.deepEqual(
+      shouldFrontOnOpenerStall({ haveForm: false, isExternalClick: false, changed: false, modalMounted: false, alreadyFronted: false, postingClosed: closed }),
+      { front: true, reason: 'opener-clicked-no-mount-front-and-retry' });
+    assert.equal(shouldFrontOnOpenerStall({ haveForm: true, postingClosed: closed }).reason, 'form-already-open');
+    assert.equal(shouldFrontOnOpenerStall({ haveForm: false, isExternalClick: true, postingClosed: closed }).reason, 'external-route-has-own-cap');
+    assert.equal(shouldFrontOnOpenerStall({ haveForm: false, isExternalClick: false, changed: true, postingClosed: closed }).reason, 'page-changed');
+    assert.equal(shouldFrontOnOpenerStall({ haveForm: false, isExternalClick: false, changed: false, modalMounted: true, postingClosed: closed }).reason, 'modal-mounted');
+    assert.equal(shouldFrontOnOpenerStall({ haveForm: false, isExternalClick: false, changed: false, modalMounted: false, alreadyFronted: true, postingClosed: closed }).reason, 'already-fronted-retry-spent');
+    assert.equal(shouldFrontOnOpenerStall({ postingClosed: closed }).front, false, 'unknown signals still default-deny');
+  }
 });

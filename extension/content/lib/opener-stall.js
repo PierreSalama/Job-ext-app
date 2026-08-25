@@ -15,6 +15,29 @@
 // This module is the PURE decision so it can be unit-tested without a browser. The executor
 // supplies the live signals; this returns whether to front+retry vs. let the breaker proceed.
 
+// ============================================================
+// CLOSED POSTING — the stall that is not a bug.
+// ============================================================
+// LIVE DATA (2026-08-25): every LinkedIn failure in three days was the same shape — the opener
+// was found and clicked, the modal never mounted, the fronted retry spent, and the task failed
+// as "repeated page-level action did not transfer". Fetching six of those postings showed two
+// were simply CLOSED: LinkedIn leaves the Easy Apply button on the page after a posting stops
+// accepting applications, and clicking it does nothing at all.
+//
+// A closed posting is not a hydration problem, so fronting the window cannot help and the
+// duplicate-opener breaker's verdict ("needs inspection") is wrong and misleading. Detect it and
+// terminal-SKIP with the true reason, so the pool stops re-burning it and the number Pierre reads
+// stops counting dead postings as failures.
+//
+// Pure and node-testable: the executor passes document text, this decides.
+const POSTING_CLOSED_RX = /no longer accepting applications|this job is no longer available|applications are closed|position (?:has been|is) (?:filled|closed)/i;
+
+// Does this page say, in LinkedIn's own words, that it has stopped accepting applications?
+// Text only — never a selector, so a markup change cannot silently turn this off.
+function isPostingClosed(pageText) {
+  return POSTING_CLOSED_RX.test(String(pageText == null ? '' : pageText));
+}
+
 // Should we front the apply window and retry, instead of failing on a repeated opener?
 //
 // Front+retry exactly when ALL hold:
@@ -33,7 +56,11 @@ function shouldFrontOnOpenerStall({
   changed,
   modalMounted,
   alreadyFronted,
+  postingClosed,
 } = {}) {
+  // A closed posting is checked FIRST: it explains the stall completely, and every branch below
+  // would otherwise waste a fronted retry on a button that can never work.
+  if (postingClosed) return { front: false, reason: 'posting-closed', terminal: true };
   if (haveForm) return { front: false, reason: 'form-already-open' };
   if (isExternalClick) return { front: false, reason: 'external-route-has-own-cap' };
   if (changed) return { front: false, reason: 'page-changed' };
@@ -86,4 +113,4 @@ function classifyNoChangeRoute({
   return { route: 'opener-stall', reason: 'opening-click' };
 }
 
-export { shouldFrontOnOpenerStall, classifyNoChangeRoute };
+export { shouldFrontOnOpenerStall, classifyNoChangeRoute, isPostingClosed };

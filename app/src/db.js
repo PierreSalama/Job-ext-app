@@ -1368,6 +1368,14 @@ const COMPANY_ROUTING_RX = /^(?:job-?boards?|boards?|jobs?|apply|applications?|s
 const JD_SECTION_HEADING_RX = /^(?:what\s+(?:you|we|to)\b|who\s+(?:you|we)\b|about\b|the\s+role\b|your\s+(?:role|impact|team|day)\b|responsibilities\b|requirements\b|qualifications\b|benefits\b|perks\b|why\s+(?:join|us|work)\b|how\s+(?:we|you)\b|our\s+(?:team|stack|values|mission|culture|process)\b|back\s+to\s+jobs?\b|job\s+description\b|role\s+overview\b|nice\s+to\s+have\b|must\s+have\b|equal\s+(?:opportunity|employment)\b|thank\s+you\b|apply\s+(?:now|for)\b)|\bresource\s+groups?$/i;
 const SENTENCE_OPENER_RX = /^(?:we|our|us|i|you|your|it|its|they|their|this|that|these|those|here|there|come|join|build|help|let|meet|discover|learn|imagine|ready)\b/i;
 const INTERNAL_SENTENCE_BREAK_RX = /\w\.\s+[A-Z]/;
+// (5) A stylesheet, not an employer. Indeed's job page inlines a <style> block next to the company
+// element, and when the normal selector misses, the scraper's fallback grabs the whole rule text:
+//   ".css-1h4l2d7{font-family:'Indeed Sans','Noto Sans',…;-webkit-text-decoration:underline…}"
+// Rare (2 rows in 1500) but it lands in the LARGEST source — Indeed is ~1,950 of the tracked jobs —
+// and a company field holding a stylesheet poisons every later match on that employer. Caught here,
+// server-side on ingest, rather than in the extension: this protects every source at once and does
+// not need the applier's Chrome extension to be reloaded to take effect.
+const CSS_BLOB_RX = /(?:^|[\s;{])(?:-webkit-|-moz-|-ms-)[a-z-]+\s*:|\.css-[a-z0-9]|\bfont-family\s*:|\btext-decoration\s*:|\bdisplay\s*:\s*(?:block|flex|grid|inline)\b/i;
 function isImplausibleCompany(value) {
   const s = String(value == null ? '' : value).trim();
   if (!s) return false;                                    // empty is not "implausible", just absent
@@ -1379,6 +1387,7 @@ function isImplausibleCompany(value) {
   const words = s.split(/\s+/).filter(Boolean);
   if (SENTENCE_OPENER_RX.test(s) && words.length >= 3) return true;   // (4a)
   if (INTERNAL_SENTENCE_BREAK_RX.test(s)) return true;               // (4b)
+  if (CSS_BLOB_RX.test(s)) return true;                              // (5)
   return false;
 }
 

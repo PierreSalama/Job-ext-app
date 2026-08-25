@@ -234,3 +234,33 @@ test('the AI-answer pass refuses the same value before it claims a save', () => 
   assert.deepEqual(declared.sort(), [...required].sort(), 'every declared property must also be required');
   assert.match(src, /JUNK \(\$\{conf\.toFixed\(2\)\}\)/, 'a URN answer must be reported, not silently dropped');
 });
+
+// A stylesheet is not an employer. Both strings below are VERBATIM from Pierre's own database
+// (2 rows in 1500, both Indeed) — Indeed inlines a <style> block beside the company element and
+// the scraper's fallback selector swallowed the whole rule. Caught server-side on ingest so the
+// fix protects every source and needs no extension reload to take effect.
+test('a CSS rule scraped in place of the employer is refused', () => {
+  const real = ".css-1h4l2d7{font-family:'Indeed Sans','Noto Sans','Helvetica Neue',Helvetica,Arial,'Liberation Sans',Roboto,Noto,sans-serif;-webkit-text-decoration:underline solid currentcolor 0.06em;text-decoration:underline solid currentcolor 0.06em;text-decoration-skip-ink:none;text-underline-offset:0.25em;text";
+  assert.equal(db.isImplausibleCompany(real), true, 'the real Indeed stylesheet must be refused');
+
+  for (const v of [
+    '.css-1h4l2d7{font-family:Arial}',
+    'display:flex',
+    '-webkit-text-decoration:underline',
+    'a{text-decoration:none}',
+  ]) {
+    assert.equal(db.isImplausibleCompany(v), true, `should refuse ${JSON.stringify(v)}`);
+  }
+
+  // ...and it must not start refusing real employers. These are all genuine companies from the
+  // same dataset, including the awkward ones with punctuation, taglines and long legal names.
+  for (const v of [
+    'Fortify Services', 'Picton Mahoney Asset Management', 'gitlab', 'faire', 'robinhood',
+    'Wenco (a Hitachi Construction Machinery subsidiary)',
+    'Delta Intelligent Building Technologies (Canada) Inc.',
+    'Btech Studio', 'Amaris Consulting', 'Hootsuite', 'AYHAN’S Barbershop',
+    'Display Technologies Inc.', 'Sans Serif Media', 'Text Inc.',
+  ]) {
+    assert.equal(db.isImplausibleCompany(v), false, `should accept ${JSON.stringify(v)}`);
+  }
+});
