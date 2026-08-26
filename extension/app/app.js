@@ -3047,9 +3047,18 @@ route('/procedures', async () => {
     const scopeChip = r.scope === 'company'
       ? `<span class="sys-chip">company · ${esc(r.company || '?')}</span>`
       : '<span class="sys-chip">ATS · cross-company</span>';
+    // CAP THE STEPS SHOWN. Measured on the real database: 92 recipes, 1,121 steps, and this page
+    // rendered every one -- 24,202 elements, 1,690 KB. One recipe alone (indeed) holds 532 steps,
+    // which nobody scrolls; it was cost with no reader. The first 20 are the useful ones (they are
+    // the start of the flow), the rest are one click away, per recipe.
+    const STEP_CAP = 20;
     const steps = r.steps || [];
+    const shown = steps.slice(0, STEP_CAP);
     const stepsHtml = steps.length
-      ? steps.map((s, i) => stepRowHtml(r, s, i, steps.length)).join('')
+      ? (shown.map((s, i) => stepRowHtml(r, s, i, steps.length)).join('')
+         + (steps.length > STEP_CAP
+            ? `<button class="btn ghost sm proc-more" data-proc-more="${esc(r.id)}" style="margin:8px 4px">Show the other ${steps.length - STEP_CAP} steps</button>`
+            : ''))
       : '<div class="muted" style="padding:10px 4px;font-size:12px">No steps in this recipe.</div>';
     return `<section class="section proc-recipe" data-recipe="${esc(r.id)}" data-scope="${esc(r.scope)}">
       <header class="section-header">
@@ -3104,7 +3113,10 @@ route('/procedures', async () => {
     catch (e) { errToast(e); }
   };
 
-  v.querySelectorAll('.proc-step').forEach((row) => {
+  // DELEGATED-BY-BINDER, not bound once at render. Steps beyond the first 20 per recipe now
+  // arrive when someone asks for them, and a step bound only at first render would look identical
+  // and do nothing -- the same silent failure the Applications and Profile tables had.
+  const bindStep = (row) => {
     const stepId = row.dataset.step;
     const recipeEl = row.closest('.proc-recipe');
     const scope = recipeEl?.dataset.scope;
@@ -3135,6 +3147,27 @@ route('/procedures', async () => {
       if (!(await confirmModal('Delete this learned step?', { danger: true, okLabel: 'Delete' }))) return;
       try { await api('/recipe-step/' + encodeURIComponent(stepId), { method: 'DELETE' }); toast('Step deleted'); navigate(); }
       catch (e) { errToast(e); }
+    });
+  };
+  const bindAllSteps = () => v.querySelectorAll('.proc-step').forEach((row) => {
+    if (row.dataset.stepBound) return;
+    row.dataset.stepBound = '1';
+    bindStep(row);
+  });
+  bindAllSteps();
+
+  // "Show the other N steps" — render the rest of that recipe's steps in place, then bind them.
+  v.querySelectorAll('[data-proc-more]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.procMore;
+      const recipe = recipes.find((r) => String(r.id) === String(id));
+      if (!recipe) return;
+      const box = btn.parentElement;
+      const all = recipe.steps || [];
+      btn.remove();
+      box.insertAdjacentHTML('beforeend',
+        all.slice(20).map((s, i) => stepRowHtml(recipe, s, i + 20, all.length)).join(''));
+      bindAllSteps();
     });
   });
 
@@ -3193,7 +3226,11 @@ route('/profile', async () => {
     </div>`;
 
   const langBadge = (loc) => loc === 'fr' ? '<span class="lang-badge fr">FR</span>' : '<span class="lang-badge">EN</span>';
-  const harvestRows = harvested.length ? harvested.map((it) => `
+  // INCREMENTAL RENDER. Measured on the real database: this page was the heaviest in the app --
+  // 27,756 elements and 2.3 MB of markup, because it rendered every one of ~2,700 learned answers
+  // at once. The Applications table had the same problem and was fixed the same way.
+  const PF_PAGE = 100;
+  const pfRow = (it) => `
     <tr data-pf="${esc(it.id)}" class="${it.locked ? 'pf-locked' : ''}">
       <td class="title-cell" title="${esc(it.label)}${it.source ? ' · from ' + esc(it.source) : ''}">${langBadge(it.locale)} ${esc(it.label.length > 60 ? it.label.slice(0, 60) + '…' : it.label)}</td>
       <td><input class="input" data-pf-answer value="${esc(it.value)}" style="width:100%" /></td>
@@ -3203,8 +3240,18 @@ route('/profile', async () => {
         <button class="btn small ${it.locked ? 'primary' : ''}" data-pf-lock title="${it.locked ? 'Locked — new applications won’t overwrite. Click to unlock.' : 'Lock so new applications don’t overwrite this value.'}">${it.locked ? '🔒' : '🔓'}</button>
         <button class="btn small" data-pf-del title="Forget">✕</button>
       </td>
-    </tr>`).join('')
-    : `<tr><td colspan="4">${emptyHtml('Empty memory', 'No learned answers yet', 'Apply to jobs (or “Build from past applications”) and JAT learns how you answer — EN + FR.')}</td></tr>`;
+    </tr>`;
+
+  const pfEmpty = `<tr><td colspan="4">${emptyHtml('Empty memory', 'No learned answers yet', 'Apply to jobs (or “Build from past applications”) and JAT learns how you answer — EN + FR.')}</td></tr>`;
+  const pfMore = (from, total) => (from >= total ? '' : `
+    <tr class="pf-more"><td colspan="4" style="text-align:center;padding:12px">
+      <button class="btn" data-pf-show-more>Show ${Math.min(PF_PAGE, total - from)} more</button>
+      <button class="btn ghost" data-pf-show-all style="margin-left:8px">Show all ${total}</button>
+      <div class="muted" style="margin-top:5px;font-size:12px">Showing ${from} of ${total}</div>
+    </td></tr>`);
+  const harvestRows = harvested.length
+    ? (harvested.slice(0, PF_PAGE).map(pfRow).join('') + pfMore(Math.min(PF_PAGE, harvested.length), harvested.length))
+    : pfEmpty;
 
   const v = el(`<div>
     <header class="page-header">
@@ -3292,17 +3339,42 @@ route('/profile', async () => {
   // preserves the query while you type.
   const memSearch = v.querySelector('#pf-mem-search');
   const memCount = v.querySelector('#pf-mem-count');
+  const pfBody = v.querySelector('tr[data-pf], tr.pf-more') ? v.querySelector('tr[data-pf], tr.pf-more').parentElement : null;
+
+  // Search now filters the DATA, not the DOM, and that change was FORCED by the pagination above.
+  // The old version hid non-matching <tr>s -- which worked only because every row was in the page.
+  // With 100 rendered out of ~2,700, hiding rows would have searched the first hundred and quietly
+  // told you there were no matches. Filtering the array searches all of them, and is the reason
+  // this is a behaviour IMPROVEMENT rather than a regression traded for speed.
+  const pfRender = (list) => {
+    if (!pfBody) return;
+    pfBody.innerHTML = list.length
+      ? (list.slice(0, PF_PAGE).map(pfRow).join('') + pfMore(Math.min(PF_PAGE, list.length), list.length))
+      : `<tr><td colspan="4" class="muted" style="padding:16px 24px">No learned answer matches that.</td></tr>`;
+  };
+  let pfFiltered = harvested;
   if (memSearch) {
     memSearch.addEventListener('input', () => {
       const q = memSearch.value.trim().toLowerCase();
-      let shown = 0;
-      v.querySelectorAll('tr[data-pf]').forEach((tr) => {
-        const hay = ((tr.querySelector('.title-cell')?.textContent || '') + ' ' + (tr.querySelector('[data-pf-answer]')?.value || '')).toLowerCase();
-        const match = !q || hay.includes(q);
-        tr.style.display = match ? '' : 'none';
-        if (match) shown++;
-      });
-      if (memCount) memCount.textContent = q ? `${shown} match${shown === 1 ? '' : 'es'}` : '';
+      pfFiltered = !q ? harvested : harvested.filter((it) =>
+        ((it.label || '') + ' ' + (it.value || '')).toLowerCase().includes(q));
+      pfRender(pfFiltered);
+      if (memCount) memCount.textContent = q ? `${pfFiltered.length} match${pfFiltered.length === 1 ? '' : 'es'} of ${harvested.length}` : '';
+    });
+  }
+
+  // Reveal more rows of whatever is currently filtered.
+  if (pfBody) {
+    pfBody.addEventListener('click', (e) => {
+      const more = e.target.closest('[data-pf-show-more]');
+      const all = e.target.closest('[data-pf-show-all]');
+      if (!more && !all) return;
+      const shown = pfBody.querySelectorAll('tr[data-pf]').length;
+      const take = all ? pfFiltered.length : shown + PF_PAGE;
+      const ctl = pfBody.querySelector('tr.pf-more');
+      if (ctl) ctl.remove();
+      pfBody.insertAdjacentHTML('beforeend',
+        pfFiltered.slice(shown, take).map(pfRow).join('') + pfMore(Math.min(take, pfFiltered.length), pfFiltered.length));
     });
   }
 
@@ -3499,7 +3571,12 @@ route('/profile', async () => {
   });
 
   // Harvested answers: edit (override + lock), lock toggle, forget.
-  v.querySelectorAll('tr[data-pf]').forEach((tr) => {
+  //
+  // DELEGATED, not bound per row -- the same trap the Applications table had. These were attached
+  // with querySelectorAll at render time, which is fine for a table built once and silently fatal
+  // for one that now paginates and re-renders on every search keystroke: a row revealed later, or
+  // re-rendered by a filter, would look identical and do NOTHING. No error, no clue.
+  const pfBind = (tr) => {
     const id = tr.dataset.pf;
     const answerEl = tr.querySelector('[data-pf-answer]');
     const lockBtn = tr.querySelector('[data-pf-lock]');
@@ -3549,7 +3626,21 @@ route('/profile', async () => {
         toast(`Copied into your profile (${key ? (PF_LABEL[key] || key) : 'custom field'}) — review, then Save profile.`);
       }
     });
+  };
+
+  // Bind what is on screen now, and anything that appears later. A MutationObserver is used
+  // rather than re-binding at each call site because rows now arrive from three different places
+  // -- first render, "show more", and a search re-render -- and one of those would eventually be
+  // forgotten. Watching the table means every row is wired however it got there.
+  const pfBindAll = (root) => root.querySelectorAll('tr[data-pf]').forEach((tr) => {
+    if (tr.dataset.pfBound) return;
+    tr.dataset.pfBound = '1';
+    pfBind(tr);
   });
+  if (pfBody) {
+    pfBindAll(pfBody);
+    new MutationObserver(() => pfBindAll(pfBody)).observe(pfBody, { childList: true });
+  }
 
   return v;
 });

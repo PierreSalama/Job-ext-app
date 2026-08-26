@@ -1308,9 +1308,9 @@ function migrateImplausibleCompanies() {
     // GitLab applications were filed under the company "underrepresented groups", and their URLs
     // (job-boards.greenhouse.io/gitlab/...) name the employer plainly. Idempotent, so a machine
     // that already ran V1 simply repairs the newly-refused rows and stops.
-    if (kvGet('companyGuardRepairV2')) return;
+    if (kvGet('companyGuardRepairV3')) return;
     const fixed = repairImplausibleCompanies();
-    kvSet('companyGuardRepairV2', 1);
+    kvSet('companyGuardRepairV3', 1);
     if (fixed && fixed.length) log.info && log.info(`company repair: corrected ${fixed.length} row(s)`);
   } catch (e) { log.warn && log.warn('company repair migration skipped:', e.message); }
 }
@@ -1396,6 +1396,21 @@ const CSS_BLOB_RX = /(?:^|[\s;{])(?:-webkit-|-moz-|-ms-)[a-z-]+\s*:|\.css-[a-z0-
 // "all qualified applicants" could not.
 const EEO_BOILERPLATE_RX = /\b(?:underrepresented|equal opportunity|all qualified applicants|without regard to|regardless of (?:race|gender|age|sex|religion)|veteran status|protected (?:class|veteran)|reasonable accommodation|affirmative action|we encourage applications)\b/i;
 
+// (7) The page CHROME, not the employer. Observed live: seven AutoTrader applications filed under
+//     "Careers Privacy Notice - AutoTrader - AutoTrader.ca" -- a browser <title>, scraped whole.
+//     Rules (1)-(6) all passed it: it is not a routing word on its own, not a JD heading, does not
+//     open like a sentence, has no internal sentence break, is not CSS, and is not EEO text.
+//
+//     Phrases only, and legal-boilerplate ones at that. The constraint this had to respect is real:
+//     "sign in solutions inc" is a GENUINE employer in this database, so anything keying on "sign
+//     in", "careers" or "privacy" as bare words would have started refusing a real company.
+//     These seven rows are repairable rather than merely refusable, because their URL
+//     (job-boards.greenhouse.io/autotradercanada/...) names the employer outright.
+//     'site ?map' was in the first draft and came straight back out: it refused
+//     'Sitemap Digital Inc'. It caught nothing in the observed data, so it was cost with no
+//     benefit -- exactly the trade this rule set exists to avoid.
+const PAGE_CHROME_RX = /\b(?:privacy (?:notice|policy|statement)|cookie (?:policy|notice|preferences)|terms (?:of use|of service|and conditions)|accessibility statement|all rights reserved)\b/i;
+
 function isImplausibleCompany(value) {
   const s = String(value == null ? '' : value).trim();
   if (!s) return false;                                    // empty is not "implausible", just absent
@@ -1409,6 +1424,7 @@ function isImplausibleCompany(value) {
   if (INTERNAL_SENTENCE_BREAK_RX.test(s)) return true;               // (4b)
   if (CSS_BLOB_RX.test(s)) return true;                              // (5)
   if (EEO_BOILERPLATE_RX.test(s)) return true;                       // (6)
+  if (PAGE_CHROME_RX.test(s)) return true;                           // (7)
   return false;
 }
 

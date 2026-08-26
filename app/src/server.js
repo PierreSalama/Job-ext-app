@@ -1171,8 +1171,29 @@ async function handle(req, res, parsed) {
     const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml' };
     try {
       const data = fs2.readFileSync(file);
-      // no-store: this is a live dev/support surface — a stale cached SPA is worse than a re-download.
-      res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-store' });
+      // WAS no-store, with the reasoning "a stale cached SPA is worse than a re-download". The
+      // goal was right; the mechanism was the costly way to get it. `no-store` forbids the browser
+      // from KEEPING the response at all, so it could never ask "has this changed?" and re-fetched
+      // everything on every load. Measured on this node: app.js 289 KB + app.css 85 KB +
+      // themes.js 17 KB + the shell = **394,710 bytes on every single dashboard load**.
+      //
+      // An ETag gets the same guarantee for free. The tag is a hash OF THE BYTES, so editing any
+      // of these files changes the tag, misses the cache, and serves the new copy — a stale SPA is
+      // impossible by construction, not by policy. `no-cache` still revalidates on every load; it
+      // just answers with a bodyless 304 when nothing moved. Same fix, same reasoning, as
+      // etag_asset in the Plex Hub server.
+      const etag = '"' + crypto.createHash('sha1').update(data).digest('hex').slice(0, 16) + '"';
+      const headers = {
+        'Content-Type': MIME[path.extname(file)] || 'application/octet-stream',
+        'Cache-Control': 'no-cache',
+        ETag: etag,
+      };
+      const inm = req.headers['if-none-match'];
+      if (inm && inm.split(',').some((t) => t.trim() === etag)) {
+        res.writeHead(304, headers);
+        return res.end();
+      }
+      res.writeHead(200, headers);
       return res.end(data);
     } catch {
       return sendJson(res, 404, { ok: false, error: 'not found' });

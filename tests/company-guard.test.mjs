@@ -304,3 +304,34 @@ test('...and it does not start refusing real employers', () => {
     assert.equal(db.isImplausibleCompany(v), false, `should accept ${JSON.stringify(v)}`);
   }
 });
+
+// Page CHROME is not an employer. Observed live 2026-08-26: seven AutoTrader applications filed
+// under "Careers Privacy Notice - AutoTrader - AutoTrader.ca" -- a browser <title> scraped whole.
+// Rules (1)-(6) all passed it, and their URL (job-boards.greenhouse.io/autotradercanada/...) names
+// the employer outright, so these are repairable rather than merely refusable.
+test('legal page-chrome text is refused as a company name', () => {
+  assert.equal(db.isImplausibleCompany('Careers Privacy Notice - AutoTrader - AutoTrader.ca'), true);
+  for (const v of ['Privacy Policy', 'Privacy Notice', 'Cookie Preferences', 'Cookie Policy',
+                   'Terms of Service', 'Terms of Use', 'Terms and Conditions',
+                   'Accessibility Statement', 'All Rights Reserved']) {
+    assert.equal(db.isImplausibleCompany(v), true, `should refuse ${JSON.stringify(v)}`);
+  }
+});
+
+test('...and the real employers that made this rule narrow still pass', () => {
+  // THE CONSTRAINT, from the live database: "sign in solutions inc" is a genuine employer, so
+  // nothing may key on "sign in", "careers" or "privacy" as bare words.
+  // "site ?map" was in the first draft and came straight back out -- it refused "Sitemap Digital
+  // Inc" while catching nothing real. A pattern that costs a true company and buys nothing is a
+  // bad trade, and this test is where that stays recorded.
+  for (const v of ['sign in solutions inc', 'Sitemap Digital Inc', 'Privacy Dynamics',
+                   'Terms Software Ltd', 'AutoTrader.ca', 'GitLab', 'The Access Group',
+                   'Equal Experts', 'Veteran Solutions Inc.']) {
+    assert.equal(db.isImplausibleCompany(v), false, `should accept ${JSON.stringify(v)}`);
+  }
+});
+
+test('the repair can resolve those rows, because the URL names the employer', () => {
+  assert.equal(db.atsCompanyFromUrl('https://job-boards.greenhouse.io/autotradercanada/jobs/7751122003'),
+    'autotradercanada');
+});

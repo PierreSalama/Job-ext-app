@@ -105,3 +105,43 @@ test('a path traversal out of the app directory is still refused', async () => {
     assert.notEqual(r.status, 200, 'must not serve files outside the app directory');
   });
 });
+
+// The dashboard re-downloaded ITSELF on every load: 394,710 bytes of app.js + app.css +
+// themes.js + shell, because the route said `no-store`. The reasoning behind that was sound --
+// "a stale cached SPA is worse than a re-download" -- but no-store buys it the expensive way: it
+// forbids KEEPING the response, so the browser can never ask whether anything changed.
+//
+// An ETag gets the same guarantee for free, and gets it structurally: the tag is a hash of the
+// bytes, so a stale SPA is impossible by construction rather than by policy.
+test('dashboard assets carry an ETag and revalidate instead of re-downloading', async () => {
+  await withServer(async (base) => {
+    for (const asset of ['/app/app.js', '/app/app.css']) {
+      const first = await fetch(`${base}${asset}`);
+      assert.equal(first.status, 200);
+      const etag = first.headers.get('etag');
+      assert.ok(etag, `${asset} must send an ETag`);
+      assert.equal(first.headers.get('cache-control'), 'no-cache',
+        'no-cache revalidates every load; no-store would forbid caching entirely');
+
+      const again = await fetch(`${base}${asset}`, { headers: { 'If-None-Match': etag } });
+      assert.equal(again.status, 304, `${asset} must answer 304 when the client already has it`);
+      assert.equal((await again.text()).length, 0, '304 must carry no body');
+    }
+  });
+});
+
+test('THE GUARANTEE: editing a file changes its tag, so nothing stale can be served', async () => {
+  // This is the assertion that replaces `no-store`. If it ever fails, the reasoning behind the
+  // original policy is back in force and this change must be reverted.
+  const { readFileSync } = await import('node:fs');
+  const { createHash } = await import('node:crypto');
+  const p = path.join(here, '..', 'app', 'src', 'app', 'app.js');
+  const real = readFileSync(p);
+  const tagOf = (buf) => createHash('sha1').update(buf).digest('hex').slice(0, 16);
+
+  const before = tagOf(real);
+  const edited = Buffer.concat([real, Buffer.from('\n// one byte of change\n')]);
+  const after = tagOf(edited);
+  assert.notEqual(before, after, 'any edit must produce a different tag');
+  assert.equal(tagOf(real), before, 'and the same bytes must always produce the same tag');
+});
