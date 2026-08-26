@@ -71,6 +71,45 @@ const NON_BRAND = new Set([
   // form/legal words often title-cased in ATS copy
   'yes', 'no', 'n', 'a', 'true', 'false', 'select', 'other', 'none', 'company', 'employer',
   'position', 'role', 'job', 'application', 'resume', 'cv', 'linkedin', 'github',
+  // FORM FIELD LABELS. An ATS labels its fields in Title Case -- "Street Address",
+  // "Location (City)", "First Name", "Postal Code" -- and every capital after the first word
+  // read as a company identity. The stored question is lowercase and names no brand, so the
+  // sizes differed and brandConflict refused the recall. Measured on the real database: this
+  // was the single largest source of parked applications, with "Location (City)*" the most
+  // parked question of all. These nouns are never the company a question is ABOUT.
+  'address', 'street', 'city', 'town', 'province', 'state', 'country', 'postal', 'zip',
+  'code', 'name', 'first', 'last', 'middle', 'preferred', 'legal', 'full', 'line',
+  'number', 'phone', 'mobile', 'email', 'date', 'birth', 'gender', 'pronouns', 'title',
+  'level', 'salary', 'website', 'portfolio', 'url', 'link', 'file', 'upload', 'required',
+  'optional', 'question', 'answer', 'resident', 'residence', 'citizenship', 'status',
+  'downtown', 'export', 'control', 'region', 'location', 'apartment', 'unit', 'suite',
+  // TECHNOLOGIES. "How would you rate your proficiency in Python?" names a language, not an
+  // employer -- but Python/React/Java are capitalized mid-sentence exactly like Geotab, so
+  // every skills question was locked out of its own stored answer. Vendor-named products
+  // whose company Pierre could plausibly be ASKED about (Oracle, Salesforce, MongoDB,
+  // Docker, Redis, Atlassian) are deliberately NOT here -- there the brand reading is right.
+  'python', 'java', 'javascript', 'typescript', 'react', 'angular', 'vue', 'svelte',
+  'node', 'nodejs', 'deno', 'spring', 'boot', 'rails', 'django', 'flask', 'laravel',
+  'golang', 'rust', 'kotlin', 'swift', 'scala', 'perl', 'php', 'ruby', 'dart', 'flutter',
+  'sql', 'nosql', 'graphql', 'grpc', 'rest', 'api', 'apis', 'json', 'xml', 'yaml', 'html',
+  'css', 'sass', 'scss', 'jquery', 'redux', 'webpack', 'vite', 'babel', 'jest', 'cypress',
+  'aws', 'azure', 'gcp', 'linux', 'unix', 'ubuntu', 'bash', 'powershell', 'git',
+  'kubernetes', 'k8s', 'terraform', 'ansible', 'jenkins', 'kafka', 'spark', 'hadoop',
+  'net', 'asp', 'mvc', 'wpf', 'xamarin', 'unity', 'android', 'ios', 'kb', 'ide',
+  'node.js', 'ci', 'cd', 'ci/cd',
+  // CORPORATE SUFFIXES. "Acme Inc" and "Acme" are the same employer, but as token SETS they
+  // differ in size, which brandConflict reads as two different companies. The identity lives
+  // in the name, never in the suffix.
+  'inc', 'inc.', 'ltd', 'ltd.', 'llc', 'llp', 'corp', 'corp.', 'corporation', 'limited',
+  'plc', 'gmbh', 'ag', 'nv', 'bv', 'srl', 'pty', 'co', 'co.', 'holdings', 'group',
+  // LEGAL / CONSENT BOILERPLATE. "Please review the Privacy Notice" names no employer -- and
+  // where it does ("the Robinhood Applicant Privacy Notice") the real brand still survives.
+  'privacy', 'notice', 'policy', 'consent', 'disclaimer', 'statement', 'agreement',
+  'terms', 'conditions', 'acknowledgement', 'acknowledgment', 'applicant', 'candidate',
+  // MISCELLANEOUS SCRAPE NOISE seen in the real corpus: a tax form, a truncated accented
+  // place name (Montreal/Quebec lose their accented letter upstream and split), and ordinary
+  // words that happen to be title-cased mid-label.
+  't4', 'expv2', 'montr', 'qu', 'are', 'greater', 'mi', 'am', 'is', 'the', 'and', 'or',
 ]);
 
 // Does this token look like a company/brand NAME rather than an ordinary word?
@@ -83,9 +122,21 @@ function isBrandToken(tok) {
   const lower = t.toLowerCase();
   if (NON_BRAND.has(lower)) return false;
   if (/^\d+$/.test(t)) return false;                       // a bare number is not a brand
+  // A hex fragment is not a brand. The mixed letters+digits rule below exists for 1Password
+  // and S1, but it also fired on every UUID and DOM id that leaks into a scraped field label
+  // -- "7a08ec2d", "b470", "ae77", "id62". Each became a phantom company name that no stored
+  // question could match, so the recall was refused and the application parked. Measured on
+  // the real database, these were a third of the most frequent "brands" in Pierre's data.
+  if (/^[0-9a-f]{3,}$/i.test(t) && /\d/.test(t)) return false;
+  if (/^id\d+$/i.test(t)) return false;                     // id0, id62, id101
+  // Digits followed by LOWERCASE letters is a scrape artifact, not a name. Real brands that
+  // open with a digit capitalize the next letter -- 1Password, 3M, 7-Eleven. A run like
+  // "355algeria" is a phone country-code <option> harvested into the field label; Pierre's
+  // database holds a whole dropdown of them, each one a phantom company.
+  if (/^\d+[a-z]/.test(t)) return false;
   if (/\d/.test(t) && /[a-z]/i.test(t)) return true;       // 1Password, 3M, C3, S1
   if (!/^[A-Z]/.test(t)) return false;                     // must be capitalized
-  if (/^[A-Z]{2,6}$/.test(t)) return true;                 // IBM, AWS, SAP, RBC
+  if (/^[A-Z]{2,6}$/.test(t)) return true;                 // IBM, SAP, RBC (AWS/GCP are in NON_BRAND: technologies)
   return /^[A-Z][a-z]/.test(t);                            // Geotab, Robinhood, Shopify
 }
 
@@ -120,9 +171,70 @@ function brandTokens(text) {
 //   • asked names nobody, stored names Geotab         → a Geotab-specific answer is not a
 //     generic answer ("do you work for a reseller of Geotab" ≠ "do you work for a reseller")
 // Returns TRUE when a recall between these two must be refused.
+// A string with no capital letter anywhere carries no case information, so brandTokens()
+// -- which finds names BY their mid-sentence capital -- can never find anything in it.
+const CASELESS_RX = /[A-Z]/;
+const WORD_RX = /[a-z0-9][a-z0-9'’&.-]*/g;
+// "worked AT geotab", "hear ABOUT d2l", "sponsor FOR stripe" -- in a caseless question the
+// company still sits after one of these prepositions. It is the only handle left.
+// The word after a preposition is USUALLY not a company. Ranked over every caseless stored
+// question in the real database, the head of the distribution is entirely generic -- "work"
+// (538), "this" (145), "the" (139), "experience" (112) -- while actual employers sit far down
+// the tail (microsoft 16, tailscale 8, robinhood 7, shopify 7). Without this set the rule
+// below reads "relocate for this role" as a company called "this" and refuses the recall,
+// which is the very mass-refusal this whole change exists to end.
+const COMMON_AFTER = new Set([
+  'work', 'working', 'works', 'this', 'that', 'these', 'those', 'the', 'a', 'an', 'any',
+  'your', 'our', 'their', 'my', 'his', 'her', 'its', 'you', 'us', 'we', 'them', 'it',
+  'experience', 'stay', 'date', 'dates', 'professional', 'relocate', 'relocation', 'start',
+  'residence', 'employment', 'employer', 'be', 'been', 'hands', 'hands-on', 'education',
+  'receive', 'proficiency', 'how', 'which', 'what', 'who', 'when', 'where', 'why',
+  'least', 'most', 'all', 'both', 'each', 'every', 'some', 'none', 'no', 'not',
+  'someone', 'anyone', 'people', 'person', 'contact', 'make', 'future', 'travel', 'web',
+  'sign', 'embedded', 'capital', 'commute', 'commuting', 'home', 'office', 'remote',
+  'onsite', 'on-site', 'hybrid', 'team', 'teams', 'time', 'times', 'year', 'years',
+  'month', 'months', 'week', 'weeks', 'day', 'days', 'more', 'less', 'other', 'others',
+  'here', 'there', 'then', 'than', 'same', 'such', 'if', 'and', 'or', 'but', 'so',
+  'me', 'i', 'he', 'she', 'they', 'one', 'two', 'three', 'new', 'current', 'previous',
+  'past', 'recent', 'this-role', 'role', 'roles', 'position', 'positions', 'job', 'jobs',
+]);
+const NAMED_AFTER_RX = /\b(?:at|for|about|with|by|from|to|of|joining|join)\s+([a-z0-9][a-z0-9'’&.-]{1,30})/g;
+
 function brandConflict(askedQuestion, storedQuestion) {
   const a = brandTokens(askedQuestion);
   const b = brandTokens(storedQuestion);
+
+  // THE STORED SIDE IS USUALLY CASELESS. Measured on Pierre's real database: 3,570 of 4,601
+  // remembered questions (78%) hold no capital letter at all, because they were flattened
+  // upstream before being stored. Against those rows brandTokens() returns an empty set, so
+  // every properly-capitalized form question that named a company -- which is how real ATS
+  // forms write them -- had a.size=1 against b.size=0, read as "two different companies",
+  // and its own remembered answer was refused. That was the single largest cause of parked
+  // applications: eleven copies of "have you previously been employed at Affirm" sat waiting
+  // for a human next to the stored answer to that exact question.
+  //
+  // When the stored side is caseless, compare by WORD PRESENCE instead of by capitalization.
+  if (!b.size && !CASELESS_RX.test(String(storedQuestion == null ? '' : storedQuestion))) {
+    const words = new Set(String(storedQuestion == null ? '' : storedQuestion).toLowerCase().match(WORD_RX) || []);
+    // Every company the asked question names must actually be mentioned in the stored one.
+    for (const t of a) if (!words.has(t)) return true;
+    if (a.size) return false;
+    // The reverse direction still has to hold: a generic question must not be answered from
+    // a company-specific memory ("why do you want to work here?" answered from "why do you
+    // want to work at geotab?"). With no capitals to read, the preposition is the only clue.
+    const asked = String(askedQuestion == null ? '' : askedQuestion).toLowerCase();
+    const askedWords = new Set(asked.match(WORD_RX) || []);
+    const stored = String(storedQuestion == null ? '' : storedQuestion).toLowerCase();
+    let mm; NAMED_AFTER_RX.lastIndex = 0;
+    while ((mm = NAMED_AFTER_RX.exec(stored))) {
+      const cand = mm[1].replace(/[.'’-]+$/, '');
+      if (cand.length < 2 || NON_BRAND.has(cand) || COMMON_AFTER.has(cand)) continue;
+      if (/^\d+$/.test(cand)) continue;
+      if (!askedWords.has(cand)) return true;   // stored names someone the asked does not
+    }
+    return false;
+  }
+
   if (!a.size && !b.size) return false;
   if (a.size !== b.size) return true;
   for (const t of a) if (!b.has(t)) return true;
@@ -140,7 +252,11 @@ const YESNO_PHRASE_RX = /\b(?:do you|does your|did you|are you|is your|are there
 const WH_RX = /^(?:what|which|where|when|who|whom|whose|how|why)\b/i;
 
 const DATE_RX = /\b(?:what date|which date|date would|start date|available to (?:start|onboard)|earliest (?:start|date)|when (?:could|can|would|will) you (?:start|begin|join)|date of|dd\/mm|mm\/dd|yyyy)\b/i;
-const NUMBER_RX = /\b(?:how many|how much|number of|years? of experience|total years|quantity|combien)\b/i;
+// "Years of React?" is a counting question just as much as "years of experience" is -- ATS
+// forms ask it about a named technology far more often than in the abstract. It used to fall
+// through to 'text', which mattered the moment a bare numeral stopped being an acceptable
+// answer to a text question: the honest answer "5" was refused.
+const NUMBER_RX = /\b(?:how many|how much|number of|years? of|years? experience|how long|total years|quantity|combien)\b/i;
 const SALARY_RX = /\b(?:salary|compensation|pay|rate|remuneration|salaire|wage|hourly rate)\b/i;
 const LOCATION_RX = /\b(?:city|province|state|country|located|location|based|reside|residing|address|postal|zip|where are you|where do you)\b/i;
 
@@ -232,11 +348,35 @@ function looksLocation(v) {
 //
 // Conservative on purpose: 'text' questions are never gated, and an answer that is verbatim
 // one of the field's own options is always allowed (the form itself defined that vocabulary).
+// An ATTESTATION is not a free-text question. "I have read and understand the Export Control
+// statement", "Please review and acknowledge the Applicant Privacy Notice" -- these are
+// checkboxes, and the only answer they take is an affirmation. Pierre's memory held the
+// province "Ontario" against that exact Export Control question, and once the brand guard
+// stopped masking it, the recall path was about to send "Ontario" to an employer as his
+// acknowledgement of an export-control statement.
+const ACK_Q_RX = /^(?:i\s+(?:have\s+read|acknowledge|agree|confirm|understand|consent|certify|accept|declare)|please\s+(?:read|review|confirm|acknowledge|indicate\s+your\s+agreement)|by\s+(?:checking|clicking|submitting)|do\s+you\s+(?:agree|acknowledge|consent))/i;
+const ACK_A_RX = /^(?:yes|y|true|on|1|checked|agree[d]?|i\s+agree|acknowledged?|i\s+acknowledge|accept(?:ed)?|confirm(?:ed)?|understood|i\s+have\s+read|consent(?:ed)?|ok(?:ay)?)\b/i;
+
+// A bare numeral answers a counting question and nothing else. "0" was stored against "How
+// did you first learn about Affirm as an employer?" -- an exact-match hit, so it would have
+// been submitted verbatim.
+const BARE_NUMERAL_RX = /^-?\d+(?:\.\d+)?$/;
+
+function looksAcknowledgement(a) { return ACK_A_RX.test(String(a || '').trim()); }
+function isAttestation(question) { return ACK_Q_RX.test(operativeClause(question)); }
+
 function answerFitsQuestion(question, answer, options) {
   const a = String(answer == null ? '' : answer).trim();
   if (!a) return false;
   if (Array.isArray(options) && options.some((o) => String(o).trim().toLowerCase() === a.toLowerCase())) return true;
-  switch (questionShape(question)) {
+  const shape = questionShape(question);
+  if (isAttestation(question) && shape !== 'date' && shape !== 'number' && shape !== 'salary') {
+    return looksAcknowledgement(a);
+  }
+  if (BARE_NUMERAL_RX.test(a) && shape !== 'number' && shape !== 'salary' && shape !== 'date') {
+    return false;   // a naked number is not an answer to a worded question
+  }
+  switch (shape) {
     case 'yesno':   return looksYesNo(a);
     case 'date':    return looksDate(a);
     case 'number':  return looksNumeric(a);
@@ -257,5 +397,5 @@ module.exports = {
   brandTokens, brandConflict, isBrandToken,
   questionShape, operativeClause,
   looksYesNo, isYes, isNo, looksDate, looksNumeric, looksLocation,
-  answerFitsQuestion, recallAllowed,
+  answerFitsQuestion, recallAllowed, isAttestation, looksAcknowledgement,
 };
