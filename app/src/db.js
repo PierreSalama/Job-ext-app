@@ -1302,9 +1302,16 @@ function migrateMemoryPlaceholders() {
 function migrateImplausibleCompanies() {
   if (!db) return;
   try {
-    if (kvGet('companyGuardRepairV1')) return;
-    repairImplausibleCompanies();
-    kvSet('companyGuardRepairV1', 1);
+    // BUMP THE FLAG WHENEVER A NEW RULE LANDS, the same way migrateForceVacuumOnce does. The
+    // repair only rewrites rows the CURRENT guard refuses, so a rule added after V1 ran leaves
+    // its own rows uncorrected for ever. V2 is the EEO-boilerplate rule: on 2026-08-26 five real
+    // GitLab applications were filed under the company "underrepresented groups", and their URLs
+    // (job-boards.greenhouse.io/gitlab/...) name the employer plainly. Idempotent, so a machine
+    // that already ran V1 simply repairs the newly-refused rows and stops.
+    if (kvGet('companyGuardRepairV2')) return;
+    const fixed = repairImplausibleCompanies();
+    kvSet('companyGuardRepairV2', 1);
+    if (fixed && fixed.length) log.info && log.info(`company repair: corrected ${fixed.length} row(s)`);
   } catch (e) { log.warn && log.warn('company repair migration skipped:', e.message); }
 }
 
@@ -1376,6 +1383,19 @@ const INTERNAL_SENTENCE_BREAK_RX = /\w\.\s+[A-Z]/;
 // server-side on ingest, rather than in the extension: this protects every source at once and does
 // not need the applier's Chrome extension to be reloaded to take effect.
 const CSS_BLOB_RX = /(?:^|[\s;{])(?:-webkit-|-moz-|-ms-)[a-z-]+\s*:|\.css-[a-z0-9]|\bfont-family\s*:|\btext-decoration\s*:|\bdisplay\s*:\s*(?:block|flex|grid|inline)\b/i;
+// (6) EEO / diversity boilerplate, which is on almost every ATS page and is never a company.
+//
+// LIVE 2026-08-26: an application to GitLab was filed under the company
+// "underrepresented groups" — scraped out of GitLab's own equal-opportunity paragraph
+// ("...we encourage applications from underrepresented groups..."). None of the rules above
+// matched it: it is not a routing word, not a JD heading, does not open like a sentence, has
+// no internal break, and is not CSS. It is simply a fragment of the one paragraph that appears
+// on every ATS posting in existence, which is exactly why it will keep happening.
+//
+// Phrases, never single words. "Diversity" alone could plausibly sit in a real company name;
+// "all qualified applicants" could not.
+const EEO_BOILERPLATE_RX = /\b(?:underrepresented|equal opportunity|all qualified applicants|without regard to|regardless of (?:race|gender|age|sex|religion)|veteran status|protected (?:class|veteran)|reasonable accommodation|affirmative action|we encourage applications)\b/i;
+
 function isImplausibleCompany(value) {
   const s = String(value == null ? '' : value).trim();
   if (!s) return false;                                    // empty is not "implausible", just absent
@@ -1388,6 +1408,7 @@ function isImplausibleCompany(value) {
   if (SENTENCE_OPENER_RX.test(s) && words.length >= 3) return true;   // (4a)
   if (INTERNAL_SENTENCE_BREAK_RX.test(s)) return true;               // (4b)
   if (CSS_BLOB_RX.test(s)) return true;                              // (5)
+  if (EEO_BOILERPLATE_RX.test(s)) return true;                       // (6)
   return false;
 }
 
@@ -2170,7 +2191,7 @@ function qaLookup(profileId, question, cache, opts) {
   let best = null;
   for (const row of (c ? c.rows : all('SELECT * FROM qa WHERE profile_id = ?', [profileId]))) {
     if (isPlaceholderAnswer(row.answer)) continue;   // a placeholder is not an answer — don't serve it
-    const have = new Set(row.question_norm.split(' ').filter(Boolean));
+    const have = row.__tok || tokenize(row.question_norm);   // precomputed when it came from the cache
     let hit = 0;
     for (const t of want) if (have.has(t)) hit++;
     // Query-coverage scoring: a short query fully contained in a wordier
@@ -2328,7 +2349,7 @@ function profileFieldLookup(profileId, question, cache, opts) {
   let best = null;
   for (const r of (c ? c.rows : all('SELECT * FROM profile_fields WHERE profile_id = ?', [profileId]))) {
     if (isPlaceholderAnswer(r.value)) continue;   // a placeholder is not an answer — don't serve it
-    const have = new Set(String(r.key_norm).split(' ').filter(Boolean));
+    const have = r.__tok || tokenize(r.key_norm);   // precomputed when it came from the cache
     let hit = 0; for (const t of want) if (have.has(t)) hit++;
     const coverage = hit / want.size;
     const symmetric = hit / Math.max(want.size, have.size);
@@ -4153,20 +4174,41 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
 // fuzzy full-scan per question. Lazily loads per profile id; a norm-keyed Map serves the exact hit,
 // the row list the fuzzy fallback. A single request's data doesn't change under it, so a snapshot is
 // safe. Pass the returned object as the `cache` arg to profileFieldLookup/qaLookup.
+// TOKENS ARE PART OF THE CACHE, and that is the whole point of this function.
+//
+// Both fuzzy lookups score a question against every stored row by intersecting word sets. The
+// rows were already cached; the TOKEN SETS were not, so `new Set(r.key_norm.split(' '))` ran once
+// per row PER QUESTION. On Pierre's laptop that is 2,744 profile fields and a comparable qa table,
+// against ~150 outstanding questions — on the order of a million Set allocations to answer one
+// request. Measured cost of GET /auto-apply/needs-you: 1,566 ms, and the Applications page awaits
+// it alongside the job list, so the whole screen waited on it.
+//
+// Splitting once per row, here, makes the inner loop a plain set-intersection. Attached
+// NON-ENUMERABLE so `{ ...row }` in the callers cannot leak it into an API response.
+function tokenize(text) {
+  return new Set(String(text || '').split(' ').filter(Boolean));
+}
+function withTokens(rows, col) {
+  for (const r of rows) {
+    Object.defineProperty(r, '__tok', { value: tokenize(r[col]), enumerable: false, configurable: true });
+  }
+  return rows;
+}
+
 function makeMemoryCache() {
   const qaByPid = new Map();
   const pfByPid = new Map();
   return {
     qa(pid) {
       if (!qaByPid.has(pid)) {
-        const rows = all('SELECT * FROM qa WHERE profile_id = ?', [pid]);
+        const rows = withTokens(all('SELECT * FROM qa WHERE profile_id = ?', [pid]), 'question_norm');
         qaByPid.set(pid, { rows, byNorm: new Map(rows.map((r) => [r.question_norm, r])) });
       }
       return qaByPid.get(pid);
     },
     pf(pid) {
       if (!pfByPid.has(pid)) {
-        const rows = all('SELECT * FROM profile_fields WHERE profile_id = ?', [pid]);
+        const rows = withTokens(all('SELECT * FROM profile_fields WHERE profile_id = ?', [pid]), 'key_norm');
         pfByPid.set(pid, { rows, byNorm: new Map(rows.map((r) => [r.key_norm, r])) });
       }
       return pfByPid.get(pid);

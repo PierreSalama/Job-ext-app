@@ -586,5 +586,29 @@
   {
     "ats": "ashby",
     "token": "relay"
+  },
+  {
+    "ats": "greenhouse",
+    "token": "stackadapt"
+  },
+  {
+    "ats": "ashby",
+    "token": "sardine"
+  },
+  {
+    "ats": "ashby",
+    "token": "mintlify"
+  },
+  {
+    "ats": "ashby",
+    "token": "coder"
+  },
+  {
+    "ats": "ashby",
+    "token": "knock"
+  },
+  {
+    "ats": "ashby",
+    "token": "hightouch"
   }
 ]

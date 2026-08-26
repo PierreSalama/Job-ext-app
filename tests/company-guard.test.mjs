@@ -264,3 +264,43 @@ test('a CSS rule scraped in place of the employer is refused', () => {
     assert.equal(db.isImplausibleCompany(v), false, `should accept ${JSON.stringify(v)}`);
   }
 });
+
+// EEO boilerplate is not an employer. Observed live on 2026-08-26: an application to GitLab
+// filed under the company "underrepresented groups", scraped straight out of GitLab's own
+// equal-opportunity paragraph. None of rules (1)-(5) matched it, and that paragraph appears on
+// virtually every ATS posting in existence — so without a rule it would keep recurring.
+//
+// Deliberately server-side: the PC node's Chrome extension is stale and cannot be reloaded
+// remotely, so an extension-side guard would not protect it. This one runs on ingest for BOTH
+// nodes regardless of what version of the extension scraped the page.
+test('equal-opportunity boilerplate is refused as a company name', () => {
+  // the exact value that reached the database
+  assert.equal(db.isImplausibleCompany('underrepresented groups'), true);
+
+  for (const v of [
+    'We encourage applications from underrepresented groups',
+    'Equal Opportunity Employer',
+    'all qualified applicants',
+    'without regard to race, color, religion',
+    'regardless of gender identity',
+    'veteran status',
+    'protected veteran',
+    'reasonable accommodation',
+    'affirmative action',
+  ]) {
+    assert.equal(db.isImplausibleCompany(v), true, `should refuse ${JSON.stringify(v)}`);
+  }
+});
+
+test('...and it does not start refusing real employers', () => {
+  // The expensive direction. Phrases were chosen over single words precisely so that a real
+  // company containing "diversity", "equal", "group" or "protected" still passes.
+  for (const v of [
+    'Diversity Recruiting Partners', 'Equal Experts', 'The Access Group',
+    'Protected Networks GmbH', 'Veteran Solutions Inc.', 'Groups.io',
+    'Opportunity International', 'Race Roster', 'GitLab', 'gitlab',
+    'Canada Goose Inc.', 'Futran Solutions', 'StackAdapt', 'Sardine',
+  ]) {
+    assert.equal(db.isImplausibleCompany(v), false, `should accept ${JSON.stringify(v)}`);
+  }
+});

@@ -1144,6 +1144,24 @@ async function handle(req, res, parsed) {
   // the HTML. Every DATA route below stays token-gated — the SPA itself carries the token
   // (?token= in the URL) for its API calls. Loopback-only server; serve-the-dir with a
   // confinement guard — never an enumerated whitelist (the v13 blank-dashboard scar).
+  // A directory URL without its trailing slash makes every RELATIVE asset in app.html resolve
+  // one level too high. At `/app` the browser reads `href="app.css"` as `/app.css` — which is not
+  // this route, so it falls through to the token-gated API and 401s. Same for app.js. The result
+  // is an unstyled shell with no scripts: a BLANK PAGE, indistinguishable from "the app is broken",
+  // and the only clue is two 401s in the network tab. `/app/` has always worked, which is why this
+  // survived — everyone who hit it had a trailing slash from a bookmark.
+  //
+  // One redirect fixes every asset at once, and is exactly what a static file server does with a
+  // directory. The query string is carried over because the dashboard reads ?token= from it.
+  // NOTE the RAW parsed.pathname. `pathname` above has already had its trailing slash stripped
+  // (line ~1093), so by the time it reaches here `/app` and `/app/` are the SAME string — testing
+  // it would redirect the directory form to itself, forever. A first version of this fix did
+  // exactly that, and the e2e test below caught it as "redirect count exceeded": an infinite loop
+  // that would have made the dashboard unreachable rather than merely unstyled.
+  if (req.method === 'GET' && parsed.pathname === '/app') {
+    res.writeHead(302, { Location: '/app/' + (parsed.search || ''), 'Cache-Control': 'no-store' });
+    return res.end();
+  }
   if (req.method === 'GET' && (pathname === '/app' || pathname === '/app/' || pathname.startsWith('/app/'))) {
     const fs2 = require('fs');
     const appDir = path.join(__dirname, 'app');
