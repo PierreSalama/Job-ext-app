@@ -307,6 +307,10 @@ async function fetchAllNodes(path) {
 // Same job applied from two machines = ONE row (deduped by URL), keeping the most-advanced status
 // so a combined total never double-counts.
 const _STATUS_RANK = { offer: 7, interview: 6, submitted: 5, applied: 5, awaiting_review: 4, responded: 4, rejected: 3, started: 2, saved: 1, new: 0 };
+// The machines that did not answer this round, by name. Empty is the normal case.
+function missingOf(res) {
+  return res.filter((r) => !r.ok).map((r) => r.node.name || r.node.id || 'a machine');
+}
 async function mergedJobs(qs) {
   const res = await fetchAllNodes('/jobs' + (qs ? ('?' + qs) : ''));
   const seen = new Map();
@@ -320,7 +324,10 @@ async function mergedJobs(qs) {
     }
   }
   const items = [...seen.values()].sort((a, b) => (Date.parse(b.updatedAt || 0) || 0) - (Date.parse(a.updatedAt || 0) || 0));
-  return { ok: true, items, total: items.length };
+  // WHICH MACHINES DID NOT ANSWER. Skipping an unreachable node is the right call — one machine
+  // being off must not blank the view — but saying nothing about it is not. With the laptop
+  // unreachable this view drops from 113 applications to 6 and looks exactly like a real number.
+  return { ok: true, items, total: items.length, missing: missingOf(res) };
 }
 async function mergedStats() {
   const res = await fetchAllNodes('/stats');
@@ -335,6 +342,7 @@ async function mergedStats() {
   // Match the server's format: an INTEGER percentage (the dashboard appends "%"). Computing the
   // raw ratio here printed things like "0.00105820…%".
   out.funnel.responseRate = out.funnel.submitted ? Math.round(100 * out.funnel.responded / out.funnel.submitted) : null;
+  out.missing = missingOf(res);   // see mergedJobs — a total missing a machine is not a total
   return out;
 }
 
@@ -1043,6 +1051,13 @@ route('/', async () => {
   const awaiting = (qCounts.awaiting_review || 0) + (qCounts.awaiting_input || 0);
   // If some of the queue can never run on this machine, say so here rather than letting the
   // number imply work in progress.
+  // A COMBINED TOTAL THAT IS MISSING A MACHINE IS NOT A TOTAL. Every headline number on this page
+  // is the sum across machines; when one does not answer its share is simply absent, and 6 looks
+  // exactly like 113 does — a plain number with nothing to suggest it is short.
+  const missingNodes = (statsR && statsR.missing) || [];
+  if (missingNodes.length) {
+    sysBits.push(`<span class="sys-chip bad" title="These numbers are the total across your machines. ${esc(missingNodes.join(', '))} did not answer, so its applications are not counted here.">${esc(missingNodes.join(', '))} not reachable · totals incomplete</span>`);
+  }
   const qBlocked = Number(liveR && liveR.queuedBlocked) || 0;
   const blockedNote = qBlocked ? ` · ${qBlocked} not for this machine` : '';
   if (qTotal) sysBits.push(`<span class="sys-chip ${awaiting || qBlocked ? 'warn' : ''}">Auto-apply · ${qCounts.queued || 0} queued${blockedNote}${awaiting ? ` · ${awaiting} need you` : ''}</span>`);

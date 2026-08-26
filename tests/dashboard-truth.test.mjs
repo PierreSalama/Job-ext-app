@@ -265,3 +265,48 @@ test('a node whose lanes ARE primary is untouched', () => {
   assert.ok(!/queuedBlocked \+= 1;|queuedBlocked = live\.queuedDepth/.test(blk),
     'only genuinely non-primary sources may count as blocked');
 });
+
+// ---------------------------------------------------------------------------------------
+// 5. A COMBINED TOTAL THAT IS MISSING A MACHINE IS NOT A TOTAL
+//
+// Dashboard, Applications and Pipeline all show every machine combined. When one does not
+// answer its share is skipped — deliberately, and correctly: one machine being off must not
+// blank the view. But nothing SAID so, and both helpers returned ok:true regardless.
+//
+// Demonstrated in a browser by making the laptop unreachable mid-session:
+//   "Submitted today"  33  ->  6      (an 82% drop, indistinguishable from a real number)
+// and back to 33, with no warning, once it answered again.
+test('the merge helpers report which machines did not answer', () => {
+  assert.match(APP, /function missingOf\(res\) \{/);
+  assert.match(APP, /res\.filter\(\(r\) => !r\.ok\)\.map/,
+    'derived from the per-node ok flag fetchAllNodes already returns');
+  assert.match(APP, /return \{ ok: true, items, total: items\.length, missing: missingOf\(res\) \};/);
+  assert.match(APP, /out\.missing = missingOf\(res\);/);
+});
+
+test('an unreachable machine is still SKIPPED, not fatal', () => {
+  // The original behaviour is the right one and must survive: one machine off must never blank
+  // the combined view. This change adds the disclosure, not a failure.
+  const i = APP.indexOf('async function fetchAllNodes');
+  const fn = APP.slice(i, i + 500);
+  assert.match(fn, /Promise\.allSettled/, 'one node failing must not reject the whole fetch');
+});
+
+test('the dashboard says so when the totals are short', () => {
+  assert.match(APP, /const missingNodes = \(statsR && statsR\.missing\) \|\| \[\];/);
+  assert.match(APP, /not reachable · totals incomplete/);
+  assert.match(APP, /sys-chip bad/, 'an incomplete total is not a neutral condition');
+});
+
+test('and says nothing when every machine answered', () => {
+  // The expensive direction: a warning that shows on a healthy system is noise, and noise is
+  // how the Gmail chip earned its eighteen days of being ignored.
+  assert.match(APP, /if \(missingNodes\.length\) \{/,
+    'the note must be conditional on an actual failure');
+});
+
+test('the tooltip explains what the number is missing', () => {
+  // "not reachable" alone does not tell him the headline figures are understated.
+  assert.match(APP, /These numbers are the total across your machines\./);
+  assert.match(APP, /did not answer, so its applications are not counted here/);
+});
