@@ -667,6 +667,38 @@ function findLoadingAdvanceButton(root) {
 // Deliberately narrow: only real ATS hosts, only reasonably-sized visible frames, so a
 // tracking pixel or a marketing widget can never redirect the tab.
 const EMBEDDED_ATS_HOST_RX = /(^|\.)(job-boards\.greenhouse\.io|boards\.greenhouse\.io|greenhouse\.io|jobs\.lever\.co|jobs\.ashbyhq\.com|ashbyhq\.com|apply\.workable\.com|smartrecruiters\.com|myworkdayjobs\.com|icims\.com|bamboohr\.com)$/i;
+// FOLLOW A FULL-PAGE APPLY HANDOFF.
+//
+// The evidence, not a guess. Across 14 opener stalls captured on the laptop by the diagnostic
+// that was written to discriminate exactly this, TWELVE carried the identical shape:
+//
+//     openerCount=0   dialogs=0   applyHref=true   closedText=false
+//
+// Read it back: the Easy Apply button was clicked and then REMOVED, NO dialog ever mounted, the
+// posting is open, and an /apply/ link is sitting on the page. That is LinkedIn's full-page apply
+// flow -- the click moves the user rather than mounting a modal. Waiting for a modal this flow
+// never creates is what produced "repeated page-level action did not transfer: Easy Apply to this
+// job", 16 times in two days.
+//
+// Navigate, and let sendRunWithNavResume re-dispatch the run on the page that holds the form --
+// the same mechanism the embedded-ATS recovery below uses. Returns true when it takes the tab.
+// Called from BOTH give-up points, because the same page shape can exit either one.
+let _fullPageHandoffTried = false;
+function tryFullPageApplyHandoff(why) {
+  try {
+    if (_fullPageHandoffTried) return false;                   // once per document -- never a loop
+    if (qsa('dialog,[role="dialog"]').length) return false;    // a modal DID mount: not this case
+    const a = document.querySelector('a[href*="/apply/"]');
+    if (!a) return false;
+    let url = '';
+    try { url = new URL(a.getAttribute('href'), location.href).href; } catch { return false; }
+    if (!url || url.replace(/#.*$/, '') === location.href.replace(/#.*$/, '')) return false;
+    _fullPageHandoffTried = true;
+    logLine('ok', `the apply opener handed off to a full-page flow (${why}) — following it`);
+    try { location.assign(url); return true; } catch { return false; }
+  } catch { return false; }
+}
+
 function findEmbeddedAtsFrame() {
   try {
     for (const f of qsa('iframe')) {
@@ -3560,6 +3592,15 @@ export async function run(task, context, helpers) {
         // is the cause, and reporting the symptom sends the task round the retry loop forever.
         if (reportIfRestricted('terminal no-advance')) { finalState = 'failed'; break; }
         if (reportIfSignedOut('terminal no-advance')) { finalState = 'failed'; break; }
+        // The OTHER way a full-page handoff surfaces. The comment above already names "the
+        // /apply/-advance case"; this acts on it instead of retrying into the same wall.
+        if (tryFullPageApplyHandoff('no opener, no form')) {
+            // The document is being torn down. Park the run here — background re-dispatches it on
+            // the apply page. Resolving instead reports a terminal state for a task still going,
+            // which surfaces as "no response from content script".
+            await new Promise(() => {});
+            return;
+          }
         report({
           state: 'failed',
           lastError: opening
@@ -4138,6 +4179,13 @@ export async function run(task, context, helpers) {
           } catch {}
           logLine('warn', 'apply modal still did not mount after fronting — treating as a genuine stall');
           if (stallDiag) report({ transcriptAppend: { kind: 'diagnostic', note: 'opener stall unexplained', diag: stallDiag } });
+          if (tryFullPageApplyHandoff('opener stall')) {
+            // The document is being torn down. Park the run here — background re-dispatches it on
+            // the apply page. Resolving instead reports a terminal state for a task still going,
+            // which surfaces as "no response from content script".
+            await new Promise(() => {});
+            return;
+          }
         }
       }
       // ---- FIX 1 KEYSTONE: advance BLOCKED on a form → re-scan, ANSWER, RETRY (before give-up) ----
