@@ -1844,3 +1844,20 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
   .proc-step { grid-template-columns: 1fr; }
   .proc-controls { flex-direction: row; flex-wrap: wrap; }
 }
+
+/* ---------- Needs-you: nav badge, pointer strip, sticky save bar ---------- */
+.nav-badge {
+  margin-left: auto;
+  font-size: 10px; font-weight: 600; line-height: 1; letter-spacing: 0.02em;
+  padding: 3px 7px; border-radius: 999px;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+}
+.aa-needsyou { justify-content: space-between; flex-wrap: wrap; }
+.ny-savebar {
+  position: sticky; bottom: 0;
+  display: flex; align-items: center; gap: 14px;
+  padding: 14px 0 6px;
+  background: linear-gradient(to top, var(--bg) 65%, transparent);
+}

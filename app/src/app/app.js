@@ -555,6 +555,9 @@ function openPalette() {
     { label: 'Applications', hint: 'page', go: '#/applications' },
     { label: 'Pipeline', hint: 'page', go: '#/pipeline' },
     { label: 'Auto-apply queue', hint: 'page', go: '#/queue' },
+    { label: 'Needs you', hint: 'page', go: '#/needs-you' },
+    { label: 'Auto-apply settings', hint: 'page', go: '#/aa-settings' },
+    { label: 'Taught Procedures', hint: 'page', go: '#/procedures' },
     { label: 'Profile', hint: 'page', go: '#/profile' },
     { label: 'Documents', hint: 'page', go: '#/documents' },
     { label: 'Activity', hint: 'page', go: '#/activity' },
@@ -680,6 +683,7 @@ async function navigate(opts = {}) {
     const r = n.dataset.route;
     n.classList.toggle('active', r === path || (r !== '/' && path.startsWith(r + '/')));
   });
+  updateNyBadgeSoon();
   if (!state.token) { renderNotConnected(); return; }
   const seq = ++navSeq;
   const match = resolve(path) || resolve('/');
@@ -846,6 +850,22 @@ function morphChildren(from, to) {
   }
 }
 
+// ---------- "Needs you" nav badge — parked + review counts, kept live by SSE ----------
+async function updateNyBadge() {
+  const b = document.getElementById('nav-ny-badge');
+  if (!b || !state.token) return;
+  try {
+    // ALWAYS this machine — never the node the Auto-apply page is viewing. The badge
+    // mirrors #/needs-you, which is local; and an older remote build 404s this route.
+    const r = await api('/queue/counts', { node: selfTarget() });
+    const c = (r && r.counts) || {};
+    const n = (c.parked || 0) + (c.awaiting_review || 0) + (c.awaiting_input || 0);
+    b.textContent = n > 99 ? '99+' : String(n);
+    b.hidden = n === 0;
+  } catch { /* a badge must never surface an error */ }
+}
+const updateNyBadgeSoon = debounce(updateNyBadge, 2000);
+
 const softRefresh = debounce(() => {
   if (!LIST_ROUTES.has(state.route.path)) return;
   if (document.querySelector('.ctx-menu')) return;               // don't reshuffle under a right-click menu
@@ -875,6 +895,7 @@ function connectSSE() {
   for (const ev of ['jobs.updated', 'queue.updated', 'documents.updated', 'profileFields.updated', 'emails.updated']) {
     es.addEventListener(ev, () => softRefresh());
   }
+  es.addEventListener('queue.updated', updateNyBadgeSoon);
   es.addEventListener('settings.updated', async () => {
     try {
       const s = await getSettings(true);
@@ -1333,56 +1354,24 @@ route('/applications', async () => {
     </td></tr>`);
   const bodyRows = rows.length ? (rows.slice(0, PAGE).map(rowHtml).join('') + moreRow(Math.min(PAGE, rows.length))) : emptyRow;
 
-  // "Needs your input" — auto-apply tasks that parked / await you, surfaced so you can
-  // answer the missing question right here and the pipeline re-queues + finishes them.
-  const NY_STATE_LABEL = { parked: 'Parked', awaiting_input: 'Needs you', awaiting_review: 'Review' };
-  const nyCard = (t) => `
-    <div class="ny-card" data-task="${esc(t.taskId)}" data-job="${esc(t.jobId)}">
-      <div class="ny-head">
-        <span class="ny-title">${esc(t.title || 'Application')}</span>
-        <span class="ny-co">${esc(t.company || '')}</span>
-        <span class="state-chip" data-state="${esc(t.state)}">${esc(NY_STATE_LABEL[t.state] || t.state)}</span>
-        ${t.route === 'external' ? '<span class="aa-route-chip external">external</span>' : ''}
-      </div>
-      ${t.reason ? `<div class="ny-reason">${esc(t.reason)}</div>` : ''}
-      ${(t.questions || []).map((qq) => `
-        <div class="ny-q">
-          <label class="ny-q-label">${esc(qq.question)}</label>
-          ${(qq.options && qq.options.length)
-            ? `<select class="select ny-input" data-q="${esc(qq.question)}">${qq.options.map((o) => `<option>${esc(o)}</option>`).join('')}</select>`
-            : `<input class="input ny-input" data-q="${esc(qq.question)}" placeholder="Your answer" />`}
-        </div>`).join('')}
-      ${(t.questions || []).length ? '' : '<div class="ny-reason muted">No specific question captured — open the job to finish it by hand.</div>'}
-      <div class="ny-actions">
-        ${(t.questions || []).length ? '<button class="btn small primary" data-ny-save>Save &amp; continue</button>' : ''}
-        ${t.jobUrl ? `<a class="btn small" href="${esc(t.jobUrl)}" target="_blank" rel="noopener">Open job ↗</a>` : ''}
-        <button class="btn small" data-ny-detail>Details</button>
-        <button class="btn small" data-ny-skip>Dismiss</button>
-      </div>
-    </div>`;
-  // An empty slot the late fetch fills. Rendering nothing until it arrives is deliberate: a
-  // skeleton here would reserve space and shove the table down when it resolved.
+  // "Needs your input" — a one-line pointer, not a wall. The cards live on #/needs-you
+  // now (ONE implementation, delegated events). The old injected card section had two
+  // problems at once: up to 100 cards shoved the table down thousands of px after paint,
+  // and every button on them was dead — bound at render time, injected after, so the
+  // binding loop always matched zero cards.
   const needsYouHtml = '<div id="ny-slot"></div>';
   const fillNeedsYou = (nyR) => {
-    const needsYou = (nyR && nyR.items) || [];
-    // Look the slot up INSIDE `v`, not in the document. The first version used
-    // document.getElementById and silently did nothing: this fetch resolves in ~400ms, and the
-    // view is still a detached element at that point, so the lookup found null and returned.
-    // The endpoint answered 200 with 100 items and the banner never appeared -- a failure with
-    // no error anywhere, which is the exact shape of bug this codebase keeps producing.
-    // Searching `v` works whether or not the router has mounted it yet.
+    const n = ((nyR && nyR.items) || []).length;
+    // Look the slot up INSIDE `v`, not the document — this resolves while the view can
+    // still be detached (the document lookup silently found null; see git history).
     const slot = v.querySelector('#ny-slot');
-    if (!slot || !needsYou.length) return;
+    if (!slot || !n) return;
     slot.outerHTML = `
-    <section class="section needs-you">
-      <header class="section-header">
-        <div><div class="section-eyebrow">Needs your input</div><h2 class="section-title">${needsYou.length} auto-apply${needsYou.length === 1 ? '' : 's'} waiting on you</h2></div>
-        <a href="#/queue" class="section-link">Auto-apply page</a>
-      </header>
-      <div class="section-body">${needsYou.map(nyCard).join('')}</div>
-    </section>`;
+    <div class="aa-running aa-needsyou">
+      <span>⚑ <strong>${n}</strong> auto-appl${n === 1 ? 'y is' : 'ies are'} waiting on you</span>
+      <a class="btn small primary" href="#/needs-you">Answer them</a>
+    </div>`;
   };
-  // Resolves after this function returns and the router has mounted `v`, so the slot exists.
   nyPromise.then(fillNeedsYou).catch(() => {});
 
   const v = el(`<div>
@@ -1465,29 +1454,6 @@ route('/applications', async () => {
   v.querySelector('#f-status').addEventListener('change', (e) => { f.status = e.target.value; requery(); });
   v.querySelector('#f-source').addEventListener('change', (e) => { f.source = e.target.value; requery(); });
   v.querySelector('#f-via').addEventListener('change', (e) => { f.via = e.target.value; requery(); });
-
-  // Needs-you intake cards: answer the parked question(s) → saved to profile → the task
-  // is re-queued and the pipeline finishes it on the next tick.
-  v.querySelectorAll('.ny-card').forEach((card) => {
-    const taskId = card.dataset.task, jobId = card.dataset.job;
-    card.querySelector('[data-ny-save]')?.addEventListener('click', async (e) => {
-      const btn = e.currentTarget; btn.disabled = true;
-      const answers = [...card.querySelectorAll('.ny-input')]
-        .map((inp) => ({ question: inp.dataset.q, value: (inp.value || '').trim() }))
-        .filter((a) => a.value);
-      if (!answers.length) { toast('Type an answer first', 'danger'); btn.disabled = false; return; }
-      try {
-        const rr = await api('/auto-apply/intake', { method: 'POST', body: { answers } });
-        toast(`Saved${rr && rr.requeued ? ` — ${rr.requeued} re-queued` : ''} ✓`);
-        navigate();
-      } catch (err) { errToast(err); btn.disabled = false; }
-    });
-    card.querySelector('[data-ny-detail]')?.addEventListener('click', () => { location.hash = '#/applications/' + jobId; });
-    card.querySelector('[data-ny-skip]')?.addEventListener('click', async () => {
-      try { await api('/queue/' + encodeURIComponent(taskId), { method: 'PATCH', body: { state: 'skipped' } }); toast('Dismissed'); navigate(); }
-      catch (err) { errToast(err); }
-    });
-  });
 
   v.querySelectorAll('th[data-sort]').forEach((h) => h.addEventListener('click', () => {
     const k = h.dataset.sort;
@@ -2294,16 +2260,14 @@ route('/queue', async () => {
   // doesn't reset the user's Queue↔History choice).
   const qview = (() => { try { return localStorage.getItem('jat11.queue.view') === 'history' ? 'history' : 'tasks'; } catch { return 'tasks'; } })();
 
-  const intakeHtml = parked.length ? `
-    <section class="section aa-intake" data-keep>
-      <header class="section-header"><div><div class="section-eyebrow">Self-healing</div><h2 class="section-title">Needs your input</h2>
-        <div class="form-hint">${parked.length} question(s) auto-apply couldn't answer confidently. Answer them — they're saved to your profile and the set-aside jobs retry automatically.</div></div></header>
-      ${parked.map((q) => `<div class="form-row"><div class="form-label">${esc(q.question)}${q.reason ? `<div class="form-hint">${esc(q.reason)}</div>` : ''}</div>
-        <div class="form-control">${(q.options && q.options.length)
-          ? `<select class="select aa-intake-a" data-q="${esc(q.question)}" data-ft="${esc(q.fieldType || '')}"><option value="">—</option>${q.options.map((o) => `<option>${esc(o)}</option>`).join('')}</select>`
-          : `<input class="input aa-intake-a" data-q="${esc(q.question)}" data-ft="${esc(q.fieldType || '')}" />`}</div></div>`).join('')}
-      <div class="section-footer"><button class="btn small primary" data-intake-save>Save answers & retry jobs</button></div>
-    </section>` : '';
+  // The question wall moved to #/needs-you — this page is the cockpit. One honest
+  // line and a door, instead of ~290 form rows between the header and the queue.
+  const parkedTasks = (groups.get('parked') || []).length;
+  const nyStripHtml = parked.length ? `
+    <div class="aa-running aa-needsyou">
+      <span>⚑ <strong>${parked.length}</strong> question${parked.length === 1 ? '' : 's'} ${parked.length === 1 ? 'is' : 'are'} holding up ${parkedTasks ? `<strong>${parkedTasks}</strong> application${parkedTasks === 1 ? '' : 's'}` : 'applications'}</span>
+      <a class="btn small primary" href="#/needs-you">Answer them</a>
+    </div>` : '';
 
   // Multi-node: which machine this view is pointed at. When a remote node is selected the
   // whole page already reflects it (every call above went through api()→that node). Chunk 1
@@ -2326,10 +2290,10 @@ route('/queue', async () => {
         ${switcherHtml}
         <span class="aa-timer" id="aa-timer" data-start="${aa.enabled && aa.startedAt ? esc(aa.startedAt) : ''}" title="Running for">${aa.enabled && aa.startedAt ? fmtElapsed(Date.now() - Date.parse(aa.startedAt)) : ''}</span>
         <button class="btn aa-power ${aa.enabled ? 'danger' : 'primary'}" data-power>${aa.enabled ? '⏹ Stop' : '▶ Start'}</button>
-        <button class="btn" data-save>Save settings</button>
+        <a class="btn" href="#/aa-settings" title="What to apply to and how fast — now its own page">⚙ Settings</a>
       </div>
     </header>
-    ${viewingRemote ? `<div class="aa-running" style="background:rgba(90,120,200,.14);border-color:rgba(90,120,200,.4)">👁 Viewing <strong>${esc(aaTgt.name)}</strong> — you can <strong>Start/Stop</strong> it from here. Editing its keywords and other settings stays on <strong>This PC</strong> for now.</div>` : ''}
+    ${viewingRemote ? `<div class="aa-running" style="background:rgba(90,120,200,.14);border-color:rgba(90,120,200,.4)">👁 Viewing <strong>${esc(aaTgt.name)}</strong> — you can <strong>Start/Stop</strong> it from here. ⚙ Settings edits This PC — each machine keeps its own.</div>` : ''}
 
     ${working ? '<div class="aa-running"><span class="aa-pulse"></span> Auto-apply is working in a background tab — <strong>don\'t touch that window</strong>. It\'s paced and you can Stop any time.</div>' : ''}
     ${(aa.enabled && aa.idleOnly === true && disc && disc.paused) ? `<div class="aa-running" style="background:rgba(120,124,160,.14);border-color:rgba(120,124,160,.35)">🌙 <strong>Idle-pause</strong> — ${esc(disc.pauseReason || 'you\'re using the computer')}. Auto-apply resumes automatically the moment you\'re idle and nothing is playing.</div>` : ''}
@@ -2349,58 +2313,8 @@ route('/queue', async () => {
       </div>
     </div>
 
-    ${intakeHtml}
+    ${nyStripHtml}
 
-    <section class="section">
-      <header class="section-header"><div><div class="section-eyebrow">Target</div><h2 class="section-title">What to apply to</h2></div></header>
-      <div class="queue-controls section-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px">
-        ${qc('Keywords', '<div id="aa-keywords-slot"></div>')}
-        ${qc('Locations', '<div id="aa-locations-slot"></div><div class="form-hint">Geography only — e.g. Toronto, ON · Canada. For remote/hybrid use Work mode, not a location.</div>')}
-        ${qc('Work mode', `<label class="aa-chk"><input type="checkbox" id="aa-wm-remote" ${(aa.workModes || []).includes('remote') ? 'checked' : ''}/> Remote</label> <label class="aa-chk"><input type="checkbox" id="aa-wm-hybrid" ${(aa.workModes || []).includes('hybrid') ? 'checked' : ''}/> Hybrid</label> <label class="aa-chk"><input type="checkbox" id="aa-wm-onsite" ${(aa.workModes || []).includes('onsite') ? 'checked' : ''}/> On-site</label><div class="form-hint">Filter by how you work. None checked = any. Separate from Locations so "remote" never means worldwide.</div>`)}
-        ${qc('Country', `<input class="input" id="aa-country" value="${esc(aa.country || 'Canada')}" placeholder="Canada" /><div class="form-hint">Hard limit — every search stays inside this country.</div>`)}
-        ${qc('Mode', `<select class="select" id="aa-mode">
-          <option value="auto" ${aa.mode === 'auto' ? 'selected' : ''}>Auto — submit for me</option>
-          <option value="review" ${aa.mode === 'review' ? 'selected' : ''}>Review — stop before submit</option>
-        </select>`)}
-        ${qc('Job boards', `<label class="aa-chk"><input type="checkbox" id="aa-li" ${boards.includes('linkedin') ? 'checked' : ''}/> LinkedIn</label> <label class="aa-chk"><input type="checkbox" id="aa-in" ${boards.includes('indeed') ? 'checked' : ''}/> Indeed</label> <label class="aa-chk"><input type="checkbox" id="aa-gd" ${boards.includes('glassdoor') ? 'checked' : ''}/> Glassdoor</label> <label class="aa-chk"><input type="checkbox" id="aa-google" ${boards.includes('google') ? 'checked' : ''}/> Google Jobs</label> <label class="aa-chk"><input type="checkbox" id="aa-zip" ${boards.includes('zip_recruiter') ? 'checked' : ''}/> ZipRecruiter</label>`)}
-        ${qc('Easy Apply only', `<label class="toggle"><input type="checkbox" id="aa-easy" ${aa.easyApplyOnly !== false ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">On = only 1-click / in-page applies. Off = also includes normal postings and tries the company/ATS handoff, then fills the external form when it can.</div>`)}
-        ${qc('Apply with profile', `<select class="select" id="aa-profile"><option value="">Default</option>${profiles.map((p) => `<option value="${esc(p.id)}" ${aa.profileId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>`)}
-        ${qc('Attach résumé', `<select class="select" id="aa-resume"><option value="">Active résumé</option>${resumes.map((d) => `<option value="${esc(d.id)}" ${aa.resumeDocId === d.id ? 'selected' : ''}>${esc(d.label || d.name)}</option>`).join('')}</select>`)}
-        ${qc('Your experience (years)', `<input class="input" id="aa-exp" type="number" min="0" max="40" value="${Number(aa.experienceYears) || 0}" /><div class="form-hint">skip roles that demand many more years than this (0 = off)</div>`)}
-        ${qc('Max seniority', `<select class="select" id="aa-seniority">
-          <option value="any" ${(aa.seniorityMax || 'any') === 'any' ? 'selected' : ''}>Any level</option>
-          <option value="entry" ${aa.seniorityMax === 'entry' ? 'selected' : ''}>Entry / Junior only</option>
-          <option value="mid" ${aa.seniorityMax === 'mid' ? 'selected' : ''}>Up to Mid</option>
-          <option value="senior" ${aa.seniorityMax === 'senior' ? 'selected' : ''}>Up to Senior (skip Lead/Manager)</option>
-        </select>`)}
-        ${qc('Exclude titles', '<div id="aa-exclude-slot"></div><div class="form-hint">skip any title containing these</div>')}
-        ${qc('Exclude companies', '<div id="aa-exclude-companies-slot"></div><div class="form-hint">skip any company containing these</div>')}
-        ${qc('Exclude locations', '<div id="aa-exclude-locations-slot"></div><div class="form-hint">skip any location containing these</div>')}
-      </div>
-    </section>
-
-    <details class="section aa-advanced" ${(aa.runAnytime === false || aa.idleOnly === true || aa.maxPerDay < 50 || (Number(aa.concurrency) || 1) > 1) ? 'open' : ''}>
-      <summary><span class="section-eyebrow">Advanced</span> Pacing &amp; limits</summary>
-      <div class="queue-controls section-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px">
-        ${qc('Run anytime (24/7)', `<label class="toggle"><input type="checkbox" id="aa-anytime" ${aa.runAnytime !== false ? 'checked' : ''} /><span class="knob"></span></label>`)}
-        ${qc('Only when I\'m idle', `<label class="toggle"><input type="checkbox" id="aa-idleonly" ${aa.idleOnly === true ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">Pauses the moment you touch the mouse/keyboard <em>or</em> any tab plays audio/video (YouTube, music, a call), and resumes automatically only when you're completely idle with nothing playing — ideal for applying while you're away. Uses your browser's idle + audible-tab detection; audio from apps outside the browser isn't detected.</div>`)}
-        ${qc('Count me idle after (sec)', `<input class="input" id="aa-idlesecs" type="number" min="15" max="1800" step="5" value="${Math.max(15, Number(aa.idleThresholdSeconds) || 60)}" /><div class="form-hint">Seconds of no mouse/keyboard before you count as idle (minimum 15).</div>`)}
-        ${qc('Max / day', `<input class="input" id="aa-day" type="number" min="1" max="500" value="${aa.maxPerDay}" />`)}
-        ${qc('Max / hour', `<input class="input" id="aa-hour" type="number" min="1" max="100" value="${aa.maxPerHour}" />`)}
-        ${qc('Gap min (min)', `<input class="input" id="aa-gmin" type="number" min="0" max="180" step="0.25" value="${aa.minGapMinutes}" />`)}
-        ${qc('Gap max (min)', `<input class="input" id="aa-gmax" type="number" min="0" max="360" step="0.25" value="${aa.maxGapMinutes}" />`)}
-        ${qc('Parallel applications', `<input class="input" id="aa-conc" type="number" min="1" max="5" value="${Math.max(1, Math.min(5, Number(aa.concurrency) || 1))}" /><div class="form-hint">1 (the default) applies one at a time, keeping the single apply window in the foreground so the new full-page Easy Apply (/apply/) page reliably LOADS — most reliable, lowest automation footprint. Raising it opens that many apply windows at once (tiled side-by-side so they aren't occluded), for throughput. The hourly cap still binds total throughput.</div>`)}
-        ${qc('Max on the same site', `<input class="input" id="aa-persite" type="number" min="1" max="5" value="${Math.max(1, Math.min(5, Number(aa.perSiteConcurrency) || 2))}" /><div class="form-hint">Of those parallel windows, how many may run on the SAME site at once. ALL LinkedIn jobs count as one site, so this is effectively "how many LinkedIn applications run together". 2 is the ban-safe default. 3+ is more throughput but several simultaneous Easy-Apply sessions on ONE account looks more like a bot (higher flag risk). Capped at your Parallel-applications value.</div>`)}
-        ${qc('Bring window to front while applying', `<label class="toggle"><input type="checkbox" id="aa-bringfront" ${aa.bringToFrontToHydrate ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">For max reliability when a fullscreen app (e.g. a game) covers the apply window — Chrome throttles a fully-hidden window so the Easy-Apply button never loads. ON brings the apply window to the front while each application runs (it takes focus). Leave OFF for unobtrusive background applying.</div>`)}
-        ${qc('Keep PC awake while running', `<label class="toggle"><input type="checkbox" id="aa-keepawake" ${aa.keepAwake !== false ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">Session-scoped. JAT does not change your Windows power plan.</div>`)}
-        ${qc('Keep display awake too', `<label class="toggle"><input type="checkbox" id="aa-keepdisplay" ${aa.keepDisplayAwake ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">Stronger mode for overnight runs on sites that throttle hidden displays.</div>`)}
-        <div id="aa-window-row">
-          ${qc('Window start', `<input class="input" id="aa-ws" type="time" value="${esc(aa.windowStart || '')}" />`)}
-          ${qc('Window end', `<input class="input" id="aa-we" type="time" value="${esc(aa.windowEnd || '')}" />`)}
-        </div>
-      </div>
-      <div class="section-footer muted">Run anytime is on by default (24/7). Turn it off to restrict applying to a daily time window. LinkedIn/Indeed flag bots — if you push the volume up, expect more risk to your account. Auto mode submits real applications.</div>
-    </details>
 
     <section class="section">
       <header class="section-header" style="align-items:center">
@@ -2427,74 +2341,8 @@ route('/queue', async () => {
     </section>
   </div>`);
 
-  const kw = chipsInput(aa.keywords || [], 'software engineer, data analyst…');
-  v.querySelector('#aa-keywords-slot').appendChild(kw.node);
-  const locs = chipsInput(aa.locations || [], 'Toronto, ON · Canada…');
-  v.querySelector('#aa-locations-slot').appendChild(locs.node);
-  const exTitles = chipsInput(aa.excludeKeywords || [], 'game, manager, sales…');
-  v.querySelector('#aa-exclude-slot').appendChild(exTitles.node);
-  const exCompanies = chipsInput(aa.excludeCompanies || [], 'Acme, staffing…');
-  v.querySelector('#aa-exclude-companies-slot').appendChild(exCompanies.node);
-  const exLocations = chipsInput(aa.excludeLocations || [], 'onsite only, New York…');
-  v.querySelector('#aa-exclude-locations-slot').appendChild(exLocations.node);
-  // The run-anytime toggle shows/hides #aa-window-row purely via CSS :has() — no JS
-  // here, so a live morph refresh can never fight the user's toggle state.
 
-  v.querySelector('[data-save]').addEventListener('click', async () => {
-    try {
-      const boardsSel = [];
-      if (v.querySelector('#aa-li').checked) boardsSel.push('linkedin');
-      if (v.querySelector('#aa-in').checked) boardsSel.push('indeed');
-      if (v.querySelector('#aa-gd').checked) boardsSel.push('glassdoor');
-      if (v.querySelector('#aa-google').checked) boardsSel.push('google');
-      if (v.querySelector('#aa-zip').checked) boardsSel.push('zip_recruiter');
-      const conc = Math.max(1, Math.min(8, Number(v.querySelector('#aa-conc').value) || 1));
-      // Parallel = more apply tabs at once = much faster, but a bigger automation
-      // footprint. Warn (once) only when the user is RAISING it past safe serial.
-      if (conc > 1 && conc > (Math.max(1, Number(aa.concurrency) || 1))) {
-        const ok = await confirmModal(
-          `This opens ${conc} apply windows at the same time. Reliability tradeoff: only ONE window can be in the foreground at a time, and Chrome THROTTLES the other backgrounded/occluded apply windows while their full-page Easy Apply (/apply/) page is still LOADING — those windows may load slowly or NOT HYDRATE at all, so their applications can time out and retry. Serial ("1") keeps the single apply window foreground so its /apply/ page reliably loads — it is the most reliable and the default. The other trade-off is automation footprint: several apply windows in parallel looks more like a bot to LinkedIn/Indeed (higher risk of a temporary block or account flag). Continue?`,
-          { title: `Run ${conc} applications in parallel?`, danger: true, okLabel: 'Yes, go parallel', cancelLabel: 'Keep it safe' });
-        if (!ok) return;
-      }
-      await api('/settings', {
-        method: 'PATCH',
-        body: { autoApply: {
-          // enabled is owned by the Start/Stop button, not Save — don't touch it here.
-          mode: v.querySelector('#aa-mode').value,
-          keywords: kw.get(),
-          locations: locs.get(),
-          workModes: ['remote', 'hybrid', 'onsite'].filter((m) => v.querySelector('#aa-wm-' + m)?.checked),
-          country: (v.querySelector('#aa-country').value || '').trim() || 'Canada',
-          boards: boardsSel,
-          easyApplyOnly: v.querySelector('#aa-easy').checked,
-          concurrency: conc,
-          perSiteConcurrency: Math.max(1, Math.min(conc, Number(v.querySelector('#aa-persite')?.value) || 2)),
-          bringToFrontToHydrate: v.querySelector('#aa-bringfront').checked,
-          keepAwake: v.querySelector('#aa-keepawake').checked,
-          keepDisplayAwake: v.querySelector('#aa-keepdisplay').checked,
-          experienceYears: Math.max(0, Number(v.querySelector('#aa-exp').value) || 0),
-          seniorityMax: v.querySelector('#aa-seniority').value,
-          excludeKeywords: exTitles.get(),
-          excludeCompanies: exCompanies.get(),
-          excludeLocations: exLocations.get(),
-          profileId: v.querySelector('#aa-profile').value,
-          resumeDocId: v.querySelector('#aa-resume').value,
-          maxPerDay: Number(v.querySelector('#aa-day').value) || 50,
-          maxPerHour: Number(v.querySelector('#aa-hour').value) || 10,
-          minGapMinutes: Math.max(0, Number(v.querySelector('#aa-gmin').value) || 0),
-          maxGapMinutes: Math.max(0, Number(v.querySelector('#aa-gmax').value) || 0),
-          runAnytime: v.querySelector('#aa-anytime').checked,
-          windowStart: v.querySelector('#aa-ws')?.value || '',
-          windowEnd: v.querySelector('#aa-we')?.value || '',
-          idleOnly: v.querySelector('#aa-idleonly')?.checked || false,
-          idleThresholdSeconds: Math.max(15, Math.min(1800, Number(v.querySelector('#aa-idlesecs')?.value) || 60)),
-        } },
-      });
-      state.settings = null;
-      toast(conc > 1 ? `Saved — running ${conc} in parallel` : 'Auto-apply settings saved');
-    } catch (e) { errToast(e); }
-  });
+  // Save settings moved to #/aa-settings with the controls it saves.
 
   // One Start↔Stop button (replaces the old ON/OFF toggle + "Stop everything").
   // Start: enable auto-apply. Stop: disable + skip queued/running + close the tabs.
@@ -2820,19 +2668,6 @@ route('/queue', async () => {
     } catch (err) { errToast(err); btn.disabled = false; }
   });
 
-  v.querySelector('[data-intake-save]')?.addEventListener('click', async (e) => {
-    const answers = [...v.querySelectorAll('.aa-intake-a')]
-      .map((el2) => ({ question: el2.dataset.q, value: (el2.value || '').trim(), fieldType: el2.dataset.ft }))
-      .filter((a) => a.value);
-    if (!answers.length) { toast('Answer at least one question', 'danger'); return; }
-    const btn = e.currentTarget; btn.disabled = true;
-    try {
-      const r = await api('/auto-apply/intake', { method: 'POST', body: { answers } });
-      toast(`Saved ${r.saved} answer(s) · ${r.requeued} job(s) re-queued`);
-      navigate();
-    } catch (err) { errToast(err); btn.disabled = false; }
-  });
-
   const wireCard = (card) => {
     const taskId = card.dataset.task;
     const t = tasks.find((x) => x.id === taskId);
@@ -3075,6 +2910,357 @@ function confChipHtml(conf) {
   const cls = c < 0.5 ? 'low' : (c < 0.75 ? 'mid' : 'high');
   return `<span class="proc-conf ${cls}" title="replay confidence">${pct}%</span>`;
 }
+
+// ---------- Needs you — the single home for human input ----------
+// ONE implementation of "answer what auto-apply is stuck on": the queue page's
+// question wall and the Applications page's injected cards both moved here. Card
+// events are DELEGATED to the container, so cards that arrive by pagination or a
+// soft morph always work — the Applications copy bound at render time against
+// cards injected 300ms later, which left every button dead.
+const NY_STATE_LABEL = { parked: 'Parked', awaiting_input: 'Needs you', awaiting_review: 'Review' };
+const nyCardHtml = (t) => `
+    <div class="ny-card" data-task="${esc(t.taskId)}" data-job="${esc(t.jobId)}">
+      <div class="ny-head">
+        <span class="ny-title">${esc(t.title || 'Application')}</span>
+        <span class="ny-co">${esc(t.company || '')}</span>
+        <span class="state-chip" data-state="${esc(t.state)}">${esc(NY_STATE_LABEL[t.state] || t.state)}</span>
+        ${t.route === 'external' ? '<span class="aa-route-chip external">external</span>' : ''}
+      </div>
+      ${t.reason ? `<div class="ny-reason">${esc(t.reason)}</div>` : ''}
+      ${(t.questions || []).map((qq) => `
+        <div class="ny-q">
+          <label class="ny-q-label">${esc(qq.question)}</label>
+          ${(qq.options && qq.options.length)
+            ? `<select class="select ny-input" data-q="${esc(qq.question)}">${qq.options.map((o) => `<option>${esc(o)}</option>`).join('')}</select>`
+            : `<input class="input ny-input" data-q="${esc(qq.question)}" placeholder="Your answer" />`}
+        </div>`).join('')}
+      ${(t.questions || []).length ? '' : '<div class="ny-reason muted">No specific question captured — open the job to finish it by hand.</div>'}
+      <div class="ny-actions">
+        ${(t.questions || []).length ? '<button class="btn small primary" data-ny-save>Save &amp; continue</button>' : ''}
+        ${t.jobUrl ? `<a class="btn small" href="${esc(t.jobUrl)}" target="_blank" rel="noopener">Open job ↗</a>` : ''}
+        <button class="btn small" data-ny-detail>Details</button>
+        <button class="btn small" data-ny-skip>Dismiss</button>
+      </div>
+    </div>`;
+
+route('/needs-you', async () => {
+  const [parkedR, nyR] = await Promise.all([
+    api('/queue/parked').catch(() => ({ items: [] })),
+    api('/auto-apply/needs-you').catch(() => ({ items: [] })),
+  ]);
+  const parked = parkedR.items || [];
+  const nyTasks = nyR.items || [];
+  const tab = (() => { try { return localStorage.getItem('jat11.ny.tab') === 'apps' ? 'apps' : 'questions'; } catch { return 'questions'; } })();
+  const QPAGE = 25;
+  // Typed-but-unsaved answers survive search/pagination repaints — and still save
+  // even when their row is filtered out of view at save time.
+  const pending = new Map();
+
+  const qRow = (q) => `<div class="form-row"><div class="form-label">${esc(q.question)}${q.reason ? `<div class="form-hint">${esc(q.reason)}</div>` : ''}</div>
+    <div class="form-control">${(q.options && q.options.length)
+      ? `<select class="select aa-intake-a" data-q="${esc(q.question)}" data-ft="${esc(q.fieldType || '')}"><option value="">—</option>${q.options.map((o) => `<option>${esc(o)}</option>`).join('')}</select>`
+      : `<input class="input aa-intake-a" data-q="${esc(q.question)}" data-ft="${esc(q.fieldType || '')}" />`}</div></div>`;
+
+  const v = el(`<div>
+    <header class="page-header">
+      <div>
+        <div class="page-eyebrow">Automate</div>
+        <h1 class="page-title">Needs you</h1>
+        <div class="page-sub">Everything auto-apply is waiting on a human for. Answer once — it is remembered for every future form that asks.</div>
+      </div>
+      <div class="page-actions">
+        <a class="btn" href="#/queue">▶ Auto-apply</a>
+        <a class="btn" href="#/aa-settings">⚙ Settings</a>
+      </div>
+    </header>
+    <div class="seg" role="tablist" style="margin-bottom:14px">
+      <button class="seg-btn ${tab === 'questions' ? 'on' : ''}" data-ny-tab="questions">Questions · ${parked.length}</button>
+      <button class="seg-btn ${tab === 'apps' ? 'on' : ''}" data-ny-tab="apps">Applications · ${nyTasks.length}</button>
+    </div>
+    <div data-ny-pane="questions" ${tab === 'questions' ? '' : 'hidden'}>
+      ${parked.length ? `
+      <section class="section aa-intake" data-keep>
+        <header class="section-header"><div><div class="section-eyebrow">Self-healing</div><h2 class="section-title">Unanswered questions</h2>
+          <div class="form-hint">${parked.length} question(s) auto-apply could not answer confidently. Answers are saved to your profile and the set-aside jobs retry automatically.</div></div>
+          <input class="input" id="ny-q-search" placeholder="Search questions…" style="max-width:240px" />
+        </header>
+        <div id="ny-q-list"></div>
+        <div class="ny-savebar"><button class="btn primary" data-intake-save>Save answers &amp; retry jobs</button><span class="muted" id="ny-q-note"></span></div>
+      </section>` : emptyHtml('Clear', 'No unanswered questions', 'Auto-apply has an answer for everything it has met so far. New questions land here the moment a form asks one it cannot answer.')}
+    </div>
+    <div data-ny-pane="apps" ${tab === 'apps' ? '' : 'hidden'}>
+      ${nyTasks.length ? `<section class="section needs-you" data-keep><div class="section-body" id="ny-cards">${nyTasks.map(nyCardHtml).join('')}</div></section>`
+        : emptyHtml('Clear', 'No applications waiting', 'Parked and review-mode applications appear here when they need your call.')}
+    </div>
+  </div>`);
+
+  // tabs
+  v.querySelectorAll('[data-ny-tab]').forEach((b) => b.addEventListener('click', () => {
+    const t = b.dataset.nyTab === 'apps' ? 'apps' : 'questions';
+    try { localStorage.setItem('jat11.ny.tab', t); } catch {}
+    v.querySelectorAll('[data-ny-tab]').forEach((x) => x.classList.toggle('on', x === b));
+    v.querySelectorAll('[data-ny-pane]').forEach((p) => { p.hidden = p.dataset.nyPane !== t; });
+  }));
+
+  // Questions: paged + searchable, painted imperatively into the data-keep section.
+  const qList = v.querySelector('#ny-q-list');
+  if (qList) {
+    let filter = '';
+    let shown = QPAGE;
+    let lastMatch = parked.length;
+    const collect = () => qList.querySelectorAll('.aa-intake-a').forEach((inp) => {
+      const val = (inp.value || '').trim();
+      if (val) pending.set(inp.dataset.q, { value: val, fieldType: inp.dataset.ft || '' });
+      else pending.delete(inp.dataset.q);
+    });
+    const paintNote = () => {
+      const note = v.querySelector('#ny-q-note');
+      if (note) note.textContent = (filter ? `${lastMatch} of ${parked.length} match` : `${parked.length} outstanding`) + (pending.size ? ` · ${pending.size} answered, unsaved` : '');
+    };
+    const paint = () => {
+      const match = filter ? parked.filter((q) => (q.question + ' ' + (q.reason || '')).toLowerCase().includes(filter)) : parked;
+      lastMatch = match.length;
+      qList.innerHTML = match.slice(0, shown).map(qRow).join('') +
+        (match.length > shown ? `<div class="queue-more"><button class="btn small" data-ny-more>Show ${Math.min(QPAGE, match.length - shown)} more</button><span class="muted" style="margin-left:10px">${match.length - shown} more${filter ? ' matching' : ''} hidden</span></div>` : '');
+      qList.querySelectorAll('.aa-intake-a').forEach((inp) => { const p = pending.get(inp.dataset.q); if (p) inp.value = p.value; });
+      paintNote();
+    };
+    paint();
+    qList.addEventListener('input', () => { collect(); paintNote(); });
+    qList.addEventListener('click', (e) => { if (e.target.closest('[data-ny-more]')) { collect(); shown += QPAGE; paint(); } });
+    v.querySelector('#ny-q-search').addEventListener('input', debounce((e) => { collect(); filter = e.target.value.trim().toLowerCase(); shown = QPAGE; paint(); }, 200));
+
+    v.querySelector('[data-intake-save]').addEventListener('click', async (e) => {
+      collect();
+      const answers = [...pending.entries()].map(([question, a]) => ({ question, value: a.value, fieldType: a.fieldType }));
+      if (!answers.length) { toast('Answer at least one question', 'danger'); return; }
+      const btn = e.currentTarget; btn.disabled = true;
+      try {
+        const r = await api('/auto-apply/intake', { method: 'POST', body: { answers } });
+        toast(`Saved ${r.saved} answer(s) · ${r.requeued} job(s) re-queued`);
+        updateNyBadge();
+        navigate();
+      } catch (err) { errToast(err); btn.disabled = false; }
+    });
+  }
+
+  // Application cards: delegated, so morphed or late-added cards always work.
+  const cards = v.querySelector('#ny-cards');
+  if (cards) cards.addEventListener('click', async (e) => {
+    const card = e.target.closest('.ny-card');
+    if (!card) return;
+    const taskId = card.dataset.task, jobId = card.dataset.job;
+    if (e.target.closest('[data-ny-detail]')) { location.hash = '#/applications/' + jobId; return; }
+    if (e.target.closest('[data-ny-skip]')) {
+      try { await api('/queue/' + encodeURIComponent(taskId), { method: 'PATCH', body: { state: 'skipped' } }); toast('Dismissed'); updateNyBadge(); navigate(); }
+      catch (err) { errToast(err); }
+      return;
+    }
+    const saveB = e.target.closest('[data-ny-save]');
+    if (!saveB) return;
+    const answers = [...card.querySelectorAll('.ny-input')]
+      .map((inp) => ({ question: inp.dataset.q, value: (inp.value || '').trim() }))
+      .filter((a) => a.value);
+    if (!answers.length) { toast('Type an answer first', 'danger'); return; }
+    saveB.disabled = true;
+    try {
+      const rr = await api('/auto-apply/intake', { method: 'POST', body: { answers } });
+      toast(`Saved${rr && rr.requeued ? ` — ${rr.requeued} re-queued` : ''} ✓`);
+      updateNyBadge();
+      navigate();
+    } catch (err) { errToast(err); saveB.disabled = false; }
+  });
+
+  return v;
+});
+
+// ---------- Auto-apply settings — one click, zero questions in the way ----------
+route('/aa-settings', async () => {
+  const [settings, profilesR, docsR] = await Promise.all([
+    getSettings(true),
+    api('/profiles').catch(() => ({ items: [] })),
+    api('/documents').catch(() => ({ items: [] })),
+  ]);
+  const aa = settings.autoApply;
+  const profiles = profilesR.items || [];
+  const resumes = (docsR.items || []).filter((d) => d.role === 'resume');
+  const boards = aa.boards || ['linkedin', 'indeed'];
+  const qc = (label, html) => `<div class="qc-field"><span class="qc-label form-label">${esc(label)}</span>${html}</div>`;
+
+  const v = el(`<div>
+    <header class="page-header">
+      <div>
+        <div class="page-eyebrow">Automate</div>
+        <h1 class="page-title">Auto-apply settings</h1>
+        <div class="page-sub">What it applies to and how fast it runs — for This PC.${(state.nodes || []).length ? ' Other machines keep their own settings.' : ''}</div>
+      </div>
+      <div class="page-actions aa-master">
+        <button class="btn aa-power ${aa.enabled ? 'danger' : 'primary'}" data-power>${aa.enabled ? '⏹ Stop' : '▶ Start'}</button>
+        <a class="btn" href="#/queue" title="Watch it run">▶ Auto-apply</a>
+        <button class="btn primary" data-save>Save settings</button>
+      </div>
+    </header>
+    <section class="section" data-keep>
+      <header class="section-header"><div><div class="section-eyebrow">Target</div><h2 class="section-title">What to apply to</h2></div></header>
+      <div class="queue-controls section-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px">
+        ${qc('Keywords', '<div id="aa-keywords-slot"></div>')}
+        ${qc('Locations', '<div id="aa-locations-slot"></div><div class="form-hint">Geography only — e.g. Toronto, ON · Canada. For remote/hybrid use Work mode, not a location.</div>')}
+        ${qc('Work mode', `<label class="aa-chk"><input type="checkbox" id="aa-wm-remote" ${(aa.workModes || []).includes('remote') ? 'checked' : ''}/> Remote</label> <label class="aa-chk"><input type="checkbox" id="aa-wm-hybrid" ${(aa.workModes || []).includes('hybrid') ? 'checked' : ''}/> Hybrid</label> <label class="aa-chk"><input type="checkbox" id="aa-wm-onsite" ${(aa.workModes || []).includes('onsite') ? 'checked' : ''}/> On-site</label><div class="form-hint">Filter by how you work. None checked = any. Separate from Locations so "remote" never means worldwide.</div>`)}
+        ${qc('Country', `<input class="input" id="aa-country" value="${esc(aa.country || 'Canada')}" placeholder="Canada" /><div class="form-hint">Hard limit — every search stays inside this country.</div>`)}
+        ${qc('Mode', `<select class="select" id="aa-mode">
+          <option value="auto" ${aa.mode === 'auto' ? 'selected' : ''}>Auto — submit for me</option>
+          <option value="review" ${aa.mode === 'review' ? 'selected' : ''}>Review — stop before submit</option>
+        </select>`)}
+        ${qc('Job boards', `<label class="aa-chk"><input type="checkbox" id="aa-li" ${boards.includes('linkedin') ? 'checked' : ''}/> LinkedIn</label> <label class="aa-chk"><input type="checkbox" id="aa-in" ${boards.includes('indeed') ? 'checked' : ''}/> Indeed</label> <label class="aa-chk"><input type="checkbox" id="aa-gd" ${boards.includes('glassdoor') ? 'checked' : ''}/> Glassdoor</label> <label class="aa-chk"><input type="checkbox" id="aa-google" ${boards.includes('google') ? 'checked' : ''}/> Google Jobs</label> <label class="aa-chk"><input type="checkbox" id="aa-zip" ${boards.includes('zip_recruiter') ? 'checked' : ''}/> ZipRecruiter</label>`)}
+        ${qc('Easy Apply only', `<label class="toggle"><input type="checkbox" id="aa-easy" ${aa.easyApplyOnly !== false ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">On = only 1-click / in-page applies. Off = also includes normal postings and tries the company/ATS handoff, then fills the external form when it can.</div>`)}
+        ${qc('Apply with profile', `<select class="select" id="aa-profile"><option value="">Default</option>${profiles.map((p) => `<option value="${esc(p.id)}" ${aa.profileId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>`)}
+        ${qc('Attach résumé', `<select class="select" id="aa-resume"><option value="">Active résumé</option>${resumes.map((d) => `<option value="${esc(d.id)}" ${aa.resumeDocId === d.id ? 'selected' : ''}>${esc(d.label || d.name)}</option>`).join('')}</select>`)}
+        ${qc('Your experience (years)', `<input class="input" id="aa-exp" type="number" min="0" max="40" value="${Number(aa.experienceYears) || 0}" /><div class="form-hint">skip roles that demand many more years than this (0 = off)</div>`)}
+        ${qc('Max seniority', `<select class="select" id="aa-seniority">
+          <option value="any" ${(aa.seniorityMax || 'any') === 'any' ? 'selected' : ''}>Any level</option>
+          <option value="entry" ${aa.seniorityMax === 'entry' ? 'selected' : ''}>Entry / Junior only</option>
+          <option value="mid" ${aa.seniorityMax === 'mid' ? 'selected' : ''}>Up to Mid</option>
+          <option value="senior" ${aa.seniorityMax === 'senior' ? 'selected' : ''}>Up to Senior (skip Lead/Manager)</option>
+        </select>`)}
+        ${qc('Exclude titles', '<div id="aa-exclude-slot"></div><div class="form-hint">skip any title containing these</div>')}
+        ${qc('Exclude companies', '<div id="aa-exclude-companies-slot"></div><div class="form-hint">skip any company containing these</div>')}
+        ${qc('Exclude locations', '<div id="aa-exclude-locations-slot"></div><div class="form-hint">skip any location containing these</div>')}
+      </div>
+    </section>
+
+    <section class="section" data-keep>
+      <header class="section-header"><div><div class="section-eyebrow">Pace</div><h2 class="section-title">Pacing &amp; limits</h2></div></header>
+      <div class="queue-controls section-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px">
+        ${qc('Run anytime (24/7)', `<label class="toggle"><input type="checkbox" id="aa-anytime" ${aa.runAnytime !== false ? 'checked' : ''} /><span class="knob"></span></label>`)}
+        ${qc('Only when I\'m idle', `<label class="toggle"><input type="checkbox" id="aa-idleonly" ${aa.idleOnly === true ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">Pauses the moment you touch the mouse/keyboard <em>or</em> any tab plays audio/video (YouTube, music, a call), and resumes automatically only when you're completely idle with nothing playing — ideal for applying while you're away. Uses your browser's idle + audible-tab detection; audio from apps outside the browser isn't detected.</div>`)}
+        ${qc('Count me idle after (sec)', `<input class="input" id="aa-idlesecs" type="number" min="15" max="1800" step="5" value="${Math.max(15, Number(aa.idleThresholdSeconds) || 60)}" /><div class="form-hint">Seconds of no mouse/keyboard before you count as idle (minimum 15).</div>`)}
+        ${qc('Max / day', `<input class="input" id="aa-day" type="number" min="1" max="500" value="${aa.maxPerDay}" />`)}
+        ${qc('Max / hour', `<input class="input" id="aa-hour" type="number" min="1" max="100" value="${aa.maxPerHour}" />`)}
+        ${qc('Gap min (min)', `<input class="input" id="aa-gmin" type="number" min="0" max="180" step="0.25" value="${aa.minGapMinutes}" />`)}
+        ${qc('Gap max (min)', `<input class="input" id="aa-gmax" type="number" min="0" max="360" step="0.25" value="${aa.maxGapMinutes}" />`)}
+        ${qc('Parallel applications', `<input class="input" id="aa-conc" type="number" min="1" max="5" value="${Math.max(1, Math.min(5, Number(aa.concurrency) || 1))}" /><div class="form-hint">1 (the default) applies one at a time, keeping the single apply window in the foreground so the new full-page Easy Apply (/apply/) page reliably LOADS — most reliable, lowest automation footprint. Raising it opens that many apply windows at once (tiled side-by-side so they aren't occluded), for throughput. The hourly cap still binds total throughput.</div>`)}
+        ${qc('Max on the same site', `<input class="input" id="aa-persite" type="number" min="1" max="5" value="${Math.max(1, Math.min(5, Number(aa.perSiteConcurrency) || 2))}" /><div class="form-hint">Of those parallel windows, how many may run on the SAME site at once. ALL LinkedIn jobs count as one site, so this is effectively "how many LinkedIn applications run together". 2 is the ban-safe default. 3+ is more throughput but several simultaneous Easy-Apply sessions on ONE account looks more like a bot (higher flag risk). Capped at your Parallel-applications value.</div>`)}
+        ${qc('Bring window to front while applying', `<label class="toggle"><input type="checkbox" id="aa-bringfront" ${aa.bringToFrontToHydrate ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">For max reliability when a fullscreen app (e.g. a game) covers the apply window — Chrome throttles a fully-hidden window so the Easy-Apply button never loads. ON brings the apply window to the front while each application runs (it takes focus). Leave OFF for unobtrusive background applying.</div>`)}
+        ${qc('Keep PC awake while running', `<label class="toggle"><input type="checkbox" id="aa-keepawake" ${aa.keepAwake !== false ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">Session-scoped. JAT does not change your Windows power plan.</div>`)}
+        ${qc('Keep display awake too', `<label class="toggle"><input type="checkbox" id="aa-keepdisplay" ${aa.keepDisplayAwake ? 'checked' : ''} /><span class="knob"></span></label><div class="form-hint">Stronger mode for overnight runs on sites that throttle hidden displays.</div>`)}
+        <div id="aa-window-row">
+          ${qc('Window start', `<input class="input" id="aa-ws" type="time" value="${esc(aa.windowStart || '')}" />`)}
+          ${qc('Window end', `<input class="input" id="aa-we" type="time" value="${esc(aa.windowEnd || '')}" />`)}
+        </div>
+      </div>
+      <div class="section-footer muted">Run anytime is on by default (24/7). Turn it off to restrict applying to a daily time window. LinkedIn/Indeed flag bots — if you push the volume up, expect more risk to your account. Auto mode submits real applications.</div>
+    </section>
+  </div>`);
+
+  // Unsaved-changes indicator — declared before the save handler so it can reset it.
+  const saveBtn = v.querySelector('[data-save]');
+  const markDirty = () => { if (saveBtn && !saveBtn.dataset.dirty) { saveBtn.dataset.dirty = '1'; saveBtn.textContent = 'Save settings ·'; } };
+  v.addEventListener('input', markDirty);
+  v.addEventListener('change', markDirty);
+
+  const kw = chipsInput(aa.keywords || [], 'software engineer, data analyst…');
+  v.querySelector('#aa-keywords-slot').appendChild(kw.node);
+  const locs = chipsInput(aa.locations || [], 'Toronto, ON · Canada…');
+  v.querySelector('#aa-locations-slot').appendChild(locs.node);
+  const exTitles = chipsInput(aa.excludeKeywords || [], 'game, manager, sales…');
+  v.querySelector('#aa-exclude-slot').appendChild(exTitles.node);
+  const exCompanies = chipsInput(aa.excludeCompanies || [], 'Acme, staffing…');
+  v.querySelector('#aa-exclude-companies-slot').appendChild(exCompanies.node);
+  const exLocations = chipsInput(aa.excludeLocations || [], 'onsite only, New York…');
+  v.querySelector('#aa-exclude-locations-slot').appendChild(exLocations.node);
+  // The run-anytime toggle shows/hides #aa-window-row purely via CSS :has() — no JS
+  // here, so a live morph refresh can never fight the user's toggle state.
+
+  v.querySelector('[data-save]').addEventListener('click', async () => {
+    try {
+      const boardsSel = [];
+      if (v.querySelector('#aa-li').checked) boardsSel.push('linkedin');
+      if (v.querySelector('#aa-in').checked) boardsSel.push('indeed');
+      if (v.querySelector('#aa-gd').checked) boardsSel.push('glassdoor');
+      if (v.querySelector('#aa-google').checked) boardsSel.push('google');
+      if (v.querySelector('#aa-zip').checked) boardsSel.push('zip_recruiter');
+      const conc = Math.max(1, Math.min(8, Number(v.querySelector('#aa-conc').value) || 1));
+      // Parallel = more apply tabs at once = much faster, but a bigger automation
+      // footprint. Warn (once) only when the user is RAISING it past safe serial.
+      if (conc > 1 && conc > (Math.max(1, Number(aa.concurrency) || 1))) {
+        const ok = await confirmModal(
+          `This opens ${conc} apply windows at the same time. Reliability tradeoff: only ONE window can be in the foreground at a time, and Chrome THROTTLES the other backgrounded/occluded apply windows while their full-page Easy Apply (/apply/) page is still LOADING — those windows may load slowly or NOT HYDRATE at all, so their applications can time out and retry. Serial ("1") keeps the single apply window foreground so its /apply/ page reliably loads — it is the most reliable and the default. The other trade-off is automation footprint: several apply windows in parallel looks more like a bot to LinkedIn/Indeed (higher risk of a temporary block or account flag). Continue?`,
+          { title: `Run ${conc} applications in parallel?`, danger: true, okLabel: 'Yes, go parallel', cancelLabel: 'Keep it safe' });
+        if (!ok) return;
+      }
+      await api('/settings', {
+        method: 'PATCH',
+        body: { autoApply: {
+          // enabled is owned by the Start/Stop button, not Save — don't touch it here.
+          mode: v.querySelector('#aa-mode').value,
+          keywords: kw.get(),
+          locations: locs.get(),
+          workModes: ['remote', 'hybrid', 'onsite'].filter((m) => v.querySelector('#aa-wm-' + m)?.checked),
+          country: (v.querySelector('#aa-country').value || '').trim() || 'Canada',
+          boards: boardsSel,
+          easyApplyOnly: v.querySelector('#aa-easy').checked,
+          concurrency: conc,
+          perSiteConcurrency: Math.max(1, Math.min(conc, Number(v.querySelector('#aa-persite')?.value) || 2)),
+          bringToFrontToHydrate: v.querySelector('#aa-bringfront').checked,
+          keepAwake: v.querySelector('#aa-keepawake').checked,
+          keepDisplayAwake: v.querySelector('#aa-keepdisplay').checked,
+          experienceYears: Math.max(0, Number(v.querySelector('#aa-exp').value) || 0),
+          seniorityMax: v.querySelector('#aa-seniority').value,
+          excludeKeywords: exTitles.get(),
+          excludeCompanies: exCompanies.get(),
+          excludeLocations: exLocations.get(),
+          profileId: v.querySelector('#aa-profile').value,
+          resumeDocId: v.querySelector('#aa-resume').value,
+          maxPerDay: Number(v.querySelector('#aa-day').value) || 50,
+          maxPerHour: Number(v.querySelector('#aa-hour').value) || 10,
+          minGapMinutes: Math.max(0, Number(v.querySelector('#aa-gmin').value) || 0),
+          maxGapMinutes: Math.max(0, Number(v.querySelector('#aa-gmax').value) || 0),
+          runAnytime: v.querySelector('#aa-anytime').checked,
+          windowStart: v.querySelector('#aa-ws')?.value || '',
+          windowEnd: v.querySelector('#aa-we')?.value || '',
+          idleOnly: v.querySelector('#aa-idleonly')?.checked || false,
+          idleThresholdSeconds: Math.max(15, Math.min(1800, Number(v.querySelector('#aa-idlesecs')?.value) || 60)),
+        } },
+      });
+      state.settings = null;
+      if (saveBtn) { saveBtn.dataset.dirty = ''; saveBtn.textContent = 'Save settings'; }
+      toast(conc > 1 ? `Saved — running ${conc} in parallel` : 'Auto-apply settings saved');
+    } catch (e) { errToast(e); }
+  });
+
+
+  // Start/Stop, same semantics as the Auto-apply page: stopping never skips the
+  // queue; only a RUNNING task is stood down, back to queued so it retries.
+  v.querySelector('[data-power]').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const turnOn = !btn.classList.contains('danger');
+    btn.disabled = true;
+    try {
+      if (turnOn) {
+        await api('/settings', { method: 'PATCH', body: { autoApply: { enabled: true } } });
+        toast('Auto-apply started — searching & applying, paced');
+      } else {
+        await api('/settings', { method: 'PATCH', body: { autoApply: { enabled: false } } });
+        try {
+          const queueR = await api('/queue');
+          for (const t of (queueR.items || [])) {
+            if (t.state === 'running') {
+              await api('/queue/' + encodeURIComponent(t.id), { method: 'PATCH', body: { state: 'queued', lastError: null, transcriptAppend: { note: 'stopped from dashboard — returned to the queue, not skipped' } } });
+            }
+          }
+        } catch {}
+        stopAutoApplyTabs();
+        toast('Auto-apply stopped — tabs closed');
+      }
+      state.settings = null;
+      navigate();
+    } catch (err) { errToast(err); btn.disabled = false; }
+  });
+
+  return v;
+});
+
+
 route('/procedures', async () => {
   const profilesR = await api('/profiles').catch(() => ({ items: [] }));
   const profiles = profilesR.items || [];
@@ -4405,7 +4591,7 @@ route('/settings', async () => {
       if (!box) return;
       if (!n.ips?.length) { box.textContent = 'No network address found — is this computer on the network?'; return; }
       box.innerHTML = 'Open from another computer on the same network:<br/>' + n.ips.map((i) =>
-        `<span class="mono">http://${esc(i.ip)}:${esc(String(n.port))}/app/?token=${esc(state.token || '')}#/auto-apply</span> <span class="muted">(${esc(i.iface)})</span>`
+        `<span class="mono">http://${esc(i.ip)}:${esc(String(n.port))}/app/?token=${esc(state.token || '')}#/queue</span> <span class="muted">(${esc(i.iface)})</span>`
       ).join('<br/>') + '<br/>The link includes this JAT’s access key — share it only with your own devices.';
     }).catch(() => {});
   }
