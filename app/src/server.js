@@ -1824,6 +1824,12 @@ async function handle(req, res, parsed) {
   }
 
   // ---- auto-apply queue ----
+  // Counts only. The Dashboard renders one chip from three of these numbers and used to pull
+  // the entire queue (1.1 MB on the real node) to compute them in the browser. Registered
+  // BEFORE /queue so the more specific path wins.
+  if (req.method === 'GET' && pathname === '/queue/counts') {
+    return sendJson(res, 200, { ok: true, counts: db.queueCounts() });
+  }
   if (req.method === 'GET' && pathname === '/queue') {
     return sendJson(res, 200, { ok: true, items: db.queueList({ state: parsed.searchParams.get('state') || undefined }) });
   }

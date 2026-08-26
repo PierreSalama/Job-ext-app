@@ -980,7 +980,17 @@ route('/', async () => {
   const [statsR, jobsR, queueR, aiR, gmailR, liveR, bdR, trendR] = await Promise.all([
     mergedStats(),               // headline totals = every machine combined
     mergedJobs('limit=50'),      // recent applications across all machines (render slices to a few)
-    api('/queue').catch(() => ({ items: [] })),
+    // COUNTS, not the queue. This used to be api('/queue'), which on the real node returns
+    // 1,152,389 bytes -- 1,334 task rows -- and the dashboard used it for exactly one thing:
+    // counting three states to render the "Auto-apply - N queued - M need you" chip. The other
+    // nine calls on this page come to about 60 KB together, so this single request was 95% of
+    // the dashboard's payload. /auto-apply/live was NOT a valid substitute: its counts are for
+    // the current run, and awaiting_review measured 90 in the queue against 1 in the session.
+    // The fallback is for a node old enough not to have the route (apiTarget can point at
+    // another machine); it costs one 404 and then behaves exactly as before.
+    api('/queue/counts')
+      .then((r) => (r && r.counts) ? { counts: r.counts } : Promise.reject(new Error('no counts')))
+      .catch(() => api('/queue').then((r) => ({ items: r.items || [] })).catch(() => ({ items: [] }))),
     api('/ai/status').catch(() => null),
     api('/gmail/status').catch(() => null),
     api('/auto-apply/live').catch(() => null),
@@ -989,10 +999,11 @@ route('/', async () => {
   ]);
   const stats = statsR;
   const jobs = jobsR.items || [];
-  const tasks = queueR.items || [];
   const byStatus = stats.byStatus || {};
-  const qCounts = {};
-  for (const t of tasks) qCounts[t.state] = (qCounts[t.state] || 0) + 1;
+  // Either shape: counts straight from the server, or counted here from a fallback list.
+  const qCounts = queueR.counts || {};
+  if (!queueR.counts) for (const t of (queueR.items || [])) qCounts[t.state] = (qCounts[t.state] || 0) + 1;
+  const qTotal = Object.values(qCounts).reduce((a, b) => a + b, 0);
 
   const aiChip = (label, st) => {
     if (!st) return '';
@@ -1002,11 +1013,35 @@ route('/', async () => {
   const sysBits = [];
   if (aiR) { sysBits.push(aiChip('Codex', aiR.codex)); sysBits.push(aiChip('Ollama', aiR.ollama)); }
   if (gmailR?.enabled) {
+    // THIS CHIP IS WHY AN 18-DAY OUTAGE WENT UNNOTICED.
+    //
+    // It used to read `lastResult.at` and print "synced " + how long ago. But `at` is stamped on
+    // every attempt, INCLUDING a failed one — so a node reporting authorized:false, stale:true
+    // and "deleted_client: The OAuth client was deleted" rendered as "Gmail · synced just now",
+    // once a quarter-hour, for eighteen days. The one surface that gets looked at said it was
+    // fine every single time it failed.
+    //
+    // Now it reports the last SUCCESS, and says plainly when the last attempt failed. Same rule
+    // as everywhere else in this app: a failure must never be rendered as an answer.
     const lr = gmailR.lastResult;
-    sysBits.push(`<span class="sys-chip">Gmail · ${lr?.at ? 'synced ' + fmtRel(lr.at) : (gmailR.authorized ? 'connected' : 'not connected')}</span>`);
+    const h = gmailR.health || {};
+    const lastOk = h.lastSuccessAt ? Date.parse(h.lastSuccessAt) : null;
+    const failing = !!(lr && lr.error) || gmailR.authorized === false;
+    const why = String((lr && lr.error) || h.lastError || '').slice(0, 180);
+    let cls = 'sys-chip', text;
+    if (!gmailR.configured && !gmailR.authorized) { cls += ' bad'; text = 'not connected'; }
+    else if (failing) {
+      cls += ' bad';
+      text = lastOk ? `failing · last synced ${fmtRel(lastOk)}` : 'failing · never synced';
+    } else if (gmailR.stale) {
+      cls += ' warn';
+      text = lastOk ? `stale · last synced ${fmtRel(lastOk)}` : 'stale';
+    } else if (lastOk) text = `synced ${fmtRel(lastOk)}`;
+    else text = gmailR.authorized ? 'connected' : 'not connected';
+    sysBits.push(`<span class="${cls}" title="${esc(why)}">Gmail · ${esc(text)}</span>`);
   }
   const awaiting = (qCounts.awaiting_review || 0) + (qCounts.awaiting_input || 0);
-  if (tasks.length) sysBits.push(`<span class="sys-chip ${awaiting ? 'warn' : ''}">Auto-apply · ${qCounts.queued || 0} queued${awaiting ? ` · ${awaiting} need you` : ''}</span>`);
+  if (qTotal) sysBits.push(`<span class="sys-chip ${awaiting ? 'warn' : ''}">Auto-apply · ${qCounts.queued || 0} queued${awaiting ? ` · ${awaiting} need you` : ''}</span>`);
 
   // ---- auto-apply health (live) ----
   const live = (liveR && liveR.ok) ? liveR : null;

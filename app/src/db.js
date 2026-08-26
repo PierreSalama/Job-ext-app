@@ -3469,6 +3469,26 @@ function rowToTask(r) {
   };
 }
 
+// queueCounts() — how many tasks are in each state, WITHOUT reading the tasks.
+//
+// The Dashboard needs exactly three numbers (queued, awaiting_review, awaiting_input) to render
+// one chip: "Auto-apply - N queued - M need you". It was getting them by downloading the whole
+// queue and counting in JavaScript: measured on the real node, 1,334 tasks and 1,152,389 bytes
+// on EVERY dashboard load, to produce three integers. The rest of the dashboard's ten calls
+// come to about 60 KB combined, so this one request was 95% of the page.
+//
+// It cannot be served from /auto-apply/live instead, which was the obvious shortcut: those
+// counts are for the CURRENT RUN, not the whole table. Measured side by side on the same node,
+// awaiting_review was 90 in the queue and 1 in the session. Swapping them would have quietly
+// changed what the chip reports rather than just making it cheaper.
+function queueCounts() {
+  const out = {};
+  for (const r of all('SELECT state, COUNT(*) AS n FROM auto_apply_tasks GROUP BY state')) {
+    out[r.state] = r.n;
+  }
+  return out;
+}
+
 function queueList({ state, full } = {}) {
   let sql = `SELECT t.*, j.title AS _title, j.company AS _company, j.job_url AS _url, j.source AS _src
              FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id`;
@@ -5835,7 +5855,7 @@ module.exports = {
   classifyAts, normCompanyKey, recordNavEvent, navEventsForProfile, isSensitiveKey,
   upsertRecipe, getRecipe, upsertRecipeStep, recipeSteps, markRecipeOutcome, recordRecipeCorrection, resolveRecipe,
   recordDemonstration, pruneDemonstrations, demonstrationsFor, demonstrationsForSession, recordTeachScreenshot, maybeDeleteScreenshot, pruneOrphanScreenshots,
-  listRecipesWithSteps, updateRecipeStepFields, deleteRecipeStep, getTeachScreenshotPath,
+  queueCounts, listRecipesWithSteps, updateRecipeStepFields, deleteRecipeStep, getTeachScreenshotPath,
   listProfiles, saveProfile, deleteProfile, profileForSource,
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,
   extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,
