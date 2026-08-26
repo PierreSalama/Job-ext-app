@@ -335,3 +335,93 @@ test('the repair can resolve those rows, because the URL names the employer', ()
   assert.equal(db.atsCompanyFromUrl('https://job-boards.greenhouse.io/autotradercanada/jobs/7751122003'),
     'autotradercanada');
 });
+
+// ---------------------------------------------------------------------------------------
+// RULE 8 + THE ABBREVIATION FALSE POSITIVE (2026-08-26, sweep 96)
+//
+// Caught live rather than by reading code: the PC node was mid-apply to a Samsara role with the
+// company recorded as "Departments" -- the Greenhouse filter heading. Measured across the 3,000
+// tracked jobs, the platform slugs were the larger share of the same failure: "smartapply" on 42
+// rows and "job-boards" on 25. None of those sit on an ATS board URL, so none could be repaired
+// until atsCompanyFromUrl learned to read the employer's own domain.
+//
+// Adding that fallback then exposed a false positive that had been latent for as long as the
+// guard existed, and would have turned actively destructive: rule (4b) treats ". " followed by a
+// capital as a sentence break, so "Warner Bros. Discovery" was judged page text. On a database
+// copy the repair rewrote it to the slug "wbd" -- a correct company name replaced by a worse one.
+// The measurement is the only reason that was caught; the rule change alone looked clean.
+import { createRequire as _cr8 } from 'node:module';
+const _req8 = _cr8(import.meta.url);
+const _db8 = _req8(new URL('../app/src/db.js', import.meta.url).pathname.replace(/^\//, ''));
+
+test('rule 8a: an ATS navigation heading is not an employer', () => {
+  for (const v of ['Departments', 'All Departments', 'Engineering', 'Teams', 'Open Roles',
+                   'Open Positions', 'Our Team', 'Opportunities', 'Current Openings']) {
+    assert.equal(_db8.isImplausibleCompany(v), true, `${v} is a page heading`);
+  }
+});
+
+test('rule 8b: a platform slug is the vendor, not the employer', () => {
+  for (const v of ['smartapply', 'job-boards', 'ultipro', 'ukg', 'herefish', 'recruiting', 'apply']) {
+    assert.equal(_db8.isImplausibleCompany(v), true, `${v} is a platform, not who he applied to`);
+  }
+});
+
+test('rule 8 is WHOLE-STRING — a real name containing those words survives', () => {
+  // "Teams" is not a company; "Microsoft Teams Engineering Ltd" is. Matching as a substring
+  // would delete real employers.
+  for (const v of ['Microsoft Teams Engineering Ltd', 'Engineering Inc', 'Roles Recruitment Ltd',
+                   'Samsara', 'Open Systems International']) {
+    assert.equal(_db8.isImplausibleCompany(v), false, `${v} is a real employer`);
+  }
+});
+
+test('THE FALSE POSITIVE: an abbreviation is not a sentence break', () => {
+  // Every one of these was refused before this fix, which means they could never be stored at
+  // all -- and once the domain fallback existed, the repair would have overwritten them.
+  for (const v of ['Warner Bros. Discovery', 'Johnson & Johnson Inc. Canada', 'St. Jude Medical',
+                   'J. P. Morgan', 'Astra-North Infoteck Inc.']) {
+    assert.equal(_db8.isImplausibleCompany(v), false, `${v} is a real employer, not page text`);
+  }
+});
+
+test('...but genuine prose still breaks into sentences and is still refused', () => {
+  // The expensive direction: if this fails, the rule the abbreviation fix sits inside has been
+  // defeated and page text starts being filed as employers again.
+  for (const v of ['We are hiring. Join our team today', 'Apply now. See all openings',
+                   'This role is remote. You will build things']) {
+    assert.equal(_db8.isImplausibleCompany(v), true, `${v} is prose`);
+  }
+});
+
+test('the domain fallback reads the employer, never the platform', () => {
+  const f = _db8.atsCompanyFromUrl;
+  // an employer's own careers page names the employer
+  assert.equal(f('https://www.samsara.com/company/careers/roles/7992889?gh_jid=7992889'), 'samsara');
+  assert.equal(f('https://careers.shopify.com/jobs/123'), 'shopify');
+  assert.equal(f('https://www.bbc.co.uk/careers/jobs/9'), 'bbc', 'co.uk must not yield "co"');
+  // ATS board URLs keep using the board token, exactly as before
+  assert.equal(f('https://job-boards.greenhouse.io/affirm/jobs/1'), 'affirm');
+  assert.equal(f('https://jobs.lever.co/faire/abc'), 'faire');
+  // and a platform host yields NOTHING -- deriving "indeed" or "linkedin" here would re-create
+  // the very corruption ("smartapply", "job-boards") this repair exists to undo
+  for (const u of ['https://smartapply.indeed.com/x', 'https://www.linkedin.com/jobs/view/1',
+                   'https://myworkdayjobs.com/en-US/x', 'https://www.indeed.com/viewjob?jk=1']) {
+    assert.equal(f(u), '', `${u} names a vendor, not an employer`);
+  }
+});
+
+test('the repair migration flag was bumped, or the new rules reach nothing', () => {
+  // The repair only rewrites rows the CURRENT guard refuses, so a rule added after the last
+  // flag ran would leave its own rows uncorrected for ever.
+  const src = _req8('node:fs').readFileSync(
+    new URL('../app/src/db.js', import.meta.url).pathname.replace(/^\//, ''), 'utf8');
+  assert.match(src, /kvGet\('companyGuardRepairV4'\)/, 'V4 must gate the repair');
+  assert.match(src, /kvSet\('companyGuardRepairV4', 1\)/);
+});
+
+// Measured on a copy of the live database before committing:
+//   with rule 8 alone .. 49 rows repaired, but TWO wrong: "Warner Bros. Discovery" -> "wbd",
+//                        and "recruiting" -> "ultipro" on 5 rows (one vendor for another)
+//   with both fixes  .. 41 rows repaired, none wrong: careers -> capgemini / lululemon / cisco,
+//                        job-boards -> coinbase, jobs -> bell, linkedin -> ebayinc

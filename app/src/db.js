@@ -1308,9 +1308,15 @@ function migrateImplausibleCompanies() {
     // GitLab applications were filed under the company "underrepresented groups", and their URLs
     // (job-boards.greenhouse.io/gitlab/...) name the employer plainly. Idempotent, so a machine
     // that already ran V1 simply repairs the newly-refused rows and stops.
-    if (kvGet('companyGuardRepairV3')) return;
+    //
+    // V4 is the ATS-navigation rule plus the employer-domain fallback. Caught live: the PC node
+    // was mid-apply to a Samsara role filed under the company "Departments". Across the 3,000
+    // tracked jobs the platform slugs are the larger share -- "smartapply" on 42 rows and
+    // "job-boards" on 25 -- and those only became repairable once atsCompanyFromUrl learned to
+    // read the employer's own domain, because none of them sit on an ATS board URL.
+    if (kvGet('companyGuardRepairV4')) return;
     const fixed = repairImplausibleCompanies();
-    kvSet('companyGuardRepairV3', 1);
+    kvSet('companyGuardRepairV4', 1);
     if (fixed && fixed.length) log.info && log.info(`company repair: corrected ${fixed.length} row(s)`);
   } catch (e) { log.warn && log.warn('company repair migration skipped:', e.message); }
 }
@@ -1374,6 +1380,16 @@ function isConfirmationTitle(value) {
 const COMPANY_ROUTING_RX = /^(?:job-?boards?|boards?|jobs?|apply|applications?|smart-?apply|embed|careers?|recruiting|recruitment|hiring|talent|greenhouse|lever|ashby|ashbyhq|workday|myworkdayjobs|workable|bamboohr|smartrecruiters|zip-?recruiter|icims|taleo|linkedin|indeed|glassdoor|www|app|apps|secure|my)$/i;
 const JD_SECTION_HEADING_RX = /^(?:what\s+(?:you|we|to)\b|who\s+(?:you|we)\b|about\b|the\s+role\b|your\s+(?:role|impact|team|day)\b|responsibilities\b|requirements\b|qualifications\b|benefits\b|perks\b|why\s+(?:join|us|work)\b|how\s+(?:we|you)\b|our\s+(?:team|stack|values|mission|culture|process)\b|back\s+to\s+jobs?\b|job\s+description\b|role\s+overview\b|nice\s+to\s+have\b|must\s+have\b|equal\s+(?:opportunity|employment)\b|thank\s+you\b|apply\s+(?:now|for)\b)|\bresource\s+groups?$/i;
 const SENTENCE_OPENER_RX = /^(?:we|our|us|i|you|your|it|its|they|their|this|that|these|those|here|there|come|join|build|help|let|meet|discover|learn|imagine|ready)\b/i;
+// An abbreviation is not a sentence break. "Warner Bros. Discovery", "Johnson & Johnson Inc.
+// Canada" and "St. Jude Medical" are all real employers, and the rule below refused every one of
+// them -- a period, a space, a capital. That was a latent false positive for as long as the rule
+// has existed (those companies simply could never be stored), and the employer-domain repair
+// turned it into an active one: it would have rewritten "Warner Bros. Discovery" to the slug
+// "wbd". Mask the period on a known abbreviation, and on a single-letter initial ("J. P. Morgan"),
+// before asking whether the string breaks into sentences.
+const NAME_ABBREV_RX = /\b(?:bros|st|ste|inc|ltd|llc|llp|co|corp|plc|pty|mt|ft|dr|mr|mrs|ms|jr|sr|ave|blvd|rd|dept|univ|assn|intl|natl|mfg|svcs|no|vs|etc|approx|est)\.(?=\s)/gi;
+const INITIAL_RX = /\b[A-Za-z]\.(?=\s)/g;
+const stripAbbrevPeriods = (s) => String(s).replace(NAME_ABBREV_RX, (m) => m.slice(0, -1)).replace(INITIAL_RX, (m) => m.slice(0, -1));
 const INTERNAL_SENTENCE_BREAK_RX = /\w\.\s+[A-Z]/;
 // (5) A stylesheet, not an employer. Indeed's job page inlines a <style> block next to the company
 // element, and when the normal selector misses, the scraper's fallback grabs the whole rule text:
@@ -1410,6 +1426,15 @@ const EEO_BOILERPLATE_RX = /\b(?:underrepresented|equal opportunity|all qualifie
 //     'Sitemap Digital Inc'. It caught nothing in the observed data, so it was cost with no
 //     benefit -- exactly the trade this rule set exists to avoid.
 const PAGE_CHROME_RX = /\b(?:privacy (?:notice|policy|statement)|cookie (?:policy|notice|preferences)|terms (?:of use|of service|and conditions)|accessibility statement|all rights reserved)\b/i;
+// (8) ATS NAVIGATION LABELS AND PLATFORM SLUGS. A careers page is mostly navigation, and when the
+// employer cannot be found the scraper settles on whatever heading or hostname is nearest. Caught
+// live: the PC node was mid-apply to a Samsara role with the company recorded as "Departments" --
+// the Greenhouse filter heading. Measured across the 3,000 tracked jobs, the platform slugs are
+// the bigger half: "smartapply" (42 rows) and "job-boards" (25) are hostnames, not employers.
+// Matched WHOLE-STRING, not as a substring: "Teams" is not a company but "Microsoft Teams
+// Engineering Ltd" would be, and a company legitimately called "Engineering Inc" keeps its suffix.
+const ATS_NAV_LABEL_RX = /^(?:all\s+)?(?:departments?|engineering|teams?|roles?|openings?|open\s+(?:roles?|positions?)|current\s+openings?|our\s+team|join\s+us|work\s+with\s+us|life\s+at|positions?|opportunities|vacancies|search\s+jobs?|view\s+all\s+jobs?|browse\s+jobs?)$/i;
+const ATS_PLATFORM_SLUG_RX = /^(?:smartapply|job-boards?|boards|myworkdayjobs|workdayjobs|icims|taleo|jobvite|workable|breezy|recruitee|smartrecruiters|bamboohr|successfactors|brassring|applytojob|jazzhr|ultipro|ukg|herefish|bullhorn|recruiting|apply|app|jobs|careers)$/i;
 
 function isImplausibleCompany(value) {
   const s = String(value == null ? '' : value).trim();
@@ -1421,10 +1446,12 @@ function isImplausibleCompany(value) {
   if (JD_SECTION_HEADING_RX.test(s)) return true;          // (3)
   const words = s.split(/\s+/).filter(Boolean);
   if (SENTENCE_OPENER_RX.test(s) && words.length >= 3) return true;   // (4a)
-  if (INTERNAL_SENTENCE_BREAK_RX.test(s)) return true;               // (4b)
+  if (INTERNAL_SENTENCE_BREAK_RX.test(stripAbbrevPeriods(s))) return true;   // (4b)
   if (CSS_BLOB_RX.test(s)) return true;                              // (5)
   if (EEO_BOILERPLATE_RX.test(s)) return true;                       // (6)
   if (PAGE_CHROME_RX.test(s)) return true;                           // (7)
+  if (ATS_NAV_LABEL_RX.test(s)) return true;                         // (8a)
+  if (ATS_PLATFORM_SLUG_RX.test(s)) return true;                     // (8b)
   return false;
 }
 
@@ -1433,14 +1460,38 @@ function isImplausibleCompany(value) {
 // already store (lowercase: "affirm", "gitlab", "faire"), which is what makes it a safe repair
 // value rather than a guess. `embed` is Greenhouse's iframe route, not a company.
 const ATS_BOARD_TOKEN_RX = /^https?:\/\/(?:(?:job-boards|boards)\.greenhouse\.io|jobs\.lever\.co|jobs\.ashbyhq\.com)\/([^/?#]+)/i;
+// Hosts that are ATS platforms or job boards. On these the DOMAIN is the vendor, never the
+// employer, so the domain fallback below must refuse them outright.
+const PLATFORM_HOST_RX = /(?:greenhouse\.io|lever\.co|ashbyhq\.com|myworkdayjobs\.com|workday\.com|icims\.com|taleo\.net|jobvite\.com|workable\.com|breezy\.hr|recruitee\.com|smartrecruiters\.com|bamboohr\.com|successfactors\.com|brassring\.com|applytojob\.com|jazzhr\.com|indeed\.com|linkedin\.com|glassdoor\.[a-z.]+|ziprecruiter\.com|monster\.[a-z.]+|dice\.com|smartapply\.[a-z.]+|google\.com|ultipro\.com|ukg\.(?:com|net)|herefish\.com|bullhorn(?:staffing)?\.com|jobs\.[a-z]{2,3}$)/i;
+
 function atsCompanyFromUrl(url) {
-  const m = ATS_BOARD_TOKEN_RX.exec(String(url || ''));
-  if (!m) return '';
-  let token = '';
-  try { token = decodeURIComponent(m[1]); } catch { token = m[1]; }
-  token = token.trim();
-  if (!token || COMPANY_ROUTING_RX.test(token)) return '';
-  return token;
+  const raw = String(url || '');
+  const m = ATS_BOARD_TOKEN_RX.exec(raw);
+  if (m) {
+    let token = '';
+    try { token = decodeURIComponent(m[1]); } catch { token = m[1]; }
+    token = token.trim();
+    if (token && !COMPANY_ROUTING_RX.test(token)) return token;
+    return '';
+  }
+  // FALLBACK: a role hosted on the EMPLOYER'S OWN SITE names the employer in its domain.
+  // Caught live: samsara.com/company/careers/roles/7992889 had been stored with the company
+  // "Departments" (the page's filter heading). The registrable domain is the one thing on that
+  // URL that cannot be a heading. Platform and job-board hosts are excluded above, because
+  // there the domain is the vendor -- that is exactly the "smartapply"/"job-boards" corruption
+  // this repair exists to undo, and deriving it from the host would re-create it.
+  let host = '';
+  try { host = new URL(raw).hostname.replace(/^www\./i, ''); } catch { return ''; }
+  if (!host || PLATFORM_HOST_RX.test(host)) return '';
+  const parts = host.split('.').filter(Boolean);
+  if (parts.length < 2) return '';
+  // Take the registrable label: the part before the public suffix, allowing for co.uk / com.au.
+  const idx = (parts.length >= 3 && /^(?:co|com|org|net|gov|ac)$/i.test(parts[parts.length - 2]))
+    ? parts.length - 3 : parts.length - 2;
+  const label = (parts[idx] || '').trim();
+  if (!label || label.length < 2) return '';
+  if (COMPANY_ROUTING_RX.test(label) || isImplausibleCompany(label)) return '';
+  return label;
 }
 
 // Repair the rows the missing guard already wrote. UNAMBIGUOUS ONLY: the job must be hosted on an

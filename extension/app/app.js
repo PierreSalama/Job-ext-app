@@ -1918,6 +1918,20 @@ route('/pipeline', async () => {
     </div>`;
   };
 
+  // CAP THE CARDS PER COLUMN. Measured on the real board: 832 cards, and they are not spread
+  // evenly -- "started" alone holds 550 and "ghosted" 190, which is 11,133 elements and 528 KB
+  // rendered on every visit to a board nobody scrolls 550 cards down. The column HEADER count
+  // is deliberately left as the true total (byStatus[s.id].length), so capping changes what is
+  // drawn and never what the board says you have.
+  const CARD_CAP = 40;
+  const cardsFor = (statusId) => {
+    const list = byStatus[statusId] || [];
+    const html = list.slice(0, CARD_CAP).map(cardHtml).join('');
+    if (list.length <= CARD_CAP) return html;
+    return html + `<button class="btn ghost sm kb-more" data-kb-more="${esc(statusId)}"
+      style="width:100%;margin:6px 0">Show the other ${list.length - CARD_CAP}</button>`;
+  };
+
   const cols = STATUSES.filter((s) => !b.hiddenCols.includes(s.id)).map((s) => {
     const collapsed = b.collapsed.includes(s.id);
     return `<div class="kb-col ${collapsed ? 'collapsed' : ''}" data-status="${s.id}">
@@ -1929,7 +1943,7 @@ route('/pipeline', async () => {
         </span>
         <span class="n">${byStatus[s.id].length}</span>
       </div>
-      <div class="kb-body">${byStatus[s.id].map(cardHtml).join('')}</div>
+      <div class="kb-body">${cardsFor(s.id)}</div>
     </div>`;
   }).join('');
 
@@ -2011,7 +2025,11 @@ route('/pipeline', async () => {
     e.currentTarget.closest('.email-banner')?.remove();
   });
 
-  v.querySelectorAll('.kb-card').forEach((card) => {
+  // DELEGATED-BY-BINDER. Cards revealed by "Show the other N" arrive after this runs, and a
+  // card bound only at first render looks completely normal while being undraggable and
+  // unclickable -- the same silent trap the Applications, Profile and Procedures pages each
+  // shipped with. bindCard is therefore re-callable, and the reveal calls it.
+  const bindCard = (card) => {
     card.addEventListener('dragstart', (e) => {
       e.dataTransfer.setData('text/plain', card.dataset.id);
       e.dataTransfer.effectAllowed = 'move';
@@ -2027,6 +2045,23 @@ route('/pipeline', async () => {
       { label: 'Queue auto-apply', run: async () => { await api('/queue', { method: 'POST', body: { jobId: card.dataset.id } }); toast('Queued for auto-apply'); } },
       { label: 'Delete', danger: true, run: async () => { if (!(await confirmModal('Delete this application?', { danger: true, okLabel: 'Delete' }))) return; await api('/jobs/' + encodeURIComponent(card.dataset.id), { method: 'DELETE' }); navigate(); } },
     ]));
+  };
+  const bindAllCards = () => v.querySelectorAll('.kb-card').forEach((card) => {
+    if (card.dataset.kbBound) return;      // idempotent: a second listener would fire everything twice
+    card.dataset.kbBound = '1';
+    bindCard(card);
+  });
+  bindAllCards();
+
+  // "Show the other N" -- draw that column's remaining cards in place, then bind them.
+  v.querySelectorAll('[data-kb-more]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const rest = (byStatus[btn.dataset.kbMore] || []).slice(CARD_CAP);
+      btn.insertAdjacentHTML('beforebegin', rest.map(cardHtml).join(''));
+      btn.remove();
+      bindAllCards();
+    });
   });
 
   v.querySelectorAll('.kb-col').forEach((col) => {
