@@ -132,3 +132,73 @@ test('stale-but-not-failing is its own state', () => {
 //   dashboard payload   1,152,389 B -> 105 B, chip text identical ("21 queued - 90 need you")
 //   PC gmail chip       "synced 0h ago"  -> "failing - last synced 18d ago"  [sys-chip bad]
 //   laptop gmail chip   "synced 25d ago" -> "not connected"                  [sys-chip bad]
+
+// ---------------------------------------------------------------------------------------
+// 3. THE SAME LIE, TWO MORE PLACES (found by auditing every fmtRel() call)
+//
+// Having fixed the dashboard chip, the obvious question is where else a timestamp becomes a
+// status claim. Grepping every fmtRel() call in the file found two more:
+//
+//   Settings -> Gmail   "● connected · last sync just now · 0 updated"   while every sync was
+//                       being refused. This is the page you would OPEN IN ORDER TO FIX IT.
+//                       `authorized` only means a token exists, not that Google still takes it.
+//                       On the laptop it was self-contradictory: "○ not connected" AND
+//                       "last sync 25d ago · 0 updated" on the same line.
+//
+//   Auto-apply watchdog `const hp = d.health || {}` then two absent counters rendered as
+//                       "healthy". Absence of evidence printed as a positive health claim --
+//                       a node that stopped reporting looked identical to a node with nothing
+//                       wrong.
+const SETTINGS = (() => {
+  const i = APP.indexOf('const gmailStatusHtml =');
+  assert.ok(i > 0, 'the settings Gmail status must be built up front');
+  return APP.slice(i, i + 1500);
+})();
+
+test('Settings shows Gmail as FAILING when the last sync errored', () => {
+  assert.match(SETTINGS, /if \(lr && lr\.error\)/);
+  assert.match(SETTINGS, /● failing/);
+  assert.match(SETTINGS, /sys-chip bad/, 'and it must be styled as bad, not neutral');
+});
+
+test('Settings measures "last sync" from the last SUCCESS', () => {
+  assert.match(SETTINGS, /gh\.lastSuccessAt \? Date\.parse\(gh\.lastSuccessAt\) : null/);
+  assert.ok(!/lastResult\.at/.test(SETTINGS),
+    'lastResult.at is stamped on failures — it can never mean "last sync"');
+});
+
+test('Settings no longer prints a sync time next to "not connected"', () => {
+  // The laptop rendered both at once, which is how a contradiction hides in plain sight.
+  assert.match(SETTINGS, /return '<span class="sys-chip">○ not connected<\/span>';/,
+    'the not-connected branch must return on its own, with no trailing note');
+});
+
+test('Settings still says connected, plainly, when it is', () => {
+  assert.match(SETTINGS, /'<span class="sys-chip ok">● connected<\/span>'/);
+  assert.match(SETTINGS, /last sync ' \+ fmtRel\(lastOk\)/);
+});
+
+test('the Gmail status is built OUTSIDE the template literal', () => {
+  // Not style: a nested template literal inside the settings markup is what broke this file on
+  // the first attempt. Keeping it in a const is the thing that makes it safe to edit.
+  const i = APP.indexOf('const gmailStatusHtml =');
+  const j = APP.indexOf('${gmailStatusHtml}');
+  assert.ok(i > 0 && j > i, 'it must be computed before the markup that uses it');
+});
+
+test('THE WATCHDOG: missing health data is not "healthy"', () => {
+  const i = APP.indexOf('const healthLine =');
+  const line = APP.slice(i, i + 700);
+  assert.match(line, /\(hp\.staleTasks == null && hp\.invalidWaits == null\) \? '<b>not reporting<\/b>'/,
+    'a node that reports nothing must say so, not claim health');
+  assert.match(line, /'<b>healthy<\/b>'/, 'and a node reporting zero issues must still say healthy');
+});
+
+// Verified against BOTH real nodes' /gmail/status payloads:
+//   PC      Settings  "● connected · last sync 0h ago · 0 updated"
+//                 ->  "● failing · last successful sync 18d ago"      [bad]
+//   laptop  Settings  "○ not connected · last sync 25d ago · 0 updated"
+//                 ->  "○ not connected"
+// And the watchdog line across all four states: {} -> "not reporting", {0,0} -> "healthy",
+// {3,0} -> "3 issue(s) detected", {0,1} -> "1 issue(s) detected". Both real nodes report 0/0,
+// so "healthy" there is now an earned claim rather than a default.

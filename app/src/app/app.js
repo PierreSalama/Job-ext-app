@@ -2670,7 +2670,7 @@ route('/queue', async () => {
       : `<div class="aa-empty-live">${d.enabled ? (d.queuedDepth ? 'Next application starting…' : 'No applications in flight — topping up the queue from discovery + retries.') : 'Auto-apply is stopped. Press Start to begin.'}</div>`;
     const hp = d.health || {};
     const dh = hp.discovery || {};
-    const healthLine = `<div class="muted" style="font-size:12px;margin-bottom:10px">Watchdog: ${hp.staleTasks || hp.invalidWaits ? `<b style="color:var(--danger)">${esc((hp.staleTasks || 0) + (hp.invalidWaits || 0))} issue(s) detected</b>` : '<b>healthy</b>'} · discovery ${dh.lastSuccess ? `last healthy ${esc(fmtRel(dh.lastSuccess))}` : 'awaiting first healthy batch'}${dh.pendingFallbacks ? ` · ${esc(dh.pendingFallbacks)} fallback pending` : ''}</div>`;
+    const healthLine = `<div class="muted" style="font-size:12px;margin-bottom:10px">Watchdog: ${(hp.staleTasks == null && hp.invalidWaits == null) ? '<b>not reporting</b>' : (hp.staleTasks || hp.invalidWaits ? `<b style="color:var(--danger)">${esc((hp.staleTasks || 0) + (hp.invalidWaits || 0))} issue(s) detected</b>` : '<b>healthy</b>')} · discovery ${dh.lastSuccess ? `last healthy ${esc(fmtRel(dh.lastSuccess))}` : 'awaiting first healthy batch'}${dh.pendingFallbacks ? ` · ${esc(dh.pendingFallbacks)} fallback pending` : ''}</div>`;
     const stat = (n, lbl, cls) => `<div class="mini"><div class="mini-label">${lbl}</div><div class="mini-value ${cls || ''}">${n}</div></div>`;
     // R3 — HONEST run-scoped breakdown. The headline is the RAW verified rate (verified
     // submits ÷ everything dispatched this run); the supported rate (over jobs we could
@@ -4035,6 +4035,29 @@ route('/settings', async () => {
   const s = settings;
   const ollamaModels = aiSt?.ollama?.models?.map((m) => m.name) || [];
 
+  // THE SAME LIE THE DASHBOARD CHIP TOLD, on the page you would come to in order to fix it.
+  // `authorized` only means a token EXISTS, not that Google still accepts it, and
+  // lastResult.at is stamped on failed attempts too. On the real node this section read
+  // "● connected · last sync just now · 0 updated" while every sync was being refused with
+  // "deleted_client: The OAuth client was deleted". Built here rather than inline, because the
+  // markup below is already a template literal and nesting another one inside it is how this
+  // file gets broken.
+  const gmailStatusHtml = (() => {
+    const lr = gmailSt && gmailSt.lastResult;
+    const gh = (gmailSt && gmailSt.health) || {};
+    const lastOk = gh.lastSuccessAt ? Date.parse(gh.lastSuccessAt) : null;
+    const note = (txt) => '<span class="muted" style="font-size:12px;margin-left:8px">' + esc(txt) + '</span>';
+    if (!gmailSt || (!gmailSt.authorized && !gmailSt.configured)) {
+      return '<span class="sys-chip">○ not connected</span>';
+    }
+    if (lr && lr.error) {
+      return '<span class="sys-chip bad" title="' + esc(String(lr.error).slice(0, 200)) + '">● failing</span>'
+        + note(lastOk ? 'last successful sync ' + fmtRel(lastOk) : 'never synced successfully');
+    }
+    return '<span class="sys-chip ok">● connected</span>'
+      + (lastOk ? note('last sync ' + fmtRel(lastOk) + ' · ' + ((lr && lr.updated) || 0) + ' updated') : '');
+  })();
+
   // AI provider priority (defensive: bridge legacy string order, ensure all 3).
   const aiOrder = (() => {
     const base = Array.isArray(s.ai.order) ? s.ai.order.filter((k) => ['claude', 'chatgpt', 'local'].includes(k)) : [];
@@ -4247,8 +4270,7 @@ route('/settings', async () => {
         <div class="form-hint">Legacy LinkedIn-notification sync via Google OAuth (needs your own Google Cloud client). Most people should use “Connect your email” above instead.</div></div>
         <button class="btn small primary" data-save-section="gmail">Save</button></header>
       <div class="section-body">
-        <span class="sys-chip ${gmailSt?.authorized ? 'ok' : ''}">${gmailSt?.authorized ? '● connected' : '○ not connected'}</span>
-        ${gmailSt?.lastResult?.at ? `<span class="muted" style="font-size:12px;margin-left:8px">last sync ${esc(fmtRel(gmailSt.lastResult.at))} · ${esc(gmailSt.lastResult.updated ?? 0)} updated</span>` : ''}
+        ${gmailStatusHtml}
       </div>
       ${row('Enabled', toggle('gm-enabled', s.gmail.enabled))}
       ${row('Search query', `<input class="input" id="gm-query" value="${esc(s.gmail.query)}" />`, 'Gmail search syntax')}
