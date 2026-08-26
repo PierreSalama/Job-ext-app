@@ -3481,6 +3481,26 @@ function rowToTask(r) {
 // counts are for the CURRENT RUN, not the whole table. Measured side by side on the same node,
 // awaiting_review was 90 in the queue and 1 in the session. Swapping them would have quietly
 // changed what the chip reports rather than just making it cheaper.
+// queuedBySource() — how many QUEUED tasks each source owns, without reading the tasks.
+//
+// The caller needs this to answer a question the queue depth alone cannot: how many of the
+// waiting tasks can this machine actually run? On the PC every one of its 21 queued tasks is
+// LinkedIn or Indeed, both deliberately set to role:'none' there so it can never re-trigger the
+// LinkedIn restriction. They are permanently undispatchable on that node, and only a human
+// changing the role frees them -- yet the dashboard counted them as queue depth and the node
+// reported "pacing", which reads as "about to work" rather than "has nothing it may touch".
+//
+// Counted in SQL for the same reason queueCounts() is: the honest alternative was queueList(),
+// which returns 1.1 MB to answer a question about integers.
+function queuedBySource() {
+  const out = {};
+  const sql = `SELECT LOWER(COALESCE(j.source, '')) AS src, COUNT(*) AS n
+               FROM auto_apply_tasks t JOIN jobs j ON j.id = t.job_id
+               WHERE t.state = 'queued' GROUP BY src`;
+  for (const r of all(sql)) out[r.src || 'unknown'] = r.n;
+  return out;
+}
+
 function queueCounts() {
   const out = {};
   for (const r of all('SELECT state, COUNT(*) AS n FROM auto_apply_tasks GROUP BY state')) {
@@ -5855,7 +5875,7 @@ module.exports = {
   classifyAts, normCompanyKey, recordNavEvent, navEventsForProfile, isSensitiveKey,
   upsertRecipe, getRecipe, upsertRecipeStep, recipeSteps, markRecipeOutcome, recordRecipeCorrection, resolveRecipe,
   recordDemonstration, pruneDemonstrations, demonstrationsFor, demonstrationsForSession, recordTeachScreenshot, maybeDeleteScreenshot, pruneOrphanScreenshots,
-  queueCounts, listRecipesWithSteps, updateRecipeStepFields, deleteRecipeStep, getTeachScreenshotPath,
+  queueCounts, queuedBySource, listRecipesWithSteps, updateRecipeStepFields, deleteRecipeStep, getTeachScreenshotPath,
   listProfiles, saveProfile, deleteProfile, profileForSource,
   listDocuments, getDocument, addDocument, patchDocument, deleteDocument, defaultDocument,
   extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,

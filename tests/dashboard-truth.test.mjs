@@ -202,3 +202,66 @@ test('THE WATCHDOG: missing health data is not "healthy"', () => {
 // And the watchdog line across all four states: {} -> "not reporting", {0,0} -> "healthy",
 // {3,0} -> "3 issue(s) detected", {0,1} -> "1 issue(s) detected". Both real nodes report 0/0,
 // so "healthy" there is now an earned claim rather than a default.
+
+// ---------------------------------------------------------------------------------------
+// 4. "PACING" WITH A QUEUE THIS MACHINE MAY NEVER TOUCH
+//
+// The PC reported status "pacing" with 21 queued — which reads as "working through them". Every
+// one of those 21 is LinkedIn or Indeed, both deliberately role:'none' on that node so it can
+// never re-trigger the 2026-08-10 LinkedIn restriction. They are permanently undispatchable
+// there; only a human changing the role frees them. So the number described work that was never
+// going to happen, which is the same class of untruth as the Gmail chip above: a surface that
+// says fine because nothing told it otherwise.
+//
+// Measured against a copy of the live database:
+//   PC      status pacing -> queue-blocked, queuedDepth 21, queuedBlocked 21, queuedRunnable 0
+//   laptop  linkedin=primary indeed=primary -> queuedBlocked 0, queuedRunnable 56, still pacing
+test('the server counts queued tasks by source without reading them', () => {
+  assert.match(DB, /function queuedBySource\(\)/);
+  assert.match(DB, /WHERE t\.state = 'queued' GROUP BY src/,
+    'counted in SQL — queueList() returns 1.1 MB to answer a question about integers');
+});
+
+test('a queue nothing here may run is its own status, not "pacing"', () => {
+  assert.match(SERVER, /status = 'queue-blocked'/);
+  assert.match(SERVER, /queuedRunnable === 0 && live\.scheduled === 0/,
+    'blocked means nothing RUNNABLE and nothing scheduled — not merely "some are blocked"');
+});
+
+test('blocked is decided by the SAME role rule as dispatch and discovery', () => {
+  // If these three ever disagree, the dashboard starts describing a queue the pump does not
+  // actually have — the reverse of the bug, and harder to notice.
+  const i = SERVER.indexOf('let queuedBlocked = 0;');
+  assert.ok(i > 0);
+  const blk = SERVER.slice(i, i + 700);
+  assert.match(blk, /safety\.isConfiguredPlatform\(s\.safety, src\)/);
+  assert.match(blk, /String\(safety\.platformConfig\(s\.safety, src\)\.role\)\.toLowerCase\(\) !== 'primary'/);
+  assert.match(blk, /s\.safety\.enabled !== false/, 'safety off means ungoverned means dispatchable');
+});
+
+test('both counts reach the client', () => {
+  assert.match(SERVER, /concurrency, status, \.\.\.live, queuedBlocked, queuedRunnable,/);
+});
+
+test('the status label says what it means in words', () => {
+  assert.match(APP, /'queue-blocked': 'Idle · nothing this machine may run'/,
+    'a raw status string in the UI is not an explanation');
+});
+
+test('the dashboard chip names the blocked share', () => {
+  assert.match(APP, /const qBlocked = Number\(liveR && liveR\.queuedBlocked\) \|\| 0;/);
+  assert.match(APP, /not for this machine/);
+  assert.match(APP, /\$\{awaiting \|\| qBlocked \? 'warn' : ''\}/,
+    'a queue that cannot move should not look calm');
+});
+
+test('a node whose lanes ARE primary is untouched', () => {
+  // The expensive direction. On the laptop linkedin and indeed are both primary, so nothing is
+  // blocked and the status must stay exactly as it was — verified against its real settings:
+  // queuedBlocked 0, queuedRunnable 56, status pacing.
+  const i = SERVER.indexOf('let queuedBlocked = 0;');
+  const blk = SERVER.slice(i, i + 700);
+  assert.match(blk, /queuedBlocked \+= n;/);
+  assert.ok(!/queuedBlocked \+= 1;|queuedBlocked = live\.queuedDepth/.test(blk),
+    'only genuinely non-primary sources may count as blocked');
+});

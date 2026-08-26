@@ -1041,13 +1041,20 @@ route('/', async () => {
     sysBits.push(`<span class="${cls}" title="${esc(why)}">Gmail · ${esc(text)}</span>`);
   }
   const awaiting = (qCounts.awaiting_review || 0) + (qCounts.awaiting_input || 0);
-  if (qTotal) sysBits.push(`<span class="sys-chip ${awaiting ? 'warn' : ''}">Auto-apply · ${qCounts.queued || 0} queued${awaiting ? ` · ${awaiting} need you` : ''}</span>`);
+  // If some of the queue can never run on this machine, say so here rather than letting the
+  // number imply work in progress.
+  const qBlocked = Number(liveR && liveR.queuedBlocked) || 0;
+  const blockedNote = qBlocked ? ` · ${qBlocked} not for this machine` : '';
+  if (qTotal) sysBits.push(`<span class="sys-chip ${awaiting || qBlocked ? 'warn' : ''}">Auto-apply · ${qCounts.queued || 0} queued${blockedNote}${awaiting ? ` · ${awaiting} need you` : ''}</span>`);
 
   // ---- auto-apply health (live) ----
   const live = (liveR && liveR.ok) ? liveR : null;
   const sess = (live && live.session) || {};
   const aaStatus = live ? live.status : 'off';
-  const AA_STATUS_LABEL = { off: 'Off', running: 'Running', 'queue-empty': 'Idle · queue empty', 'hourly-cap': 'Hourly cap hit', pacing: 'Paced · waiting' };
+  // 'queue-blocked' is NOT 'pacing'. Pacing means the next application is coming; blocked means
+  // every waiting task belongs to a platform this machine is not allowed to touch, and none of
+  // them will ever start here. On the PC that is all 21 of them.
+  const AA_STATUS_LABEL = { off: 'Off', running: 'Running', 'queue-empty': 'Idle · queue empty', 'queue-blocked': 'Idle · nothing this machine may run', 'hourly-cap': 'Hourly cap hit', pacing: 'Paced · waiting' };
   const subAuto = stats.submittedAuto || 0, subMan = stats.submittedManual || 0;
   const subBot = stats.submittedAutoSubmitted || 0, subCap = stats.submittedAutoAssisted || 0;
   const subTot = stats.submittedTotal || (subAuto + subMan);

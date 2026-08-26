@@ -2027,16 +2027,40 @@ async function handle(req, res, parsed) {
     const bindingCap = maxPerHour && maxPerHour <= gapPerHour ? 'hourly-cap' : 'gap';
     const dailyCap = Number(s.dailyCap) || 0;
     const softCapReached = dailyCap > 0 && stats.dispatchedDay >= dailyCap;
+    // HOW MANY OF THE WAITING TASKS MAY THIS MACHINE ACTUALLY TOUCH?
+    //
+    // Queue depth alone cannot answer that, and the difference is not academic: on the PC all 21
+    // queued tasks are LinkedIn or Indeed, both deliberately role:'none' there so it can never
+    // re-trigger the LinkedIn restriction. They are permanently undispatchable on that node --
+    // only a human changing the role frees them -- yet it reported "pacing" with 21 queued, which
+    // reads as "about to work through them" rather than "has nothing it is allowed to touch".
+    // Same rule the discovery refill gate and decideTouch already use, so the three agree.
+    let queuedBlocked = 0;
+    try {
+      const bySrc = db.queuedBySource();
+      for (const [src, n] of Object.entries(bySrc)) {
+        if (s.safety && s.safety.enabled !== false && safety.isConfiguredPlatform(s.safety, src)
+            && String(safety.platformConfig(s.safety, src).role).toLowerCase() !== 'primary') {
+          queuedBlocked += n;
+        }
+      }
+    } catch { queuedBlocked = 0; }
+    const queuedRunnable = Math.max(0, live.queuedDepth - queuedBlocked);
+
     let status;
     if (!s.enabled) status = 'off';
     else if (live.active > 0) status = 'running';
     else if (live.queuedDepth === 0 && live.scheduled === 0) status = 'queue-empty';
+    // Distinct from queue-empty: there IS a queue, and none of it belongs to this machine.
+    // Saying "pacing" here is the same class of untruth as a status light that reports fine
+    // because it has no data -- it describes waiting, when nothing is coming.
+    else if (queuedRunnable === 0 && live.scheduled === 0) status = 'queue-blocked';
     else if (softCapReached) status = 'daily-soft-cap';
     else if (maxPerHour && stats.doneHour >= maxPerHour) status = 'hourly-cap';
     else status = 'pacing';
     return sendJson(res, 200, {
       ok: true, enabled: !!s.enabled, startedAt: s.startedAt || '', mode: s.mode || 'auto',
-      concurrency, status, ...live,
+      concurrency, status, ...live, queuedBlocked, queuedRunnable,
       runSummary,
       health: db.pipelineHealth(),
       pacing: {
