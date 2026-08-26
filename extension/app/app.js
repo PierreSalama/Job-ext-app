@@ -1212,12 +1212,18 @@ route('/applications', async () => {
   if (f.q) q += '&q=' + encodeURIComponent(f.q);
   // Applications is ALWAYS every machine combined (deduped by URL). needs-you stays local — it's
   // this machine's "answer these to retry" queue, not a cross-machine total.
-  const [r, nyR] = await Promise.all([mergedJobs(q.slice(q.indexOf('?') + 1)), api('/auto-apply/needs-you').catch(() => ({ items: [] }))]);
+  // DO NOT AWAIT needs-you. Measured on loopback (so no network in the way): the job list
+  // answers in 28ms and this one takes 310ms -- eleven times slower -- because it scores every
+  // outstanding question against ~2,700 stored profile fields and ~4,600 remembered answers.
+  // Awaiting both together made the ENTIRE page wait on the slower one, so the table full of
+  // applications sat invisible behind a banner that is supplementary. Fetch it alongside, paint
+  // without it, and slot it in when it lands.
+  const nyPromise = api('/auto-apply/needs-you').catch(() => ({ items: [] }));
+  const r = await mergedJobs(q.slice(q.indexOf('?') + 1));
   let rows = r.items || [];
   // Provenance filter (client-side — `via` is derived server-side, not a DB column).
   if (f.via === 'auto') rows = rows.filter((j) => j.via === 'auto' || j.autoApply);
   else if (f.via === 'manual') rows = rows.filter((j) => j.via === 'manual' && !j.autoApply);
-  const needsYou = (nyR && nyR.items) || [];
 
   const dir = f.dir === 'asc' ? 1 : -1;
   rows = rows.slice().sort((a, b) => {
@@ -1237,7 +1243,13 @@ route('/applications', async () => {
     return `<th data-sort="${key}" style="cursor:pointer">${esc(label)}${active ? (f.dir === 'asc' ? ' ↑' : ' ↓') : ''}</th>`;
   };
 
-  const bodyRows = rows.length ? rows.map((j) => `
+  // INCREMENTAL RENDER. Measured against the real database: this table put 837 rows -- 14,990
+  // elements, one 710 KB block of markup -- into the page in a single go. Nobody reads row 400
+  // before scrolling. A first page plus a control to reveal more keeps the DOM small without
+  // hiding anything: sorting, filtering and select-all all still operate on the FULL set, which
+  // is why `rows` (not the visible slice) stays the source of truth everywhere below.
+  const PAGE = 100;
+  const rowHtml = (j) => `
     <tr data-id="${esc(j.id)}" class="row-link">
       <td><input type="checkbox" data-sel="${esc(j.id)}" ${state.selection.has(j.id) ? 'checked' : ''} /></td>
       <td class="title-cell">${esc(j.title || 'Untitled')}${j.needsReview ? ' <span class="muted" title="Needs review">⚠</span>' : ''}</td>
@@ -1248,11 +1260,21 @@ route('/applications', async () => {
       <td>${esc(j.source || '—')}</td>
       <td>${dateHtml(j.createdAt)}</td>
       <td>${relHtml(j.updatedAt)}</td>
-    </tr>`).join('')
-    : `<tr><td colspan="9">${emptyHtml(
+    </tr>`;
+
+  const emptyRow = `<tr><td colspan="9">${emptyHtml(
       f.q || f.status !== 'all' || f.source !== 'all' ? 'No matches' : 'No entries',
       f.q || f.status !== 'all' || f.source !== 'all' ? 'Nothing matches the current filter' : 'The ledger is empty',
       'Adjust the filters, or hit Apply on a job and JAT will record it.')}</td></tr>`;
+  // The reveal row lives INSIDE the tbody so it cannot be mistaken for a table row that got
+  // orphaned, and it states the true totals rather than a bare "more".
+  const moreRow = (from) => (from >= rows.length ? '' : `
+    <tr class="row-more"><td colspan="9" style="text-align:center;padding:14px">
+      <button class="btn" data-show-more>Show ${Math.min(PAGE, rows.length - from)} more</button>
+      <button class="btn ghost" data-show-all style="margin-left:8px">Show all ${rows.length}</button>
+      <div class="muted" style="margin-top:6px;font-size:12px">Showing ${from} of ${rows.length}</div>
+    </td></tr>`);
+  const bodyRows = rows.length ? (rows.slice(0, PAGE).map(rowHtml).join('') + moreRow(Math.min(PAGE, rows.length))) : emptyRow;
 
   // "Needs your input" — auto-apply tasks that parked / await you, surfaced so you can
   // answer the missing question right here and the pipeline re-queues + finishes them.
@@ -1281,14 +1303,30 @@ route('/applications', async () => {
         <button class="btn small" data-ny-skip>Dismiss</button>
       </div>
     </div>`;
-  const needsYouHtml = needsYou.length ? `
+  // An empty slot the late fetch fills. Rendering nothing until it arrives is deliberate: a
+  // skeleton here would reserve space and shove the table down when it resolved.
+  const needsYouHtml = '<div id="ny-slot"></div>';
+  const fillNeedsYou = (nyR) => {
+    const needsYou = (nyR && nyR.items) || [];
+    // Look the slot up INSIDE `v`, not in the document. The first version used
+    // document.getElementById and silently did nothing: this fetch resolves in ~400ms, and the
+    // view is still a detached element at that point, so the lookup found null and returned.
+    // The endpoint answered 200 with 100 items and the banner never appeared -- a failure with
+    // no error anywhere, which is the exact shape of bug this codebase keeps producing.
+    // Searching `v` works whether or not the router has mounted it yet.
+    const slot = v.querySelector('#ny-slot');
+    if (!slot || !needsYou.length) return;
+    slot.outerHTML = `
     <section class="section needs-you">
       <header class="section-header">
         <div><div class="section-eyebrow">Needs your input</div><h2 class="section-title">${needsYou.length} auto-apply${needsYou.length === 1 ? '' : 's'} waiting on you</h2></div>
         <a href="#/queue" class="section-link">Auto-apply page</a>
       </header>
       <div class="section-body">${needsYou.map(nyCard).join('')}</div>
-    </section>` : '';
+    </section>`;
+  };
+  // Resolves after this function returns and the router has mounted `v`, so the slot exists.
+  nyPromise.then(fillNeedsYou).catch(() => {});
 
   const v = el(`<div>
     <header class="page-header">
@@ -1407,11 +1445,18 @@ route('/applications', async () => {
     bar.hidden = state.selection.size === 0;
     v.querySelector('#bulk-n').textContent = `${state.selection.size} selected`;
   };
-  v.querySelectorAll('[data-sel]').forEach((cb) => cb.addEventListener('click', (e) => {
+  // DELEGATED, not bound per row. These handlers used to be attached with querySelectorAll on
+  // render, which is fine for a table built once and fatal for one that grows: a row revealed
+  // later would look identical and do NOTHING -- no selection, no click-through. Delegating to
+  // the table means every row works whenever it arrives.
+  const tableEl = v.querySelector('table');
+  tableEl.addEventListener('click', (e) => {
+    const cb = e.target.closest('[data-sel]');
+    if (!cb) return;
     e.stopPropagation();
     if (cb.checked) state.selection.add(cb.dataset.sel); else state.selection.delete(cb.dataset.sel);
     paintBulk();
-  }));
+  });
   v.querySelector('#sel-all').addEventListener('click', (e) => {
     e.stopPropagation();
     const on = e.target.checked;
@@ -1492,12 +1537,28 @@ route('/applications', async () => {
     downloadBlob(new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' }), `jat-applications-${new Date().toISOString().slice(0, 10)}.csv`);
   });
 
-  v.querySelectorAll('.row-link').forEach((tr) => {
-    tr.style.cursor = 'pointer';
-    tr.addEventListener('click', (e) => {
-      if (e.target.matches('input[type="checkbox"]')) return;
-      location.hash = '#/applications/' + tr.dataset.id;
-    });
+  tableEl.addEventListener('click', (e) => {
+    if (e.target.closest('input[type="checkbox"]') || e.target.closest('button')) return;
+    const tr = e.target.closest('tr.row-link');
+    if (!tr || !tr.dataset.id) return;
+    location.hash = '#/applications/' + tr.dataset.id;
+  });
+
+  // Reveal more rows. Appends to the tbody and moves the control down; it never re-renders the
+  // whole view, so scroll position and any selection are kept exactly as they were.
+  const tbodyEl = tableEl.querySelector('tbody');
+  const revealFrom = () => tbodyEl.querySelectorAll('tr.row-link').length;
+  const reveal = (count) => {
+    const from = revealFrom();
+    const next = rows.slice(from, from + count);
+    if (!next.length) return;
+    const ctl = tbodyEl.querySelector('tr.row-more');
+    if (ctl) ctl.remove();
+    tbodyEl.insertAdjacentHTML('beforeend', next.map(rowHtml).join('') + moreRow(from + next.length));
+  };
+  tableEl.addEventListener('click', (e) => {
+    if (e.target.closest('[data-show-more]')) { e.stopPropagation(); reveal(PAGE); }
+    else if (e.target.closest('[data-show-all]')) { e.stopPropagation(); reveal(rows.length); }
   });
   return v;
 });
