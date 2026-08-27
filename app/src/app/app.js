@@ -710,18 +710,53 @@ async function navigate(opts = {}) {
 
 // ---------- Error / not-connected states ----------
 function errorView(e) {
+  // NOT every failure is "the app is off". api() throws with status 0 when the node is
+  // genuinely unreachable, with a real HTTP status when the server answered and refused,
+  // and a plain TypeError from a view's own render code arrives here with no status at
+  // all. All three used to print "App offline - start the Job Application Tracker app",
+  // which for the last two is simply false: the app IS running, and it sends you to fix
+  // the wrong thing while hiding the actual bug. Same family as the status lights that
+  // read healthy because nothing had told them otherwise.
+  const status = e && typeof e.status === 'number' ? e.status : null;
+  let eyebrow, title, sub;
+  const bug = status === null;                 // no status => it threw inside our own code
+  if (status === 0) {
+    eyebrow = 'App offline';
+    title = "The desktop companion isn't answering";
+    sub = (e && e.message ? e.message + ' — ' : '') + 'Start the Job Application Tracker app, then retry.';
+  } else if (bug) {
+    eyebrow = 'Page error';
+    title = 'This page hit a bug';
+    sub = 'The app is running — this is a fault in the page itself, not a connection problem. '
+        + 'Copy the details and send them over; other pages should still work.';
+  } else {
+    eyebrow = 'Server error ' + status;
+    title = 'The app answered, but refused this page';
+    sub = (e && e.message ? e.message : 'The request was rejected.')
+        + ' — the app itself is running, so this is one endpoint failing rather than an outage.';
+  }
   const v = el(`<div>
     <div class="empty">
       <div class="empty-mark"></div>
-      <div class="empty-eyebrow">App offline</div>
-      <div class="empty-title">The desktop companion isn't answering</div>
+      <div class="empty-eyebrow">${esc(eyebrow)}</div>
+      <div class="empty-title">${esc(title)}</div>
       <div class="empty-sub"></div>
-      <div class="mt"><button class="btn primary" data-retry>Retry</button></div>
+      <div class="mt"><button class="btn primary" data-retry>Retry</button>${
+        status === 0 ? '' : '<button class="btn" data-copy style="margin-left:8px">Copy details</button>'}</div>
     </div>
   </div>`);
-  v.querySelector('.empty-sub').textContent =
-    (e && e.message ? e.message + ' — ' : '') + 'Start the Job Application Tracker app, then retry.';
+  v.querySelector('.empty-sub').textContent = sub;
   v.querySelector('[data-retry]').addEventListener('click', navigate);
+  const copyBtn = v.querySelector('[data-copy]');
+  if (copyBtn) copyBtn.addEventListener('click', async () => {
+    const detail = [
+      'JAT ' + (state.version || '?') + ' — ' + (state.route && state.route.path || '?'),
+      'status: ' + (status === null ? '(none — thrown in the page)' : status),
+      String((e && e.stack) || (e && e.message) || e),
+    ].join(String.fromCharCode(10));
+    try { await navigator.clipboard.writeText(detail); toast('Details copied'); }
+    catch { toast('Could not copy — the details are in the console', 'danger'); console.error(e); }
+  });
   return v;
 }
 
