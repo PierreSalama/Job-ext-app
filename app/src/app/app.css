@@ -1665,6 +1665,33 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
 .mini-value.gold { color: var(--primary); }
 .mini-value.warn { color: var(--warn); }
 .mini-value.live { color: var(--success); font-size: 15px; letter-spacing: 0.02em; }
+
+/* ---- auto-apply rate strip ----
+   Four cells: what it did today, what it did this hour, what it is ACHIEVING,
+   and the ceiling its settings allow. The last two used to be conflated: the
+   panel printed the ceiling and called it a rate. */
+.aa-rates { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  gap: 10px; margin: 4px 0 12px; }
+.rate-cell { border: 1px solid var(--border); border-radius: 10px; padding: 11px 13px; }
+.rate-label { font-size: 9px; letter-spacing: .24em; text-transform: uppercase;
+  color: var(--muted); font-weight: 500; }
+.rate-num { font-size: 23px; font-weight: 600; margin-top: 6px; line-height: 1.05;
+  font-variant-numeric: tabular-nums; display: flex; align-items: baseline; gap: 6px; }
+.rate-num.muted { color: var(--muted); }
+.rate-of { font-size: 11px; font-weight: 500; color: var(--muted); letter-spacing: .01em; }
+.rate-sub { font-size: 11px; color: var(--muted); margin-top: 6px; line-height: 1.4; }
+.rate-bar { height: 4px; border-radius: 2px; background: var(--border); margin-top: 9px; overflow: hidden; }
+.rate-fill { height: 100%; background: var(--primary); border-radius: 2px; transition: width .4s ease; }
+.rate-fill.hot { background: var(--warn); }
+.rate-note { font-size: 11.5px; line-height: 1.5; color: var(--muted); margin: 0 0 12px;
+  padding: 9px 12px; border-left: 2px solid var(--border); }
+/* a second line under a mini stat, for when the number needs a caveat rather
+   than a tooltip nobody hovers */
+.mini-sub { margin-top: 6px; font-size: 11px; line-height: 1.35; }
+.mini-sub a { color: var(--warn); text-decoration: none; border-bottom: 1px solid transparent; }
+.mini-sub a:hover { border-bottom-color: currentColor; }
+.stat-value.muted { color: var(--muted); font-size: 20px; letter-spacing: 0.01em; }
+.stat-delta.warn { color: var(--warn); }
 .mini.warn { background: var(--warn-wash); }
 
 .split-wrap { margin-bottom: 12px; }

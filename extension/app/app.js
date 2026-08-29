@@ -1075,6 +1075,9 @@ route('/', async () => {
     return `<span class="sys-chip ${ok ? 'ok' : 'bad'}" title="${esc(st.reason || '')}">${esc(label)} ${ok ? '●' : '○'}</span>`;
   };
   const sysBits = [];
+  // Set when the reply detector is not actually running. The response-rate stat
+  // reads it -- see the comment there.
+  let repliesBlind = null;
   if (aiR) { sysBits.push(aiChip('Codex', aiR.codex)); sysBits.push(aiChip('Ollama', aiR.ollama)); }
   if (gmailR?.enabled) {
     // THIS CHIP IS WHY AN 18-DAY OUTAGE WENT UNNOTICED.
@@ -1103,6 +1106,15 @@ route('/', async () => {
     } else if (lastOk) text = `synced ${fmtRel(lastOk)}`;
     else text = gmailR.authorized ? 'connected' : 'not connected';
     sysBits.push(`<span class="${cls}" title="${esc(why)}">Gmail · ${esc(text)}</span>`);
+    // Three days is generous: the sync runs every quarter-hour when it is healthy.
+    const STALE_MS = 3 * 24 * 60 * 60 * 1000;
+    if (failing || !lastOk || (Date.now() - lastOk) > STALE_MS) {
+      repliesBlind = failing ? 'the Gmail sync is failing'
+        : !lastOk ? 'the Gmail sync has never completed'
+        : `the Gmail sync last succeeded ${fmtRel(lastOk)}`;
+    }
+  } else if (gmailR && gmailR.enabled === false) {
+    repliesBlind = 'the Gmail sync is switched off';
   }
   const awaiting = (qCounts.awaiting_review || 0) + (qCounts.awaiting_input || 0);
   // If some of the queue can never run on this machine, say so here rather than letting the
@@ -1217,7 +1229,26 @@ route('/', async () => {
       <div class="stat"><div class="stat-label">Submitted</div><div class="stat-value gold">${subTot}</div><div class="stat-delta">${stats.submittedToday || 0} today · ${stats.total || 0} started</div></div>
       <div class="stat"><div class="stat-label">Via auto-apply</div><div class="stat-value">${subAuto}</div><div class="stat-delta">${autoPct}% · ${subBot} submitted${subCap ? ` · ${subCap} captured` : ''}</div></div>
       <div class="stat"><div class="stat-label">By hand</div><div class="stat-value">${subMan}</div><div class="stat-delta">${100 - autoPct}% — no auto-apply task</div></div>
-      <div class="stat"><div class="stat-label">Response rate</div><div class="stat-value">${fn.responseRate == null ? '—' : fn.responseRate + '%'}</div><div class="stat-delta">${fn.responded || 0} replied${fn.interviews ? ` · ${fn.interviews} interview${fn.interviews === 1 ? '' : 's'}` : ''}</div></div>
+      ${(() => {
+        // Replies are detected by reading the inbox. If that is not running, this
+        // is not a low response rate -- it is no measurement at all, and showing
+        // "0%" next to 1,036 submissions reads as "nobody wants you" when the
+        // truthful reading is "nothing has been checked since <date>".
+        // Observed 2026-08-28: 0% shown while Gmail had been dead 26 days.
+        const pct = fn.responseRate == null ? '—' : fn.responseRate + '%';
+        const detail = `${fn.responded || 0} replied${fn.interviews ? ` · ${fn.interviews} interview${fn.interviews === 1 ? '' : 's'}` : ''}`;
+        if (repliesBlind) {
+          return `<div class="stat" title="${esc(repliesBlind)} — replies are found by reading your inbox, so this number is not being kept up to date.">
+            <div class="stat-label">Response rate</div>
+            <div class="stat-value muted">not counting</div>
+            <div class="stat-delta warn">${esc(repliesBlind)}</div>
+          </div>`;
+        }
+        // Rounding also lies at this scale: 1 reply in 1,036 renders as "0%"
+        // directly above the words "1 replied". Show "<1%" instead of a flat zero.
+        const shown = (fn.responseRate === 0 && (fn.responded || 0) > 0) ? '<1%' : pct;
+        return `<div class="stat"><div class="stat-label">Response rate</div><div class="stat-value">${shown}</div><div class="stat-delta">${detail}</div></div>`;
+      })()}
       <div class="stat clickable" data-go-review><div class="stat-label">Needs review</div><div class="stat-value ${stats.needsReview ? 'warn' : ''}">${stats.needsReview || 0}</div><div class="stat-delta">${stats.thisWeek || 0} new this week</div></div>
     </section>
 
@@ -1244,7 +1275,11 @@ route('/', async () => {
           <div class="mini"><div class="mini-label">Status</div><div class="mini-value ${aaStatus === 'running' ? 'live' : ''}">${aaStatus === 'running' ? '<span class="aa-pulse"></span> ' : ''}${esc(AA_STATUS_LABEL[aaStatus] || aaStatus)}</div></div>
           <div class="mini"><div class="mini-label">Submitted today</div><div class="mini-value gold">${stats.submittedToday || 0}</div></div>
           <div class="mini"><div class="mini-label">In queue</div><div class="mini-value">${(live ? live.queuedDepth : 0) || 0}</div></div>
-          <div class="mini ${sess.needsYou ? 'warn' : ''}"><div class="mini-label">Needs you</div><div class="mini-value ${sess.needsYou ? 'warn' : ''}">${sess.needsYou || 0}</div></div>
+          <div class="mini ${sess.needsYou ? 'warn' : ''}" title="Questions this auto-apply SESSION has parked. The sidebar count is every parked item, across all sessions — that is why the two numbers differ.">
+            <div class="mini-label">Needs you · this session</div>
+            <div class="mini-value ${sess.needsYou ? 'warn' : ''}">${sess.needsYou || 0}</div>
+            ${awaiting && !sess.needsYou ? `<div class="mini-sub"><a href="#/needs-you">${awaiting} waiting overall →</a></div>` : ''}
+          </div>
           <div class="mini"><div class="mini-label">Session open-rate</div><div class="mini-value">${openRate == null ? '—' : openRate + '%'}</div></div>
         </div>
         <div class="dash-aa-cols">
@@ -2194,7 +2229,11 @@ route('/queue', async () => {
       getSettings(true), api('/queue'),
       api('/profiles').catch(() => ({ items: [] })),
       api('/documents').catch(() => ({ items: [] })),
-      api('/queue/parked').catch(() => ({ items: [] })),
+      // COUNT ONLY. This page shows a one-line strip, never the questions themselves
+      // (they are on #/needs-you). Fetching the full list here cost 91 KB / 236 rows /
+      // ~0.8s on every open. Older nodes ignore ?count=1 and still return items, so the
+      // reader below accepts either shape.
+      api('/queue/parked?count=1').catch(() => ({ count: 0 })),
       api('/auto-apply/discovery-status').catch(() => ({ status: null })),
     ]);
   } catch (e) {
@@ -2218,7 +2257,8 @@ route('/queue', async () => {
   const tasks = queueR.items || [];
   const profiles = profilesR.items || [];
   const resumes = (docsR.items || []).filter((d) => d.role === 'resume');
-  const parked = parkedR.items || [];
+  // Either shape: {count} from a current node, {items} from one that predates ?count=1.
+  const parkedCount = typeof parkedR.count === 'number' ? parkedR.count : (parkedR.items || []).length;
   const boards = aa.boards || ['linkedin', 'indeed'];
   const working = tasks.some((t) => t.state === 'running' || t.state === 'scheduled');
   const groups = new Map(QUEUE_STATE_ORDER.map((s) => [s, []]));
@@ -2298,9 +2338,9 @@ route('/queue', async () => {
   // The question wall moved to #/needs-you — this page is the cockpit. One honest
   // line and a door, instead of ~290 form rows between the header and the queue.
   const parkedTasks = (groups.get('parked') || []).length;
-  const nyStripHtml = parked.length ? `
+  const nyStripHtml = parkedCount ? `
     <div class="aa-running aa-needsyou">
-      <span>⚑ <strong>${parked.length}</strong> question${parked.length === 1 ? '' : 's'} ${parked.length === 1 ? 'is' : 'are'} holding up ${parkedTasks ? `<strong>${parkedTasks}</strong> application${parkedTasks === 1 ? '' : 's'}` : 'applications'}</span>
+      <span>⚑ <strong>${parkedCount}</strong> question${parkedCount === 1 ? '' : 's'} ${parkedCount === 1 ? 'is' : 'are'} holding up ${parkedTasks ? `<strong>${parkedTasks}</strong> application${parkedTasks === 1 ? '' : 's'}` : 'applications'}</span>
       <a class="btn small primary" href="#/needs-you">Answer them</a>
     </div>` : '';
 
@@ -2577,6 +2617,49 @@ route('/queue', async () => {
     const dh = hp.discovery || {};
     const healthLine = `<div class="muted" style="font-size:12px;margin-bottom:10px">Watchdog: ${(hp.staleTasks == null && hp.invalidWaits == null) ? '<b>not reporting</b>' : (hp.staleTasks || hp.invalidWaits ? `<b style="color:var(--danger)">${esc((hp.staleTasks || 0) + (hp.invalidWaits || 0))} issue(s) detected</b>` : '<b>healthy</b>')} · discovery ${dh.lastSuccess ? `last healthy ${esc(fmtRel(dh.lastSuccess))}` : 'awaiting first healthy batch'}${dh.pendingFallbacks ? ` · ${esc(dh.pendingFallbacks)} fallback pending` : ''}</div>`;
     const stat = (n, lbl, cls) => `<div class="mini"><div class="mini-label">${lbl}</div><div class="mini-value ${cls || ''}">${n}</div></div>`;
+
+    // HOW LONG HAS THIS NUMBER BEEN ADDING UP? The run-scoped counters reset when the
+    // run does, and a run that is never stopped never resets. On the live node this
+    // read "submitted 177" while the run had been going for 210 hours -- so 177 looked
+    // like a day's work and was nine days of it.
+    const runMs = d.startedAt ? (Date.now() - Date.parse(d.startedAt)) : 0;
+    const runH = runMs > 0 ? runMs / 3600000 : 0;
+    const runAge = runH >= 48 ? `${Math.floor(runH / 24)}d` : runH >= 1 ? `${Math.round(runH)}h` : `${Math.round(runH * 60)}m`;
+    const runLabel = runH >= 1 ? `submitted · ${runAge} run` : 'submitted · this run';
+    // achieved, not permitted
+    const achieved = runH > 0.25 ? (s.submitted || 0) / runH : null;
+    const perDay = achieved == null ? null : achieved * 24;
+    const cap = p.effectivePerHour || 0;
+    const fmtRate = (x) => x == null ? '—' : x >= 10 ? Math.round(x) : x >= 1 ? x.toFixed(1) : x.toFixed(2);
+    const bar = (done, max, warn) => {
+      const pctv = max ? Math.min(100, Math.round(100 * (done || 0) / max)) : 0;
+      return `<div class="rate-bar"><div class="rate-fill${warn && pctv >= 90 ? ' hot' : ''}" style="width:${pctv}%"></div></div>`;
+    };
+    const rateHtml = `<div class="aa-rates">
+      <div class="rate-cell">
+        <div class="rate-label">Today</div>
+        <div class="rate-num">${p.doneDay || 0}<span class="rate-of">/ ${p.maxPerDay || 0} cap</span></div>
+        ${bar(p.doneDay, p.maxPerDay, true)}
+        <div class="rate-sub">${p.dispatchedDay || 0} dispatched today</div>
+      </div>
+      <div class="rate-cell">
+        <div class="rate-label">This hour</div>
+        <div class="rate-num">${p.doneHour || 0}<span class="rate-of">/ ${p.maxPerHour || 0} cap</span></div>
+        ${bar(p.doneHour, p.maxPerHour, true)}
+        <div class="rate-sub">${(p.bindingCap || '').replace('-', ' ') || 'not capped'}</div>
+      </div>
+      <div class="rate-cell">
+        <div class="rate-label">Actually achieving</div>
+        <div class="rate-num">${fmtRate(achieved)}<span class="rate-of">/ hour</span></div>
+        <div class="rate-sub">${fmtRate(perDay)} a day at this pace</div>
+      </div>
+      <div class="rate-cell">
+        <div class="rate-label">Ceiling at your settings</div>
+        <div class="rate-num muted">${cap}<span class="rate-of">/ hour</span></div>
+        <div class="rate-sub">${achieved != null && cap ? `you are getting <b>${Math.round(100 * achieved / cap)}%</b> of it` : 'a limit, not a forecast'}</div>
+      </div>
+    </div>
+    ${runH >= 24 ? `<div class="rate-note">The run counters below started <b>${esc(fmtFull(d.startedAt))}</b> and have been adding up for <b>${runAge}</b> — they reset only when the run does. <b>Today</b> and <b>this hour</b> are real clock periods and reset on their own.</div>` : ''}`;
     // R3 — HONEST run-scoped breakdown. The headline is the RAW verified rate (verified
     // submits ÷ everything dispatched this run); the supported rate (over jobs we could
     // actually drive — excludes site/bot gates + out-of-scope skips) sits beside it as
@@ -2611,7 +2694,7 @@ route('/queue', async () => {
       </header>
       <div class="section-body">
         <div class="aa-dash-grid" style="margin-bottom:14px">
-          ${stat(s.submitted || 0, 'submitted', 'gold')}
+          ${stat(s.submitted || 0, runLabel, 'gold')}
           ${stat(s.readyForReview || 0, 'to review', '')}
           ${stat(s.needsYou || 0, 'needs you', s.needsYou ? 'warn' : '')}
           ${stat(s.skipped || 0, 'skipped', '')}
@@ -2619,7 +2702,8 @@ route('/queue', async () => {
           ${stat(d.queuedDepth || 0, 'in queue', '')}
         </div>
         ${safetyHtml(d.safety)}
-        <div class="muted" style="font-size:12px;margin-bottom:12px">≈ <b style="color:${slow ? 'var(--danger)' : 'inherit'}">${p.effectivePerHour || 0}</b> applications/hour at current settings${p.bindingCap ? ` (capped by ${p.bindingCap === 'hourly-cap' ? 'your hourly limit' : 'the gap between applications'})` : ''}${slow ? ` — your saved pacing predates the speed update. <button class="btn small" data-aa-maxspeed style="padding:2px 9px">⚡ Max speed</button>` : ''}</div>
+        ${rateHtml}
+        ${slow ? `<div class="muted" style="font-size:12px;margin-bottom:12px">Your saved pacing predates the speed update. <button class="btn small" data-aa-maxspeed style="padding:2px 9px">⚡ Max speed</button></div>` : ''}
         ${honest}
         ${siteSpread}
         ${healthLine}

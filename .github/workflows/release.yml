@@ -74,6 +74,15 @@ jobs:
           npm install sharp --no-save --no-audit --no-fund
           node build/make-icons.mjs
 
+      # Pin Python. The runner images move: macos-latest went to 3.14+, and
+      # pyinstaller==6.14.2 is <3.14, so pip silently stopped offering it and the
+      # mac and linux jobs failed in the step below -- which blocked the release
+      # job from publishing ANY asset, including the Windows build that succeeded.
+      # Node is pinned above; Python was not, and that asymmetry was the bug.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Build bundled JobSpy discovery worker
         shell: bash
         run: |

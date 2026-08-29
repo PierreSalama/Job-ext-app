@@ -310,3 +310,72 @@ test('the tooltip explains what the number is missing', () => {
   assert.match(APP, /These numbers are the total across your machines\./);
   assert.match(APP, /did not answer, so its applications are not counted here/);
 });
+
+// ---------------------------------------------------------------------------------------
+// 3. A METRIC THAT DEPENDS ON A DEAD PIPELINE MUST NOT REPORT A NUMBER
+//
+//    Observed on the laptop node, 2026-08-28, on the SAME row of the SAME page:
+//      "Response rate  0%   1 replied · 1 interview"      against 1,036 submitted
+//      "Gmail · synced 26d"
+//    Replies are found by reading the inbox. With that sync dead for 26 days the response
+//    rate is not low, it is UNMEASURED -- and 0% next to a thousand applications is the most
+//    demoralising thing this app can put on a screen. Same rule as the Gmail chip: a failure
+//    must never be rendered as an answer.
+// ---------------------------------------------------------------------------------------
+test('the dashboard knows when replies are not being detected', () => {
+  assert.match(APP, /let repliesBlind = null;/,
+    'the stat row needs the Gmail health that only the chip block computes');
+  assert.match(APP, /repliesBlind = failing \? 'the Gmail sync is failing'/);
+  assert.match(APP, /the Gmail sync has never completed/);
+  assert.match(APP, /the Gmail sync is switched off/,
+    'switched off is also blind — not just failing');
+});
+
+test('a stale sync counts as blind, not just an outright failure', () => {
+  // The 26-day case reported `synced`, not `failing`: it was not erroring, it simply was not
+  // running. Age has to be part of the test or this whole fix misses the case that prompted it.
+  assert.match(APP, /const STALE_MS = 3 \* 24 \* 60 \* 60 \* 1000;/);
+  assert.match(APP, /\(Date\.now\(\) - lastOk\) > STALE_MS/);
+});
+
+test('a blind response rate shows no percentage at all', () => {
+  const i = APP.indexOf('Replies are detected by reading the inbox');
+  assert.ok(i > 0, 'the reasoning must stay next to the code');
+  const block = APP.slice(i, i + 1400);
+  assert.match(block, /if \(repliesBlind\) \{/);
+  assert.match(block, /not counting</, 'print words, not a number that will be read as a result');
+  assert.ok(!/\$\{pct\}/.test(block.slice(0, block.indexOf('return `<div class="stat"><div class="stat-label">Response rate'))),
+    'the percentage must not be rendered on the blind path');
+});
+
+test('and rounding does not manufacture a zero either', () => {
+  // 1 reply in 1,036 is 0.096%, which Math.round prints as "0%" directly above the words
+  // "1 replied". Arithmetically fine, and it reads as a contradiction.
+  assert.match(APP, /fn\.responseRate === 0 && \(fn\.responded \|\| 0\) > 0\) \? '<1%'/);
+});
+
+// ---------------------------------------------------------------------------------------
+// 4. TWO DIFFERENT NUMBERS MAY NOT SHARE ONE LABEL
+//
+//    Sidebar chip: "Auto-apply · 46 queued · 85 need you"   (every parked item, all sessions)
+//    Auto-apply card: "Needs you  0"                        (this session only)
+//    Both correct, both on screen together, nothing to tell them apart. This is the same trap
+//    the /auto-apply/live swap above was rejected for: session counts are not queue counts.
+// ---------------------------------------------------------------------------------------
+test('the session needs-you number says it is the session', () => {
+  assert.match(APP, /Needs you · this session/,
+    'an unqualified "Needs you" beside a different unqualified "Needs you" is the defect');
+});
+
+test('and points at the real total when the session count is zero', () => {
+  // Zero is the misleading case: the card reads "nothing to do" while 85 items wait.
+  assert.match(APP, /awaiting && !sess\.needsYou \? `<div class="mini-sub"><a href="#\/needs-you">\$\{awaiting\} waiting overall/);
+});
+
+test('the two counts still come from their own sources', () => {
+  // The fix is labelling, NOT making them equal. Making the card show the queue total would
+  // lose the "what is this run doing" signal, which is the card's whole job.
+  assert.match(APP, /\$\{sess\.needsYou \|\| 0\}/, 'the card still reports the session');
+  assert.match(APP, /const awaiting = \(qCounts\.awaiting_review \|\| 0\) \+ \(qCounts\.awaiting_input \|\| 0\);/,
+    'the overall figure still comes from /queue/counts');
+});

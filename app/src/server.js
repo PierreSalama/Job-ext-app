@@ -1954,6 +1954,13 @@ async function handle(req, res, parsed) {
   }
   // The deduped list of questions parked jobs are waiting on (the intake form).
   if (req.method === 'GET' && pathname === '/queue/parked') {
+    // ?count=1 returns ONLY the number. The Auto-apply cockpit prints that number in a
+    // one-line strip and renders none of the questions (they live on #/needs-you), but it
+    // was still pulling the whole list on every visit: 236 questions, 91 KB, ~0.8s on a
+    // real queue. Old nodes ignore the param and return items, so callers must accept both.
+    if (parsed.searchParams.get('count') === '1') {
+      return sendJson(res, 200, { ok: true, count: db.queueParkedQuestions().length });
+    }
     return sendJson(res, 200, { ok: true, items: db.queueParkedQuestions() });
   }
   // Single FULL task incl. transcript — the queue list is lean (no transcript blob), so the
