@@ -79,7 +79,12 @@ test('a. OBSERVE — a submitted Workday apply at Rogers harvests its answers in
   // The always-on Observer harvest (upsertJob → harvestAnswersToProfile → qa) landed every
   // non-sensitive answer in the qa store, each stamped with answer_lineage source 'manual'.
   for (const label of Object.keys(ROGERS_ANSWERS)) {
-    const m = db.qaLookup(pid, label);
+    // UNGATED, because this test is about the harvest, not about recall. Since 2026-09-04 a
+    // work-authorisation answer is only ever RECALLED when a human typed it, and the Rogers
+    // "Are you authorized to work in Canada?" row is harvested off a form like the rest. It is
+    // still learned, still stamped, and still visible here. It is simply not served to an
+    // application on its own authority.
+    const m = db.qaLookup(pid, label, null, { ungated: true });
     assert.ok(m && m.answer === ROGERS_ANSWERS[label], `qa learned "${label}"`);
     const lineage = JSON.parse(m.answer_lineage || '[]');
     assert.ok(Array.isArray(lineage) && lineage.length >= 1, `answer_lineage recorded for "${label}"`);

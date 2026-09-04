@@ -31,7 +31,27 @@ const cdp = require('../../browser/cdp');
 let log = { info() {}, warn() {}, error() {} };
 try { log = require('../../logger').scope('ai:tools:documents'); } catch { /* usable outside the app */ }
 
-const RESUME_TEMPLATE = 'F:/GITHUB/Perosnal/portfolio-site/resume/resume-2026.html';
+// WHERE THE RESUME STYLING COMES FROM.
+//
+// This was one absolute path on Pierre's PC: F:/GITHUB/Perosnal/portfolio-site/resume/... . The
+// server laptop has no such drive, so `write_resume` threw ENOENT on the one machine this system
+// exists to run on. Caught by the first real application from the laptop, twelve green end-to-end
+// runs after the tool was written, because every one of those ran here where the file happens to be.
+//
+// The styling now SHIPS WITH THE APP. The authored copy in the portfolio repo stays first when it
+// is present, so editing the real résumé still updates what the agent produces on this machine.
+const BUNDLED_TEMPLATE = path.join(__dirname, '..', 'resume-template.html');
+const AUTHORED_TEMPLATE = 'F:/GITHUB/Perosnal/portfolio-site/resume/resume-2026.html';
+function defaultTemplate() {
+  // An override exists so the machine that HAS the authored copy can still exercise the path taken
+  // by the machine that does not. Without it the bundled template is only ever proven by the
+  // laptop, in production, which is how the missing template reached production in the first place.
+  const forced = process.env.JAT_RESUME_TEMPLATE;
+  if (forced) return forced === 'bundled' ? BUNDLED_TEMPLATE : forced;
+  try { if (fs.existsSync(AUTHORED_TEMPLATE)) return AUTHORED_TEMPLATE; } catch { /* not this machine */ }
+  return BUNDLED_TEMPLATE;
+}
+const RESUME_TEMPLATE = defaultTemplate();
 const APPLICATIONS_ROOT = path.join(os.homedir(), 'Desktop', 'important', 'resume', '2026', 'applications');
 
 const slugify = (s) => String(s || '')
@@ -39,7 +59,17 @@ const slugify = (s) => String(s || '')
 
 // The <head> of the shared résumé, up to and including <html>/<head> but stopping before <body>.
 function resumeHead(templatePath = RESUME_TEMPLATE) {
-  const raw = fs.readFileSync(templatePath, 'utf8');
+  let raw;
+  try { raw = fs.readFileSync(templatePath, 'utf8'); }
+  catch (e) {
+    // Never fail the application over styling. A plain résumé beats no résumé, and the run that
+    // found this spent thirteen steps and 134k characters before giving up on a missing stylesheet.
+    if (templatePath !== BUNDLED_TEMPLATE) {
+      log.warn(`résumé template ${templatePath} unreadable (${e.message}), using the bundled one`);
+      return resumeHead(BUNDLED_TEMPLATE);
+    }
+    throw e;
+  }
   const i = raw.search(/<body\b/i);
   if (i === -1) throw new Error(`no <body> in the résumé template at ${templatePath}`);
   return raw.slice(0, i);
@@ -167,4 +197,4 @@ function makeDocumentTools(opts = {}) {
   return { tools, folderFor, resumeHead: () => resumeHead(template) };
 }
 
-module.exports = { makeDocumentTools, renderPdf, resumeHead, slugify, APPLICATIONS_ROOT, RESUME_TEMPLATE };
+module.exports = { makeDocumentTools, renderPdf, resumeHead, slugify, APPLICATIONS_ROOT, RESUME_TEMPLATE, BUNDLED_TEMPLATE };

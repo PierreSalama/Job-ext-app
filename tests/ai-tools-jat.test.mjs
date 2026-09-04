@@ -314,3 +314,53 @@ test('write_resume sends the agent to the source first', () => {
   assert.match(r.description, /my_resume FIRST/);
   assert.match(r.description, /three lines of nothing/);
 });
+
+// ---------------------------------------------------------------------------
+// check_fit: naming what he does NOT have
+//
+// Pierre's rule has always been that if a posting needs something he lacks, say so plainly in one
+// clause or skip the job. The agent had no way to know. It read a posting, read his résumé, and
+// applied. The overnight run needed a human in the loop to catch a furniture manufacturer whose
+// "Product Engineer" turned out to be a mechanical role.
+// ---------------------------------------------------------------------------
+const PLATFORM = 'Toronto, hybrid. We build control software for warehouse robots. You will work across '
+  + 'a Python and Node backend, a React front end, and the PostgreSQL layer under both. We ask for 2+ '
+  + 'years of professional experience. Bonus: experience integrating an ERP, and CI/CD you built yourself.';
+const CHEMICAL = 'We are seeking a Senior Process Engineer for chemical plant design. Responsibilities '
+  + 'include P&ID development, HAZOP studies, distillation column sizing, ASPEN simulation, pressure '
+  + 'vessel specification and APEGA registration. Ten years of process engineering in oil and gas required.';
+
+const fitTool = () => {
+  const { makeJatTools: mk } = require(path.join(root, 'app/src/ai/tools/jat.js'));
+  return mk({}).tools.find((t) => t.name === 'check_fit');
+};
+
+test('a role he can do scores far above one he cannot', () => {
+  const t = fitTool();
+  const good = Number(/score (\d+)/.exec(t.run({ title: 'Software Developer, Platform', description: PLATFORM }))[1]);
+  const bad = Number(/score (\d+)/.exec(t.run({ title: 'Senior Process Engineer', description: CHEMICAL }))[1]);
+  assert.ok(good > bad * 2, `expected a clear gap, got ${good} vs ${bad}`);
+});
+
+test('it names the gap and forbids writing it onto the résumé', () => {
+  const said = fitTool().run({ title: 'Senior Process Engineer', description: CHEMICAL });
+  assert.match(said, /no match in his history/);
+  assert.match(said, /HAZOP|distillation|ASPEN/i, 'the specific thing he lacks has to be named');
+  assert.match(said, /Do NOT put anything from that list on the résumé/);
+});
+
+test('the score is labelled as a signal, not a verdict', () => {
+  // A number that looks authoritative is worse than no number. The judgement is the agent's.
+  assert.match(fitTool().run({ title: 'x', description: PLATFORM }), /crude token overlap, not a verdict/);
+});
+
+test('punctuation and filler are stripped, real tokens are not', () => {
+  // The raw scorer emits "robots.", "hybrid.", "under", "ask", which buries the word that matters.
+  const said = fitTool().run({ title: 'Software Developer, Platform', description: PLATFORM });
+  assert.equal(/\brobots\.|hybrid\./.test(said), false, 'trailing punctuation must go');
+  assert.equal(/(^|[ ,])(under|ask|both|bonus)([ ,]|$)/.test(said.split('\n')[2] || ''), false, 'filler must go');
+});
+
+test('a summary instead of the posting is refused', () => {
+  assert.match(fitTool().run({ title: 'x', description: 'Nice job in Toronto' }), /posting text, not a summary/);
+});

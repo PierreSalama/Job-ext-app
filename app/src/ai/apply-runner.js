@@ -140,6 +140,8 @@ const APPLY_RULES = [
   '- Check for a duplicate BEFORE writing anything. Never apply to an employer twice, on any machine.',
   '- Never invent experience. Every claim traces to the stored profile or a previous answer. If the',
   '  posting wants something the candidate does not have, leave it out or say so plainly.',
+  '- check_fit before writing anything. If the posting requires something he has no record of,',
+  '  say so in one clause or pick a different job. Never write a missing skill onto the resume.',
   '- Read my_resume BEFORE writing a resume. It is the only source of his work history and',
   '  projects. Every line of a tailored resume traces back to it or to my_profile.',
   '- Always tailor the resume to this posting, in wording only, never in facts.',

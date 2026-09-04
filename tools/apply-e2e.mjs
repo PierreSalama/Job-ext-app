@@ -139,7 +139,11 @@ try {
       + '6. Call submit when the form is complete. Do not click any submit button yourself.\n'
       + 'If anything needs a human, use ask_human and finish.',
     tools,
-    limits: { maxSteps: 26, maxChars: 260000 },
+    // The product default is 40. The rig used to cap at 26, which was fine until runs started
+    // reading the real résumé and occasionally rewriting an answer the voice check rejected:
+    // the application would be fully prepared and parked, then the run would be recorded as
+    // `stopped (max_steps)` because it had no step left to say so.
+    limits: { maxSteps: 40, maxChars: 400000 },
     deps: { generate: (a) => providerMod.run({ ...a, providerOverride: chosen }) },
     onStep: (s) => {
       const mark = s.refused ? 'REFUSED' : s.ok === false ? 'ERROR  ' : 'ok     ';

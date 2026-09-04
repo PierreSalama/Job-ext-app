@@ -24,6 +24,7 @@
 // ============================================================================
 
 const db = require('../../db');
+const fit = require('../../fit');
 
 let log = { info() {}, warn() {}, error() {} };
 try { log = require('../../logger').scope('ai:tools:jat'); } catch { /* usable outside the app */ }
@@ -315,6 +316,63 @@ function makeJatTools(opts = {}) {
         }
         return `--- ${doc.name} ---
 ${text}`;
+      },
+    },
+    {
+      name: 'check_fit',
+      // WHAT HE DOES NOT HAVE, NAMED.
+      //
+      // Pierre's rule has always been that if a posting needs something he lacks, say so plainly in
+      // one clause or skip the job. The agent had no way to know: it read a posting, read his
+      // résumé, and applied. The overnight run needed a human to catch a furniture manufacturer
+      // whose "Product Engineer" turned out to be mechanical.
+      //
+      // The score is the least interesting part of this. `missing` is the point: the posting's own
+      // vocabulary that appears nowhere in his history. It is a crude signal and it is named that
+      // way on purpose, because the judgement belongs to the agent and not to a token count.
+      description: 'Compare this posting against the candidate real history BEFORE writing anything. '
+        + 'Pass the job title and the posting text. Returns what genuinely overlaps and what the '
+        + 'posting asks for that he has no record of. Use it to decide whether to apply at all, and '
+        + 'to keep the résumé honest. NEVER write a missing item onto the résumé.',
+      args: ['title', 'description'],
+      run: ({ title, description }) => {
+        const text = String(description || '').trim();
+        if (text.length < 80) return 'give me the posting text, not a summary of it';
+        let resumeText = '';
+        try {
+          const doc = db.defaultDocument('resume');
+          if (doc) resumeText = (db.getDocument(doc.id, { withText: true }) || {}).textContent || '';
+        } catch { /* handled below */ }
+        if (!resumeText.trim()) return 'NO RESUME ON FILE, so there is nothing to compare against. Use ask_human.';
+        let profile = {};
+        try { profile = (db.listProfiles() || []).find((p) => p.id === pid()) || {}; } catch { /* identity only */ }
+        const r = fit.score({ title: String(title || ''), description: text }, profile, resumeText);
+        // The scorer's tokens keep trailing punctuation and ordinary English, so the raw list reads
+        // "hybrid., robots., under, both., ask" and buries the one word that matters. Cleaned HERE
+        // rather than in fit.js, because that scorer also drives job ranking and this is a
+        // presentation problem, not a scoring one.
+        const NOISE = new Set(('the a an and or of to in on for with at by from as is are be will you your we our '
+          + 'this that these those it its they them their has have had do does did can could should would may might '
+          + 'about into over under both ask asks asked include includes including such via per across within also '
+          + 'more most other others any all each every some no not new work works working role position job team '
+          + 'years year experience professional bonus plus strong good great excellent required require requires '
+          + 'responsibilities responsibility skills skill ability able seeking looking candidate candidates').split(' '));
+        const clean = (list) => (list || [])
+          // Trailing dots go, internal ones stay, so "node.js" and "c#" survive but "robots." does not.
+          .map((t) => String(t).replace(/[^a-z0-9+#.]+$/i, '').replace(/\.+$/, '').replace(/^[^a-z0-9]+/i, ''))
+          .filter((t) => t.length > 1 && !NOISE.has(t.toLowerCase()))
+          .filter((t, i, a) => a.indexOf(t) === i);
+        const missing = clean(r.missing).slice(0, 14);
+        const matched = clean(r.matched).slice(0, 14);
+        return `overlap score ${r.score}/100 (a crude token overlap, not a verdict)
+`
+          + `  he has a record of: ${matched.join(', ') || '(nothing recognisable)'}
+`
+          + `  the posting mentions, with no match in his history: ${missing.join(', ') || '(nothing)'}
+`
+          + 'Judge it yourself. A low score on a role he can plainly do is fine. If the posting '
+          + 'requires something in that second list, say so in one clause or pick a different job. '
+          + 'Do NOT put anything from that list on the résumé.';
       },
     },
     {

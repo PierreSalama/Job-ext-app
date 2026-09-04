@@ -855,7 +855,21 @@ async function queueNext(force = false, skipHosts = null) {
   const profileId = (profile && profile.id && profile.id !== 'derived') ? profile.id : db.resolveProfileId(job.source);
   if (!profile) profile = db.deriveProfileFromLearned(profileId);
   const resume = (s.resumeDocId && db.getDocument(s.resumeDocId, { withText: true })) || db.defaultDocument('resume');
-  const harvested = db.profileFieldList(profileId).filter((f) => f.value);
+  // THE OTHER WAY AN ANSWER REACHES A REAL FORM.
+  //
+  // These harvested fields are shipped to the extension, which matches them against the page
+  // itself. No recall path is involved, so the gate added to qaLookup on 2026-09-04 does not apply
+  // here. The live bank held "are you legally authorized to work in the united states" answered
+  // "Yes", scraped off a LinkedIn form. Pierre is a Canadian citizen who needs sponsorship for a US
+  // role, and auto-apply would have typed that answer onto a real application.
+  //
+  // Work authorisation, sponsorship, citizenship and clearance never travel in this bundle. The
+  // structured profile still carries his true, self-entered answers, and anything not covered by
+  // that parks the application for him rather than being guessed at.
+  const harvestedAll = db.profileFieldList(profileId).filter((f) => f.value);
+  const harvested = harvestedAll.filter((f) => !db.isHighStakesQuestion(f.label || f.key || ''));
+  const withheld = harvestedAll.length - harvested.length;
+  if (withheld) log.info(`autofill bundle: withheld ${withheld} harvested work-authorisation answer(s) from ${job.company || 'this job'}`);
   const siteCfg = s.sites?.[String(job.source || '').toLowerCase()] || {};
   let mode = siteCfg.mode || task.mode || s.mode;
 

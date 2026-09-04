@@ -2330,8 +2330,48 @@ function qaRecord({ profileId, question, answer, source, fieldType, lineageSourc
 // rows poisoned by the profile-string bug, and gating on read repairs them without touching
 // the live store. `opts.options` — when the caller knows the field's own option list — lets a
 // verbatim option through regardless of shape.
+// The questions where a wrong answer is not a wrong answer, it is a false statement of fact about
+// the candidate. Work authorisation, sponsorship, citizenship, clearance. Answer one of these wrong
+// and an offer can be withdrawn after it is signed.
+const HIGH_STAKES_RECALL = /\b(work authoriz|authorized to work|authorised to work|legally (?:authoriz|eligible|entitled)|right to work|eligible to work|sponsor(?:ship)?|visa|h-?1b|work permit|citizen(?:ship)?|permanent resident|green card|security clearance)\b/i;
+
+// Did a person actually give this answer, or was it scraped off a form?
+function answeredByAHuman(row) {
+  const raw = row && (row.answer_lineage || row.answerLineage);
+  if (!raw) return false;
+  let v;
+  try { v = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { return false; }
+  // Lineage is an append-only LIST of where this answer came from. Only the newest entry produced
+  // the answer sitting in the row today, so a human answer that a later scrape overwrote must not
+  // keep vouching for the value that replaced it.
+  const entries = Array.isArray(v) ? v : [v];
+  const latest = entries[entries.length - 1];
+  return String(latest && latest.source) === 'user';
+}
+
+// Exported so the autofill bundle can apply the same rule. The bundle is the OTHER way an answer
+// reaches a real form: it ships harvested fields to the extension, which matches them locally, with
+// no recall path involved at all.
+function isHighStakesQuestion(q) { return HIGH_STAKES_RECALL.test(String(q || '')); }
+
 function recallOk(asked, row, opts) {
   try {
+    // A HARVESTED WORK-AUTHORISATION ANSWER IS NEVER SERVED.
+    //
+    // Found on 2026-09-04 in the live bank: "are you legally authorized to work in the united
+    // states" answered "Yes", and "yes i have us work authorization as a us citizen or us permanent
+    // resident green card holder" answered "Yes". Pierre is a Canadian citizen who needs
+    // sponsorship for a US role. Those answers were captured off forms, not typed by him, and the
+    // shape gate waved them through because "Yes" is a perfectly good shape for a yes/no question.
+    // Meanwhile the TRUE Canadian answer was being refused. Exactly backwards.
+    //
+    // His own typed answer to one of these is trustworthy and is still recalled. Anything else
+    // escalates once, and resolving that block records the answer with 'user' lineage, so the
+    // question is asked at most one more time.
+    if (HIGH_STAKES_RECALL.test(String(asked || '')) && !answeredByAHuman(row)) {
+      log.info(`recall: refusing a harvested answer to a work-authorisation question — "${String(asked).slice(0, 70)}"`);
+      return false;
+    }
     return answerShape.recallAllowed(asked, row.question || row.label || '', row.answer != null ? row.answer : row.value, opts && opts.options);
   } catch { return true; }   // a guard must never take down the lookup
 }
@@ -5332,7 +5372,19 @@ function setEmailMatch(emailId, { jobId, source, confidence } = {}) {
 function listEmails({ q, unmatchedOnly, limit = 100 } = {}) {
   let sql = 'SELECT * FROM emails'; const args = []; const where = [];
   if (unmatchedOnly) where.push('matched_job_id IS NULL');   // no job → available to link (incl. orphaned-by-delete)
-  if (q) { const k = '%' + q + '%'; where.push('(subject LIKE ? OR from_addr LIKE ? OR from_name LIKE ?)'); args.push(k, k, k); }
+  // SEARCH THE BODY TOO.
+  //
+  // Subject and sender only, which sounds reasonable until you look at what an ATS actually sends.
+  // A Greenhouse or Ashby confirmation arrives from no-reply@greenhouse-mail.io or
+  // no-reply@ashbyhq.com and the employer is frequently named nowhere but the body. Live on
+  // 2026-09-04: eleven companies had an application recorded as "submit clicked but could not be
+  // verified", and searching for them returned nothing at all for ten of them, which read as
+  // evidence the application never landed. It was evidence of nothing.
+  if (q) {
+    const k = '%' + q + '%';
+    where.push('(subject LIKE ? OR from_addr LIKE ? OR from_name LIKE ? OR body LIKE ? OR snippet LIKE ?)');
+    args.push(k, k, k, k, k);
+  }
   if (where.length) sql += ' WHERE ' + where.join(' AND ');
   sql += ' ORDER BY sent_at DESC LIMIT ?'; args.push(Math.min(500, limit));
   return all(sql, args).map(rowToEmail);
@@ -6132,7 +6184,7 @@ module.exports = {
   getSettings, patchSettings, normalizeAutoApply, kvGet, kvSet,
   listJobs, getJob, upsertJob, patchJob, deleteJob, sweepGhosted, stats, activityTrend,
   listEvents, listRecentEvents, recordEvent,
-  qaRecord, qaLookup, qaList, answerMemory, qaDelete, qaSetAnswer, normalizeQuestion, guessLocale,
+  qaRecord, isHighStakesQuestion, qaLookup, qaList, answerMemory, qaDelete, qaSetAnswer, normalizeQuestion, guessLocale,
   answerShape,   // re-exported so callers that already hold `db` can reach the recall gates
   isPlaceholderAnswer, stripPlaceholderAnswers, isJunkQuestionText,
   isMisattributedUrlAnswer, purgeMisattributedUrlAnswers,
