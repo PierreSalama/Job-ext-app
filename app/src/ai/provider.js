@@ -46,7 +46,11 @@ function bridgeChatgpt(s) {
   return {
     useSubscription: cg.useSubscription,
     apiKey: cg.apiKey || old.apiKey || '',
-    model: cg.model || old.model || 'gpt-5.4',
+    // No hardcoded id here. '' means "let the Codex CLI choose", which is the ONLY thing a
+    // ChatGPT subscription accepts, and buildAttempts decides the right default per backend
+    // (empty for the codex CLI, an explicit id for the api.openai.com path). Substituting one
+    // here defeated the clear-the-setting fix twice before this was found.
+    model: cg.model || old.model || '',
     timeoutMs: cg.timeoutMs || old.timeoutMs,
   };
 }
@@ -103,12 +107,21 @@ function buildAttempts(s, { prose, modelOverride, providerOverride }) {
       }
     } else if (key === 'chatgpt') {
       const cfg = bridgeChatgpt(s);
-      const model = modelOverride || cfg.model || 'gpt-5.4';
+      // The two chatgpt backends need OPPOSITE defaults, so they must not share one `model`.
+      // Codex runs on the ChatGPT subscription and rejects EVERY explicit model id ("The
+      // 'gpt-5.4' model is not supported when using Codex with a ChatGPT account" — verified
+      // 2026-09-03 against gpt-5.4, gpt-5.3-codex, gpt-5-codex and gpt-5.1-codex), so '' has to
+      // survive as "let the CLI choose", exactly as the claude-cli branch above already does.
+      // The old shared `cfg.model || 'gpt-5.4'` put the broken id straight back the moment the
+      // setting was cleared, which is why clearing it appeared to do nothing at all.
+      // openai.js is a different service (api.openai.com), where an explicit model IS required.
       if (cfg.useSubscription !== false) {
-        attempts.push({ name: 'codex', model, run: (a) => codex.generate({ ...a, model, timeoutMs: cfg.timeoutMs }) });
+        const m = modelOverride || cfg.model || '';
+        attempts.push({ name: 'codex', model: m || 'cli-default', run: (a) => codex.generate({ ...a, model: m, timeoutMs: cfg.timeoutMs }) });
       }
       if (cfg.apiKey) {
-        attempts.push({ name: 'openai', model, run: (a) => openai.generate({ ...a, model, cfg }) });
+        const m = modelOverride || cfg.model || 'gpt-5.4';
+        attempts.push({ name: 'openai', model: m, run: (a) => openai.generate({ ...a, model: m, cfg }) });
       }
     } else if (key === 'local') {
       const cfg = s.local || {};

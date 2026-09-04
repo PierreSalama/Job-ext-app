@@ -26,6 +26,46 @@ const log = scope('ai:codex');
 const CODEX_HOME = path.join(os.homedir(), '.codex');
 let cachedCli = null;
 
+// ---- quota ----------------------------------------------------------------
+// Codex reports an exhausted subscription as a JSONL error/turn.failed event and then exits
+// non-zero with an EMPTY stderr, so this surfaced as `CODEX_EXIT codex exited 1:` with no message
+// and got RETRIED as if it were the known transient alpha flake. Worse, status() only asks
+// `codex login status`, and a quota-exhausted account is still logged in — so /ai/status reported
+// available:true while every generate call failed. That pair is what let both nodes sit dead for
+// hours while the health check read green (2026-09-03). Quota is now its own hard, non-retryable
+// code, remembered until the reset time the CLI hands us, and status() reports it honestly.
+const QUOTA_RE = /usage limit|quota|rate limit|too many requests/i;
+let quotaBlock = null; // { message, until } — until is epoch ms, or null when no date was given
+
+// "…try again at Sep 26th, 2026 5:25 PM." → epoch ms, or null when there is no parseable date.
+function parseQuotaReset(message) {
+  const m = /try again at\s+([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?,\s*(\d{4})(?:\s+(\d{1,2}):(\d{2})\s*(AM|PM))?/i
+    .exec(String(message || ''));
+  if (!m) return null;
+  const months = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+  const mon = months[m[1].slice(0, 3).toLowerCase()];
+  if (mon === undefined) return null;
+  let hour = m[4] ? parseInt(m[4], 10) % 12 : 0;
+  if (m[6] && /pm/i.test(m[6])) hour += 12;
+  const d = new Date(parseInt(m[3], 10), mon, parseInt(m[2], 10), hour, m[5] ? parseInt(m[5], 10) : 0, 0, 0);
+  return Number.isFinite(d.getTime()) ? d.getTime() : null;
+}
+
+// The live block, or null once its reset time has passed (a block with no date never expires on
+// its own — the next successful call clears it).
+function quotaStatus() {
+  if (!quotaBlock) return null;
+  if (quotaBlock.until && Date.now() >= quotaBlock.until) { quotaBlock = null; return null; }
+  return quotaBlock;
+}
+
+function noteQuota(message) {
+  quotaBlock = { message: String(message), until: parseQuotaReset(message) };
+  return quotaBlock;
+}
+
+function clearQuota() { quotaBlock = null; }
+
 function discoverCli() {
   if (cachedCli && fs.existsSync(cachedCli)) return cachedCli;
   cachedCli = null;
@@ -90,6 +130,14 @@ function tokenExpiry(file) {
 async function status() {
   const cli = discoverCli();
   if (!cli) return { available: false, reason: 'codex CLI not found' };
+  // Logged in is NOT the same as has quota. Report the block first or canAnswer lies.
+  const blocked = quotaStatus();
+  if (blocked) {
+    return {
+      available: false, cli, quotaBlocked: true, reason: blocked.message,
+      ...(blocked.until ? { retryAt: new Date(blocked.until).toISOString() } : {}),
+    };
+  }
   return new Promise((resolve) => {
     const child = spawn(cli, ['login', 'status'], {
       env: { ...process.env, CODEX_HOME },
@@ -119,6 +167,10 @@ async function status() {
 // ~99.8%. A single retry recovers most of those without changing the contract. Auth/missing
 // errors are NOT retried (they won't get better).
 async function generate(opts) {
+  const blocked = quotaStatus();
+  if (blocked) {
+    throw Object.assign(new Error(blocked.message), { code: 'CODEX_QUOTA', until: blocked.until });
+  }
   try { return await generateOnce(opts); }
   catch (e) {
     if (e.code === 'CODEX_EXIT' || e.code === 'CODEX_EMPTY' || e.code === 'CODEX_BADJSON' || e.code === 'CODEX_TIMEOUT') {
@@ -159,28 +211,57 @@ async function generateOnce({ prompt, system, schema, model, timeoutMs = 120000 
     });
     let stderr = '';
     let authError = false;
+    let quotaError = null;
+    let lastEventError = null;   // best diagnostic seen in the JSONL, for when stderr is useless
     const timer = setTimeout(() => {
       try { child.kill(); } catch {}
       reject(Object.assign(new Error(`codex timed out after ${timeoutMs}ms`), { code: 'CODEX_TIMEOUT' }));
     }, timeoutMs);
 
+    // BUFFER ACROSS CHUNKS. stdout arrives in arbitrary slices, so a long JSONL line is routinely
+    // delivered in two pieces. Parsing each raw chunk meant the fragments failed JSON.parse and were
+    // swallowed by the catch below — and the quota notice is one of the LONGEST lines Codex emits
+    // ("You've hit your usage limit… try again at Sep 26th, 2026 5:25 PM.", ~180 chars), so it was
+    // the event most likely to be lost. That is why an exhausted account surfaced as a bare
+    // CODEX_EXIT and got retried as a transient flake instead of being recorded as quota.
+    let lineBuf = '';
+    const consumeLine = (line) => {
+      if (!line.trim()) return;
+      try {
+        const ev = JSON.parse(line);
+        const blob = JSON.stringify(ev).toLowerCase();
+        if (blob.includes('unauthorized') || (blob.includes('login') && blob.includes('required'))) {
+          authError = true;
+        }
+        const msg = ev?.message || ev?.error?.message || '';
+        if (msg && QUOTA_RE.test(msg)) quotaError = msg;
+        // KEEP THE ONLY DIAGNOSTIC THERE IS. On a failed turn Codex exits non-zero with a stderr
+        // that carries nothing usable (29 bytes on the 2026-09-03 repro), so the sole explanation
+        // lives in these events. Discarding it is what made every non-quota failure surface as a
+        // bare "codex exited 1:" — including a plainly actionable one: the configured model
+        // gpt-5.4 being rejected outright for a ChatGPT account.
+        if (msg && (ev?.type === 'error' || ev?.type === 'turn.failed' || ev?.item?.type === 'error')) {
+          let detail = msg;
+          // The payload is often a JSON string wrapping the real sentence — unwrap it once.
+          try { const inner = JSON.parse(msg); detail = inner?.error?.message || inner?.message || msg; } catch { /* plain text */ }
+          lastEventError = String(detail).slice(0, 300);
+        }
+      } catch { /* alpha channel emits shapes we do not model — ignore the line, not the stream */ }
+    };
     child.stdout.on('data', (d) => {
       // JSONL progress events; tolerate unknown shapes (alpha channel).
-      for (const line of String(d).split(/\r?\n/)) {
-        if (!line.trim()) continue;
-        try {
-          const ev = JSON.parse(line);
-          const blob = JSON.stringify(ev).toLowerCase();
-          if (blob.includes('unauthorized') || blob.includes('login') && blob.includes('required')) {
-            authError = true;
-          }
-        } catch {}
-      }
+      lineBuf += String(d);
+      const lines = lineBuf.split(/\r?\n/);
+      lineBuf = lines.pop() ?? '';   // keep the trailing partial for the next chunk
+      for (const line of lines) consumeLine(line);
     });
     child.stderr.on('data', (d) => { stderr += d; });
 
     child.on('close', (code) => {
       clearTimeout(timer);
+      // The last line often arrives without a trailing newline, so it is still sitting in the
+      // buffer here. Codex emits turn.failed LAST — exactly the event carrying the quota reason.
+      if (lineBuf) { consumeLine(lineBuf); lineBuf = ''; }
       let text = '';
       try { text = fs.readFileSync(outFile, 'utf8').trim(); } catch {}
       try { fs.rmSync(work, { recursive: true, force: true }); } catch {}
@@ -188,9 +269,14 @@ async function generateOnce({ prompt, system, schema, model, timeoutMs = 120000 
       if (authError || /unauthorized|not logged in|login required/i.test(stderr)) {
         return reject(Object.assign(new Error('codex auth failed — run `codex login`'), { code: 'CODEX_AUTH' }));
       }
+      if (quotaError) {
+        const blocked = noteQuota(quotaError);
+        return reject(Object.assign(new Error(quotaError), { code: 'CODEX_QUOTA', until: blocked.until }));
+      }
       if (code !== 0 && !text) {
         return reject(Object.assign(
-          new Error(`codex exited ${code}: ${stderr.trim().slice(0, 300)}`), { code: 'CODEX_EXIT' }));
+          new Error(`codex exited ${code}: ${lastEventError || stderr.trim().slice(0, 300) || '(no diagnostic)'}`),
+          { code: 'CODEX_EXIT', detail: lastEventError || null }));
       }
       if (!text) {
         return reject(Object.assign(new Error('codex returned no output'), { code: 'CODEX_EMPTY' }));
@@ -203,6 +289,7 @@ async function generateOnce({ prompt, system, schema, model, timeoutMs = 120000 
             new Error('codex output did not parse as JSON despite schema'), { code: 'CODEX_BADJSON' }));
         }
       }
+      clearQuota();
       resolve({ text, json });
     });
     child.on('error', (e) => {
@@ -228,4 +315,7 @@ function login() {
   } catch (e) { return { ok: false, error: e.message }; }
 }
 
-module.exports = { discoverCli, status, generate, login, tokenExpiry, name: 'codex' };
+module.exports = {
+  discoverCli, status, generate, login, tokenExpiry, name: 'codex',
+  parseQuotaReset, quotaStatus, noteQuota, clearQuota,
+};

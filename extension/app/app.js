@@ -665,9 +665,59 @@ function resolve(path) {
   }
   return null;
 }
+// ---------- role manifest ----------
+// One codebase, three faces. `applicant` is Dad's laptop: he sees his progress, the questions
+// waiting on him and his own details, and nothing else — no queue depth, no discovery providers,
+// no AI settings. Hiding a nav item is not enough on its own, because a hash URL can be typed or
+// bookmarked, so ROUTES are gated too and an out-of-role path lands somewhere he is allowed.
+const ROLE_HOME = { owner: '/', worker: '/', applicant: '/ai-apply' };
+const ROUTE_ROLES = {
+  '/': 'owner,worker',
+  '/applications': 'owner,worker',
+  '/pipeline': 'owner',
+  '/queue': 'owner,worker',
+  '/ai-apply': 'owner,worker,applicant',
+  '/needs-you': 'owner,worker',
+  '/aa-settings': 'owner,worker',
+  '/procedures': 'owner,worker',
+  '/profile': 'owner,worker,applicant',
+  '/documents': 'owner,worker,applicant',
+  '/answers': 'owner,worker,applicant',
+  '/activity': 'owner,worker',
+  '/settings': 'owner,worker,applicant',
+};
+function appRole() {
+  const r = state.settings?.app?.role;
+  return (r === 'applicant' || r === 'worker') ? r : 'owner';
+}
+function roleAllows(path, role = appRole()) {
+  if (role === 'owner') return true;              // the owner sees everything, always
+  const allowed = ROUTE_ROLES[path];
+  return allowed === undefined ? false : allowed.split(',').includes(role);
+}
+function applyRoleToNav(role = appRole()) {
+  document.querySelectorAll('[data-roles]').forEach((el) => {
+    el.hidden = role !== 'owner' && !el.dataset.roles.split(',').includes(role);
+  });
+  // A section header with nothing left under it is noise.
+  document.querySelectorAll('.nav-section').forEach((h) => {
+    let next = h.nextElementSibling;
+    let any = false;
+    while (next && !next.classList.contains('nav-section')) {
+      if (next.classList.contains('nav-item') && !next.hidden) { any = true; break; }
+      next = next.nextElementSibling;
+    }
+    if (!any) h.hidden = true;
+  });
+}
+
 let navSeq = 0;
 let aaHistoryLoad = null;   // set by the auto-apply view; lets SSE refreshes reload the History pane
 let aaLiveLoad = null;      // set by the auto-apply view; refreshes the live "Running now" panel
+// Set by the AI Apply view. Steps arrive one at a time and are APPENDED, never re-rendered from
+// scratch — a transcript that redraws on every step would fight the user's scroll position during
+// exactly the long run they are trying to watch.
+let aiApplyOnEvent = null;
 async function navigate(opts = {}) {
   // soft = an SSE-driven live refresh: morph the current view in place (counts and
   // rows update, focus + scroll preserved) instead of a full re-render.
@@ -684,6 +734,16 @@ async function navigate(opts = {}) {
     n.classList.toggle('active', r === path || (r !== '/' && path.startsWith(r + '/')));
   });
   updateNyBadgeSoon();
+  applyRoleToNav();
+  // ROUTE GUARD. Hiding a nav item does not stop a typed or bookmarked hash, and on Dad's laptop
+  // an out-of-role screen is at best confusing and at worst something he can break.
+  if (!roleAllows(path)) {
+    const home = ROLE_HOME[appRole()] || '/';
+    if (path !== home) { location.hash = `#${home}`; return; }
+  }
+  // Drop the AI Apply hook when leaving the page, so a run that is still going does not keep
+  // appending steps into a DOM node that no longer exists. The view re-registers on render.
+  if (path !== '/ai-apply') aiApplyOnEvent = null;
   if (!state.token) { renderNotConnected(); return; }
   const seq = ++navSeq;
   const match = resolve(path) || resolve('/');
@@ -942,6 +1002,16 @@ function connectSSE() {
   // ever showing a native OS popup.
   es.addEventListener('updates.state', (e) => { try { state.update = JSON.parse(e.data); } catch {} renderUpdateBanner(); });
   es.addEventListener('notify.toast', (e) => { try { const d = JSON.parse(e.data); toast(d.body || d.title || '', d.toastKind || 'info'); } catch {} });
+  // AI Apply: deliberately NOT in the softRefresh list above. A run emits a step every few
+  // seconds, and a full view refresh per step would be both wasteful and jumpy. The page handles
+  // its own events and appends.
+  for (const ev of ['ai-apply.step', 'ai-apply.run', 'ai-apply.block']) {
+    es.addEventListener(ev, (e) => {
+      if (!aiApplyOnEvent) return;
+      let d = {}; try { d = JSON.parse(e.data); } catch { return; }
+      try { aiApplyOnEvent(ev, d); } catch {}
+    });
+  }
 }
 function startPollingFallback() {
   if (state.pollTimer) return;
@@ -4279,6 +4349,481 @@ route('/documents', async () => {
 });
 
 // ============================================================
+// VIEW: Answer bank (#/answers)
+// ============================================================
+// Auto-apply answers screening questions out of this bank, so a wrong row is SUBMITTED under
+// Pierre's name. The audit sorts by what he has to decide, not by what is easiest to compute:
+//
+//   review  — the shape is fine but the value decides whether he gets the job (work authorization,
+//             sponsorship, citizenship, salary). No bulk action ever touches these.
+//   broken  — the answer cannot possibly fit the question ("Ontario" to an attestation).
+//   junk    — a captured widget artefact ("on", "37", "-- No answer --"). Safe to clear in bulk.
+const ANS_SEVERITY = {
+  review: { label: 'Needs your decision', hint: 'The answer looks well-formed, but a wrong value here costs the application.' },
+  broken: { label: 'Cannot be right', hint: 'The answer does not fit the question that was asked.' },
+  junk: { label: 'Captured by mistake', hint: 'A checkbox value or placeholder that was never really an answer.' },
+};
+
+function ansRow(a) {
+  const stakes = (a.stakeLabels || []).length
+    ? `<span class="ans-stake">${esc(a.stakeLabels.join(' · '))}</span>` : '';
+  return `<div class="ans-row" data-id="${esc(a.id)}" data-sev="${esc(a.severity)}">
+    <div class="ans-main">
+      <div class="ans-q">${esc(a.question)}${stakes}</div>
+      <div class="ans-why">${esc(a.reason)}</div>
+    </div>
+    <div class="ans-edit">
+      <input class="input ans-input" data-answer value="${esc(a.answer)}" aria-label="Answer" />
+      <div class="ans-meta">seen ${esc(a.seenCount)}&times; · ${esc(a.shape)}</div>
+    </div>
+    <div class="ans-actions">
+      <button class="btn small" data-save>Save</button>
+      <button class="btn small danger" data-del>Delete</button>
+    </div>
+  </div>`;
+}
+
+route('/answers', async () => {
+  const audit = await api('/qa/audit').catch(() => null);
+  const counts = audit?.counts || { total: 0, review: 0, broken: 0, junk: 0, ok: 0 };
+  const items = audit?.items || [];
+  const groups = ['review', 'broken', 'junk']
+    .map((sev) => ({ sev, rows: items.filter((i) => i.severity === sev) }))
+    .filter((g) => g.rows.length);
+
+  const v = el(`<div>
+    <header class="page-header">
+      <div>
+        <div class="page-eyebrow">Material</div>
+        <h1 class="page-title">Answer bank</h1>
+        <div class="page-sub">What auto-apply says on your behalf when a form asks a question.</div>
+      </div>
+      <div class="page-actions"><button class="btn" data-refresh>Re-check</button></div>
+    </header>
+
+    <section class="card">
+      <div class="ans-tiles">
+        <div class="ans-tile"><span class="num">${esc(counts.total)}</span><span>stored answers</span></div>
+        <div class="ans-tile" data-sev="review"><span class="num">${esc(counts.review)}</span><span>need your decision</span></div>
+        <div class="ans-tile" data-sev="broken"><span class="num">${esc(counts.broken)}</span><span>cannot be right</span></div>
+        <div class="ans-tile" data-sev="junk"><span class="num">${esc(counts.junk)}</span><span>captured by mistake</span></div>
+      </div>
+    </section>
+
+    ${groups.length ? groups.map((g) => `
+      <section class="card" data-group="${g.sev}">
+        <div class="card-head">
+          <h2 class="card-title">${esc(ANS_SEVERITY[g.sev].label)} <span class="muted">(${g.rows.length})</span></h2>
+          ${g.sev === 'junk' ? '<button class="btn small danger" data-clearjunk>Delete all of these</button>' : ''}
+        </div>
+        <div class="card-note muted">${esc(ANS_SEVERITY[g.sev].hint)}</div>
+        <div class="ans-list">${g.rows.map(ansRow).join('')}</div>
+      </section>`).join('')
+      : `<section class="card"><div class="ans-list">${emptyHtml('Clean', 'Nothing to fix', 'Every stored answer fits the question it belongs to.')}</div></section>`}
+  </div>`);
+
+  v.querySelector('[data-refresh]').addEventListener('click', navigate);
+
+  v.addEventListener('click', async (e) => {
+    const row = e.target.closest('.ans-row');
+    if (row && e.target.closest('[data-save]')) {
+      const id = row.dataset.id;
+      const answer = row.querySelector('[data-answer]').value.trim();
+      try {
+        await api(`/qa/${encodeURIComponent(id)}`, { method: 'PATCH', body: { answer } });
+        toast('Answer updated', 'ok');
+        navigate();
+      } catch (err) { errToast(err); }
+      return;
+    }
+    if (row && e.target.closest('[data-del]')) {
+      const id = row.dataset.id;
+      if (!await confirmModal(
+        'Auto-apply will ask you next time instead of answering it automatically.',
+        { title: 'Delete this answer?', okLabel: 'Delete', danger: true },
+      )) return;
+      try { await api(`/qa/${encodeURIComponent(id)}`, { method: 'DELETE' }); toast('Deleted', 'ok'); navigate(); }
+      catch (err) { errToast(err); }
+      return;
+    }
+    const clear = e.target.closest('[data-clearjunk]');
+    if (clear) {
+      const ids = [...v.querySelectorAll('[data-group="junk"] .ans-row')].map((r) => r.dataset.id);
+      if (!ids.length) return;
+      if (!await confirmModal(
+        'These are checkbox values and placeholders that were never real answers. '
+        + 'Nothing that needs your judgement is included — the server refuses those even if asked.',
+        { title: `Delete ${ids.length} mis-captured answers?`, okLabel: `Delete ${ids.length}`, danger: true },
+      )) return;
+      try {
+        const r = await api('/qa/bulk-delete', { method: 'POST', body: { ids } });
+        toast(`Deleted ${r.deleted}${r.refused?.length ? `, kept ${r.refused.length} that need review` : ''}`, 'ok');
+        navigate();
+      } catch (err) { errToast(err); }
+    }
+  });
+
+  return v;
+});
+
+// ============================================================
+// VIEW: AI Apply (#/ai-apply)
+// ============================================================
+// The engine strip deliberately reports provider health from /ai-apply/status, which is
+// provider.statusAll reconciled with the LAST REAL CALL. "Logged in" is not health: a
+// quota-exhausted Codex account is still logged in, and that pair is what let both nodes sit dead
+// for hours on 2026-09-03 while the check read green. `proven` means a real request actually
+// succeeded; anything else says exactly why not.
+function aiProviderCard(name, label, card) {
+  if (!card) return `<div class="ai-prov" data-state="off"><div class="ai-prov-name">${esc(label)}</div><div class="ai-prov-state muted">not configured</div></div>`;
+  const quota = card.quotaBlocked;
+  const state = card.available ? (card.proven ? 'proven' : 'ready') : (quota ? 'quota' : 'down');
+  const stateLabel = { proven: 'working', ready: 'ready, unproven', quota: 'out of quota', down: 'unavailable' }[state];
+  const detail = quota && card.retryAt
+    ? `resets ${esc(fmtFull(card.retryAt))}`
+    : esc((card.reason || '').slice(0, 180));
+  return `<div class="ai-prov" data-state="${state}">
+    <div class="ai-prov-name">${esc(label)}${card.version ? ` <span class="muted">${esc(card.version)}</span>` : ''}</div>
+    <div class="ai-prov-state">${esc(stateLabel)}</div>
+    ${detail ? `<div class="ai-prov-detail muted">${detail}</div>` : ''}
+  </div>`;
+}
+
+function aiStepRow(s) {
+  const verdict = s.refused ? 'refused' : (s.ok === false ? 'error' : 'ok');
+  const detail = (s.refused || s.ok === false) ? (s.error || '') : (s.result || '');
+  return `<div class="ai-step" data-verdict="${verdict}">
+    <span class="ai-step-seq num">${esc(s.seq)}</span>
+    <span class="ai-step-tool">${esc(s.tool || '—')}</span>
+    <span class="ai-step-verdict">${esc(verdict)}</span>
+    <span class="ai-step-thought">${esc((s.thought || '').slice(0, 160))}</span>
+    <span class="ai-step-detail">${esc(String(detail).slice(0, 240))}</span>
+  </div>`;
+}
+
+// A thing the agent needs from Pierre. `alert` kinds (CAPTCHA, an account wall, a password) are
+// listed first and coloured differently, because they are the ones that stop a run dead until he
+// walks over to the machine. Everything else waits patiently.
+const AI_BLOCK_LABEL = {
+  needs_answer: 'Question', captcha: 'Human check', account: 'Account needed',
+  password: 'Password needed', payment: 'Payment', awaiting_submit: 'Ready to submit',
+  auth_lapsed: 'Sign-in expired', other: 'Needs you',
+};
+
+function aiBlockCard(b) {
+  const where = [b.company, b.title].filter(Boolean).join(' — ');
+  const answerable = b.kind === 'needs_answer';
+  return `<div class="ai-block" data-id="${esc(b.id)}" data-urgency="${esc(b.urgency)}">
+    <div class="ai-block-head">
+      <span class="ai-block-kind">${esc(AI_BLOCK_LABEL[b.kind] || b.kind)}</span>
+      ${where ? `<span class="ai-block-where">${esc(where)}</span>` : ''}
+      <span class="ai-block-when">${relHtml(b.created_at)}</span>
+    </div>
+    <div class="ai-block-q">${esc(b.question)}</div>
+    ${b.detail ? `<div class="ai-block-detail muted">${esc(b.detail)}</div>` : ''}
+    ${b.url ? `<div class="ai-block-detail"><a href="${esc(b.url)}" target="_blank" rel="noopener">open the posting</a></div>` : ''}
+    <div class="ai-block-actions">
+      ${answerable
+        ? '<input class="input" data-blockanswer placeholder="Your answer — it is remembered for next time" />'
+        : '<span class="muted ai-block-note">Do this on the machine, then mark it done.</span>'}
+      <button class="btn small primary" data-blockresolve>${answerable ? 'Save answer' : 'Mark done'}</button>
+      <button class="btn small" data-blockdismiss>Skip</button>
+    </div>
+  </div>`;
+}
+
+// Which person this page is acting as. Persisted, because switching to Dad and having it silently
+// reset to Pierre on the next visit is how an application goes out under the wrong name.
+const LS_AI_PROFILE = 'jat11.aiApply.profile';
+const aiProfileId = () => { try { return localStorage.getItem(LS_AI_PROFILE) || ''; } catch { return ''; } };
+const setAiProfileId = (id) => { try { localStorage.setItem(LS_AI_PROFILE, id || ''); } catch {} };
+
+function aiProfileCard(p, active) {
+  const state = p.running ? 'running' : p.signedInBefore ? 'ready' : 'needs-signin';
+  const label = { running: 'applying now', ready: 'signed in', 'needs-signin': 'not signed in yet' }[state];
+  return `<div class="ai-prof ${active ? 'active' : ''}" data-state="${state}" data-profile="${esc(p.id)}">
+    <div class="ai-prof-name">${esc(p.name)}${p.isDefault ? ' <span class="muted">default</span>' : ''}</div>
+    <div class="ai-prof-state">${esc(label)}${p.openBlocks?.open ? ` · ${p.openBlocks.open} waiting` : ''}</div>
+    <div class="ai-prof-actions">
+      <button class="btn small" data-useprofile>${active ? 'Selected' : 'Act as this person'}</button>
+      <button class="btn small" data-signin>${p.browserOpen ? 'Close browser' : 'Open browser to sign in'}</button>
+    </div>
+  </div>`;
+}
+
+// An applicant install must not start applying on someone's behalf until they have said yes. This
+// is a gate, not a banner: on Dad's laptop the page shows this and nothing else until he agrees,
+// and the agreement is stored as a date so it is auditable rather than a flag somebody flipped.
+function consentGate() {
+  const s = state.settings?.app || {};
+  if (appRole() !== 'applicant' || s.consentAt) return null;
+  const el2 = el(`<div>
+    <header class="page-header">
+      <div>
+        <div class="page-eyebrow">Before we start</div>
+        <h1 class="page-title">Applying for you</h1>
+      </div>
+    </header>
+    <section class="card">
+      <div class="consent">
+        <p>This app can apply to jobs on your behalf. Here is exactly what that means.</p>
+        <ul>
+          <li>It fills in application forms using your CV and the answers you give it.</li>
+          <li>It uses <strong>your</strong> browser sign-ins, so applications come from you.</li>
+          <li>It will <strong>never</strong> type a password, create an account, complete a human check, or answer a question about your race, gender, disability or veteran status.</li>
+          <li>Whenever it is unsure, it stops and asks you rather than guessing.</li>
+          <li>You can see everything it has done, and turn it off, from this app.</li>
+        </ul>
+        <p class="muted">You can withdraw this at any time in Settings.</p>
+        <div class="consent-actions">
+          <button class="btn primary" data-consent-yes>I understand, apply for me</button>
+          <button class="btn" data-consent-no>Not now</button>
+        </div>
+      </div>
+    </section>
+  </div>`);
+  el2.querySelector('[data-consent-yes]').addEventListener('click', async () => {
+    try {
+      await api('/settings', { method: 'PATCH', body: { app: { consentAt: new Date().toISOString() } } });
+      await getSettings(true);
+      toast('Thanks — you can change this any time in Settings', 'ok');
+      navigate();
+    } catch (e) { errToast(e); }
+  });
+  el2.querySelector('[data-consent-no]').addEventListener('click', () => {
+    toast('No problem. Nothing will be applied for until you say so.', 'info');
+  });
+  return el2;
+}
+
+route('/ai-apply', async () => {
+  const gate = consentGate();
+  if (gate) return gate;
+  const pid = aiProfileId();
+  const q = pid ? `?profileId=${encodeURIComponent(pid)}` : '';
+  const [st, blocksR, profsR] = await Promise.all([
+    api(`/ai-apply/status${q}`).catch(() => null),
+    api(`/ai-apply/blocks${q}`).catch(() => ({ items: [], counts: { open: 0, alert: 0 } })),
+    api('/ai-apply/profiles').catch(() => ({ items: [] })),
+  ]);
+  const profiles = profsR?.items || [];
+  // An unset selection means "the default profile" — resolve it so the label is never blank.
+  const activeId = pid || (profiles.find((p) => p.isDefault) || profiles[0] || {}).id || '';
+  const active = profiles.find((p) => p.id === activeId) || null;
+  const providers = st?.providers || {};
+  const live = st?.run || null;
+  const recent = st?.recent || [];
+  const blocks = blocksR?.items || [];
+  const blockCounts = blocksR?.counts || { open: 0, alert: 0, queue: 0 };
+
+  const anyUsable = !!(providers.codex?.available || providers.claude?.available);
+
+  const v = el(`<div>
+    <header class="page-header">
+      <div>
+        <div class="page-eyebrow">Automate</div>
+        <h1 class="page-title">AI Apply</h1>
+        <div class="page-sub">Applying as <strong>${esc(active ? active.name : 'you')}</strong>. It works one action at a time, and stops when it needs you.</div>
+      </div>
+      <div class="page-actions">
+        <button class="btn" data-probe>Re-check engines</button>
+        <button class="btn primary" data-start ${live?.running ? 'disabled' : ''}>Start</button>
+        <button class="btn danger" data-stop ${live?.running ? '' : 'disabled'}>Stop</button>
+      </div>
+    </header>
+
+    <section class="card">
+      <div class="card-head"><h2 class="card-title">Engine</h2>
+        <span class="muted">order: ${esc((providers.order || []).join(' → ') || '—')}</span></div>
+      <div class="ai-prov-row">
+        ${aiProviderCard('codex', 'Codex · ChatGPT', providers.codex)}
+        ${aiProviderCard('claude', 'Claude Code', providers.claude)}
+      </div>
+      ${anyUsable ? '' : '<div class="ai-warn">No engine can answer right now. Start is disabled until one can.</div>'}
+    </section>
+
+    ${profiles.length ? `
+    <section class="card">
+      <div class="card-head"><h2 class="card-title">Who is applying</h2>
+        <span class="muted">each person has their own browser and their own logins</span></div>
+      <div class="ai-prof-row">${profiles.map((p) => aiProfileCard(p, p.id === activeId)).join('')}</div>
+    </section>` : ''}
+
+    ${blocks.length ? `
+    <section class="card" data-blocks>
+      <div class="card-head">
+        <h2 class="card-title">Waiting on you <span class="muted">(${blocks.length}${blockCounts.alert ? `, ${blockCounts.alert} urgent` : ''})</span></h2>
+      </div>
+      <div class="ai-block-list">${blocks.map(aiBlockCard).join('')}</div>
+    </section>` : ''}
+
+    <section class="card">
+      <div class="card-head"><h2 class="card-title">This run</h2>
+        <span class="muted" data-runmeta>${live?.running ? esc(`${live.steps} steps · ${live.autonomy}`) : 'idle'}</span></div>
+      <div class="ai-controls">
+        <label class="ai-field"><span>Autonomy</span>
+          <select class="input" data-autonomy>
+            <option value="prepare">Prepare — fill everything, wait for me to submit</option>
+            <option value="auto">Full auto — submit without asking</option>
+          </select>
+        </label>
+        <label class="ai-field"><span>Tools</span>
+          <select class="input" data-toolset>
+            <option value="sandbox">Sandbox — fake tools, no browser</option>
+            <option value="browser">Browser — drives a real Chrome</option>
+            <option value="apply">Apply — browser plus your ledger</option>
+          </select>
+        </label>
+        <label class="ai-field grow"><span>Goal</span>
+          <input class="input" data-goal placeholder="Leave blank for the built-in sandbox goal" />
+        </label>
+      </div>
+      <div class="ai-transcript" data-transcript>
+        ${live?.running ? '<div class="muted" style="padding:14px 20px">Running…</div>'
+                        : '<div class="muted" style="padding:14px 20px">Nothing running. Press Start.</div>'}
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2 class="card-title">Recent runs</h2></div>
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>Status</th><th>Steps</th><th>Prompt chars</th><th>Provider</th><th>Summary</th><th>When</th></tr></thead>
+        <tbody data-runs>${recent.length ? recent.map((r) => `
+          <tr><td>${esc(r.status)}${r.stop_reason && r.stop_reason !== r.status ? ` <span class="muted">${esc(r.stop_reason)}</span>` : ''}</td>
+          <td class="num">${esc(r.steps)}</td>
+          <td class="num">${esc(r.prompt_chars)}</td>
+          <td>${esc(r.provider || '—')}</td>
+          <td>${esc((r.summary || '').slice(0, 90))}</td>
+          <td>${relHtml(r.started_at)}</td></tr>`).join('')
+          : '<tr><td colspan="6" class="muted" style="padding:16px 24px">No runs yet.</td></tr>'}
+        </tbody>
+      </table></div>
+    </section>
+  </div>`);
+
+  const transcript = v.querySelector('[data-transcript]');
+  const runMeta = v.querySelector('[data-runmeta]');
+  const btnStart = v.querySelector('[data-start]');
+  const btnStop = v.querySelector('[data-stop]');
+  if (!anyUsable) btnStart.disabled = true;
+
+  let seen = 0;
+  function appendStep(step) {
+    if (seen === 0) transcript.innerHTML = '';
+    seen++;
+    transcript.insertAdjacentHTML('beforeend', aiStepRow(step));
+    // Only follow the tail if the user has not scrolled away to read something.
+    const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
+    if (nearBottom) transcript.scrollTop = transcript.scrollHeight;
+    runMeta.textContent = `${seen} steps`;
+  }
+
+  // Profile selection and sign-in.
+  v.addEventListener('click', async (e) => {
+    const prof = e.target.closest('.ai-prof');
+    if (!prof) return;
+    const id = prof.dataset.profile;
+    if (e.target.closest('[data-useprofile]')) {
+      setAiProfileId(id);
+      toast('Now applying as this person', 'ok');
+      navigate();
+      return;
+    }
+    if (e.target.closest('[data-signin]')) {
+      const closing = /Close/.test(e.target.textContent || '');
+      try {
+        const r = await api(`/ai-apply/profiles/${encodeURIComponent(id)}/signin${closing ? '/close' : ''}`,
+          { method: 'POST', body: {} });
+        toast(closing
+          ? 'Browser closed — the session is saved'
+          : 'Browser open. Sign in there, then close it so the session is written.', 'ok');
+        void r;
+        navigate();
+      } catch (err) { errToast(err); }
+    }
+  });
+
+  // Answer / dismiss a block. Delegated so cards added by a live SSE refresh still work.
+  v.addEventListener('click', async (e) => {
+    const card = e.target.closest('.ai-block');
+    if (!card) return;
+    const id = card.dataset.id;
+    if (e.target.closest('[data-blockresolve]')) {
+      const field = card.querySelector('[data-blockanswer]');
+      const answer = field ? field.value.trim() : 'done';
+      if (field && !answer) { toast('Type an answer first', 'info'); return; }
+      try {
+        await api(`/ai-apply/blocks/${encodeURIComponent(id)}/answer`, { method: 'POST', body: { answer } });
+        toast(field ? 'Saved — the agent will reuse this' : 'Marked done', 'ok');
+        navigate();
+      } catch (err) { errToast(err); }
+    } else if (e.target.closest('[data-blockdismiss]')) {
+      try { await api(`/ai-apply/blocks/${encodeURIComponent(id)}/dismiss`, { method: 'POST', body: {} }); navigate(); }
+      catch (err) { errToast(err); }
+    }
+  });
+
+  aiApplyOnEvent = (ev, d) => {
+    if (ev === 'ai-apply.block') {
+      // A new block mid-run: tell him immediately, and refresh so the card appears.
+      const b = d.block || {};
+      if (b.status === 'open') toast(`AI Apply needs you: ${AI_BLOCK_LABEL[b.kind] || b.kind}`, b.urgency === 'alert' ? 'warn' : 'info');
+      navigate({ soft: true });
+      return;
+    }
+    if (ev === 'ai-apply.step' && d.step) appendStep(d.step);
+    else if (ev === 'ai-apply.run') {
+      const running = d.status === 'running' || d.running === true;
+      btnStart.disabled = running || !anyUsable;
+      btnStop.disabled = !running;
+      if (d.status && d.status !== 'running') {
+        runMeta.textContent = `${d.status}${d.stopReason ? ` · ${d.stopReason}` : ''}`;
+        toast(`AI Apply ${d.status}`, d.status === 'done' ? 'ok' : 'info');
+        navigate({ soft: true });
+      }
+    }
+  };
+
+  btnStart.addEventListener('click', async () => {
+    btnStart.disabled = true;
+    seen = 0;
+    transcript.innerHTML = '<div class="muted" style="padding:14px 20px">Starting…</div>';
+    try {
+      await api('/ai-apply/start', {
+        method: 'POST',
+        body: {
+          // Without this the run is always the default profile, and an application goes out under
+          // the wrong person's name while the page says otherwise.
+          profileId: activeId,
+          autonomy: v.querySelector('[data-autonomy]').value,
+          toolset: v.querySelector('[data-toolset]').value,
+          goal: v.querySelector('[data-goal]').value.trim(),
+        },
+      });
+      btnStop.disabled = false;
+    } catch (e) {
+      btnStart.disabled = false;
+      transcript.innerHTML = '<div class="muted" style="padding:14px 20px">Could not start.</div>';
+      errToast(e);
+    }
+  });
+
+  btnStop.addEventListener('click', async () => {
+    btnStop.disabled = true;
+    try { await api('/ai-apply/stop', { method: 'POST', body: { profileId: activeId } }); toast('Stopping after the current action', 'info'); }
+    catch (e) { btnStop.disabled = false; errToast(e); }
+  });
+
+  v.querySelector('[data-probe]').addEventListener('click', async () => {
+    toast('Re-checking engines…', 'info');
+    try { await api('/ai-apply/status?force=1'); } catch {}
+    navigate();
+  });
+
+  return v;
+});
+
+// ============================================================
 // VIEW: Activity (#/activity)
 // ============================================================
 const EVENT_ICONS = {
@@ -4391,7 +4936,7 @@ route('/settings', async () => {
     for (const k of ['claude', 'chatgpt', 'local']) if (!base.includes(k)) base.push(k);
     return base;
   })();
-  const PROV_LABEL = { claude: 'Claude · Sonnet 4.6', chatgpt: 'ChatGPT · GPT-5.4', local: 'Local · Ollama' };
+  const PROV_LABEL = { claude: 'Claude · Sonnet 5', chatgpt: 'ChatGPT · Codex', local: 'Local · Ollama' };
   const provStatusOf = (k) => (k === 'claude' ? aiSt?.claude : k === 'chatgpt' ? aiSt?.chatgpt : aiSt?.local);
   const aiDot = (st) => st?.available ? '<span class="sys-chip ok">● ready</span>' : '<span class="sys-chip">○ not set up</span>';
   const claude = s.ai.claude || {};
@@ -4782,7 +5327,10 @@ route('/settings', async () => {
         chatgpt: {
           useSubscription: v.querySelector('#ai-cg-sub').checked,
           apiKey: v.querySelector('#ai-oai-key').value.trim(),
-          model: v.querySelector('#ai-cg-model').value.trim() || 'gpt-5.4',
+          // Keep an EMPTY box empty. It means "let the Codex CLI pick", which is the only thing
+          // a ChatGPT subscription accepts — coercing it back to a hardcoded id here would
+          // silently undo the fix the next time these settings are saved.
+          model: v.querySelector('#ai-cg-model').value.trim(),
         },
         local: {
           enabled: v.querySelector('#ai-local-enabled').checked,

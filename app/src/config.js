@@ -31,6 +31,17 @@ const DEFAULTS = {
     closeToTray: true,       // closing the window keeps capture alive in the tray
     autoLaunch: false,       // start with Windows
     globalHotkey: true,      // Ctrl+Shift+J toggles the dashboard window
+
+    // WHO THIS INSTALL IS FOR. One codebase, three faces — forking would mean two databases, two
+    // sync layers and two update pipelines to deliver four screens.
+    //   owner     — Pierre's machine. Everything.
+    //   applicant — Dad's laptop. His progress, his questions, his own details. No queue depth, no
+    //               discovery providers, no AI settings, nothing he did not ask to see.
+    //   worker    — the server laptop. Runs the engines; nobody sits in front of it.
+    role: 'owner',
+    // An applicant must agree once, in their own words, before an agent applies as them. Recorded
+    // as an ISO date so it is auditable rather than a boolean somebody flipped.
+    consentAt: '',
   },
 
   autoUpdate: {
@@ -67,7 +78,7 @@ const DEFAULTS = {
       useSubscription: true,        // use the logged-in Claude Code CLI (Claude subscription)
       cliModel: '',                 // '' = the CLI's default model; or e.g. 'claude-sonnet-4-6'
       apiKey: '',                   // Anthropic API key (alternative / fallback)
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-5',
       timeoutMs: 120000,
     },
 
@@ -76,7 +87,11 @@ const DEFAULTS = {
     chatgpt: {
       useSubscription: true,        // use the logged-in Codex CLI (ChatGPT sub)
       apiKey: '',                   // OpenAI API key (alternative / fallback)
-      model: 'gpt-5.4',
+      // '' = let the Codex CLI pick. An EXPLICIT model id is rejected outright on a ChatGPT
+      // subscription ("The 'gpt-5.4' model is not supported when using Codex with a ChatGPT
+      // account.") — verified 2026-09-03 against gpt-5.4, gpt-5.3-codex, gpt-5-codex and
+      // gpt-5.1-codex, all refused. A bad default here breaks EVERY new node silently.
+      model: '',
       timeoutMs: 120000,
     },
 

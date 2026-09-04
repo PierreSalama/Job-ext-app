@@ -1888,3 +1888,161 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
   padding: 14px 0 6px;
   background: linear-gradient(to top, var(--bg) 65%, transparent);
 }
+
+/* ---------- AI Apply (#/ai-apply) ---------- */
+/* Every colour below comes from the 11 theme variables, so the page follows the user's theme
+   rather than pinning one palette. Provider state is carried by data-state, not by a class per
+   colour, so the four states stay mutually exclusive by construction. */
+.ai-prov-row { display: grid; gap: 12px; padding: 0 24px 20px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.ai-prov {
+  border: 1px solid var(--border); border-left-width: 3px; border-radius: 4px;
+  padding: 12px 14px; background: var(--wash-04); min-width: 0;
+}
+.ai-prov[data-state="proven"] { border-left-color: var(--success); background: var(--success-wash); }
+.ai-prov[data-state="ready"]  { border-left-color: var(--primary); }
+.ai-prov[data-state="quota"]  { border-left-color: var(--warn);    background: var(--warn-wash); }
+.ai-prov[data-state="down"]   { border-left-color: var(--danger);  background: var(--danger-wash); }
+.ai-prov[data-state="off"]    { border-left-color: var(--border); }
+.ai-prov-name   { font-weight: 600; margin-bottom: 3px; }
+.ai-prov-state  { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; }
+.ai-prov[data-state="proven"] .ai-prov-state { color: var(--success); }
+.ai-prov[data-state="quota"]  .ai-prov-state { color: var(--warn); }
+.ai-prov[data-state="down"]   .ai-prov-state { color: var(--danger); }
+.ai-prov-detail { font-size: 12px; margin-top: 6px; line-height: 1.45; overflow-wrap: anywhere; }
+
+.ai-warn {
+  margin: 0 24px 20px; padding: 10px 14px; border-radius: 4px;
+  border: 1px solid var(--danger); background: var(--danger-wash); color: var(--danger); font-size: 13px;
+}
+
+.ai-controls { display: flex; gap: 14px; flex-wrap: wrap; padding: 0 24px 16px; align-items: flex-end; }
+.ai-field { display: flex; flex-direction: column; gap: 6px; min-width: 220px; }
+.ai-field.grow { flex: 1 1 320px; }
+.ai-field > span { font-size: 12px; color: var(--muted); letter-spacing: .04em; text-transform: uppercase; }
+
+/* Fixed height + its own scroll: a long run must never push the controls off the screen. */
+.ai-transcript {
+  margin: 0 24px 20px; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg2); max-height: 420px; overflow-y: auto; font-size: 13px;
+}
+.ai-step {
+  display: grid; gap: 10px; align-items: baseline;
+  grid-template-columns: 34px 130px 72px minmax(0, 1fr) minmax(0, 1.4fr);
+  padding: 7px 14px; border-bottom: 1px solid var(--border); border-left: 3px solid transparent;
+}
+.ai-step:last-child { border-bottom: none; }
+.ai-step[data-verdict="refused"] { border-left-color: var(--warn);    background: var(--warn-wash); }
+.ai-step[data-verdict="error"]   { border-left-color: var(--danger);  background: var(--danger-wash); }
+.ai-step[data-verdict="ok"]      { border-left-color: var(--success); }
+.ai-step-seq     { color: var(--muted); }
+.ai-step-tool    { font-weight: 600; overflow-wrap: anywhere; }
+.ai-step-verdict { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.ai-step[data-verdict="refused"] .ai-step-verdict { color: var(--warn); }
+.ai-step[data-verdict="error"]   .ai-step-verdict { color: var(--danger); }
+.ai-step-thought,
+.ai-step-detail  { color: var(--body-text); overflow-wrap: anywhere; }
+.ai-step-detail  { color: var(--muted); }
+
+@media (max-width: 860px) {
+  .ai-step { grid-template-columns: 30px 1fr; }
+  .ai-step-verdict, .ai-step-thought { grid-column: 2; }
+  .ai-step-detail { grid-column: 2; }
+}
+
+/* ---------- Answer bank (#/answers) ---------- */
+/* Severity is carried on data-sev so the three states cannot drift apart, and every colour comes
+   from the 11 theme variables. `review` uses the WARN colour rather than danger: those rows are not
+   broken, they are decisions only Pierre can make. */
+.ans-tiles { display: grid; gap: 12px; padding: 18px 24px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.ans-tile {
+  border: 1px solid var(--border); border-left-width: 3px; border-radius: 4px;
+  padding: 12px 14px; display: flex; flex-direction: column; gap: 2px; background: var(--wash-04);
+}
+.ans-tile .num { font-size: 24px; font-weight: 600; line-height: 1.1; }
+.ans-tile > span:last-child { font-size: 12px; color: var(--muted); }
+.ans-tile[data-sev="review"] { border-left-color: var(--warn);   background: var(--warn-wash); }
+.ans-tile[data-sev="broken"] { border-left-color: var(--danger); background: var(--danger-wash); }
+.ans-tile[data-sev="junk"]   { border-left-color: var(--muted); }
+
+.card-note { padding: 0 24px 14px; font-size: 13px; }
+.ans-list { padding: 0 24px 20px; display: flex; flex-direction: column; gap: 10px; }
+
+.ans-row {
+  display: grid; gap: 14px; align-items: start;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr) auto;
+  border: 1px solid var(--border); border-left: 3px solid var(--border);
+  border-radius: 4px; padding: 12px 14px; background: var(--bg2);
+}
+.ans-row[data-sev="review"] { border-left-color: var(--warn); }
+.ans-row[data-sev="broken"] { border-left-color: var(--danger); }
+.ans-row[data-sev="junk"]   { border-left-color: var(--muted); }
+
+.ans-q { font-weight: 600; line-height: 1.4; overflow-wrap: anywhere; }
+.ans-stake {
+  display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 3px;
+  font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--warn); background: var(--warn-wash); border: 1px solid var(--warn); vertical-align: 2px;
+}
+.ans-why { margin-top: 5px; font-size: 12.5px; color: var(--muted); line-height: 1.5; overflow-wrap: anywhere; }
+.ans-edit { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.ans-input { width: 100%; }
+.ans-meta { font-size: 11.5px; color: var(--muted); }
+.ans-actions { display: flex; gap: 8px; align-items: flex-start; }
+
+@media (max-width: 900px) {
+  .ans-row { grid-template-columns: 1fr; }
+  .ans-actions { justify-content: flex-end; }
+}
+
+/* ---------- AI Apply: escalation blocks ---------- */
+/* urgency, not kind, drives the colour: `alert` means a run is stopped until Pierre walks to the
+   machine (CAPTCHA, account wall, password). Everything else can wait on the page. */
+.ai-block-list { padding: 0 24px 20px; display: flex; flex-direction: column; gap: 10px; }
+.ai-block {
+  border: 1px solid var(--border); border-left: 3px solid var(--border);
+  border-radius: 4px; padding: 12px 14px; background: var(--bg2);
+}
+.ai-block[data-urgency="alert"] { border-left-color: var(--danger); background: var(--danger-wash); }
+.ai-block[data-urgency="queue"] { border-left-color: var(--warn); }
+.ai-block-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin-bottom: 6px; }
+.ai-block-kind {
+  font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 3px; border: 1px solid var(--border); color: var(--muted);
+}
+.ai-block[data-urgency="alert"] .ai-block-kind { color: var(--danger); border-color: var(--danger); }
+.ai-block[data-urgency="queue"] .ai-block-kind { color: var(--warn); border-color: var(--warn); }
+.ai-block-where { font-weight: 600; overflow-wrap: anywhere; }
+.ai-block-when { margin-left: auto; font-size: 12px; }
+.ai-block-q { line-height: 1.45; overflow-wrap: anywhere; }
+.ai-block-detail { margin-top: 5px; font-size: 12.5px; line-height: 1.5; overflow-wrap: anywhere; }
+.ai-block-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+.ai-block-actions .input { flex: 1 1 260px; }
+.ai-block-note { font-size: 12.5px; flex: 1 1 260px; }
+
+/* ---------- AI Apply: who is applying ---------- */
+/* The selected person is unmistakable, because running as the wrong one sends an application out
+   under the wrong name. State is on data-state so the three cases stay mutually exclusive. */
+.ai-prof-row { display: grid; gap: 12px; padding: 0 24px 20px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.ai-prof {
+  border: 1px solid var(--border); border-left: 3px solid var(--border);
+  border-radius: 4px; padding: 12px 14px; background: var(--wash-04); min-width: 0;
+}
+.ai-prof.active { border-color: var(--primary); border-left-color: var(--primary); background: var(--wash-10); }
+.ai-prof[data-state="running"]     { border-left-color: var(--success); }
+.ai-prof[data-state="ready"]       { border-left-color: var(--primary); }
+.ai-prof[data-state="needs-signin"]{ border-left-color: var(--warn); }
+.ai-prof-name { font-weight: 600; margin-bottom: 2px; overflow-wrap: anywhere; }
+.ai-prof-state { font-size: 12px; color: var(--muted); }
+.ai-prof[data-state="needs-signin"] .ai-prof-state { color: var(--warn); }
+.ai-prof[data-state="running"] .ai-prof-state { color: var(--success); }
+.ai-prof-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.ai-prof.active [data-useprofile] { border-color: var(--primary); color: var(--primary); }
+
+/* ---------- Companion: consent gate ---------- */
+/* Deliberately plain and readable. This is the one screen where someone who did not ask for any of
+   this decides whether it happens, so it is prose and buttons, not a dashboard. */
+.consent { padding: 4px 24px 22px; max-width: 62ch; }
+.consent p { line-height: 1.6; }
+.consent ul { line-height: 1.6; padding-left: 20px; }
+.consent li { margin: 7px 0; }
+.consent-actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }

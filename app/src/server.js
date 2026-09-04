@@ -24,6 +24,9 @@ const provider = require('./ai/provider');
 const prompts = require('./ai/prompts');
 const codexProvider = require('./ai/codex');
 const remoteAi = require('./ai/remote');
+const applyRunner = require('./ai/apply-runner');
+const answerAudit = require('./answer-audit');
+const profileBrowsers = require('./ai/profile-browsers');
 const { extractText } = require('./ai/extract');
 const hardware = require('./hardware');
 const localsetup = require('./localsetup');
@@ -167,6 +170,10 @@ function broadcast(type, data) {
     try { res.write(payload); } catch { sseClients.delete(res); }
   }
 }
+
+// The agent loop must not know what SSE is, so the runner is handed the broadcaster here. One
+// wiring point: every ai-apply.step / ai-apply.run event on the page originates from this line.
+applyRunner.setEmitter(broadcast);
 
 // A pairing request must come from a browser extension, the desktop renderer, or
 // localhost — never a remote web page (blocks the CSRF-from-evil.com vector). An empty
@@ -1495,6 +1502,42 @@ async function handle(req, res, parsed) {
   if (req.method === 'DELETE' && (jm = m(/^\/qa\/([^/]+)$/))) {
     return sendJson(res, db.qaDelete(jm[1]) ? 200 : 404, { ok: true });
   }
+  // ---- answer bank audit ----
+  // Auto-apply answers screening questions out of this bank, so a wrong row is submitted under
+  // Pierre's name. This surfaces the rows worth his attention; it never changes one by itself.
+  if (req.method === 'GET' && pathname === '/qa/audit') {
+    const pid = parsed.searchParams.get('profileId') || db.ensureDefaultProfileId();
+    const rows = db.qaList(pid, 5000);
+    return sendJson(res, 200, { ok: true, profileId: pid, ...answerAudit.auditAll(rows) });
+  }
+  if (req.method === 'PATCH' && (jm = m(/^\/qa\/([^/]+)$/))) {
+    const body = await readJson(req);
+    if (body.answer == null) return sendJson(res, 400, { ok: false, error: 'answer required' });
+    const updated = db.qaSetAnswer(jm[1], String(body.answer));
+    if (!updated) return sendJson(res, 404, { ok: false, error: 'no such answer' });
+    return sendJson(res, 200, { ok: true, item: updated, audit: answerAudit.auditAnswer(updated) });
+  }
+  if (req.method === 'POST' && pathname === '/qa/bulk-delete') {
+    const body = await readJson(req);
+    const ids = Array.isArray(body.ids) ? body.ids.slice(0, 2000).map(String) : [];
+    if (!ids.length) return sendJson(res, 400, { ok: false, error: 'ids required' });
+
+    // A bulk action may ONLY remove rows the audit calls junk. Anything needing judgement — every
+    // work-authorization, sponsorship, citizenship or salary row — has to be handled one at a time,
+    // deliberately, even if the client asks otherwise. A UI bug must not be able to wipe them.
+    const pid = body.profileId || db.ensureDefaultProfileId();
+    const byId = new Map(db.qaList(pid, 5000).map((r) => [String(r.id), r]));
+    let deleted = 0;
+    const refused = [];
+    for (const id of ids) {
+      const row = byId.get(id);
+      if (!row) { refused.push({ id, why: 'not found' }); continue; }
+      const verdict = answerAudit.auditAnswer(row);
+      if (verdict.severity !== 'junk') { refused.push({ id, why: `severity ${verdict.severity} — review it individually` }); continue; }
+      if (db.qaDelete(id)) deleted++;
+    }
+    return sendJson(res, 200, { ok: true, deleted, refused });
+  }
 
   // ---- observe (Apprenticeship Engine: always-on nav recorder) [P2] ----
   // The extension POSTs every top-frame navigation here; db.recordNavEvent classifies
@@ -2291,6 +2334,134 @@ async function handle(req, res, parsed) {
   }
   if (req.method === 'GET' && pathname === '/ai/usage') {
     return sendJson(res, 200, { ok: true, usage: db.aiUsage(), recent: db.aiLogList(50) });
+  }
+
+  // ---- AI Apply (chunk 3) ----
+  // The engine strip reads THIS, not /ai/status directly, so the page shows one reconciled view:
+  // provider health (already folded with the last REAL call by provider.honest), the live run, and
+  // recent history. Cheap enough to poll; the actual step stream rides SSE.
+  if (req.method === 'GET' && pathname === '/ai-apply/status') {
+    const profileId = parsed.searchParams.get('profileId') || '';
+    const st = await provider.statusAll(parsed.searchParams.get('force') === '1');
+    return sendJson(res, 200, {
+      ok: true,
+      providers: {
+        // subscription cards only — AI Apply runs on the CLIs, not on API keys
+        codex: st.chatgpt ? st.chatgpt.subscription : null,
+        claude: st.claude ? st.claude.subscription : null,
+        order: st.order || [],
+        canAnswer: st.canAnswer,
+        disabled: !!st.disabled,
+      },
+      run: applyRunner.getActive(profileId),
+      running: applyRunner.activeRuns(),
+      recent: db.aiRunList({ profileId: profileId || null, limit: 15 }),
+      blocks: db.aiBlockCounts(profileId || null),
+    });
+  }
+  if (req.method === 'POST' && pathname === '/ai-apply/start') {
+    const body = await readJson(req).catch(() => ({}));
+    // CONSENT IS ENFORCED HERE, not only in the page. A UI gate stops the button; it does not stop
+    // a scheduled task, another node, or a stale tab. On an applicant install nothing may be
+    // applied for until that person has agreed, and the agreement is a dated record.
+    try {
+      const appCfg = db.getSettings().app || {};
+      if (appCfg.role === 'applicant' && !appCfg.consentAt) {
+        return sendJson(res, 403, {
+          ok: false, code: 'NO_CONSENT',
+          error: 'this person has not agreed to applications being made on their behalf yet',
+        });
+      }
+    } catch { /* if settings cannot be read, fall through to the normal error path */ }
+    try {
+      const view = await applyRunner.start({
+        profileId: body.profileId || '',
+        autonomy: body.autonomy === 'auto' ? 'auto' : 'prepare',
+        goal: typeof body.goal === 'string' ? body.goal.slice(0, 4000) : '',
+        limits: body.limits && typeof body.limits === 'object' ? body.limits : {},
+        toolset: ['browser', 'apply'].includes(body.toolset) ? body.toolset : 'sandbox',
+        headless: body.headless === true,
+      });
+      return sendJson(res, 200, { ok: true, run: view });
+    } catch (e) {
+      // A second Start while one is live is a user mistake, not a server error — say so plainly.
+      return sendJson(res, e.code === 'RUN_IN_PROGRESS' ? 409 : 500, { ok: false, error: e.message, code: e.code });
+    }
+  }
+  if (req.method === 'POST' && pathname === '/ai-apply/stop') {
+    const body = await readJson(req).catch(() => ({}));
+    return sendJson(res, 200, { ok: true, ...applyRunner.stop(body.profileId || '') });
+  }
+  if (req.method === 'GET' && pathname === '/ai-apply/runs') {
+    const profileId = parsed.searchParams.get('profileId') || '';
+    return sendJson(res, 200, {
+      ok: true,
+      items: db.aiRunList({ profileId: profileId || null, limit: Number(parsed.searchParams.get('limit')) || 30 }),
+    });
+  }
+  // ---- per-person browsers (chunk 10) ----
+  // Every profile, with whether its browser has ever been signed in and whether a run is using it.
+  // This is the screen that answers "can the agent apply as me, and as Dad, right now?"
+  if (req.method === 'GET' && pathname === '/ai-apply/profiles') {
+    const profiles = db.listProfiles() || [];
+    return sendJson(res, 200, {
+      ok: true,
+      items: profiles.map((p) => ({
+        id: p.id, name: p.name, isDefault: !!p.is_default,
+        ...profileBrowsers.status(p.id),
+        running: applyRunner.isRunning(p.id),
+        openBlocks: db.aiBlockCounts(p.id),
+      })),
+    });
+  }
+  if (req.method === 'POST' && (jm = m(/^\/ai-apply\/profiles\/([^/]+)\/signin$/))) {
+    const body = await readJson(req).catch(() => ({}));
+    try {
+      const r = await profileBrowsers.openSignin(jm[1], {
+        url: typeof body.url === 'string' && /^https:\/\//.test(body.url) ? body.url : undefined,
+        isRunning: (id) => applyRunner.isRunning(id),
+      });
+      return sendJson(res, 200, { ok: true, ...r });
+    } catch (e) {
+      return sendJson(res, e.code === 'PROFILE_BUSY' ? 409 : 500, { ok: false, error: e.message, code: e.code });
+    }
+  }
+  if (req.method === 'POST' && (jm = m(/^\/ai-apply\/profiles\/([^/]+)\/signin\/close$/))) {
+    return sendJson(res, 200, { ok: true, ...(await profileBrowsers.closeSignin(jm[1])) });
+  }
+
+  // ---- escalation blocks (chunk 7) ----
+  if (req.method === 'GET' && pathname === '/ai-apply/blocks') {
+    const profileId = parsed.searchParams.get('profileId') || '';
+    const status = parsed.searchParams.get('status') || 'open';
+    return sendJson(res, 200, {
+      ok: true,
+      counts: db.aiBlockCounts(profileId || null),
+      items: db.aiBlockList({ profileId: profileId || null, status }),
+    });
+  }
+  if (req.method === 'POST' && (jm = m(/^\/ai-apply\/blocks\/([^/]+)\/answer$/))) {
+    const body = await readJson(req).catch(() => ({}));
+    try {
+      const b = db.aiBlockResolve(jm[1], body.answer);
+      if (!b) return sendJson(res, 404, { ok: false, error: 'no such block' });
+      broadcast('ai-apply.block', { block: b });
+      return sendJson(res, 200, { ok: true, block: b });
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, error: e.message });
+    }
+  }
+  if (req.method === 'POST' && (jm = m(/^\/ai-apply\/blocks\/([^/]+)\/dismiss$/))) {
+    const b = db.aiBlockDismiss(jm[1]);
+    if (!b) return sendJson(res, 404, { ok: false, error: 'no such block' });
+    broadcast('ai-apply.block', { block: b });
+    return sendJson(res, 200, { ok: true, block: b });
+  }
+  if (req.method === 'GET' && pathname.startsWith('/ai-apply/runs/')) {
+    const runId = decodeURIComponent(pathname.slice('/ai-apply/runs/'.length));
+    const run = db.aiRunGet(runId);
+    if (!run) return sendJson(res, 404, { ok: false, error: 'no such run' });
+    return sendJson(res, 200, { ok: true, run, steps: db.aiRunSteps(runId) });
   }
 
   // ---- AI providers: hardware probe, local setup, subscription connect ----

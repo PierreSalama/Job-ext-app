@@ -17,44 +17,50 @@
     </div>
 
     <nav class="nav" id="nav">
-      <div class="nav-section">Track</div>
-      <a href="#/" class="nav-item" data-route="/">
+      <div class="nav-section" data-roles="owner,worker">Track</div>
+      <a href="#/" class="nav-item" data-route="/" data-roles="owner,worker">
         <span class="nav-icon">◆</span><span class="nav-label">Dashboard</span>
       </a>
-      <a href="#/applications" class="nav-item" data-route="/applications">
+      <a href="#/applications" class="nav-item" data-route="/applications" data-roles="owner,worker">
         <span class="nav-icon">◇</span><span class="nav-label">Applications</span>
       </a>
-      <a href="#/pipeline" class="nav-item" data-route="/pipeline">
+      <a href="#/pipeline" class="nav-item" data-route="/pipeline" data-roles="owner">
         <span class="nav-icon">▤</span><span class="nav-label">Pipeline</span>
       </a>
 
-      <div class="nav-section">Automate</div>
-      <a href="#/queue" class="nav-item" data-route="/queue">
+      <div class="nav-section" data-roles="owner,worker,applicant">Automate</div>
+      <a href="#/queue" class="nav-item" data-route="/queue" data-roles="owner,worker">
         <span class="nav-icon">▶</span><span class="nav-label">Auto-apply</span>
       </a>
-      <a href="#/needs-you" class="nav-item" data-route="/needs-you">
+      <a href="#/ai-apply" class="nav-item" data-route="/ai-apply" data-roles="owner,worker,applicant">
+        <span class="nav-icon">◈</span><span class="nav-label">AI Apply</span><span class="nav-badge" id="nav-ai-badge" hidden></span>
+      </a>
+      <a href="#/needs-you" class="nav-item" data-route="/needs-you" data-roles="owner,worker">
         <span class="nav-icon">⚑</span><span class="nav-label">Needs you</span><span class="nav-badge" id="nav-ny-badge" hidden></span>
       </a>
-      <a href="#/aa-settings" class="nav-item" data-route="/aa-settings">
+      <a href="#/aa-settings" class="nav-item" data-route="/aa-settings" data-roles="owner,worker">
         <span class="nav-icon">⚙</span><span class="nav-label">Apply settings</span>
       </a>
-      <a href="#/procedures" class="nav-item" data-route="/procedures">
+      <a href="#/procedures" class="nav-item" data-route="/procedures" data-roles="owner,worker">
         <span class="nav-icon">❖</span><span class="nav-label">Taught Procedures</span>
       </a>
 
-      <div class="nav-section">Material</div>
-      <a href="#/profile" class="nav-item" data-route="/profile">
+      <div class="nav-section" data-roles="owner,worker,applicant">Material</div>
+      <a href="#/profile" class="nav-item" data-route="/profile" data-roles="owner,worker,applicant">
         <span class="nav-icon">●</span><span class="nav-label">Profile</span>
       </a>
-      <a href="#/documents" class="nav-item" data-route="/documents">
+      <a href="#/documents" class="nav-item" data-route="/documents" data-roles="owner,worker,applicant">
         <span class="nav-icon">▣</span><span class="nav-label">Documents</span>
       </a>
+      <a href="#/answers" class="nav-item" data-route="/answers" data-roles="owner,worker,applicant">
+        <span class="nav-icon">✎</span><span class="nav-label">Answer bank</span><span class="nav-badge" id="nav-ans-badge" hidden></span>
+      </a>
 
-      <div class="nav-section">System</div>
-      <a href="#/activity" class="nav-item" data-route="/activity">
+      <div class="nav-section" data-roles="owner,worker,applicant">System</div>
+      <a href="#/activity" class="nav-item" data-route="/activity" data-roles="owner,worker">
         <span class="nav-icon">≋</span><span class="nav-label">Activity</span>
       </a>
-      <a href="#/settings" class="nav-item" data-route="/settings">
+      <a href="#/settings" class="nav-item" data-route="/settings" data-roles="owner,worker,applicant">
         <span class="nav-icon">⚙</span><span class="nav-label">Settings</span>
       </a>
     </nav>

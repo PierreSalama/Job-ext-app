@@ -267,6 +267,43 @@ function nativeNotify(title, body) {
   } catch {}
 }
 
+// ---------- AI Apply alert bridge ----------
+// Alerts are the blocks that STOP a run: a human check, an account wall, a password, an expired
+// CLI login. They get a native OS notification (so a full-screen game does not hide them) AND an
+// in-app toast, and each one is announced exactly once, ever.
+let alertWatcher = null;
+function startAlertWatcher() {
+  if (alertWatcher) return alertWatcher;
+  const { makeAlertWatcher, peerFetcher } = require('./ai/alerts');
+
+  // Minimal authed GET against a peer node. Kept here rather than in alerts.js so that module
+  // stays free of transport concerns and can be tested without a network.
+  const httpJson = async (url, token) => {
+    const res = await fetch(url, {
+      headers: { 'X-JAT-Token': token || '' },
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  };
+
+  alertWatcher = makeAlertWatcher({
+    db,
+    fetchPeer: peerFetcher(httpJson),
+    selfName: 'this computer',
+    nodes: () => {
+      try { return (db.getSettings().nodes || []).filter((n) => n && n.baseUrl && n.token); }
+      catch { return []; }
+    },
+    onAlert: ({ title, body }) => {
+      nativeNotify(title, body);
+      try { broadcast('notify.toast', { kind: 'autoApply', title, body, toastKind: 'danger' }); } catch {}
+    },
+  });
+  alertWatcher.start();
+  return alertWatcher;
+}
+
 function notifyEvent(type, payload) {
   if (type === 'status' && payload?.job) {
     if (payload.action === 'created') {
@@ -873,6 +910,12 @@ app.whenReady().then(async () => {
   try { app.setAppUserModelId('com.pierre.jat11'); } catch {}
   try {
     db.open(app.getPath('userData'));
+    // Per-person Chrome profiles live beside the database, not in %TEMP%. They hold the LinkedIn
+    // and ATS logins the agent depends on, and Windows cleans temp — a profile kept there would
+    // silently sign both people out with nothing in the logs to explain the sudden login walls.
+    try {
+      require('./browser/cdp').setProfileRoot(path.join(app.getPath('userData'), 'chrome-profiles'));
+    } catch (e) { log.warn('could not set the browser profile root', e.message); }
   } catch (e) {
     log.error('failed to open DB', e);
     showFatalError('Database error', 'Could not open the JAT database:\n' + e.message + '\n\nIf this keeps happening, check the logs from the tray or app data folder.');
@@ -962,6 +1005,10 @@ app.whenReady().then(async () => {
         const r = sessionSync.applyFromSettings(db.getSettings(), { log: (lvl, m) => ((log[lvl] || log.info).call(log, m)) });
         if (r.started) log.info('session sync started (Dad-instance)');
       } catch (e) { log.warn('session sync boot skipped', e.message); }
+      // AI Apply alert bridge: a CAPTCHA or account wall on the SERVER LAPTOP is useless to Pierre
+      // sitting at his desk unless something tells him. This polls this machine and every peer node
+      // and raises a real OS notification, which survives a full-screen game.
+      try { startAlertWatcher(); } catch (e) { log.warn('alert watcher boot skipped', e.message); }
     } catch (e) {
       if (e.code === 'EADDRINUSE' && attempt < 6) {
         log.warn(`port ${port} busy — retry ${attempt}/5 in 1.5s (a stale JAT socket may still be releasing)`);

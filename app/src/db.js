@@ -759,6 +759,98 @@ const MIGRATIONS = [
   // Idempotent: it only fills evidence that is absent, and never changes state — `done` still
   // requires proof.
   () => { creditRaceLostBacklog(); },
+
+  // AI APPLY — run transcript store (chunk 2).
+  // The existing ai_log records ONE model call: provider, ms, ok. An agent run is a chain of
+  // hundreds of calls where the interesting thing is the SEQUENCE — what it decided, which tool it
+  // reached for, what came back, and where it went wrong. ai_log cannot express that, and widening
+  // it would break every caller that treats a row as one call.
+  //
+  // ai_runs is the session; ai_steps is the ordered transcript. Steps carry their own token counts
+  // so a run's cost is a SUM over the table rather than a number we have to trust someone to
+  // maintain, and (run_id, seq) is UNIQUE so a resumed run can never double-write a step.
+  () => {
+    exec(`
+      CREATE TABLE ai_runs (
+        id             TEXT PRIMARY KEY,
+        profile_id     TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        goal           TEXT,
+        autonomy       TEXT NOT NULL DEFAULT 'prepare',
+        status         TEXT NOT NULL DEFAULT 'running',
+        provider       TEXT,
+        model          TEXT,
+        steps          INTEGER NOT NULL DEFAULT 0,
+        prompt_chars   INTEGER NOT NULL DEFAULT 0,
+        response_chars INTEGER NOT NULL DEFAULT 0,
+        max_steps      INTEGER,
+        max_chars      INTEGER,
+        started_at     TEXT NOT NULL,
+        ended_at       TEXT,
+        stop_reason    TEXT,
+        error          TEXT,
+        summary        TEXT
+      );
+      CREATE INDEX idx_airuns_started ON ai_runs(started_at DESC);
+      CREATE INDEX idx_airuns_profile ON ai_runs(profile_id, started_at DESC);
+
+      CREATE TABLE ai_steps (
+        id             TEXT PRIMARY KEY,
+        run_id         TEXT NOT NULL REFERENCES ai_runs(id) ON DELETE CASCADE,
+        seq            INTEGER NOT NULL,
+        ts             TEXT NOT NULL,
+        thought        TEXT,
+        tool           TEXT,
+        args           TEXT,
+        ok             INTEGER NOT NULL DEFAULT 1,
+        result         TEXT,
+        error          TEXT,
+        refused        INTEGER NOT NULL DEFAULT 0,
+        ms             INTEGER,
+        provider       TEXT,
+        model          TEXT,
+        prompt_chars   INTEGER,
+        response_chars INTEGER,
+        UNIQUE(run_id, seq)
+      );
+      CREATE INDEX idx_aisteps_run ON ai_steps(run_id, seq);
+    `);
+  },
+
+  // AI APPLY — escalation blocks (chunk 7).
+  //
+  // Everything the agent is not allowed to do alone: a CAPTCHA, an account wall, a password, a
+  // demographic self-ID, a screening question nobody has ever answered, and — in Prepare mode — a
+  // finished form waiting for a human to press Submit.
+  //
+  // Keyed by profile because Pierre's blocks belong on his page and Dad's on his. `job_id` is
+  // nullable: a block can exist before there is a job row (a CAPTCHA on a search page), and a
+  // block must never be lost because the row it belongs to has not been written yet.
+  //
+  // `answer` doubles as the record of what he said, so a resolved block is also the provenance for
+  // the answer that later lands in the qa bank.
+  () => {
+    exec(`
+      CREATE TABLE ai_blocks (
+        id           TEXT PRIMARY KEY,
+        run_id       TEXT REFERENCES ai_runs(id) ON DELETE SET NULL,
+        profile_id   TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        job_id       TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+        kind         TEXT NOT NULL,
+        question     TEXT NOT NULL,
+        detail       TEXT,
+        company      TEXT,
+        title        TEXT,
+        url          TEXT,
+        urgency      TEXT NOT NULL DEFAULT 'queue',
+        status       TEXT NOT NULL DEFAULT 'open',
+        answer       TEXT,
+        created_at   TEXT NOT NULL,
+        resolved_at  TEXT
+      );
+      CREATE INDEX idx_aiblocks_open ON ai_blocks(profile_id, status, created_at DESC);
+      CREATE INDEX idx_aiblocks_run  ON ai_blocks(run_id);
+    `);
+  },
 ];
 
 // SUCCESS-TRUTH quarantine (shared by the migration above and exported for tests).
@@ -2253,6 +2345,21 @@ function qaLookup(profileId, question, cache, opts) {
   if (exact && !isPlaceholderAnswer(exact.answer) && (!gate || recallOk(question, exact, opts))) {
     return { ...exact, match: 'exact', score: 1 };
   }
+  // AN EXACT MATCH SHORT-CIRCUITS, EVEN WHEN IT IS REJECTED.
+  //
+  // Falling through to the fuzzy search here meant that a rejected answer to THIS question was
+  // replaced by an accepted answer to a DIFFERENT one. Live repro (2026-09-04): Pierre answered
+  // "How many years of experience do you have with Kubernetes?" with "None. My deploy stack is
+  // Docker and GitHub Actions" — the shape gate wants a number for a "how many years" question, so
+  // it dropped his answer and served "2" from an unrelated row instead. His own words, discarded,
+  // and a wrong number submitted in their place.
+  //
+  // If we have his answer to exactly this question and cannot use it, the honest result is that we
+  // do not know — which makes the agent escalate and auto-apply park, rather than guess.
+  if (exact) {
+    log.info(`recall: exact answer for "${String(question).slice(0, 60)}" failed the shape gate — reporting unknown rather than substituting another question's answer`);
+    return null;
+  }
   const want = new Set(qn.split(' ').filter(Boolean));
   if (!want.size) return null;
   let best = null;
@@ -2308,6 +2415,27 @@ function answerMemory(profileId, limit = 16, opts = {}) {
   return dedup.slice(0, limit);
 }
 function qaDelete(id) { return (run('DELETE FROM qa WHERE id = ?', [id])?.changes ?? 0) > 0; }
+
+// Correct a learned answer IN PLACE, keeping the question and its seen_count.
+//
+// Deliberately separate from qaRecord: that path is for MACHINE capture and applies write
+// boundaries (placeholders, junk keys, misattributed URLs) designed to stop bad captures landing.
+// This path is a human deliberately fixing a row the audit flagged, so those capture-time rails do
+// not apply — but the placeholder rail does, because "correcting" an answer to "-- No answer --"
+// would silently recreate the exact junk the audit exists to remove.
+function qaSetAnswer(id, answer) {
+  const a = String(answer == null ? '' : answer).trim();
+  if (!a) throw new Error('an answer cannot be blank — delete the row instead');
+  // Two checks on purpose: isPlaceholderAnswer guards machine capture and is narrow, while the
+  // audit's isNonAnswer also knows the strings that actually turned up in the live bank
+  // ("-- No answer --", "on"). Either one is enough to refuse.
+  if (isPlaceholderAnswer(a) || require('./answer-audit').isNonAnswer(a)) {
+    throw new Error(`"${a}" is a placeholder, not an answer — delete the row instead`);
+  }
+  const changed = run('UPDATE qa SET answer = ?, updated_at = ? WHERE id = ?', [a, now(), id])?.changes ?? 0;
+  if (!changed) return null;
+  return get('SELECT * FROM qa WHERE id = ?', [id]);
+}
 
 // ============================================================
 // Profile fields — dynamic, auto-harvested, EN/FR-keyed store.
@@ -4915,6 +5043,123 @@ function aiLog(entry) {
 function aiLogList(limit = 100) {
   return all('SELECT * FROM ai_log ORDER BY ts DESC LIMIT ?', [limit]);
 }
+
+// ---- AI Apply run transcripts (chunk 2) -----------------------------------
+function aiRunCreate({ profileId, goal = '', autonomy = 'prepare', maxSteps = null, maxChars = null } = {}) {
+  const id = uid('run');
+  run(`INSERT INTO ai_runs (id, profile_id, goal, autonomy, status, max_steps, max_chars, started_at)
+       VALUES (?, ?, ?, ?, 'running', ?, ?, ?)`,
+      [id, resolveProfileId(profileId), String(goal || ''), autonomy === 'auto' ? 'auto' : 'prepare',
+       maxSteps, maxChars, now()]);
+  return id;
+}
+
+// Counters are accumulated with SQL arithmetic rather than read-modify-write, so two writers
+// (the loop and a later resume) can never clobber each other's totals.
+function aiStepAppend(runId, step = {}) {
+  const id = uid('step');
+  const seq = Number(step.seq);
+  if (!Number.isInteger(seq) || seq < 0) throw new Error('aiStepAppend needs an integer seq');
+  run(`INSERT INTO ai_steps (id, run_id, seq, ts, thought, tool, args, ok, result, error,
+                             refused, ms, provider, model, prompt_chars, response_chars)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, runId, seq, now(), step.thought || null, step.tool || null,
+       step.args == null ? null : JSON.stringify(step.args),
+       step.ok === false ? 0 : 1, step.result == null ? null : String(step.result),
+       step.error || null, step.refused ? 1 : 0, step.ms || 0,
+       step.provider || null, step.model || null,
+       step.promptChars || 0, step.responseChars || 0]);
+  run(`UPDATE ai_runs SET steps = steps + 1,
+                          prompt_chars = prompt_chars + ?,
+                          response_chars = response_chars + ?,
+                          provider = COALESCE(?, provider),
+                          model = COALESCE(?, model)
+       WHERE id = ?`,
+      [step.promptChars || 0, step.responseChars || 0, step.provider || null, step.model || null, runId]);
+  return id;
+}
+
+function aiRunFinish(runId, { status = 'done', stopReason = null, error = null, summary = null } = {}) {
+  run(`UPDATE ai_runs SET status = ?, ended_at = ?, stop_reason = ?, error = ?, summary = ?
+       WHERE id = ?`,
+      [status, now(), stopReason, error ? String(error).slice(0, 500) : null,
+       summary ? String(summary).slice(0, 4000) : null, runId]);
+}
+
+// ---- escalation blocks (chunk 7) ------------------------------------------
+// Urgency decides WHERE it shows up, not how it is stored: 'alert' wakes Pierre at his desk
+// (CAPTCHA, account wall, password, a lapsed login), 'queue' waits on the person's own page.
+const BLOCK_ALERT_KINDS = new Set(['captcha', 'account', 'password', 'auth_lapsed', 'payment']);
+
+function aiBlockCreate({ runId = null, profileId, jobId = null, kind, question, detail = null,
+  company = null, title = null, url = null } = {}) {
+  const k = String(kind || 'needs_answer');
+  const q = String(question || '').trim();
+  if (!q) throw new Error('a block must say what it needs');
+  const id = uid('blk');
+  run(`INSERT INTO ai_blocks (id, run_id, profile_id, job_id, kind, question, detail,
+                              company, title, url, urgency, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`,
+      [id, runId, resolveProfileId(profileId), jobId, k, q.slice(0, 2000),
+       detail ? String(detail).slice(0, 4000) : null,
+       company, title, url, BLOCK_ALERT_KINDS.has(k) ? 'alert' : 'queue', now()]);
+  return get('SELECT * FROM ai_blocks WHERE id = ?', [id]);
+}
+
+function aiBlockList({ profileId = null, status = 'open', limit = 200 } = {}) {
+  const where = [];
+  const args = [];
+  if (profileId) { where.push('profile_id = ?'); args.push(resolveProfileId(profileId)); }
+  if (status && status !== 'all') { where.push('status = ?'); args.push(status); }
+  args.push(limit);
+  return all(`SELECT * FROM ai_blocks ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+              ORDER BY (urgency = 'alert') DESC, created_at DESC LIMIT ?`, args);
+}
+
+function aiBlockGet(id) { return get('SELECT * FROM ai_blocks WHERE id = ?', [id]); }
+
+// Resolving a block is the ONLY way an answer enters the bank from an escalation, and it records
+// it as `user` lineage — a human said this, so it is high trust and exempt from the capture-time
+// junk rails that exist to catch scraped values.
+function aiBlockResolve(id, answer, { learn = true } = {}) {
+  const b = aiBlockGet(id);
+  if (!b) return null;
+  const a = String(answer == null ? '' : answer).trim();
+  if (!a) throw new Error('an answer is required to resolve a block');
+  run('UPDATE ai_blocks SET status = ?, answer = ?, resolved_at = ? WHERE id = ?',
+      ['resolved', a.slice(0, 4000), now(), id]);
+  // Only a real screening question is worth remembering. A CAPTCHA or a "press submit" is a one
+  // off, and storing it would pollute the bank with un-reusable rows.
+  if (learn && b.kind === 'needs_answer') {
+    try { qaRecord({ profileId: b.profile_id, question: b.question, answer: a, lineageSource: 'user', source: 'ai-apply-block' }); }
+    catch (e) { log.warn('block answer not learned:', e.message); }
+  }
+  return aiBlockGet(id);
+}
+
+function aiBlockDismiss(id) {
+  const changed = run("UPDATE ai_blocks SET status = 'dismissed', resolved_at = ? WHERE id = ?", [now(), id])?.changes ?? 0;
+  return changed ? aiBlockGet(id) : null;
+}
+
+function aiBlockCounts(profileId = null) {
+  const rows = profileId
+    ? all("SELECT urgency, COUNT(*) AS n FROM ai_blocks WHERE status='open' AND profile_id = ? GROUP BY urgency", [resolveProfileId(profileId)])
+    : all("SELECT urgency, COUNT(*) AS n FROM ai_blocks WHERE status='open' GROUP BY urgency");
+  const out = { open: 0, alert: 0, queue: 0 };
+  for (const r of rows) { out[r.urgency] = r.n; out.open += r.n; }
+  return out;
+}
+
+function aiRunGet(runId) { return get('SELECT * FROM ai_runs WHERE id = ?', [runId]); }
+function aiRunSteps(runId, limit = 1000) {
+  return all('SELECT * FROM ai_steps WHERE run_id = ? ORDER BY seq ASC LIMIT ?', [runId, limit]);
+}
+function aiRunList({ profileId = null, limit = 50 } = {}) {
+  return profileId
+    ? all('SELECT * FROM ai_runs WHERE profile_id = ? ORDER BY started_at DESC LIMIT ?', [resolveProfileId(profileId), limit])
+    : all('SELECT * FROM ai_runs ORDER BY started_at DESC LIMIT ?', [limit]);
+}
 function aiUsage() {
   return all(`SELECT provider, COUNT(*) AS calls, SUM(ms) AS total_ms,
               SUM(ok) AS ok_calls FROM ai_log GROUP BY provider`);
@@ -5862,7 +6107,7 @@ module.exports = {
   getSettings, patchSettings, normalizeAutoApply, kvGet, kvSet,
   listJobs, getJob, upsertJob, patchJob, deleteJob, sweepGhosted, stats, activityTrend,
   listEvents, listRecentEvents, recordEvent,
-  qaRecord, qaLookup, qaList, answerMemory, qaDelete, normalizeQuestion, guessLocale,
+  qaRecord, qaLookup, qaList, answerMemory, qaDelete, qaSetAnswer, normalizeQuestion, guessLocale,
   answerShape,   // re-exported so callers that already hold `db` can reach the recall gates
   isPlaceholderAnswer, stripPlaceholderAnswers, isJunkQuestionText,
   isMisattributedUrlAnswer, purgeMisattributedUrlAnswers,
@@ -5891,6 +6136,8 @@ module.exports = {
   setSignedOut, clearSignedOut, isSignedOut, signedOutStatus, signedOutEligible,
   expireWalledTasks, retireUnanswerableParks,
   aiLog, aiLogList, aiUsage,
+  aiRunCreate, aiStepAppend, aiRunFinish, aiRunGet, aiRunSteps, aiRunList,
+  aiBlockCreate, aiBlockList, aiBlockGet, aiBlockResolve, aiBlockDismiss, aiBlockCounts,
   exportAll, importAll, bulkImportApplications, wipeAllData,
   emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching, findJobByThread, gmailStatusFromCategory, reprocessEmails, elevateJobFromEmail, findJobByUrl,
   recordOutcome, creditOutcomeForEmail, emailsNeedingConfirm, confirmEmailLink, outcomesForJob,

@@ -34,8 +34,39 @@ function discoverCli() {
   // 1. PATH
   try {
     const r = spawnSync(IS_WIN ? 'where.exe' : 'which', ['claude'], { encoding: 'utf8' });
-    const p = (r.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0];
-    if (p && fs.existsSync(p)) { cachedCli = p; return p; }
+    const hits = (r.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean).filter((p) => {
+      try { return fs.existsSync(p); } catch { return false; }
+    });
+    // WINDOWS: `npm i -g` drops THREE launchers next to each other — `claude` (an extensionless sh
+    // script for Git Bash), `claude.cmd` and `claude.ps1`. `where.exe` lists the extensionless one
+    // FIRST, and CreateProcess cannot execute it, so discovery "succeeded" and every call then died
+    // with `spawn ... ENOENT` — reported as "Claude CLI not found" when it was in fact installed.
+    // Only .cmd/.exe/.bat are directly spawnable here.
+    // PREFER THE NATIVE .exe, AND NOT ONLY FOR TIDINESS. The .cmd is a one-line wrapper around
+    // node_modules\@anthropic-ai\claude-code\bin\claude.exe, and spawning a .cmd on Windows forces
+    // `shell: true` (Node refuses .cmd otherwise since CVE-2024-27980). Under a shell, argv is
+    // concatenated rather than escaped — and one of our arguments is --append-system-prompt, which
+    // will soon carry text lifted off a job posting. That is a command-injection vector. Resolving
+    // to the .exe lets us spawn with no shell at all, so the hole simply does not exist.
+    const fromCmd = (c) => {
+      try {
+        const m = /"?%dp0%\\?([^"\r\n]*claude\.exe)"?/i.exec(fs.readFileSync(c, 'utf8'));
+        if (!m) return null;
+        const p = path.join(path.dirname(c), m[1].replace(/^\\+/, ''));
+        return fs.existsSync(p) ? p : null;
+      } catch { return null; }
+    };
+    let p = null;
+    if (IS_WIN) {
+      p = hits.find((h) => /\.exe$/i.test(h)) || null;
+      if (!p) {
+        const cmd = hits.find((h) => /\.cmd$/i.test(h));
+        p = (cmd && fromCmd(cmd)) || cmd || hits.find((h) => /\.bat$/i.test(h)) || null;
+      }
+    } else {
+      p = hits[0] || null;
+    }
+    if (p) { cachedCli = p; return p; }
   } catch {}
   // 2. npm global bin + common install dirs
   const guesses = IS_WIN
@@ -78,7 +109,7 @@ function credentialsCheck(file) {
   const hasAccess = typeof o.accessToken === 'string' && o.accessToken.length > 0;
   const hasRefresh = typeof o.refreshToken === 'string' && o.refreshToken.length > 0;
   if (hasAccess || hasRefresh) return { signedIn: true };
-  return { signedIn: false, reason: 'the Claude CLI is installed but signed out (no token in ~/.claude/.credentials.json) — run `claude` on that machine and sign in' };
+  return { signedIn: false, reason: 'the Claude CLI is installed but signed out (no token in ~/.claude/.credentials.json) — run `claude auth login` on that machine' };
 }
 
 // Status probe: binary present, runnable, AND holding a credential. We still avoid a paid
@@ -88,7 +119,10 @@ async function status() {
   const cli = discoverCli();
   if (!cli) return { available: false, reason: 'Claude CLI not found', needsInstall: true };
   return new Promise((resolve) => {
-    const child = spawn(cli, ['--version'], { windowsHide: true });
+    // Same shell rule as the generate path below: since Node 20 (CVE-2024-27980) a .cmd cannot be
+    // spawned directly on Windows and fails with EINVAL. The npm-installed launcher IS a .cmd, so
+    // without this the probe reported the CLI as unavailable on every machine that has it.
+    const child = spawn(cli, ['--version'], { windowsHide: true, shell: IS_WIN && /\.cmd$/i.test(cli) });
     let out = '';
     const timer = setTimeout(() => { try { child.kill(); } catch {} }, 8000);
     child.stdout.on('data', (d) => { out += d; });
@@ -124,6 +158,18 @@ async function generate({ prompt, system, schema, model, timeoutMs = 120000 }) {
 
   const args = ['-p', '--output-format', 'json'];
   args.push('--model', picked.model);
+  // NO TOOLS. This is the fix for the failure that killed three end-to-end application runs.
+  //
+  // JAT uses the CLI as a plain text generator: it is handed a list of OUR tool names and asked to
+  // name the next one, in JSON. But the CLI shipped its own default toolset, so late in a run the
+  // model would stop describing an action and try to actually CALL `recall_answer`. Its harness
+  // answered "No such tool available", and the model then reported, accurately from where it sat,
+  // that the tools had stopped working. Every one of those runs was thrown away two steps from a
+  // finished application.
+  //
+  // Shutting the toolset off also removes Bash, Read and Write from a process whose only job is to
+  // return a sentence of JSON. An agent filling in job applications has no business holding a shell.
+  args.push('--tools', '');
   if (system) args.push('--append-system-prompt', system);
   // When a schema is requested, steer Claude to emit ONLY JSON matching it (no --output-schema flag).
   const fullPrompt = schema
@@ -146,7 +192,7 @@ async function generate({ prompt, system, schema, model, timeoutMs = 120000 }) {
     child.on('close', (code) => {
       clearTimeout(timer);
       if (/unauthorized|not logged in|please run.*login|authentication|invalid api key|credit balance/i.test(stderr)) {
-        return reject(Object.assign(new Error('Claude auth failed — run `claude` and sign in'), { code: 'CLAUDE_AUTH' }));
+        return reject(Object.assign(new Error('Claude auth failed — run `claude auth login`'), { code: 'CLAUDE_AUTH' }));
       }
       if (code !== 0 && !stdout.trim()) {
         return reject(Object.assign(new Error(`claude exited ${code}: ${stderr.trim().slice(0, 300)}`), { code: 'CLAUDE_EXIT' }));
@@ -178,12 +224,14 @@ async function generate({ prompt, system, schema, model, timeoutMs = 120000 }) {
   });
 }
 
-// Claude Code signs in interactively (run `claude`, then /login, or it prompts on first run).
+// Claude Code signs in interactively. `claude auth login` is the exact command; `claude auth status`
+// reports the truth ({loggedIn:false, authMethod:'none'} when the file holds empty-string tokens,
+// which is what a half-finished sign-in leaves behind and what this module must not mistake for OK).
 // We can't drive that headlessly; surface guidance for the settings UI.
 function login() {
   const cli = discoverCli();
   if (!cli) return { ok: false, error: 'Claude CLI not found — install it (npm i -g @anthropic-ai/claude-code) and sign in.' };
-  return { ok: true, message: 'Open a terminal, run `claude`, and sign in once. Then click Re-check.' };
+  return { ok: true, message: 'Open a terminal, run `claude auth login`, and sign in once. Verify with `claude auth status`, then click Re-check.' };
 }
 
 module.exports = { discoverCli, status, generate, login, credentialsCheck, name: 'claude-cli' };
