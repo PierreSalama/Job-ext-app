@@ -22,7 +22,7 @@ const crypto = require('crypto');
 const { runAgent } = require('./agent-loop');
 const sandbox = require('./tools/sandbox');
 const { makeBrowserTools } = require('./tools/browser');
-const { makeJatTools } = require('./tools/jat');
+const { makeJatTools, ENGAGED } = require('./tools/jat');
 const { makeDocumentTools } = require('./tools/documents');
 const { makeEscalateTools } = require('./tools/escalate');
 const { makePolicy, wrapTools } = require('./guardrails');
@@ -51,6 +51,44 @@ function portFor(profileId) {
 }
 
 let emit = () => {};
+// Ask the other machines whether an employer has already been applied to.
+//
+// Kept here rather than in tools/jat.js so that module stays free of transport and can be tested
+// without a network, the same arrangement the alert bridge uses.
+function makePeers() {
+  const get = async (node, path) => {
+    const res = await fetch(`${String(node.baseUrl).replace(/\/$/, '')}${path}`, {
+      headers: { 'X-JAT-Token': node.token || '' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) { const e = new Error(`HTTP ${res.status}`); e.status = res.status; throw e; }
+    return res.json();
+  };
+  return {
+    nodes: async () => {
+      try { return (db.getSettings().nodes || []).filter((n) => n && n.baseUrl && n.token); }
+      catch { return []; }
+    },
+    engaged: async (node, { url, company, title }) => {
+      const q = `company=${encodeURIComponent(company || '')}&url=${encodeURIComponent(url || '')}`
+        + `&title=${encodeURIComponent(title || '')}`;
+      try {
+        const body = await get(node, `/ai-apply/engaged?${q}`);
+        return body.items || [];
+      } catch (e) {
+        // A node on an older build has no /ai-apply/engaged. Fall back to the jobs search it does
+        // have, and decide engagement here. Weaker matching (company name only, no board slug), so
+        // it is a stopgap for the update window, not a substitute.
+        if (e.status !== 404) throw e;
+        const body = await get(node, `/jobs?q=${encodeURIComponent(company || '')}&limit=50`);
+        return (body.items || [])
+          .filter((j) => ENGAGED.has(j.status) || (Array.isArray(j.tags) && j.tags.includes('hand-applied')))
+          .map((j) => ({ company: j.company, title: j.title, status: j.status, matchedOn: 'company name' }));
+      }
+    },
+  };
+}
+
 function setEmitter(fn) { emit = typeof fn === 'function' ? fn : () => {}; }
 
 function publicView(r) {
@@ -104,7 +142,7 @@ async function start({
       const browserTools = openBelt();
       toolList = [
         ...browserTools,
-        ...makeJatTools({ profileId: key || null }).tools,
+        ...makeJatTools({ profileId: key || null, peers: makePeers() }).tools,
         ...makeDocumentTools().tools,
         // Escalation last so it can reach the live page for the auto-submit branch, and so the
         // autonomy mode chosen for THIS run is what `submit` obeys.

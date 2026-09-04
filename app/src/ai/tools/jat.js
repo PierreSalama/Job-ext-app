@@ -115,8 +115,52 @@ function duplicateOf({ url, company, title } = {}) {
 
 const line = (j) => `${j.company || '?'} — ${j.title || '?'} [${j.status}] ${j.location || ''}`.trim();
 
+// One wording for a duplicate wherever it was found, so a hit on another machine reads exactly as
+// seriously as a hit on this one.
+function sayDuplicate(dup, where) {
+  return `DUPLICATE — already engaged on ${where}: ${dup.company} / ${dup.title} [${dup.status}]`
+    + `, matched on ${dup.matchedOn}${dup.slug ? ` "${dup.slug}"` : ''}`
+    + `${dup.sameRole ? ' (the same role)' : ` (${dup.count} row(s) for this employer)`}`
+    + '. Do not apply again. Pick a different employer.';
+}
+
+// Ask every peer node the same question this machine just asked itself. A node that errors is
+// reported, never silently treated as "nothing there".
+async function sweepPeers(peers, { url, company, title }) {
+  const hits = [];
+  const unreachable = [];
+  let list = [];
+  try { list = (await peers.nodes()) || []; }
+  catch (e) { return { hits, unreachable: [{ name: 'the other machines', why: e.message }] }; }
+  await Promise.all(list.map(async (node) => {
+    try {
+      const rows = await peers.engaged(node, { url, company, title });
+      for (const r of rows || []) {
+        const sameRole = norm(r.title) === norm(title);
+        hits.push({
+          node: node.name || node.id || 'another machine',
+          company: r.company, title: r.title, status: r.status,
+          matchedOn: r.matchedOn || 'company', slug: r.slug || null,
+          sameRole, count: (rows || []).length,
+        });
+      }
+    } catch (e) {
+      unreachable.push({ name: node.name || node.id || 'a peer node', why: e.message });
+    }
+  }));
+  // A hit on the exact same role is the one most worth showing him first.
+  hits.sort((a, b) => Number(b.sameRole) - Number(a.sameRole));
+  return { hits, unreachable };
+}
+
 function makeJatTools(opts = {}) {
-  const { profileId = null, allowWrites = true } = opts;
+  const {
+    profileId = null,
+    allowWrites = true,
+    // Injected so this module never learns about HTTP, and so the peer sweep can be tested with no
+    // network at all. Returns [{ name, engaged: [{company,title,status}] }] or throws per node.
+    peers = null,
+  } = opts;
   const pid = () => profileId || db.ensureDefaultProfileId();
 
   const tools = [
@@ -124,7 +168,7 @@ function makeJatTools(opts = {}) {
       name: 'check_duplicate',
       description: 'BEFORE writing any documents, check whether this employer has already been applied to. Pass the posting url and company.',
       args: ['url', 'company', 'title'],
-      run: ({ url, company, title }) => {
+      run: async ({ url, company, title }) => {
         const { via, slug } = employerKey({ url, company });
         // A CHECK THAT COULD NOT RUN IS NOT A PASS. With neither a board slug nor a company name
         // there is nothing to compare, and the old wording ("fresh — checked by none") read as a
@@ -135,13 +179,28 @@ function makeJatTools(opts = {}) {
             + 'Open the posting first, then call this again with the employer name and the real posting url.';
         }
         const dup = duplicateOf({ url, company, title });
-        if (!dup) {
-          return `fresh — no engaged row for this employer (checked by ${via}${slug ? ` "${slug}"` : ''})`;
+        if (dup) return sayDuplicate(dup, 'this machine');
+
+        // ASK THE OTHER MACHINES.
+        //
+        // Found the first time a real run went out from the server laptop: the laptop and the PC
+        // keep separate ledgers and neither can see the other. Every one of the 56 applications
+        // made by hand from the PC was invisible to the laptop, so `check_duplicate` would have
+        // said "fresh" for employers Pierre had already applied to, and in one case interviewed
+        // with. A duplicate application cannot be taken back.
+        const remote = peers ? await sweepPeers(peers, { url, company, title }) : { hits: [], unreachable: [] };
+        if (remote.hits.length) return sayDuplicate(remote.hits[0], remote.hits[0].node);
+
+        // A PEER THAT DID NOT ANSWER IS NOT A CLEAN BILL OF HEALTH. Same rule as the no-key case
+        // above: a check that could not run must never read as a green light.
+        if (remote.unreachable.length) {
+          return `NOT FULLY CHECKED — nothing found here (by ${via}${slug ? ` "${slug}"` : ''}), but `
+            + `${remote.unreachable.map((u) => `${u.name} (${u.why})`).join(', ')} could not be reached. `
+            + 'Applications made on that machine would not show up. Ask the human before applying, '
+            + 'or pick an employer you can check.';
         }
-        return `DUPLICATE — already engaged: ${dup.company} / ${dup.title} [${dup.status}]`
-          + `, matched on ${dup.matchedOn}${dup.slug ? ` "${dup.slug}"` : ''}`
-          + `${dup.sameRole ? ' (the same role)' : ` (${dup.count} row(s) for this employer)`}`
-          + '. Do not apply again. Pick a different employer.';
+        return `fresh — no engaged row for this employer on any machine `
+          + `(checked by ${via}${slug ? ` "${slug}"` : ''})`;
       },
     },
     {
@@ -287,4 +346,4 @@ function makeJatTools(opts = {}) {
   return { tools, duplicateOf, employerKey };
 }
 
-module.exports = { makeJatTools, employerKey, duplicateOf, engagedIndex, ENGAGED };
+module.exports = { makeJatTools, employerKey, duplicateOf, engagedIndex, sweepPeers, ENGAGED };

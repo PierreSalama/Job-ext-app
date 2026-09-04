@@ -25,6 +25,7 @@ const prompts = require('./ai/prompts');
 const codexProvider = require('./ai/codex');
 const remoteAi = require('./ai/remote');
 const applyRunner = require('./ai/apply-runner');
+const jatTools = require('./ai/tools/jat');
 const answerAudit = require('./answer-audit');
 const profileBrowsers = require('./ai/profile-browsers');
 const { extractText } = require('./ai/extract');
@@ -2392,6 +2393,27 @@ async function handle(req, res, parsed) {
     const body = await readJson(req).catch(() => ({}));
     return sendJson(res, 200, { ok: true, ...applyRunner.stop(body.profileId || '') });
   }
+  // "Have you already applied to this employer?" asked by ANOTHER machine.
+  //
+  // Each node keeps its own ledger. Before this existed the laptop could not see the 56
+  // applications made by hand from the PC, so its duplicate check would have said "fresh" for an
+  // employer Pierre had already interviewed with. Read-only, and it answers with rows rather than a
+  // yes/no so the asking node can say WHAT it found.
+  if (req.method === 'GET' && pathname === '/ai-apply/engaged') {
+    const company = parsed.searchParams.get('company') || '';
+    const url = parsed.searchParams.get('url') || '';
+    const title = parsed.searchParams.get('title') || '';
+    const dup = jatTools.duplicateOf({ url, company, title });
+    return sendJson(res, 200, {
+      ok: true,
+      node: db.getSettings().app?.nodeName || require('os').hostname(),
+      items: dup ? [{
+        company: dup.company, title: dup.title, status: dup.status,
+        matchedOn: dup.matchedOn, slug: dup.slug, sameRole: dup.sameRole, count: dup.count,
+      }] : [],
+    });
+  }
+
   if (req.method === 'GET' && pathname === '/ai-apply/runs') {
     const profileId = parsed.searchParams.get('profileId') || '';
     return sendJson(res, 200, {
