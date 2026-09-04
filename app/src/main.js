@@ -9,6 +9,7 @@ const {
   ipcMain, nativeImage, shell, powerMonitor, powerSaveBlocker, Notification,
 } = require('electron');
 const path = require('path');
+const os = require('os');
 const crypto = require('crypto');
 const { startServer, stopServer, getToken, broadcast, rescanAllFolders, startFolderWatchers, ingestDiscoveredJobs } = require('./server');
 const sessionSync = require('./session-sync');
@@ -272,6 +273,7 @@ function nativeNotify(title, body) {
 // CLI login. They get a native OS notification (so a full-screen game does not hide them) AND an
 // in-app toast, and each one is announced exactly once, ever.
 let alertWatcher = null;
+let providerHealth = null;
 function startAlertWatcher() {
   if (alertWatcher) return alertWatcher;
   const { makeAlertWatcher, peerFetcher } = require('./ai/alerts');
@@ -302,6 +304,23 @@ function startAlertWatcher() {
   });
   alertWatcher.start();
   return alertWatcher;
+}
+
+// Nothing was watching whether this machine could still think. AI Apply reached the server laptop
+// and could not take a step: both CLIs installed, neither signed in, the Codex token five weeks
+// expired, and no sign of any of it anywhere. The alert already existed. This gives it a source.
+function startProviderHealth() {
+  if (providerHealth) return providerHealth;
+  const { makeProviderHealth } = require('./ai/provider-health');
+  const provider = require('./ai/provider');
+  providerHealth = makeProviderHealth({
+    db,
+    statusAll: (force) => provider.statusAll(force),
+    machine: os.hostname(),
+    onBlock: (block) => { try { broadcast('ai.block', { block }); } catch {} },
+  });
+  providerHealth.start();
+  return providerHealth;
 }
 
 function notifyEvent(type, payload) {
@@ -1009,6 +1028,7 @@ app.whenReady().then(async () => {
       // sitting at his desk unless something tells him. This polls this machine and every peer node
       // and raises a real OS notification, which survives a full-screen game.
       try { startAlertWatcher(); } catch (e) { log.warn('alert watcher boot skipped', e.message); }
+      try { startProviderHealth(); } catch (e) { log.warn('provider health boot skipped', e.message); }
     } catch (e) {
       if (e.code === 'EADDRINUSE' && attempt < 6) {
         log.warn(`port ${port} busy — retry ${attempt}/5 in 1.5s (a stale JAT socket may still be releasing)`);

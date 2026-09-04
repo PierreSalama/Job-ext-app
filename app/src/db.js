@@ -5091,8 +5091,11 @@ function aiRunFinish(runId, { status = 'done', stopReason = null, error = null, 
 // (CAPTCHA, account wall, password, a lapsed login), 'queue' waits on the person's own page.
 const BLOCK_ALERT_KINDS = new Set(['captcha', 'account', 'password', 'auth_lapsed', 'payment']);
 
+// `urgency` may be forced by the caller for the one case the kind cannot express: a sign-in that
+// has lapsed on a provider ANOTHER provider is covering for. It is worth telling Pierre about, and
+// it is not worth waking him for, and only the caller knows which of the two it is.
 function aiBlockCreate({ runId = null, profileId, jobId = null, kind, question, detail = null,
-  company = null, title = null, url = null } = {}) {
+  company = null, title = null, url = null, urgency = null } = {}) {
   const k = String(kind || 'needs_answer');
   const q = String(question || '').trim();
   if (!q) throw new Error('a block must say what it needs');
@@ -5102,7 +5105,9 @@ function aiBlockCreate({ runId = null, profileId, jobId = null, kind, question, 
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`,
       [id, runId, resolveProfileId(profileId), jobId, k, q.slice(0, 2000),
        detail ? String(detail).slice(0, 4000) : null,
-       company, title, url, BLOCK_ALERT_KINDS.has(k) ? 'alert' : 'queue', now()]);
+       company, title, url,
+       urgency === 'alert' || urgency === 'queue' ? urgency : (BLOCK_ALERT_KINDS.has(k) ? 'alert' : 'queue'),
+       now()]);
   return get('SELECT * FROM ai_blocks WHERE id = ?', [id]);
 }
 
