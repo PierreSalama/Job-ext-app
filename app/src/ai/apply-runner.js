@@ -248,6 +248,21 @@ async function start({
   let resolveId;
   const idReady = new Promise((res) => { resolveId = res; });
 
+  // WHAT A REAL APPLICATION COSTS.
+  //
+  // The 400,000-character default was set when every observation was clipped to 1,200. Reference
+  // material changed that: his résumé and profile are pinned in view, together about 7,300
+  // characters in every prompt, which is the price of the agent actually knowing his work history.
+  // Measured on the real Ritual form: the run reached step 30 with the résumé written, attached,
+  // and name, email, phone, LinkedIn and website filled, then stopped at 401,235 characters with
+  // three fields left. It ran out of budget, not out of ability.
+  //
+  // A finished application is worth the extra. The sandbox self-test is not, and keeps the default.
+  const APPLY_CHARS = 750000;
+  const limitsForRun = ['browser', 'apply'].includes(toolset)
+    ? { maxChars: APPLY_CHARS, ...limits }
+    : limits;
+
   rec.promise = runAgent({
     goal: rec.goal,
     // Sandbox runs are a self-test with no employer and no documents, so the application rules
@@ -256,7 +271,7 @@ async function start({
     tools: toolList,
     profileId: profileId || null,
     autonomy: rec.autonomy,
-    limits,
+    limits: limitsForRun,
     signal,
     deps,
     onStep: (step, runId) => {

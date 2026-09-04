@@ -230,6 +230,10 @@ function makeJatTools(opts = {}) {
     },
     {
       name: 'my_profile',
+      // Reference, like my_resume. Measured at 2,584 characters against a 1,200 observation clip,
+      // so the tail of his stored answers was being cut off in silence. I had said this one was
+      // "about 400 characters so it is fine" without measuring it.
+      reference: true,
       description: 'Read the facts about the candidate: name, contact, work authorization and other stored profile fields.',
       args: [],
       run: () => {

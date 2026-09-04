@@ -392,3 +392,22 @@ test('the structural check runs AFTER the voice check, so one refusal names one 
   const src = fs.readFileSync(path.join(root, 'app/src/ai/tools/documents.js'), 'utf8');
   assert.ok(src.indexOf('breaks the house rules') < src.indexOf('no ${missing.join'), 'voice first, then structure');
 });
+
+test('the tools that carry material to work FROM are marked as reference', () => {
+  // Both are well over the 1,200-character observation clip: the résumé is 4,749 and the profile is
+  // 2,584. Anything not marked here is silently truncated before the model ever reads it, which is
+  // how a résumé with no Experience section got written.
+  const { makeJatTools: mk } = require(path.join(root, 'app/src/ai/tools/jat.js'));
+  const byName = Object.fromEntries(mk({}).tools.map((t) => [t.name, t]));
+  assert.equal(byName.my_resume.reference, true);
+  assert.equal(byName.my_profile.reference, true);
+  // A search result is an observation and must still fold, or compaction stops working.
+  assert.ok(!byName.search_ledger.reference, 'search_ledger is an observation, not reference material');
+  assert.ok(!byName.check_duplicate.reference);
+});
+
+// I first wrote a test here asserting every reference tool returns more than 1,200 characters.
+// It failed: in a fixture database the profile is 102 characters. The size of real data is not a
+// property of the code and cannot be asserted from a test database. What CAN be asserted is that
+// the loop honours the mark, which tests/agent-loop.test.mjs does, and that the mark is on the two
+// tools that carry material to work from, which the test above does.

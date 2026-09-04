@@ -653,3 +653,53 @@ test('every phrasing of parking is covered', () => {
 test('an honest summary of a refused park is not disputed', () => {
   assert.equal(loop.disputeSummary('Submit refused because eight fields were still empty. I escalated the school field.', refusedToPark), null);
 });
+
+// ---------------------------------------------------------------------------
+// Reference material: whole, in view, and exactly once
+//
+// His résumé is 4,749 characters against a 1,200 observation clip, so every my_resume call handed
+// back a document that stopped mid skills list, and once the call aged out of the verbatim window
+// it folded to "my_resume -> ok" and the content vanished. That is why a real run wrote a résumé
+// with no Experience section and then called my_resume five more times looking for one.
+//
+// But keeping all five copies verbatim would re-send 23,000 characters in every prompt from then
+// on, and the run would hit its character budget instead of finishing an application.
+// ---------------------------------------------------------------------------
+const REF_DOC = 'X'.repeat(4700) + 'END-OF-RESUME';
+const refSteps = (calls, thenN) => {
+  const out = [];
+  for (let i = 0; i < calls; i++) out.push({ seq: i * 2, tool: 'my_resume', thought: 'read', args: {}, ok: true, result: REF_DOC, reference: true });
+  for (let i = 0; i < thenN; i++) out.push({ seq: 100 + i, tool: 'fill', thought: 'f', args: {}, ok: true, result: 'filled' });
+  return out;
+};
+
+test('a reference result is kept whole, past the observation clip', () => {
+  const out = loop.renderTranscript(refSteps(1, 0), { verbatimSteps: 6, resultClip: 1200 });
+  assert.match(out, /END-OF-RESUME/, 'the end of the document must survive');
+});
+
+test('it stays in view however old it gets', () => {
+  const out = loop.renderTranscript(refSteps(1, 9), { verbatimSteps: 6, resultClip: 1200 });
+  assert.match(out, /END-OF-RESUME/);
+  assert.ok(out.indexOf('my_resume') > out.indexOf('RECENT:'), 'not folded into EARLIER');
+});
+
+test('only the NEWEST copy is rendered, however many times it was called', () => {
+  const out = loop.renderTranscript(refSteps(5, 9), { verbatimSteps: 6, resultClip: 1200 });
+  assert.equal((out.match(/END-OF-RESUME/g) || []).length, 1, 'five copies would blow the budget');
+  assert.equal((out.match(/my_resume -> ok/g) || []).length, 4, 'the older calls fold like anything else');
+});
+
+test('an ordinary observation still folds, or compaction stops working', () => {
+  const steps = [{ seq: 0, tool: 'page_text', thought: 't', args: {}, ok: true, result: REF_DOC }];
+  for (let i = 1; i < 9; i++) steps.push({ seq: i, tool: 'fill', thought: 'f', args: {}, ok: true, result: 'filled' });
+  assert.doesNotMatch(loop.renderTranscript(steps, { verbatimSteps: 6, resultClip: 1200 }), /END-OF-RESUME/);
+});
+
+test('a REFUSED reference call is not treated as reference material', () => {
+  // A refusal carries an error, not a document. Pinning it in view would waste the window forever.
+  const steps = [{ seq: 0, tool: 'my_resume', thought: 'read', args: {}, ok: false, refused: true, error: 'NO RESUME ON FILE', reference: true }];
+  for (let i = 1; i < 9; i++) steps.push({ seq: i, tool: 'fill', thought: 'f', args: {}, ok: true, result: 'filled' });
+  const out = loop.renderTranscript(steps, { verbatimSteps: 6, resultClip: 1200 });
+  assert.ok(out.indexOf('my_resume') < out.indexOf('RECENT:'), 'a refusal folds like any other step');
+});

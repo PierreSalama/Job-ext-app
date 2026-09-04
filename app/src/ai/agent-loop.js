@@ -97,8 +97,15 @@ function renderTranscript(steps, { verbatimSteps, resultClip }) {
   // Reference material stays whole and stays in view however old it gets. Folding his résumé to
   // the line "my_resume -> ok" is why the agent kept fetching it again: the content was gone.
   const isRef = (s) => s.reference && s.ok !== false && !s.refused;
-  const older = steps.slice(0, cut).filter((s) => !isRef(s));
-  const recent = steps.slice(0, cut).filter(isRef).concat(steps.slice(cut));
+  // ONE COPY, THE LATEST. Keeping every reference call verbatim would re-send his 4,749-character
+  // résumé once per call: five calls is 23,000 characters in every prompt from then on, and the
+  // run would hit its character budget instead of finishing an application. The newest call has
+  // the same content as the older ones, so the older ones are folded away like anything else.
+  const newestRef = new Map();
+  for (const s of steps) if (isRef(s)) newestRef.set(s.tool, s.seq);
+  const keepRef = (s) => isRef(s) && newestRef.get(s.tool) === s.seq;
+  const older = steps.slice(0, cut).filter((s) => !keepRef(s));
+  const recent = steps.slice(0, cut).filter(keepRef).concat(steps.slice(cut));
   const out = [];
   if (older.length) {
     out.push(`EARLIER (${older.length} steps, condensed):`);
@@ -114,7 +121,7 @@ function renderTranscript(steps, { verbatimSteps, resultClip }) {
     out.push(`     action:  ${s.tool} ${JSON.stringify(s.args || {}).slice(0, 300)}`);
     if (s.refused) out.push(`     REFUSED: ${clip(s.error, 300)}`);
     else if (s.ok === false) out.push(`     ERROR:   ${clip(s.error, 300)}`);
-    else out.push(`     result:  ${clip(s.result, isRef(s) ? Math.max(resultClip, 12000) : resultClip)}`);
+    else out.push(`     result:  ${clip(s.result, keepRef(s) ? Math.max(resultClip, 12000) : resultClip)}`);
   }
   return out.join('\n');
 }

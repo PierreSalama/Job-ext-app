@@ -85,3 +85,13 @@ test('a missing goal is a 400, not a 500', () => {
   const src = fs.readFileSync(path.join(root, 'app/src/server.js'), 'utf8');
   assert.match(src, /e\.code === 'NO_GOAL' \? 400/);
 });
+
+test('a real application gets a budget that fits reference material', () => {
+  // The 400,000-character default was set when every observation was clipped to 1,200. Pinning his
+  // résumé and profile costs about 7,300 characters per prompt, which is the price of the agent
+  // knowing his work history. The real Ritual run stopped at 401,235 with three fields left.
+  const src = fs.readFileSync(path.join(root, 'app/src/ai/apply-runner.js'), 'utf8');
+  assert.match(src, /const APPLY_CHARS = 750000/);
+  assert.match(src, /\['browser', 'apply'\]\.includes\(toolset\)/, 'the sandbox self-test keeps the default');
+  assert.match(src, /\{ maxChars: APPLY_CHARS, \.\.\.limits \}/, 'an explicit caller limit must still win');
+});

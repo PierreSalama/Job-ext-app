@@ -143,7 +143,9 @@ try {
     // reading the real résumé and occasionally rewriting an answer the voice check rejected:
     // the application would be fully prepared and parked, then the run would be recorded as
     // `stopped (max_steps)` because it had no step left to say so.
-    limits: { maxSteps: 40, maxChars: 400000 },
+    // Matches what apply-runner gives a real application. At 400,000 the real Ritual run stopped
+    // at step 30 with the résumé attached and three fields left: out of budget, not ability.
+    limits: { maxSteps: 40, maxChars: 750000 },
     deps: { generate: (a) => providerMod.run({ ...a, providerOverride: chosen }) },
     onStep: (s) => {
       const mark = s.refused ? 'REFUSED' : s.ok === false ? 'ERROR  ' : 'ok     ';
