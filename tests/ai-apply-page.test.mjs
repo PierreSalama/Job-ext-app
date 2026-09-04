@@ -289,3 +289,15 @@ test('the dashboard copies are still byte-identical after these edits', () => {
     assert.ok(a.equals(b), `${f} drifted — run \`npm run mirror\` in app/`);
   }
 });
+
+test('there is exactly ONE way to read a run with its transcript', () => {
+  // I claimed no endpoint exposed a run's steps, built one on `?id=`, and then found
+  // GET /ai-apply/runs/<runId> had been there the whole time returning the same shape. I had
+  // searched for the exact-match route and missed the startsWith one directly below it. Two ways to
+  // do the same thing is worse than one, so the duplicate is gone and this keeps it gone.
+  const src = fs.readFileSync(path.join(root, 'app/src/server.js'), 'utf8');
+  assert.match(src, /pathname\.startsWith\('\/ai-apply\/runs\/'\)/, 'the path form is the one');
+  const list = src.slice(src.indexOf("pathname === '/ai-apply/runs'"));
+  const body = list.slice(0, list.indexOf('\n  }'));
+  assert.equal(/searchParams\.get\('id'\)/.test(body), false, 'the list endpoint must not grow a second form');
+});

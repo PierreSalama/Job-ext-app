@@ -2432,17 +2432,7 @@ async function handle(req, res, parsed) {
   }
 
   if (req.method === 'GET' && pathname === '/ai-apply/runs') {
-    // ONE RUN, WITH ITS TRANSCRIPT.
-    //
-    // The list gives a status and a step count and nothing else, so watching a run on the server
-    // laptop from the desk meant staring at a number climbing and guessing. The steps were being
-    // written to ai_steps the whole time with no way to read them back.
-    const id = parsed.searchParams.get('id');
-    if (id) {
-      const run = db.aiRunGet(id);
-      if (!run) return sendJson(res, 404, { ok: false, error: 'no such run' });
-      return sendJson(res, 200, { ok: true, run, steps: db.aiRunSteps(id) });
-    }
+    // One run WITH its transcript is GET /ai-apply/runs/<runId>, further down. This is the list.
     const profileId = parsed.searchParams.get('profileId') || '';
     return sendJson(res, 200, {
       ok: true,

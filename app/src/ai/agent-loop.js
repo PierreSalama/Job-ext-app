@@ -231,6 +231,7 @@ async function runAgent(opts = {}) {
   let stopReason = null;
   let summary = '';
   let challengedOnce = false;   // a disputed `done` is challenged at most once per run
+  const warnedLoop = new Set(); // each repeated call is pointed out once, not every time
   let status = 'done';
   let lastError = null;
 
@@ -284,6 +285,33 @@ async function runAgent(opts = {}) {
       }
 
       const action = parsed.action;
+
+      // GOING IN CIRCLES.
+      //
+      // A real Ritual application called my_resume eight times and re-filled one field twice,
+      // because a Greenhouse suggestion box was swallowing the value. The combobox is fixed
+      // separately, but the loop itself should not need a specific cause to be noticed: repeating
+      // an identical call over and over is never progress, whatever provoked it.
+      //
+      // Said once, as an observation, and only for a REAL repeat: three identical calls in a run.
+      if (!action.done && action.tool && !warnedLoop.has(`${action.tool}|${JSON.stringify(action.args || {})}`)) {
+        const key = `${action.tool}|${JSON.stringify(action.args || {})}`;
+        const sameCalls = steps.filter((x) => `${x.tool}|${JSON.stringify(x.args || {})}` === key).length;
+        if (sameCalls >= 3) {
+          warnedLoop.add(key);
+          const step = {
+            seq: seq++, thought: action.thought, tool: '(repeating)', args: {}, ok: false, refused: false,
+            error: `You have already called ${action.tool} with these exact arguments ${sameCalls} times `
+              + 'and the answer has not changed. Whatever you are waiting for is not going to arrive by '
+              + 'asking again. Read the page to see the real state, take a different action, or if you '
+              + 'are genuinely stuck use ask_human and move on.',
+            result: null, ...meta,
+          };
+          steps.push(step); store.aiStepAppend(runId, step); if (onStep) onStep(step, runId);
+          continue;
+        }
+      }
+
       if (action.done) {
         summary = action.summary || '';
         // CHECK THE SUMMARY AGAINST THE RECORD.

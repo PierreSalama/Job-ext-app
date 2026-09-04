@@ -95,11 +95,36 @@ test('the tool belt drives a real form', { skip: chromePath ? false : 'no Chrome
     <option value="ref">Referral from a friend</option><option value="ev">Career fair</option>
   </select>
   <p id="saw">nothing</p>
+  <label for="degree">Degree</label>
+  <input id="degree" role="combobox" aria-autocomplete="list" aria-controls="degreelist" autocomplete="off" aria-label="Degree" />
+  <ul id="degreelist" role="listbox" style="display:none"></ul>
+  <p id="chosen">none</p>
   <button id="go" type="button" onclick="document.getElementById('out').textContent='CLICKED'">Continue</button>
   <p id="out">waiting</p>
   <script>window.__blur = 0; document.getElementById('phone').addEventListener('blur', () => window.__blur++);
   document.getElementById('src').addEventListener('change', function () {
     document.getElementById('saw').textContent = 'change:' + this.value;
+  });
+  // A Greenhouse-shaped suggestion box: typing shows a list, and the value only counts once an
+  // option is clicked. Typing alone commits nothing, which is the whole point.
+  const DEGREES = ["Bachelor's Degree", "Bachelor of Science", "Master's Degree", 'Doctorate'];
+  const inp = document.getElementById('degree');
+  const list = document.getElementById('degreelist');
+  inp.addEventListener('input', function () {
+    const q = this.value.toLowerCase();
+    list.innerHTML = '';
+    DEGREES.filter((d) => d.toLowerCase().includes(q)).forEach((d) => {
+      const li = document.createElement('li');
+      li.setAttribute('role', 'option');
+      li.textContent = d;
+      li.addEventListener('mousedown', () => {
+        inp.value = d;
+        document.getElementById('chosen').textContent = 'chosen:' + d;
+        list.style.display = 'none';
+      });
+      list.appendChild(li);
+    });
+    list.style.display = list.children.length ? 'block' : 'none';
   });</script>
 </body></html>`, 'utf8');
 
@@ -221,6 +246,33 @@ test('the tool belt drives a real form', { skip: chromePath ? false : 'no Chrome
       await t.test('choosing nothing is refused', async () => {
         const ref = (await call('query_ref', { selector: '#src' })).result.match(/ref_\w+/)[0];
         assert.match((await call('choose_option', { ref, value: '  ' })).refused, /choose WHICH option/);
+      });
+
+      await t.test('choose_option drives a Greenhouse-style suggestion box', async () => {
+        // Typing into one of these commits NOTHING until an option is picked. On a real Ritual
+        // application the agent filled the field, read it back empty, and looped: eight calls to
+        // my_resume and the same field filled twice, until the run ran out of steps.
+        const ref = (await call('query_ref', { selector: '#degree' })).result.match(/ref_\w+/)[0];
+        const said = (await call('choose_option', { ref, value: 'Bachelor of Science' })).result;
+        assert.match(said, /chose "Bachelor of Science"/);
+        assert.match((await call('page_text', {})).result, /chosen:Bachelor of Science/,
+          'the page must have received the click, not just the keystrokes');
+      });
+
+      await t.test('fill on a suggestion box says so instead of looping', async () => {
+        const ref = (await call('query_ref', { selector: '#degree' })).result.match(/ref_\w+/)[0];
+        const said = (await call('fill', { ref, text: "Master's Degree" })).result;
+        assert.match(said, /suggestion box/);
+        assert.match(said, /commits nothing/);
+        assert.match(said, /choose_option/);
+      });
+
+      await t.test('a second attempt does not concatenate onto the first', async () => {
+        // Without clearing, "Bachelor" typed twice becomes "BachelorBachelor" and matches nothing.
+        const ref = (await call('query_ref', { selector: '#degree' })).result.match(/ref_\w+/)[0];
+        await call('choose_option', { ref, value: 'Doctorate' });
+        const said = (await call('choose_option', { ref, value: 'Doctorate' })).result;
+        assert.match(said, /chose "Doctorate"/);
       });
 
       await t.test('fill also refuses a password field disguised as type=text', async () => {

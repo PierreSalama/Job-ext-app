@@ -426,6 +426,61 @@ async function attachPage(opts = {}) {
     }`, [String(wanted)]);
   }
 
+  // ---------------------------------------------------------------------------
+  // The combobox
+  //
+  // Greenhouse renders School, Degree, Discipline and "how did you hear about us" as an <input>
+  // with an autocomplete listbox, not a <select>. Typing into one puts text on screen and commits
+  // NOTHING: the form only takes a value when an option from the popup is chosen. So `fill`
+  // succeeds, the field reads back empty, and the agent tries again.
+  //
+  // Live on a real Ritual application: eight calls to my_resume, the same field filled twice, and
+  // the run burned its whole step budget on a field it could not set.
+  // ---------------------------------------------------------------------------
+  async function isComboRef(ref) {
+    try {
+      return await onNode(ref, `function () {
+        if (this.tagName !== 'INPUT') return false;
+        const r = this.getAttribute('role');
+        return r === 'combobox' || this.hasAttribute('aria-autocomplete') || this.hasAttribute('aria-controls')
+          || this.getAttribute('autocomplete') === 'off' && !!this.getAttribute('aria-expanded');
+      }`) === true;
+    } catch { return false; }
+  }
+
+  // Type, let the listbox appear, then CHOOSE. Returns what it chose, or the options it saw.
+  async function pickSuggestion(ref, text, { waitMs = 700 } = {}) {
+    await scrollIntoView(ref);
+    await focus(ref);
+    // Clear whatever a previous attempt typed, or the query becomes "BachelorBachelor".
+    await onNode(ref, `function () {
+      this.value = '';
+      this.dispatchEvent(new Event('input', { bubbles: true }));
+    }`);
+    await cdp.send('Input.insertText', { text: String(text) });
+    await onNode(ref, `function () { this.dispatchEvent(new Event('input', { bubbles: true })); }`);
+    await new Promise((r) => setTimeout(r, waitMs));
+
+    return onNode(ref, `function (want) {
+      const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const w = norm(want);
+      const listId = this.getAttribute('aria-controls') || this.getAttribute('aria-owns');
+      const scope = (listId && document.getElementById(listId)) || document;
+      const seen = [...scope.querySelectorAll('[role="option"], li[id], [class*="option"]')]
+        .filter((o) => { const r = o.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+      if (!seen.length) return { ok: false, noList: true };
+      const pick = seen.find((o) => norm(o.textContent) === w)
+        || seen.find((o) => norm(o.textContent).includes(w) && w.length > 1)
+        || seen[0];
+      const label = String(pick.textContent || '').trim();
+      // A real click, because these widgets listen for mousedown and not for a synthetic change.
+      for (const type of ['mousedown', 'mouseup', 'click']) {
+        pick.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+      }
+      return { ok: true, chose: label, options: seen.slice(0, 12).map((o) => String(o.textContent || '').trim()) };
+    }`, [String(text)]);
+  }
+
   async function isPasswordRef(ref) {
     const d = await describeRef(ref);
     if (d.type === 'password') return true;
@@ -526,7 +581,7 @@ async function attachPage(opts = {}) {
     navigate, readTree, find, queryRef, queryRefAll, describeRef, isPasswordRef, labelContext,
     click, focus, fill, pressKey, setFiles,
     screenshot, evaluate, text, boxCenter, scrollIntoView, readyState,
-    isSelectRef, listOptions, selectOption,
+    isSelectRef, listOptions, selectOption, isComboRef, pickSuggestion,
     refCount: () => refs.size,
     close() { cdp.close(); },
   };

@@ -233,6 +233,12 @@ function makeBrowserTools(opts = {}) {
           return `that is a dropdown, not a text field. Use choose_option with one of: `
             + `${(opts || []).slice(0, 25).join(' | ')}`;
         }
+        // A type-ahead box takes the text and commits nothing. Filling it looks like it worked,
+        // the field reads back empty, and the run loops. Send it to choose_option instead.
+        if (await p.isComboRef(ref)) {
+          return 'that is a suggestion box, not a plain text field. Typing into it commits nothing '
+            + 'until a suggestion is chosen. Use choose_option with the value you want.';
+        }
         if (await p.isPasswordRef(String(ref))) {
           throw new Error('refused: that is a password field — the agent never types credentials');
         }
@@ -242,14 +248,28 @@ function makeBrowserTools(opts = {}) {
     },
     {
       name: 'choose_option',
-      description: 'Pick a value in a dropdown. Matches the option text or value, exactly first and '
-        + 'then loosely. If nothing matches it tells you every option there is, so ask for one of those.',
+      description: 'Pick a value in a dropdown OR in a type-ahead suggestion box. Greenhouse renders '
+        + 'School, Degree and Discipline as suggestion boxes, and typing into one of those with fill '
+        + 'commits nothing. Matches the option text exactly first and then loosely, and tells you the '
+        + 'options when nothing matches.',
       args: ['ref', 'value'],
       guard: ({ value }) => (String(value || '').trim() ? null : 'refused: choose WHICH option'),
       run: async ({ ref, value }) => {
         const p = await ensure();
         const r = await p.selectOption(ref, value);
-        if (r && r.notASelect) return 'that is not a dropdown. Use fill for a text field.';
+        if (r && r.notASelect) {
+          // Not a <select>. Greenhouse renders School, Degree and Discipline as an input with an
+          // autocomplete listbox, and typing into one commits nothing until an option is chosen.
+          // Saying "use fill" here is what sent a real run into a loop: fill, read back empty,
+          // fill again.
+          if (await p.isComboRef(ref)) {
+            const c = await p.pickSuggestion(ref, value);
+            if (c && c.ok) return `typed "${value}" and chose "${c.chose}" from the suggestions`;
+            if (c && c.noList) return `typed "${value}" but no suggestion list appeared. Read the page and look again.`;
+            return `no suggestion matched "${value}". Offered: ${(c && c.options || []).join(' | ')}`;
+          }
+          return 'that is not a dropdown and not a suggestion box. Use fill for a plain text field.';
+        }
         if (!r || !r.ok) {
           return `no option matches "${value}". The choices are: ${(r && r.options || []).join(' | ')}`;
         }

@@ -565,3 +565,60 @@ test('the denial pattern has no control character in it', async () => {
   assert.ok(line, 'the pattern must exist');
   assert.equal(line.includes(String.fromCharCode(8)), false);
 });
+
+// ---------------------------------------------------------------------------
+// Going in circles
+//
+// A real Ritual application called my_resume eight times and re-filled one field twice, because a
+// Greenhouse suggestion box was swallowing the value. That specific cause is fixed elsewhere, but
+// the loop should not need a known cause to be noticed: repeating an identical call over and over
+// is never progress, whatever provoked it.
+// ---------------------------------------------------------------------------
+test('an identical call repeated three times is pointed out, once', async () => {
+  const db2 = memStore();
+  let n = 0;
+  const gen = async () => ({
+    text: JSON.stringify(n++ < 6
+      ? { thought: 'again', tool: 'echo', args: { text: 'x' } }
+      : { thought: 'ok', done: true, summary: 'finished' }),
+  });
+  const r = await loop.runAgent({
+    goal: 'g',
+    tools: [{ name: 'echo', description: 'echo', args: ['text'], run: ({ text }) => text }],
+    limits: { maxSteps: 14 },
+    deps: { db: db2, generate: gen },
+  });
+  assert.equal(r.status, 'done');
+  const notices = db2.steps.filter((s) => s.tool === '(repeating)');
+  assert.equal(notices.length, 1, 'said once, not on every repeat, or it becomes the loop');
+  assert.match(notices[0].error, /already called echo/);
+  assert.match(notices[0].error, /Read the page/);
+  assert.match(notices[0].error, /ask_human/, 'and it must offer the honest way out');
+});
+
+test('different arguments are not a repeat', async () => {
+  // Reading three different pages is work. Only an identical call is going nowhere.
+  const db2 = memStore();
+  let n = 0;
+  const gen = async () => ({
+    text: JSON.stringify(n < 5
+      ? { thought: 'next', tool: 'echo', args: { text: `page-${n++}` } }
+      : { thought: 'ok', done: true, summary: 'finished' }),
+  });
+  await loop.runAgent({
+    goal: 'g',
+    tools: [{ name: 'echo', description: 'echo', args: ['text'], run: ({ text }) => text }],
+    limits: { maxSteps: 12 },
+    deps: { db: db2, generate: gen },
+  });
+  assert.equal(db2.steps.filter((s) => s.tool === '(repeating)').length, 0);
+});
+
+test('a repeat notice is not counted as a tool failure', async () => {
+  // `(repeating)` starts with a bracket for the same reason `(unparsed)` does: it is the loop
+  // talking to itself, and counting it as a tool error would corrupt the dispute check.
+  const src = await import('node:fs').then((fs) => fs.readFileSync(
+    new URL('../app/src/ai/agent-loop.js', import.meta.url), 'utf8'));
+  assert.match(src, /tool: '\(repeating\)'/);
+  assert.match(src, /!String\(x\.tool\)\.startsWith\('\('\)/, 'the dispute filter must exclude it');
+});
