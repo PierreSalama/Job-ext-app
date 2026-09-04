@@ -77,3 +77,46 @@ test('the block is cleared so a recovered subscription is usable again', () => {
   codex.clearQuota();
   assert.equal(codex.quotaStatus(), null);
 });
+
+// ---------------------------------------------------------------------------
+// A stale access token is not a logged-out account
+//
+// The server laptop reported Codex as signed out for five weeks. Its access token had lapsed on
+// 2026-08-01 for the plainest reason possible: nothing had called Codex since July. The probe read
+// that timestamp, declared the account signed out, so the provider was never selected, so Codex was
+// never called, so the token never refreshed. The check was causing the outage it reported.
+// ---------------------------------------------------------------------------
+import os2 from 'node:os';
+import fs2 from 'node:fs';
+import path2 from 'node:path';
+
+const codexMod = codex;
+
+function authFile({ exp, refresh }) {
+  const claims = Buffer.from(JSON.stringify({ exp: Math.floor(exp / 1000) })).toString('base64url');
+  const tokens = { access_token: `x.${claims}.y` };
+  if (refresh) tokens.refresh_token = 'r';
+  const f = path2.join(fs2.mkdtempSync(path2.join(os2.tmpdir(), 'codexauth-')), 'auth.json');
+  fs2.writeFileSync(f, JSON.stringify({ auth_mode: 'chatgpt', tokens }));
+  return f;
+}
+
+test('an expired token WITH a refresh token is usable, not signed out', () => {
+  const r = codexMod.tokenExpiry(authFile({ exp: Date.parse('2026-08-01'), refresh: true }));
+  assert.equal(r.ok, true, 'the CLI refreshes this on the next call');
+  assert.equal(r.stale, true);
+  assert.match(r.note, /refresh it on the next call/);
+});
+
+test('an expired token with NO refresh token really does need a login', () => {
+  const r = codexMod.tokenExpiry(authFile({ exp: Date.parse('2026-08-01'), refresh: false }));
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /no refresh token/);
+  assert.match(r.reason, /codex login/);
+});
+
+test('a live token is simply fine', () => {
+  const r = codexMod.tokenExpiry(authFile({ exp: Date.now() + 864e5, refresh: true }));
+  assert.equal(r.ok, true);
+  assert.equal(r.stale, undefined);
+});

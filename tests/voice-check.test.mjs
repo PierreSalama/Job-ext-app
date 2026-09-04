@@ -38,7 +38,11 @@ test('every banned construction is caught, with a fix', () => {
     ['I wanted to reach out about the role', 'reach-out'],
     ['I am passionate about backend work', 'passionate'],
     ['We leverage Postgres heavily', 'leverage'],
-    ['I am excited about the opportunity to join', 'excited-opportunity'],
+    ['I am excited about the opportunity to join', 'excited'],
+    // Widened after a real generated cover letter opened with "I'm excited to apply" and passed:
+    // the rule matched the exact phrase Pierre happened to quote and missed the habit behind it.
+    ["I'm excited to apply for the role", 'excited'],
+    ['This is an exciting team to join', 'excited'],
   ];
   for (const [text, rule] of cases) {
     const r = vc.voiceCheck(text, { html: false });

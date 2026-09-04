@@ -28,14 +28,14 @@ process.on('exit', () => {
 
 // A peer that has applied to Zip, exactly as the PC had when the laptop had not.
 const PC = {
-  nodes: async () => [{ name: 'the PC', baseUrl: 'http://pc', token: 't' }],
+  nodes: async () => [{ name: 'the PC', baseUrl: 'http://pc', token: 't', sameApplicant: true }],
   engaged: async (_n, { company }) => (/zip/i.test(company || '')
     ? [{ company: 'Zip', title: 'Software Engineer, Backend', status: 'submitted', matchedOn: 'slug', slug: 'zip' }]
     : []),
 };
 const NOBODY = { nodes: async () => [], engaged: async () => [] };
 const OFFLINE = {
-  nodes: async () => [{ name: 'the PC', baseUrl: 'http://pc', token: 't' }],
+  nodes: async () => [{ name: 'the PC', baseUrl: 'http://pc', token: 't', sameApplicant: true }],
   engaged: async () => { throw new Error('ECONNREFUSED'); },
 };
 
@@ -87,7 +87,7 @@ test('this machine wins early: a local hit never waits on the network', async ()
 
 test('the same role on another machine is reported ahead of a different one', async () => {
   const many = {
-    nodes: async () => [{ name: 'the PC' }],
+    nodes: async () => [{ name: 'the PC', sameApplicant: true }],
     engaged: async () => [
       { company: 'Zip', title: 'Data Scientist', status: 'ghosted' },
       { company: 'Zip', title: 'Software Engineer, Backend', status: 'submitted' },
@@ -100,7 +100,7 @@ test('the same role on another machine is reported ahead of a different one', as
 
 test('one peer failing does not hide a duplicate found on another', async () => {
   const mixed = {
-    nodes: async () => [{ name: 'the dead one' }, { name: 'the PC' }],
+    nodes: async () => [{ name: 'the dead one', sameApplicant: true }, { name: 'the PC', sameApplicant: true }],
     engaged: async (n) => {
       if (n.name === 'the dead one') throw new Error('timeout');
       return [{ company: 'Zip', title: 'Software Engineer, Backend', status: 'submitted' }];
@@ -134,4 +134,43 @@ test('a peer on an older build is asked a question it CAN answer', async () => {
   assert.match(runner, /e\.status !== 404/, 'only a missing route may fall back');
   assert.match(runner, /\/jobs\?q=/, 'the fallback uses the search every build has');
   assert.match(runner, /hand-applied/, 'and it must honour the hand-applied tag too');
+});
+
+// ---------------------------------------------------------------------------
+// Not every node is the same person
+//
+// The laptop's node list holds itself and DAD'S machine. Asking Dad's node whether Pierre has
+// applied somewhere is a different question wearing the same shape, and both ways of getting it
+// wrong do harm: a false duplicate quietly stops Pierre applying to a job Dad went for, and a false
+// all-clear is the double application the whole mechanism exists to prevent.
+// ---------------------------------------------------------------------------
+const answersYes = async () => [{ company: 'Zip', title: 'Backend', status: 'submitted' }];
+
+test("another applicant's ledger is never consulted", async () => {
+  const dad = { nodes: async () => [{ name: 'Dad', baseUrl: 'http://dad' }], engaged: answersYes };
+  const said = await ask(dad, ZIP);
+  assert.match(said, /^fresh/, "Dad having applied to Zip says nothing about Pierre");
+  assert.doesNotMatch(said, /NOT FULLY CHECKED/, 'and it is not a gap in coverage either');
+});
+
+test('a node marked as the same applicant IS consulted', async () => {
+  const mine = { nodes: async () => [{ name: 'the PC', baseUrl: 'http://pc', sameApplicant: true }], engaged: answersYes };
+  assert.match(await ask(mine, ZIP), /DUPLICATE/);
+});
+
+test('this machine does not interrogate itself', async () => {
+  let called = 0;
+  const loop = {
+    nodes: async () => [{ name: 'Laptop (server)', baseUrl: 'http://me', sameApplicant: true, self: true }],
+    engaged: async () => { called++; return []; },
+  };
+  await ask(loop, { url: 'https://jobs.lever.co/x/1', company: 'Nowhere', title: 'Dev' });
+  assert.equal(called, 0, 'the local check already answered this');
+});
+
+test('the runner marks a node that points back at this machine', () => {
+  const src = fs.readFileSync(path.join(root, 'app/src/ai/apply-runner.js'), 'utf8');
+  assert.match(src, /function isSelfUrl/);
+  assert.match(src, /networkInterfaces/, 'nodes are configured by Tailscale address, not localhost');
+  assert.match(src, /self: me\.has/);
 });

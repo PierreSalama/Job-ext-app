@@ -132,6 +132,19 @@ async function sweepPeers(peers, { url, company, title }) {
   let list = [];
   try { list = (await peers.nodes()) || []; }
   catch (e) { return { hits, unreachable: [{ name: 'the other machines', why: e.message }] }; }
+
+  // WHOSE LEDGER IS THAT?
+  //
+  // The node list is every machine this one can talk to, and they are not all the same person. The
+  // laptop's list holds itself and DAD'S node. Asking Dad's machine whether PIERRE has applied
+  // somewhere is not a duplicate check, it is a different question with the same shape, and both
+  // ways of getting it wrong hurt: a false duplicate quietly stops him applying to a job Dad went
+  // for, and a false all-clear is the double application this whole mechanism exists to prevent.
+  //
+  // So a node counts only when it is explicitly marked as the same applicant. Anything else is
+  // left alone rather than guessed at, and `self` is dropped because asking this machine what this
+  // machine already answered is pure latency.
+  list = list.filter((n) => n && n.sameApplicant === true && !n.self);
   await Promise.all(list.map(async (node) => {
     try {
       const rows = await peers.engaged(node, { url, company, title });
@@ -267,6 +280,41 @@ function makeJatTools(opts = {}) {
         if (usable.length) parts.push(`ALSO KNOWN:\n${usable.join('\n').slice(0, 1800)}`);
         const note = dropped ? `\n(${dropped} stored field(s) were ignored because they are not real answers)` : '';
         return parts.join('\n\n') + note;
+      },
+    },
+    {
+      name: 'my_resume',
+      // THE SOURCE MATERIAL, WHICH WAS SITTING RIGHT THERE.
+      //
+      // Read what the agent actually produced on run 11 and the problem was obvious: a three line
+      // resume saying "build and maintain full-stack web applications", because `my_profile` hands
+      // over an identity and some learned screening answers and nothing else. His real resume, all
+      // 4,717 characters of it with the ERP integration, the Tauri rebuild, the 479-case suite, was
+      // already in the documents table being used by fit-score and nothing else.
+      //
+      // Tailoring needs something to tailor FROM. Without this the agent was not writing a weak
+      // resume, it was writing the only resume the facts available to it could support.
+      description: 'Read the candidate REAL resume on file. Do this BEFORE write_resume, every '
+        + 'time. It is the only source of his work history, projects and achievements. Everything '
+        + 'you put on a tailored resume must come from here or from my_profile. Choose what to '
+        + 'lead with and how to word it for this posting. Invent nothing.',
+      args: [],
+      run: () => {
+        let doc = null;
+        try { doc = db.defaultDocument('resume'); } catch { /* reported below */ }
+        if (!doc) {
+          return 'NO RESUME ON FILE. Do not write one from the profile alone, it will be three lines '
+            + 'of nothing. Use ask_human to say a resume needs uploading in Documents.';
+        }
+        let full = null;
+        try { full = db.getDocument(doc.id, { withText: true }); } catch { /* reported below */ }
+        const text = (full && full.textContent) || '';
+        if (!text.trim()) {
+          return `The resume on file (${doc.name}) has no extracted text, so there is nothing to `
+            + 'work from. Use ask_human rather than writing from the profile alone.';
+        }
+        return `--- ${doc.name} ---
+${text}`;
       },
     },
     {

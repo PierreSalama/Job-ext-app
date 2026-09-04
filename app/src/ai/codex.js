@@ -120,9 +120,28 @@ function tokenExpiry(file) {
   const exp = Number(claims && claims.exp);
   if (!Number.isFinite(exp) || exp <= 0) return null;
   if (exp * 1000 > Date.now()) return { ok: true, expiresAt: exp * 1000 };
+
+  // AN EXPIRED ACCESS TOKEN IS NOT A LOGGED-OUT ACCOUNT.
+  //
+  // Codex access tokens last about ten days and the CLI refreshes them from the refresh_token the
+  // next time it runs. Treating a stale one as "signed out" created the outage it was reporting:
+  // the server laptop had a token that lapsed on 2026-08-01 simply because nothing had invoked
+  // Codex since July, so the probe marked it unavailable, so nothing ever invoked it, so it never
+  // refreshed. Five weeks of a working account reported as dead.
+  //
+  // With a refresh_token present the honest answer is "stale, and it will sort itself out on the
+  // next call". If that refresh actually fails, the call fails and `honest()` records it from the
+  // real attempt, which is a far better source of truth than a guess made from a timestamp.
+  const refreshable = !!(j && j.tokens && j.tokens.refresh_token);
+  if (refreshable) {
+    return {
+      ok: true, stale: true, expiresAt: exp * 1000,
+      note: `the access token lapsed on ${new Date(exp * 1000).toISOString().slice(0, 10)} and the CLI will refresh it on the next call`,
+    };
+  }
   return {
     ok: false, expiresAt: exp * 1000,
-    reason: `the Codex CLI token expired on ${new Date(exp * 1000).toISOString().slice(0, 10)} and has not refreshed — run \`codex login\` on that machine`,
+    reason: `the Codex CLI token expired on ${new Date(exp * 1000).toISOString().slice(0, 10)} and there is no refresh token — run \`codex login\` on that machine`,
   };
 }
 
@@ -155,7 +174,11 @@ async function status() {
       }
       const exp = tokenExpiry();
       if (exp && !exp.ok) return resolve({ available: false, cli, reason: exp.reason, needsLogin: true, expiredAt: exp.expiresAt });
-      resolve({ available: true, cli, reason: null, needsLogin: false, ...(exp && exp.expiresAt ? { expiresAt: exp.expiresAt } : {}) });
+      resolve({
+        available: true, cli, reason: null, needsLogin: false,
+        ...(exp && exp.stale ? { staleToken: true, note: exp.note } : {}),
+        ...(exp && exp.expiresAt ? { expiresAt: exp.expiresAt } : {}),
+      });
     });
     child.on('error', (e) => { clearTimeout(timer); resolve({ available: false, reason: e.message }); });
   });

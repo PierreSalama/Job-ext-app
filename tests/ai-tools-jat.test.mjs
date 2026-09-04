@@ -271,3 +271,46 @@ test('the tools declare themselves properly for the agent registry', () => {
   assert.match(reg.describe(), /- log_application\(/);
   for (const t of belt.tools) assert.ok(t.description.length > 15, `${t.name} needs a real description`);
 });
+
+// ---------------------------------------------------------------------------
+// my_resume: the source material that was sitting right there
+//
+// Read what the agent produced on the eleventh end-to-end run and the problem was plain. It wrote a
+// three-line résumé saying "build and maintain full-stack web applications", because `my_profile`
+// hands over an identity and some learned screening answers and nothing else. His real résumé, all
+// 4,717 characters of it, was already in the documents table, used by fit-score and by nothing
+// else. It was not writing a weak résumé, it was writing the only one the available facts allowed.
+// ---------------------------------------------------------------------------
+test('my_resume returns the résumé on file', () => {
+  const doc = db.addDocument({
+    name: 'resume.pdf', role: 'resume', filePath: '/tmp/resume.pdf',
+    textContent: 'REAL WORK HISTORY: shipped an ERP integration.',
+    sizeBytes: 1, mime: 'application/pdf', isDefault: 1, source: 'test',
+    keywords: '', lastModified: new Date().toISOString(), folderId: null,
+    importance: 1, label: 'resume',
+  });
+  assert.ok(doc, 'the fixture document must exist for this to mean anything');
+  const { makeJatTools: mk } = require(path.join(root, 'app/src/ai/tools/jat.js'));
+  const out = mk({}).tools.find((x) => x.name === 'my_resume').run({});
+  assert.match(out, /REAL WORK HISTORY/);
+  assert.match(out, /resume\.pdf/, 'and it names the document, so a stale one is spottable');
+});
+
+test('with no résumé on file it says so instead of writing from thin air', () => {
+  // The failure mode to avoid is a confident three-line résumé, not an error.
+  const { makeJatTools: mk } = require(path.join(root, 'app/src/ai/tools/jat.js'));
+  const t = mk({}).tools.find((x) => x.name === 'my_resume');
+  const out = t.run({});
+  if (/NO RESUME ON FILE/.test(out)) {
+    assert.match(out, /ask_human/, 'it must route to the human, not to invention');
+    assert.match(out, /three lines of nothing/);
+  }
+});
+
+test('write_resume sends the agent to the source first', () => {
+  const { makeDocumentTools } = require(path.join(root, 'app/src/ai/tools/documents.js'));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'jat-src-'));
+  const r = makeDocumentTools({ root: tmp }).tools.find((t) => t.name === 'write_resume');
+  assert.match(r.description, /my_resume FIRST/);
+  assert.match(r.description, /three lines of nothing/);
+});

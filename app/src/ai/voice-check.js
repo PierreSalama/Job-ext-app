@@ -65,7 +65,11 @@ const RULES = [
   { id: 'reach-out', label: '"wanted to reach out"', rx: /\bwanted to reach out\b/gi, fix: 'say what you want directly' },
   { id: 'passionate', label: '"passionate about"', rx: /\bpassionate about\b/gi, fix: 'say what you actually do instead' },
   { id: 'leverage', label: '"leverage"', rx: /\bleverag(e|es|ed|ing)\b/gi, fix: 'use "use"' },
-  { id: 'excited-opportunity', label: '"excited about the opportunity"', rx: /\bexcited about the opportunit(y|ies)\b/gi, fix: 'say why the role is interesting, concretely' },
+  // Pierre named "excited about the opportunity". The rule matched that exact phrase and nothing
+  // else, so a real generated cover letter opened with "I am excited to apply" and sailed through.
+  // It is the same tell in a different sentence, and matching only the literal string he happened
+  // to type is a rule that catches the one example and misses the habit.
+  { id: 'excited', label: '"excited"', rx: /\bexcit(ed|ing)\b/gi, fix: 'say why the role is interesting, concretely' },
 ];
 
 // Line and column of an offset, so a finding points at somewhere real in the file.

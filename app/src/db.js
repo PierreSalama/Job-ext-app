@@ -5350,9 +5350,29 @@ function emailStats() {
 function emailCursor(accountId) { return kvGet('emailCursor:' + accountId) || { uid: 0, syncedAt: null }; }
 function setEmailCursor(accountId, cur) { kvSet('emailCursor:' + accountId, cur); }
 // Jobs the matcher considers when associating an incoming email.
+// The jobs an incoming email could plausibly be about.
+//
+// This used to be "the 2000 newest rows", which was fine when the ledger was applications. It is
+// not fine now: discovery adds thousands of untouched postings, so the window fills with jobs
+// nobody has ever applied to and pushes the real applications out of it. Measured on the server
+// laptop on 2026-09-04: 51 of 396 submitted rows sat outside the window, so a rejection or an
+// interview invitation for any of them could never be matched to anything.
+//
+// An application he actually made is ALWAYS a candidate, however old. The recency window stays on
+// top of that, for the confirmation emails that arrive before a row has been marked anything.
+const MATCHABLE_STATES = ['submitted', 'applied', 'contacted', 'assessment',
+  'interview_1', 'interview_2', 'interview_final', 'offer', 'hired', 'rejected', 'ghosted'];
 function jobsForMatching() {
-  return all('SELECT id, title, company, source, submitted_at, created_at FROM jobs ORDER BY created_at DESC LIMIT 2000')
-    .map((r) => ({ id: r.id, title: r.title, company: r.company, source: r.source, submittedAt: r.submitted_at, createdAt: r.created_at }));
+  const cols = 'id, title, company, source, submitted_at, created_at';
+  const marks = MATCHABLE_STATES.map(() => '?').join(', ');
+  const rows = all(
+    `SELECT ${cols} FROM jobs WHERE status IN (${marks})
+     UNION
+     SELECT ${cols} FROM jobs WHERE id IN (SELECT id FROM jobs ORDER BY created_at DESC LIMIT 2000)
+     ORDER BY created_at DESC`,
+    MATCHABLE_STATES,
+  );
+  return rows.map((r) => ({ id: r.id, title: r.title, company: r.company, source: r.source, submittedAt: r.submitted_at, createdAt: r.created_at }));
 }
 // Re-run classification + matching over ALREADY-STORED emails — used once after a classifier or
 // matcher upgrade so the existing inbox is corrected, not just future syncs. NEVER touches

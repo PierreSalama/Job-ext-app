@@ -2386,7 +2386,10 @@ async function handle(req, res, parsed) {
       return sendJson(res, 200, { ok: true, run: view });
     } catch (e) {
       // A second Start while one is live is a user mistake, not a server error — say so plainly.
-      return sendJson(res, e.code === 'RUN_IN_PROGRESS' ? 409 : 500, { ok: false, error: e.message, code: e.code });
+      // Both of these are the operator getting it wrong, not the server breaking. A 500 sends
+      // someone reading logs looking for a fault that is not there.
+      const userError = e.code === 'RUN_IN_PROGRESS' ? 409 : e.code === 'NO_GOAL' ? 400 : 500;
+      return sendJson(res, userError, { ok: false, error: e.message, code: e.code });
     }
   }
   if (req.method === 'POST' && pathname === '/ai-apply/stop') {

@@ -51,6 +51,19 @@ function portFor(profileId) {
 }
 
 let emit = () => {};
+// Does this base URL point back at us? Compared against every address this machine answers on,
+// because the node is configured by its Tailscale address, not by "localhost".
+function isSelfUrl(baseUrl) {
+  let host;
+  try { host = new URL(String(baseUrl)).hostname.toLowerCase(); } catch { return false; }
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return true;
+  const os = require('os');
+  for (const list of Object.values(os.networkInterfaces() || {})) {
+    for (const ni of list || []) if (String(ni.address).toLowerCase() === host) return true;
+  }
+  return false;
+}
+
 // Ask the other machines whether an employer has already been applied to.
 //
 // Kept here rather than in tools/jat.js so that module stays free of transport and can be tested
@@ -66,8 +79,14 @@ function makePeers() {
   };
   return {
     nodes: async () => {
-      try { return (db.getSettings().nodes || []).filter((n) => n && n.baseUrl && n.token); }
-      catch { return []; }
+      try {
+        const me = new Set([require('os').hostname().toLowerCase()]);
+        return (db.getSettings().nodes || [])
+          .filter((n) => n && n.baseUrl && n.token)
+          // A node pointing at this very machine is this machine. Marking it keeps the sweep from
+          // asking itself the question it just answered.
+          .map((n) => ({ ...n, self: me.has(String(n.name || '').toLowerCase()) || isSelfUrl(n.baseUrl) }));
+      } catch { return []; }
     },
     engaged: async (node, { url, company, title }) => {
       const q = `company=${encodeURIComponent(company || '')}&url=${encodeURIComponent(url || '')}`
@@ -112,6 +131,23 @@ function activeRuns() {
 
 function getActive(profileId) { return publicView(active.get(profileId || '')); }
 
+
+// The standing rules for a real application, carried on EVERY apply run whatever goal was typed
+// into the box. They are Pierre's, stated in his own terms, and they belong here rather than in a
+// goal string because a goal string is something a person retypes and quietly drops half of.
+const APPLY_RULES = [
+  'House rules for every application:',
+  '- Check for a duplicate BEFORE writing anything. Never apply to an employer twice, on any machine.',
+  '- Never invent experience. Every claim traces to the stored profile or a previous answer. If the',
+  '  posting wants something the candidate does not have, leave it out or say so plainly.',
+  '- Read my_resume BEFORE writing a resume. It is the only source of his work history and',
+  '  projects. Every line of a tailored resume traces back to it or to my_profile.',
+  '- Always tailor the resume to this posting, in wording only, never in facts.',
+  '- Write a cover letter ONLY if the form or the posting asks for one.',
+  '- Leave voluntary diversity questions blank. Never solve a human check, make an account, or type',
+  '  a password. Raise those for the human and move on to a different application.',
+].join('\n');
+
 // Starts a run and returns as soon as it HAS an id — the caller must not wait for the agent to
 // finish, which can take many minutes. Progress arrives over SSE.
 async function start({
@@ -119,6 +155,18 @@ async function start({
   toolset = 'sandbox', headless = false, tools = null, deps = {},
 } = {}) {
   const key = profileId || '';
+  // A BLANK GOAL IS NOT A REAL APPLICATION.
+  //
+  // The goal box on the AI Apply page is optional, and blank fell through to DEMO_GOAL, which is
+  // the sandbox self-test: find a code, try a locked drawer. Pick "Apply", leave the box empty, and
+  // the run opens Chrome, applies to nothing, and reports success. Say what is missing instead.
+  // Only the toolsets that actually touch a posting. An unrecognised name falls back to the
+  // sandbox below, so demanding a goal for it would refuse a run that is about to be harmless.
+  if (['browser', 'apply'].includes(toolset) && !String(goal || '').trim()) {
+    const e = new Error('an apply run needs a goal saying WHICH posting to apply to, with its url');
+    e.code = 'NO_GOAL';
+    throw e;
+  }
   if (isRunning(key)) {
     const e = new Error('a run is already in progress for this profile');
     e.code = 'RUN_IN_PROGRESS';
@@ -190,6 +238,9 @@ async function start({
 
   rec.promise = runAgent({
     goal: rec.goal,
+    // Sandbox runs are a self-test with no employer and no documents, so the application rules
+    // would be noise there. Every other toolset touches a real posting.
+    systemExtra: toolset === 'sandbox' ? '' : APPLY_RULES,
     tools: toolList,
     profileId: profileId || null,
     autonomy: rec.autonomy,
@@ -249,6 +300,6 @@ function stop(profileId = '') {
 function _reset() { active.clear(); }
 
 module.exports = {
-  start, stop, isRunning, activeRuns, getActive, setEmitter, _reset, DEMO_GOAL,
+  start, stop, isRunning, activeRuns, getActive, setEmitter, _reset, DEMO_GOAL, APPLY_RULES,
   _portFor: portFor,
 };

@@ -185,7 +185,7 @@ test('the browser belt is created but Chrome is NOT launched until a tool needs 
   runner.setEmitter(() => {});
   // A run that finishes without browsing must never have started Chrome.
   await runner.start({
-    profileId: 'nobrowse', toolset: 'browser', headless: true,
+    profileId: 'nobrowse', toolset: 'browser', headless: true, goal: 'Open https://example.com',
     deps: { generate: scripted([fin('nothing to browse')]) },
   });
   await waitIdle('nobrowse');
@@ -196,7 +196,7 @@ test('the browser belt is created but Chrome is NOT launched until a tool needs 
 test('the toolset choice reaches the run', async () => {
   runner.setEmitter(() => {});
   const view = await runner.start({
-    profileId: 'ts', toolset: 'browser', headless: true,
+    profileId: 'ts', toolset: 'browser', headless: true, goal: 'Open https://example.com',
     deps: { generate: scripted([fin('done')]) },
   });
   assert.equal(view.toolset, 'browser');
@@ -222,7 +222,7 @@ test('the apply toolset gives the agent BOTH the browser and the ledger', async 
   runner.setEmitter(() => {});
   const seen = [];
   const view = await runner.start({
-    profileId: 'combo', toolset: 'apply', headless: true,
+    profileId: 'combo', toolset: 'apply', headless: true, goal: 'Apply at https://example.com/job',
     deps: {
       generate: async ({ system }) => { seen.push(system); return { text: fin('ok'), provider: 's', model: 't' }; },
     },

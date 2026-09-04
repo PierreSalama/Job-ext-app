@@ -86,9 +86,21 @@ function makeDocumentTools(opts = {}) {
     },
     {
       name: 'write_resume',
-      description: 'Write the tailored résumé for one application. Pass company and bodyHtml: a complete '
-        + '<body>...</body> element, not a fragment and not a whole document. Renders a PDF and returns the '
-        + 'path you must give attach_file. REFUSED if the writing breaks the house rules.',
+      // ALWAYS tailored, and tailoring means WORDING, never facts. Pierre's standing rule is that
+      // every claim traces to something he actually did. Matching the posting is about describing
+      // the same real work in the words this employer uses for it.
+      description: 'Write the résumé for one application. Call my_resume FIRST and build from it: '
+        + 'it holds the real work history, projects and numbers, and a résumé written without it is '
+        + 'three lines of nothing. ALWAYS tailor it to this posting: lead with '
+        + 'the experience the job description asks for, and describe it in the words the posting '
+        + 'itself uses, so a reader matching the two sees the overlap immediately. Tailoring is '
+        + 'WORDING ONLY. Never add a skill, a tool, a title or a number the candidate does not '
+        + 'already have. If the posting wants something he lacks, leave it out. '
+        + 'Write date ranges as "2024 to Present": the dash a resume would normally use is banned, '
+        + 'and the comma that gets substituted for it reads as a typo. Pass company and '
+        + 'bodyHtml: a complete <body>...</body> element, not a fragment and not a whole document. '
+        + 'Renders a PDF and returns the path you must give attach_file. REFUSED if the writing '
+        + 'breaks the house rules.',
       args: ['company', 'bodyHtml'],
       // The gate. A failing document is never written, so nothing downstream can attach a draft
       // that was known to be wrong.
@@ -116,7 +128,12 @@ function makeDocumentTools(opts = {}) {
     },
     {
       name: 'write_cover_letter',
-      description: 'Write the cover letter for one application. REFUSED if the writing breaks the house rules.',
+      // ONLY WHEN ASKED. An unrequested cover letter is work nobody reads, and on a form with no
+      // field for one there is nowhere to put it. Every application before this wrote one anyway.
+      description: 'Write a cover letter for one application. ONLY do this when the posting or the '
+        + 'form actually asks for one, whether required or optional. If there is no cover letter '
+        + 'field and the posting does not ask, skip this tool entirely and carry on with the form. '
+        + 'REFUSED if the writing breaks the house rules.',
       args: ['company', 'text'],
       guard: ({ company, text }) => {
         if (!company) return 'refused: which company is this letter for?';
