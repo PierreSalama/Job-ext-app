@@ -128,8 +128,12 @@ const call = async (name, args) => {
   return { result: await t.run(args, {}) };
 };
 
+// Carries an Experience and an Education section, because since 2026-09-04 write_resume refuses a
+// body without both: a real run rendered a summary and a skills list and nothing else.
 const GOOD_BODY = '<body><h1>Pierre Salama</h1><p class="role">Software Developer &middot; Python and React</p>'
-  + '<p>I am the only developer on a 15 application platform. I build it and I answer when it breaks.</p></body>';
+  + '<p>I am the only developer on a 15 application platform. I build it and I answer when it breaks.</p>'
+  + '<h2>Experience</h2><p>Full-Stack Developer, Tacel, 2024 to Present.</p>'
+  + '<h2>Education</h2><p>Honours Bachelor of Science, Computer Science.</p></body>';
 
 test('a résumé that breaks the rules is REFUSED and nothing is written', async () => {
   const bad = '<body><h1>Pierre</h1><p>I am passionate about backend work — truly.</p></body>';

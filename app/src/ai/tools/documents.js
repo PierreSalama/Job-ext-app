@@ -140,7 +140,22 @@ function makeDocumentTools(opts = {}) {
           return 'refused: bodyHtml must be a full <body>…</body> block — the <head> is added for you';
         }
         const v = voiceCheck(String(bodyHtml), { html: true });
-        return v.ok ? null : `refused, the writing breaks the house rules:\n${report(v)}`;
+        if (!v.ok) return `refused, the writing breaks the house rules:\n${report(v)}`;
+        // A RESUME WITHOUT A WORK HISTORY IS NOT A RESUME.
+        //
+        // On the real Ritual form the agent rendered 1,262 bytes: a summary and a skills list, no
+        // Experience section, no Education, no employer named anywhere. Every fixture run had both.
+        // The voice gate passed it because the punctuation was fine, which is the wrong question.
+        // The sections a recruiter reads first are the ones it must never drop.
+        const text = String(bodyHtml).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
+        const missing = [];
+        if (!/\b(experience|employment|work history)\b/i.test(text)) missing.push('Experience section');
+        if (!/\beducation\b/i.test(text)) missing.push('Education section');
+        if (missing.length) {
+          return `refused: the résumé has no ${missing.join(' and no ')}. Build from my_resume, which has both. `
+            + 'Shortening a résumé never means dropping the work history.';
+        }
+        return null;
       },
       run: async ({ company, bodyHtml }) => {
         const dir = folderFor(company);

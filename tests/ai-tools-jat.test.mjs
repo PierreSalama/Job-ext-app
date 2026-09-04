@@ -364,3 +364,31 @@ test('punctuation and filler are stripped, real tokens are not', () => {
 test('a summary instead of the posting is refused', () => {
   assert.match(fitTool().run({ title: 'x', description: 'Nice job in Toronto' }), /posting text, not a summary/);
 });
+
+// ---------------------------------------------------------------------------
+// A résumé without a work history is not a résumé
+//
+// On the real Ritual form the agent rendered 1,262 bytes: a summary and a skills list, no Experience
+// section, no Education, no employer named anywhere. Every fixture run had both. The voice gate
+// passed it because the punctuation was fine, which is the wrong question.
+// ---------------------------------------------------------------------------
+test('write_resume refuses a body with no Experience or Education section', () => {
+  const { makeDocumentTools } = require(path.join(root, 'app/src/ai/tools/documents.js'));
+  const t = makeDocumentTools({ root: fs.mkdtempSync(path.join(os.tmpdir(), 'jat-struct-')) }).tools
+    .find((x) => x.name === 'write_resume');
+  const said = t.guard({ company: 'Ritual', bodyHtml: '<body><h1>Pierre</h1><h2>Summary</h2><p>Engineer.</p><h2>Skills</h2><p>React</p></body>' });
+  assert.match(said, /no Experience section and no Education section/);
+  assert.match(said, /my_resume/, 'and it must say where the material is');
+});
+
+test('a résumé with both sections passes the structural check', () => {
+  const { makeDocumentTools } = require(path.join(root, 'app/src/ai/tools/documents.js'));
+  const t = makeDocumentTools({ root: fs.mkdtempSync(path.join(os.tmpdir(), 'jat-struct2-')) }).tools
+    .find((x) => x.name === 'write_resume');
+  assert.equal(t.guard({ company: 'Ritual', bodyHtml: '<body><h2>Experience</h2><p>Tacel, 2024 to Present.</p><h2>Education</h2><p>Honours BSc, Computer Science.</p></body>' }), null);
+});
+
+test('the structural check runs AFTER the voice check, so one refusal names one problem', () => {
+  const src = fs.readFileSync(path.join(root, 'app/src/ai/tools/documents.js'), 'utf8');
+  assert.ok(src.indexOf('breaks the house rules') < src.indexOf('no ${missing.join'), 'voice first, then structure');
+});

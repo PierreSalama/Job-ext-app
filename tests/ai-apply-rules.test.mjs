@@ -25,6 +25,14 @@ test('the rules cover every line Pierre has actually drawn', () => {
     // Greenhouse Degree field is a dropdown and it had no way to operate one.
     ['re-read the résumé before escalating a fact', /re-read my_resume/],
     ['a dropdown is not a missing answer', /dropdown is not a missing answer/],
+    // The real Ritual run refused University of Toronto (correct) and parked, while the résumé in
+    // its hands said "(formerly Ryerson University)" and the search offered exactly that.
+    ['try the former name before escalating', /FORMER name/],
+    ['never the closest wrong institution', /Never pick a different institution/],
+    // On the real Ritual form the only country widget IS the phone-code picker, and "Canada +1"
+    // was the right pick. A rule saying otherwise would have sent the agent looking for a field
+    // that does not exist.
+    ['Canada +1 is a correct pick in a phone-code picker', /Choosing "Canada \+1" there/],
     ['self-ID left blank', /voluntary diversity questions blank/],
     ['no CAPTCHA, account or password', /human check, make an account, or type/],
   ]) assert.match(APPLY_RULES, re, `missing rule: ${what}`);
