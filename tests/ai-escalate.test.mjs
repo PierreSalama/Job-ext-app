@@ -403,3 +403,39 @@ test('neither pattern contains a control character', () => {
     assert.equal(line.includes(String.fromCharCode(8)), false, `literal backspace in ${name}`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// A committed react-select looks empty
+//
+// Greenhouse's School, Degree and Discipline keep the chosen value in a rendered element and CLEAR
+// the input they searched with. Measured on the real Ritual form: after successfully choosing
+// "Ryerson University" the input read "" and the page showed the choice beside it. Without this,
+// submit reports those three as empty for ever and refuses to hand over a complete application.
+// ---------------------------------------------------------------------------
+test('the probe treats a rendered value as filled, not empty', () => {
+  const src = fs.readFileSync(path.join(root, 'app/src/ai/tools/escalate.js'), 'utf8');
+  const probe = src.slice(src.indexOf('EMPTY_PROBE'), src.indexOf('async function stillEmpty'));
+  assert.match(probe, /singleValue/, 'react-select renders the chosen value into its own element');
+  // closest() matches the element itself, and the input's class is select__input, so a selector
+  // list is the wrong tool here. Narrowing it to [class*="container"] matched one level too low.
+  // Comments are stripped first, or the explanation of why closest() is wrong fails the check.
+  const code = probe.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+  assert.equal(/\.closest\(/.test(code), false, 'walk up rather than guessing a wrapper class');
+  assert.match(probe, /for \(let i = 0; i < 4/, 'four hops finds it whatever the class names are');
+});
+
+test('the probe reads aria-labelledby, so no field is reported as unnamed', () => {
+  // Every react-select came back as "(unlabelled field)", which tells him an application is
+  // blocked on something with no name.
+  const src = fs.readFileSync(path.join(root, 'app/src/ai/tools/escalate.js'), 'utf8');
+  const probe = src.slice(src.indexOf('EMPTY_PROBE'), src.indexOf('async function stillEmpty'));
+  assert.match(probe, /aria-labelledby/);
+  assert.match(probe, /getElementById\(id\)/);
+});
+
+test('a plain empty text input is still reported', () => {
+  // The escape must not swallow ordinary empty fields.
+  const b = belt({ page: () => ({ evaluate: async () => ['First Name', 'Email'], text: async () => 'Acme Developer' }) });
+  return b.call('submit', { company: 'Acme', title: 'Developer' })
+    .then((r) => { assert.match(r.result, /First Name/); assert.match(r.result, /NOT SUBMITTED/); });
+});

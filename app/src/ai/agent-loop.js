@@ -94,8 +94,11 @@ function systemPrompt(registry, goal, extra = '') {
 function renderTranscript(steps, { verbatimSteps, resultClip }) {
   if (!steps.length) return '(nothing yet — this is your first action)';
   const cut = Math.max(0, steps.length - verbatimSteps);
-  const older = steps.slice(0, cut);
-  const recent = steps.slice(cut);
+  // Reference material stays whole and stays in view however old it gets. Folding his résumé to
+  // the line "my_resume -> ok" is why the agent kept fetching it again: the content was gone.
+  const isRef = (s) => s.reference && s.ok !== false && !s.refused;
+  const older = steps.slice(0, cut).filter((s) => !isRef(s));
+  const recent = steps.slice(0, cut).filter(isRef).concat(steps.slice(cut));
   const out = [];
   if (older.length) {
     out.push(`EARLIER (${older.length} steps, condensed):`);
@@ -111,7 +114,7 @@ function renderTranscript(steps, { verbatimSteps, resultClip }) {
     out.push(`     action:  ${s.tool} ${JSON.stringify(s.args || {}).slice(0, 300)}`);
     if (s.refused) out.push(`     REFUSED: ${clip(s.error, 300)}`);
     else if (s.ok === false) out.push(`     ERROR:   ${clip(s.error, 300)}`);
-    else out.push(`     result:  ${clip(s.result, resultClip)}`);
+    else out.push(`     result:  ${clip(s.result, isRef(s) ? Math.max(resultClip, 12000) : resultClip)}`);
   }
   return out.join('\n');
 }
@@ -414,7 +417,14 @@ async function dispatch(registry, action, ctx, meta, seq) {
   try {
     const out = await tool.run(action.args, ctx);
     const result = typeof out === 'string' ? out : JSON.stringify(out === undefined ? null : out);
-    return { ...base, ok: true, refused: false, result, error: null };
+    // REFERENCE MATERIAL IS NOT AN OBSERVATION.
+    //
+    // A tool marked `reference: true` returns something the agent must WORK FROM, not something it
+    // glanced at. His résumé is 4,749 characters and the observation clip is 1,200, so every call
+    // to my_resume handed back a document that stopped in the middle of the skills list. The agent
+    // wrote a résumé with no Experience and no Education section because it had never seen either,
+    // then called my_resume five more times looking for them.
+    return { ...base, ok: true, refused: false, result, error: null, reference: !!tool.reference };
   } catch (e) {
     return { ...base, ok: false, refused: false, result: null, error: String(e.message || e).slice(0, 500) };
   }

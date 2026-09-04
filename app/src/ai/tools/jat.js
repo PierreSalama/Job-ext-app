@@ -285,6 +285,10 @@ function makeJatTools(opts = {}) {
     },
     {
       name: 'my_resume',
+      // Reference, not an observation: the loop keeps this whole and keeps it in view. At the
+      // ordinary 1,200-character observation clip his 4,749-character résumé stopped mid skills
+      // list, so the agent wrote one with no Experience and no Education section.
+      reference: true,
       // THE SOURCE MATERIAL, WHICH WAS SITTING RIGHT THERE.
       //
       // Read what the agent actually produced on run 11 and the problem was obvious: a three line

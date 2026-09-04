@@ -97,8 +97,37 @@ function makeEscalateTools(opts = {}) {
       const r = el.getBoundingClientRect();
       if (!r.width || !r.height) continue;              // genuinely hidden, not the agent's problem
       if (String(el.value || '').trim()) continue;      // already answered
+      // A COMMITTED react-select LOOKS EMPTY.
+      //
+      // Greenhouse's School, Degree and Discipline keep the chosen value in a rendered element and
+      // CLEAR the input they searched with. Measured on the real Ritual form: after successfully
+      // choosing "Ryerson University" the input read "" and the page showed the choice beside it.
+      // Without this, submit would report those three as still empty for ever and refuse to hand
+      // over an application that was actually complete.
+      const combo = el.getAttribute('role') === 'combobox' || el.hasAttribute('aria-autocomplete');
+      if (combo) {
+        // Walk UP, do not guess a wrapper by name. closest() matches the element itself, so a
+        // selector list including [class*="select"] returned the input, whose own class is
+        // select__input. Narrowing it to [class*="container"] then matched select__input-container,
+        // one level below the control that actually holds the value. Four hops finds it whatever
+        // the class names are this month.
+        let shown = null;
+        let box = el.parentElement;
+        for (let i = 0; i < 4 && box && !shown; i++, box = box.parentElement) {
+          shown = box.querySelector('[class*="singleValue"], [class*="single-value"], [class*="multiValue"], [class*="multi-value"]');
+        }
+        if (shown && String(shown.textContent || '').trim()) continue;
+      }
+      // aria-labelledby too, or every react-select reports as "(unlabelled field)" and he is told
+      // an application is blocked on something with no name.
+      const labelledBy = el.getAttribute('aria-labelledby');
+      const byId = labelledBy && labelledBy.split(/\s+/).map((id) => {
+        const n = document.getElementById(id);
+        return n ? String(n.textContent || '').trim() : '';
+      }).filter(Boolean).join(' ');
       const lab = (el.getAttribute('aria-label')
         || (el.labels && el.labels[0] && el.labels[0].textContent)
+        || byId
         || el.getAttribute('placeholder') || el.name || el.id || '').trim();
       // Voluntary self-ID is CORRECTLY left blank. Never nag the agent into answering one.
       if (/gender|race|ethnic|veteran|disabilit|pronoun|sexual|orientation/i.test(lab)) continue;
