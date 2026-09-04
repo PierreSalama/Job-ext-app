@@ -156,6 +156,20 @@ function disputeSummary(summary, steps) {
     problems.push('the summary says an application was submitted, but no successful submit step was recorded.');
   }
 
+  // "HANDED TO THE HUMAN" IS ALSO A CLAIM.
+  //
+  // On the real Ritual form, submit refused to park an application with eight empty fields, the
+  // model said done anyway with "called submit to hand the completed application to the human",
+  // and zero blocks existed. Nothing was handed to anyone. The old check only looked for the word
+  // "submitted", so a false claim of PARKING walked straight past it. A parked application leaves
+  // an awaiting_submit block behind, and that is the fact to test.
+  const claimsParked = /\b(hand(?:ed)? (?:it |the .{0,40})?(?:to|over to) the human|parked (?:the |this )?application|ready for (?:the )?human|awaiting (?:the )?human|for (?:final |human )?review)\b/.test(s);
+  const reallyParked = steps.some((x) => x.tool === 'submit' && x.ok !== false && !x.refused
+    && /Block blk_/i.test(String(x.result || '')));
+  if (claimsParked && !reallyParked) {
+    problems.push('the summary says the application was handed to the human, but no submit step raised a block, so nothing was handed over.');
+  }
+
   const claimsDocs = /\b(wrote|written|prepared|tailored) (?:a |the )?(?:r[ée]sum[ée]|cover letter)/.test(s);
   const reallyWrote = steps.some((x) => /^write_(resume|cover_letter)$/.test(String(x.tool)) && x.ok !== false && !x.refused);
   if (claimsDocs && !reallyWrote) {

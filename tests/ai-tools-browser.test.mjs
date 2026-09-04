@@ -89,6 +89,7 @@ test('the tool belt drives a real form', { skip: chromePath ? false : 'no Chrome
   <label for="pw">Account password</label><input id="pw" aria-label="Account password" type="password" />
   <label for="sneaky">Security answer</label><input id="sneaky" aria-label="Security answer" name="user_passwd" type="text" />
   <input id="cv" type="file" class="hidden" aria-hidden="true" style="display:none" />
+  <input id="cover_letter" type="file" class="hidden" aria-hidden="true" style="display:none" />
   <label for="src">How did you hear about us?</label>
   <select id="src" aria-label="How did you hear about us?">
     <option value="">Select...</option><option value="li">LinkedIn</option>
@@ -273,6 +274,25 @@ test('the tool belt drives a real form', { skip: chromePath ? false : 'no Chrome
         await call('choose_option', { ref, value: 'Doctorate' });
         const said = (await call('choose_option', { ref, value: 'Doctorate' })).result;
         assert.match(said, /chose "Doctorate"/);
+      });
+
+      await t.test('an ambiguous selector says so instead of silently picking one', async () => {
+        // The real Ritual form has two file inputs, id="resume" and id="cover_letter", and the
+        // accessibility tree calls both "Attach". The agent asked for `input[type=file]`, matched
+        // both, and got the first silently. It happened to be the résumé. On a form that orders
+        // them the other way it attaches a résumé as a cover letter and never knows.
+        const said = (await call('query_ref', { selector: 'input[type=file]' })).result;
+        assert.match(said, /but so do 1 other element/);
+        assert.match(said, /cv/);
+        assert.match(said, /cover_letter/);
+        assert.match(said, /FIRST one/);
+        assert.match(said, /#cover_letter/, 'and it must suggest how to name the other one');
+      });
+
+      await t.test('an unambiguous selector names what it found', async () => {
+        const said = (await call('query_ref', { selector: '#cover_letter' })).result;
+        assert.match(said, /ref_q\d+ matches #cover_letter \(cover_letter\)/);
+        assert.doesNotMatch(said, /other element/);
       });
 
       await t.test('fill also refuses a password field disguised as type=text', async () => {

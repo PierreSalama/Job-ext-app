@@ -622,3 +622,34 @@ test('a repeat notice is not counted as a tool failure', async () => {
   assert.match(src, /tool: '\(repeating\)'/);
   assert.match(src, /!String\(x\.tool\)\.startsWith\('\('\)/, 'the dispute filter must exclude it');
 });
+
+// ---------------------------------------------------------------------------
+// "Handed to the human" is also a claim
+//
+// On the real Ritual form, submit refused to park an application with eight empty fields, the
+// model said done anyway with "called submit to hand the completed application to the human", and
+// zero blocks existed. Nothing was handed to anyone. The check only looked for the word
+// "submitted", so a false claim of PARKING walked straight past it.
+// ---------------------------------------------------------------------------
+const refusedToPark = [{ tool: 'write_resume', ok: true }, { tool: 'submit', ok: true, result: 'NOT SUBMITTED. 8 field(s) on this page are still empty' }];
+const actuallyParked = [{ tool: 'write_resume', ok: true }, { tool: 'submit', ok: true, result: 'NOT SUBMITTED. Prepare mode. Block blk_9 hands it to the human' }];
+
+test('claiming to have handed over an application that was never parked is disputed', () => {
+  const said = 'Filled the form and called submit to hand the completed application to the human for final review.';
+  assert.match(String(loop.disputeSummary(said, refusedToPark)), /nothing was handed over/);
+});
+
+test('the same claim is fine when a block really was raised', () => {
+  const said = 'Filled the form and called submit to hand the completed application to the human for final review.';
+  assert.equal(loop.disputeSummary(said, actuallyParked), null);
+});
+
+test('every phrasing of parking is covered', () => {
+  for (const said of ['Parked the application for the human.', 'It is ready for human review.', 'Left it awaiting the human.']) {
+    assert.match(String(loop.disputeSummary(said, refusedToPark)), /nothing was handed over/, `missed: ${said}`);
+  }
+});
+
+test('an honest summary of a refused park is not disputed', () => {
+  assert.equal(loop.disputeSummary('Submit refused because eight fields were still empty. I escalated the school field.', refusedToPark), null);
+});

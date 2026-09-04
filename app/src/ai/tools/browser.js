@@ -188,12 +188,36 @@ function makeBrowserTools(opts = {}) {
     },
     {
       name: 'query_ref',
-      description: 'Get a ref by CSS selector, for elements the page hides from the tree (file inputs usually are).',
+      description: 'Get a ref by CSS selector, for elements the page hides from the tree (file inputs '
+        + 'usually are). Says how many elements matched and what identifies each, so an ambiguous '
+        + 'selector cannot silently hand you the wrong one.',
       args: ['selector'],
       run: async ({ selector }) => {
         const p = await ensure();
-        const ref = await p.queryRef(String(selector));
-        return ref ? `${ref} matches ${selector}` : `nothing matches ${selector}`;
+        const sel = String(selector);
+        const ref = await p.queryRef(sel);
+        if (!ref) return `nothing matches ${sel}`;
+
+        // AN AMBIGUOUS SELECTOR IS A TRAP, NOT A CONVENIENCE.
+        //
+        // The real Ritual form has TWO file inputs, id="resume" and id="cover_letter", and the
+        // accessibility tree calls both of them "Attach". The agent asked for `input[type=file]`,
+        // which matches both, and got the first one silently. It happened to be the résumé. On a
+        // form that orders them the other way it would have attached the résumé as a cover letter
+        // and never known.
+        let others = [];
+        try {
+          others = await p.evaluate(`(() => [...document.querySelectorAll(${JSON.stringify(sel)})]
+            .map((el) => el.id || el.name || el.getAttribute('aria-label') || el.tagName.toLowerCase())
+            .slice(0, 8))()`) || [];
+        } catch { /* the count is a courtesy, never a failure */ }
+
+        if (others.length > 1) {
+          return `${ref} matches ${sel}, but so do ${others.length - 1} other element(s): `
+            + `${others.join(', ')}. This ref is the FIRST one. If that is not the one you want, `
+            + 'ask again with a selector that names it, such as #' + String(others[1] || 'id') + '.';
+        }
+        return `${ref} matches ${sel}${others[0] ? ` (${others[0]})` : ''}`;
       },
     },
     {
@@ -265,8 +289,11 @@ function makeBrowserTools(opts = {}) {
           if (await p.isComboRef(ref)) {
             const c = await p.pickSuggestion(ref, value);
             if (c && c.ok) return `typed "${value}" and chose "${c.chose}" from the suggestions`;
-            if (c && c.noList) return `typed "${value}" but no suggestion list appeared. Read the page and look again.`;
-            return `no suggestion matched "${value}". Offered: ${(c && c.options || []).join(' | ')}`;
+            if (c && c.noList) return `typed "${value}" but no suggestion list appeared. Try a shorter or different spelling: these boxes search as you type.`;
+            // The first suggestion is NOT chosen for it. "Toronto Metropolitan University" offered
+            // "University of Toronto", and picking that would have been a false statement of fact.
+            return `nothing offered matches "${value}". The box suggested: ${(c && c.options || []).join(' | ')}. `
+              + 'Pick one of those by name if it is right, or try a different spelling. Do not settle for a wrong one.';
           }
           return 'that is not a dropdown and not a suggestion box. Use fill for a plain text field.';
         }

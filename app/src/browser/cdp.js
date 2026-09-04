@@ -448,17 +448,30 @@ async function attachPage(opts = {}) {
     } catch { return false; }
   }
 
-  // Type, let the listbox appear, then CHOOSE. Returns what it chose, or the options it saw.
-  async function pickSuggestion(ref, text, { waitMs = 700 } = {}) {
+  // Type with REAL KEYSTROKES, let the listbox appear, then CHOOSE.
+  //
+  // Greenhouse's School, Degree and Discipline are react-select, and react-select opens its menu
+  // on keydown. `Input.insertText` puts the characters in the box and fires no key events at all,
+  // so on the real Ritual form the value read "Toronto Metro", aria-expanded stayed false, and no
+  // menu ever appeared. Typed as keystrokes, the same field expanded and offered "University of
+  // Toronto" inside a second and a half. Clearing goes the same way: select-all and Backspace,
+  // because setting .value on a React-controlled input is invisible to React's own state.
+  async function typeKeys(text) {
+    for (const ch of String(text)) {
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', text: ch, key: ch, unmodifiedText: ch });
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: ch });
+    }
+  }
+
+  async function pickSuggestion(ref, text, { waitMs = 1500 } = {}) {
     await scrollIntoView(ref);
     await focus(ref);
-    // Clear whatever a previous attempt typed, or the query becomes "BachelorBachelor".
-    await onNode(ref, `function () {
-      this.value = '';
-      this.dispatchEvent(new Event('input', { bubbles: true }));
-    }`);
-    await cdp.send('Input.insertText', { text: String(text) });
-    await onNode(ref, `function () { this.dispatchEvent(new Event('input', { bubbles: true })); }`);
+    // Select-all + Backspace, so a second attempt does not type "BachelorBachelor".
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: 2, windowsVirtualKeyCode: 65 });
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', modifiers: 2, windowsVirtualKeyCode: 65 });
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 });
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 });
+    await typeKeys(text);
     await new Promise((r) => setTimeout(r, waitMs));
 
     return onNode(ref, `function (want) {
@@ -466,18 +479,29 @@ async function attachPage(opts = {}) {
       const w = norm(want);
       const listId = this.getAttribute('aria-controls') || this.getAttribute('aria-owns');
       const scope = (listId && document.getElementById(listId)) || document;
-      const seen = [...scope.querySelectorAll('[role="option"], li[id], [class*="option"]')]
+      const seen = [...scope.querySelectorAll('[role="option"]')]
         .filter((o) => { const r = o.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
-      if (!seen.length) return { ok: false, noList: true };
+      if (!seen.length) return { ok: false, noList: true, typed: this.value };
+      // A loose match must contain EVERY significant word of what was asked for. Matching on any
+      // one substring turned "Metropolitan" into "Inter American University of Puerto Rico -
+      // Metropolitan Campus" on the real Ritual form, which would have been a false statement of
+      // fact on his application.
+      // And a ONE-word query satisfies "every word" trivially: "Metropolitan" still chose the
+      // Puerto Rico campus. A single word matches exactly or not at all. Anything looser hands the
+      // options back for the agent to name one.
+      const words = w.split(' ').filter((t) => t.length > 2);
+      const allWords = (o) => { const n = norm(o.textContent); return words.length >= 2 && words.every((t) => n.includes(t)); };
       const pick = seen.find((o) => norm(o.textContent) === w)
-        || seen.find((o) => norm(o.textContent).includes(w) && w.length > 1)
-        || seen[0];
+        || seen.find(allWords)
+        || null;
+      const options = seen.slice(0, 12).map((o) => String(o.textContent || '').trim());
+      if (!pick) return { ok: false, options, typed: this.value };
       const label = String(pick.textContent || '').trim();
-      // A real click, because these widgets listen for mousedown and not for a synthetic change.
+      // react-select commits on mousedown, not on click.
       for (const type of ['mousedown', 'mouseup', 'click']) {
         pick.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
       }
-      return { ok: true, chose: label, options: seen.slice(0, 12).map((o) => String(o.textContent || '').trim()) };
+      return { ok: true, chose: label, options };
     }`, [String(text)]);
   }
 
