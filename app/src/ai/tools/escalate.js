@@ -38,6 +38,21 @@ const KINDS = {
   other: 'something else only a human can do',
 };
 
+// A QUESTION ABOUT HIM, OR A QUESTION FOR HIM TO ANSWER?
+//
+// "Never invent experience" is about FACTS: years with Kubernetes, work authorisation, a degree, a
+// notice period. Get one of those wrong and it is a false statement about the candidate.
+//
+// "Why do you want to work here" is not a fact. It is writing, and the agent has everything needed
+// to do it: the posting in front of it, his real résumé, and the overlap check_fit just computed.
+// Three end-to-end runs in a row prepared a complete application and then parked on exactly this,
+// which would park most real Greenhouse and Ashby forms, since nearly all of them ask some version
+// of it. Escalating it is not caution. It is handing back work that was already done.
+const MOTIVATION_RX = /\b(why (do|are) you|why this|what (interests|excites|draws|attracts)|tell us (a bit )?about (yourself|why)|what (do you know|interests you) about|reason for applying|what makes you|interested in (joining|working)|cover letter)\b/i;
+
+// A fact hiding inside a motivation-shaped question still has to be escalated.
+const FACT_RX = /\b(authoriz|sponsor|visa|citizen|permanent resident|clearance|salary|compensation|notice period|start date|graduat|degree|gpa|years? of experience|how many years)\b/i;
+
 function makeEscalateTools(opts = {}) {
   const {
     profileId = null,
@@ -138,6 +153,13 @@ function makeEscalateTools(opts = {}) {
       args: ['kind', 'question', 'detail'],
       guard: ({ kind, question }) => {
         if (!question || String(question).trim().length < 5) return 'refused: say specifically what you need';
+        const q = String(question);
+        if (MOTIVATION_RX.test(q) && !FACT_RX.test(q)) {
+          return 'refused: that is a question you can answer yourself. It asks for motivation, not '
+            + 'for a fact about the candidate. Write it from the posting and from what my_resume and '
+            + 'check_fit already told you, in his voice, claiming nothing he has not done. Only '
+            + 'escalate if it asks for a FACT you have no source for.';
+        }
         if (kind && !KINDS[String(kind)]) {
           return `refused: kind must be one of ${Object.keys(KINDS).join(', ')}`;
         }

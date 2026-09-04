@@ -516,3 +516,52 @@ test('provider availability is reported honestly, not assumed', () => {
     console.log('[agent-loop] NOTE: no usable model on this machine, so the live loop test could not run.');
   }
 });
+
+// ---------------------------------------------------------------------------
+// A denial is not a claim
+//
+// Live on a real Ritual application: the agent wrote an honest summary ending "It was not
+// submitted; it will resume once the human supplies the degree level", and the bare word
+// "submitted" got the whole run recorded as failed and disputed. Punishing a model for saying
+// plainly that it did NOT do something is the exact opposite of what the check is for, and all it
+// would teach the summary to do is go vague.
+// ---------------------------------------------------------------------------
+const wroteOnly = [{ tool: 'write_resume', ok: true }, { tool: 'ask_human', ok: true }];
+
+test('an honest "it was not submitted" is not disputed', () => {
+  const said = 'Filled out the Ritual application, resume tailored and attached, escalated the degree '
+    + 'question and parked it. It was not submitted; it will resume once the human supplies the degree level.';
+  assert.equal(loop.disputeSummary(said, wroteOnly), null);
+});
+
+test('every way of denying it reads the same', () => {
+  for (const said of [
+    'The application was not submitted because Prepare mode parks it.',
+    'I did not submit the application.',
+    'Never submitted the form.',
+    'This was not sent to the employer.',
+    "I haven't submitted anything.",
+  ]) assert.equal(loop.disputeSummary(said, wroteOnly), null, `wrongly disputed: ${said}`);
+});
+
+test('an actual false claim is still caught', () => {
+  // The denial escape must not become a way to smuggle a false claim past the check.
+  for (const said of [
+    'Prepared and submitted the application successfully.',
+    'Application sent to the employer.',
+    'Applied successfully to the role.',
+  ]) assert.match(String(loop.disputeSummary(said, wroteOnly)), /no successful submit step/, `missed: ${said}`);
+});
+
+test('the denial pattern has no control character in it', async () => {
+  // Written with a literal backspace where the word boundary belonged three times today. It is
+  // invisible in a terminal and it makes the rule match nothing while every test still passes.
+  const { readFileSync } = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const { dirname, resolve, join } = await import('node:path');
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+  const src = readFileSync(join(root, 'app/src/ai/agent-loop.js'), 'utf8');
+  const line = src.split('\n').find((l) => l.trim().startsWith('const DENIED'));
+  assert.ok(line, 'the pattern must exist');
+  assert.equal(line.includes(String.fromCharCode(8)), false);
+});

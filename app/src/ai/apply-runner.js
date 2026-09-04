@@ -146,6 +146,11 @@ const APPLY_RULES = [
   '  projects. Every line of a tailored resume traces back to it or to my_profile.',
   '- Always tailor the resume to this posting, in wording only, never in facts.',
   '- Write a cover letter ONLY if the form or the posting asks for one.',
+  '- Before escalating a FACT, re-read my_resume. It carries his degree, dates, GPA, employers',
+  '  and projects. A real run asked the human for a degree that was written in it.',
+  '- A dropdown is not a missing answer. Use choose_option. If nothing fits, THEN escalate.',
+  '- "Why do you want to work here" is WRITING, not a fact. Answer it yourself from the posting',
+  '  and his real history. Escalate only questions asking for a FACT you have no source for.',
   '- Leave voluntary diversity questions blank. Never solve a human check, make an account, or type',
   '  a password. Raise those for the human and move on to a different application.',
 ].join('\n');

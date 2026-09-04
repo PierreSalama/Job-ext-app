@@ -21,6 +21,10 @@ test('the rules cover every line Pierre has actually drawn', () => {
     ['never invent experience', /Never invent experience/],
     ['tailor wording, not facts', /wording only, never in facts/i],
     ['cover letter only on request', /ONLY if the form or the posting asks/],
+    // A real Ritual run asked Pierre for a degree that was written in his own résumé, because the
+    // Greenhouse Degree field is a dropdown and it had no way to operate one.
+    ['re-read the résumé before escalating a fact', /re-read my_resume/],
+    ['a dropdown is not a missing answer', /dropdown is not a missing answer/],
     ['self-ID left blank', /voluntary diversity questions blank/],
     ['no CAPTCHA, account or password', /human check, make an account, or type/],
   ]) assert.match(APPLY_RULES, re, `missing rule: ${what}`);

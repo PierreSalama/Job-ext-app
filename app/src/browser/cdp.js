@@ -363,6 +363,69 @@ async function attachPage(opts = {}) {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // <select>
+  //
+  // `fill` types text. Typing into a <select> does nothing at all, silently, and every real
+  // Greenhouse form has several: country, phone country, "how did you hear about us", location
+  // preference. The fixture had none, which is why twelve green end-to-end runs never noticed.
+  //
+  // Setting `.value` alone is also not enough on a React form: the framework tracks its own copy of
+  // the state and only updates it on the events a real user would produce. Same lesson as `fill`
+  // always blurring, in a different shape.
+  // ---------------------------------------------------------------------------
+  async function onNode(ref, functionDeclaration, args = []) {
+    const backendNodeId = backendIdFor(ref);
+    const { object } = await cdp.send('DOM.resolveNode', { backendNodeId });
+    if (!object || !object.objectId) throw new Error('that element is gone from the page');
+    try {
+      const r = await cdp.send('Runtime.callFunctionOn', {
+        objectId: object.objectId,
+        returnByValue: true,
+        functionDeclaration,
+        arguments: args.map((value) => ({ value })),
+      });
+      if (r && r.exceptionDetails) throw new Error(r.exceptionDetails.text || 'page threw');
+      return r && r.result && r.result.value;
+    } finally {
+      try { await cdp.send('Runtime.releaseObject', { objectId: object.objectId }); } catch { /* best effort */ }
+    }
+  }
+
+  async function isSelectRef(ref) {
+    try { return await onNode(ref, 'function () { return this.tagName === "SELECT"; }') === true; }
+    catch { return false; }
+  }
+
+  async function listOptions(ref) {
+    return (await onNode(ref, `function () {
+      if (this.tagName !== 'SELECT') return null;
+      return [...this.options].map((o) => String(o.textContent || o.value || '').trim()).filter(Boolean);
+    }`)) || null;
+  }
+
+  // Matches on the visible option text, then the value, exactly first and then as a substring.
+  // Returns the option it chose, or null with the list so the caller can say what IS available.
+  async function selectOption(ref, wanted) {
+    await scrollIntoView(ref);
+    return onNode(ref, `function (want) {
+      if (this.tagName !== 'SELECT') return { ok: false, notASelect: true };
+      const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const w = norm(want);
+      const opts = [...this.options];
+      const pick = opts.find((o) => norm(o.textContent) === w || norm(o.value) === w)
+        || opts.find((o) => norm(o.textContent).includes(w) && w.length > 1)
+        || opts.find((o) => w.includes(norm(o.textContent)) && norm(o.textContent).length > 1);
+      if (!pick) return { ok: false, options: opts.map((o) => String(o.textContent || '').trim()).filter(Boolean).slice(0, 40) };
+      this.value = pick.value;
+      // The events a real user's choice produces. Without them a React form keeps its old state.
+      this.dispatchEvent(new Event('input', { bubbles: true }));
+      this.dispatchEvent(new Event('change', { bubbles: true }));
+      this.blur();
+      return { ok: true, chose: String(pick.textContent || pick.value).trim() };
+    }`, [String(wanted)]);
+  }
+
   async function isPasswordRef(ref) {
     const d = await describeRef(ref);
     if (d.type === 'password') return true;
@@ -463,6 +526,7 @@ async function attachPage(opts = {}) {
     navigate, readTree, find, queryRef, queryRefAll, describeRef, isPasswordRef, labelContext,
     click, focus, fill, pressKey, setFiles,
     screenshot, evaluate, text, boxCenter, scrollIntoView, readyState,
+    isSelectRef, listOptions, selectOption,
     refCount: () => refs.size,
     close() { cdp.close(); },
   };

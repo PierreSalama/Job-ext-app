@@ -343,3 +343,63 @@ test('a page that cannot be read does not block the application', async () => {
   const r = await b.call('submit', { company: 'Northbeam Robotics', title: 'Anything At All' });
   assert.match(r.result, /Prepare mode/);
 });
+
+// ---------------------------------------------------------------------------
+// A question ABOUT him, or a question FOR him?
+//
+// "Never invent experience" is about facts: years with Kubernetes, work authorisation, a degree, a
+// notice period. Get one of those wrong and it is a false statement about the candidate.
+//
+// "Why do you want to work here" is not a fact. It is writing, and the agent has the posting, his
+// real résumé and the overlap check_fit just computed. Three end-to-end runs in a row prepared a
+// complete application and then parked on exactly this. Nearly every Greenhouse and Ashby form asks
+// some version of it, so escalating it would park most real applications. That is not caution, it
+// is handing back work already done.
+// ---------------------------------------------------------------------------
+test('a motivation question is refused, with the reason', async () => {
+  const b = belt();
+  const r = await b.call('ask_human', { kind: 'needs_answer', question: "What should I put for 'Why do you want to work here?'" });
+  assert.match(r.refused, /answer it yourself|question you can answer yourself/i);
+  assert.match(r.refused, /motivation, not/);
+  assert.match(r.refused, /my_resume and check_fit/, 'and it must say where the material is');
+  assert.equal(b.raised.length, 0);
+});
+
+test('the company-specific version is caught too', async () => {
+  const b = belt();
+  const r = await b.call('ask_human', { kind: 'needs_answer', question: 'Why are you interested in joining the Supabase team?' });
+  assert.ok(r.refused, 'this is the exact question 3 Supabase applications are parked on');
+});
+
+test('a FACT is still escalated', async () => {
+  const b = belt();
+  for (const q of [
+    'How many years of experience do you have with Kubernetes?',
+    'Are you open to coming to the office 2 times a week?',
+    'What is your expected start date?',
+    'Do you require visa sponsorship?',
+  ]) {
+    const r = await b.call('ask_human', { kind: 'needs_answer', question: q });
+    assert.equal(r.refused, undefined, `must still escalate: ${q}`);
+  }
+  assert.equal(b.raised.length, 4);
+});
+
+test('a fact hiding inside a motivation question still escalates', async () => {
+  // "Why do you want to work here, and what salary do you expect?" is two questions, and one of
+  // them is a number he has to stand behind.
+  const b = belt();
+  const r = await b.call('ask_human', { kind: 'needs_answer', question: 'Why do you want to work here, and what salary do you expect?' });
+  assert.equal(r.refused, undefined);
+});
+
+test('neither pattern contains a control character', () => {
+  // Written with a literal backspace where \b belonged, twice today. It is invisible in a terminal
+  // and it makes the rule match nothing at all while every test of the rule still passes.
+  const src = fs.readFileSync(path.join(root, 'app/src/ai/tools/escalate.js'), 'utf8');
+  for (const name of ['MOTIVATION_RX', 'FACT_RX']) {
+    const line = src.split('\n').find((l) => l.startsWith(`const ${name}`));
+    assert.ok(line, `${name} must exist`);
+    assert.equal(line.includes(String.fromCharCode(8)), false, `literal backspace in ${name}`);
+  }
+});

@@ -140,7 +140,16 @@ function disputeSummary(summary, steps) {
     problems.push(`the summary blames failing or missing tools, but no tool error or refusal was recorded across ${steps.length} step(s) — every one succeeded.`);
   }
 
-  const claimsSubmitted = /\b(submitted|applied successfully|application (?:was )?sent)\b/.test(s);
+  // A DENIAL IS NOT A CLAIM.
+  //
+  // Live on a real Ritual application: the agent wrote an honest summary ending "It was not
+  // submitted; it will resume once the human supplies the degree level", and the word "submitted"
+  // alone got the whole run recorded as failed and disputed. Punishing a model for saying plainly
+  // that it did NOT do something is the exact opposite of what this check is for, and all it would
+  // teach the summary to do is go vague.
+  const DENIED = /\b(?:not|never|no)\s+(?:\w+\s+){0,3}(?:submitted|applied|sent)\b|\b(?:did|was|were|has|have)\s*n(?:o|')?t\s+(?:\w+\s+){0,3}(?:submit|submitted|applied|sent)\b/;
+  const claimsSubmitted = /\b(submitted|applied successfully|application (?:was )?sent)\b/.test(s)
+    && !DENIED.test(s);
   const reallySubmitted = steps.some((x) => x.tool === 'submit' && x.ok !== false && !x.refused
     && !/NOT SUBMITTED/i.test(String(x.result || '')));
   if (claimsSubmitted && !reallySubmitted) {

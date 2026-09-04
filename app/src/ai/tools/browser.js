@@ -208,7 +208,7 @@ function makeBrowserTools(opts = {}) {
     },
     {
       name: 'fill',
-      description: 'Type text into a field. Always blurs afterwards so the page commits the value.',
+      description: 'Type text into a text field. Always blurs afterwards so the page commits the value. For a dropdown use choose_option instead.',
       args: ['ref', 'text'],
       // Intrinsic guard, not a chunk-8 policy: this tool must never be able to type a credential.
       // It asks the DOM what the element actually IS (the a11y tree calls a password box a plain
@@ -226,11 +226,34 @@ function makeBrowserTools(opts = {}) {
       },
       run: async ({ ref, text }) => {
         const p = await ensure();
+        // A <select> silently swallows typed text. Say so rather than reporting a fill that did
+        // nothing: every real Greenhouse form has several dropdowns and the fixture had none.
+        if (await p.isSelectRef(ref)) {
+          const opts = await p.listOptions(ref);
+          return `that is a dropdown, not a text field. Use choose_option with one of: `
+            + `${(opts || []).slice(0, 25).join(' | ')}`;
+        }
         if (await p.isPasswordRef(String(ref))) {
           throw new Error('refused: that is a password field — the agent never types credentials');
         }
         await p.fill(String(ref), String(text == null ? '' : text));
         return `filled ${ref} and blurred it`;
+      },
+    },
+    {
+      name: 'choose_option',
+      description: 'Pick a value in a dropdown. Matches the option text or value, exactly first and '
+        + 'then loosely. If nothing matches it tells you every option there is, so ask for one of those.',
+      args: ['ref', 'value'],
+      guard: ({ value }) => (String(value || '').trim() ? null : 'refused: choose WHICH option'),
+      run: async ({ ref, value }) => {
+        const p = await ensure();
+        const r = await p.selectOption(ref, value);
+        if (r && r.notASelect) return 'that is not a dropdown. Use fill for a text field.';
+        if (!r || !r.ok) {
+          return `no option matches "${value}". The choices are: ${(r && r.options || []).join(' | ')}`;
+        }
+        return `chose "${r.chose}"`;
       },
     },
     {

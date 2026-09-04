@@ -89,9 +89,18 @@ test('the tool belt drives a real form', { skip: chromePath ? false : 'no Chrome
   <label for="pw">Account password</label><input id="pw" aria-label="Account password" type="password" />
   <label for="sneaky">Security answer</label><input id="sneaky" aria-label="Security answer" name="user_passwd" type="text" />
   <input id="cv" type="file" class="hidden" aria-hidden="true" style="display:none" />
+  <label for="src">How did you hear about us?</label>
+  <select id="src" aria-label="How did you hear about us?">
+    <option value="">Select...</option><option value="li">LinkedIn</option>
+    <option value="ref">Referral from a friend</option><option value="ev">Career fair</option>
+  </select>
+  <p id="saw">nothing</p>
   <button id="go" type="button" onclick="document.getElementById('out').textContent='CLICKED'">Continue</button>
   <p id="out">waiting</p>
-  <script>window.__blur = 0; document.getElementById('phone').addEventListener('blur', () => window.__blur++);</script>
+  <script>window.__blur = 0; document.getElementById('phone').addEventListener('blur', () => window.__blur++);
+  document.getElementById('src').addEventListener('change', function () {
+    document.getElementById('saw').textContent = 'change:' + this.value;
+  });</script>
 </body></html>`, 'utf8');
 
   const belt = bt.makeBrowserTools({ profileId: 'belt-test', port: PORT, headless: true });
@@ -109,7 +118,7 @@ test('the tool belt drives a real form', { skip: chromePath ? false : 'no Chrome
   try {
     await t.test('the belt exposes exactly the verbs the agent is told about', () => {
       assert.deepEqual(belt.tools.map((x) => x.name).sort(), [
-        'attach_file', 'click', 'fill', 'find', 'navigate',
+        'attach_file', 'choose_option', 'click', 'fill', 'find', 'navigate',
         'page_text', 'press_key', 'query_ref', 'read_page', 'screenshot',
       ]);
       for (const x of belt.tools) {
@@ -174,6 +183,44 @@ test('the tool belt drives a real form', { skip: chromePath ? false : 'no Chrome
         assert.match(r.refused, /password field/);
         assert.equal(await belt.page().evaluate('document.getElementById("pw").value'), '',
           'nothing may have been typed');
+      });
+
+      await t.test('choose_option drives a real dropdown, and the page sees it', async () => {
+        // `fill` types text, and typing into a <select> does nothing at all, silently. Every real
+        // Greenhouse form has several: country, phone country, "how did you hear about us". The
+        // fixture had none until now, which is why twelve green end-to-end runs never noticed.
+        const ref = (await call('query_ref', { selector: '#src' })).result.match(/ref_\w+/)[0];
+        const said = await call('choose_option', { ref, value: 'LinkedIn' });
+        assert.match(said.result, /chose "LinkedIn"/);
+        // Setting .value alone is not enough on a framework form: it keeps its own state and only
+        // updates on the events a real user produces. Same lesson as `fill` always blurring.
+        assert.match((await call('page_text', {})).result, /change:li/, 'the page must see a change event');
+      });
+
+      await t.test('a loose match is allowed, because postings and options never match exactly', async () => {
+        const ref = (await call('query_ref', { selector: '#src' })).result.match(/ref_\w+/)[0];
+        assert.match((await call('choose_option', { ref, value: 'referral' })).result, /Referral from a friend/);
+      });
+
+      await t.test('no matching option lists what there IS, instead of dead-ending', async () => {
+        const ref = (await call('query_ref', { selector: '#src' })).result.match(/ref_\w+/)[0];
+        const said = (await call('choose_option', { ref, value: 'Antarctica' })).result;
+        assert.match(said, /no option matches/);
+        assert.match(said, /LinkedIn/);
+        assert.match(said, /Career fair/);
+      });
+
+      await t.test('fill on a dropdown says so instead of quietly doing nothing', async () => {
+        const ref = (await call('query_ref', { selector: '#src' })).result.match(/ref_\w+/)[0];
+        const said = (await call('fill', { ref, text: 'LinkedIn' })).result;
+        assert.match(said, /that is a dropdown/);
+        assert.match(said, /choose_option/);
+        assert.match(said, /LinkedIn/, 'and it hands over the options while it is there');
+      });
+
+      await t.test('choosing nothing is refused', async () => {
+        const ref = (await call('query_ref', { selector: '#src' })).result.match(/ref_\w+/)[0];
+        assert.match((await call('choose_option', { ref, value: '  ' })).refused, /choose WHICH option/);
       });
 
       await t.test('fill also refuses a password field disguised as type=text', async () => {
