@@ -259,8 +259,12 @@ async function start({
   //
   // A finished application is worth the extra. The sandbox self-test is not, and keeps the default.
   const APPLY_CHARS = 750000;
+  // A real Greenhouse form has about fifteen fields, four of them type-ahead boxes that cost a read
+  // and a choose each. Forty steps ran out on the Ritual form with the résumé attached, Degree,
+  // Discipline and Country set, and School still unset.
+  const APPLY_STEPS = 55;
   const limitsForRun = ['browser', 'apply'].includes(toolset)
-    ? { maxChars: APPLY_CHARS, ...limits }
+    ? { maxChars: APPLY_CHARS, maxSteps: APPLY_STEPS, ...limits }
     : limits;
 
   rec.promise = runAgent({

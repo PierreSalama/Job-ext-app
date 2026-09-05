@@ -41,6 +41,7 @@ const { makeJatTools } = require(path.join(root, 'app/src/ai/tools/jat.js'));
 const { makeDocumentTools } = require(path.join(root, 'app/src/ai/tools/documents.js'));
 const { makeEscalateTools } = require(path.join(root, 'app/src/ai/tools/escalate.js'));
 const { makePolicy, wrapTools } = require(path.join(root, 'app/src/ai/guardrails.js'));
+const applyRunner = require(path.join(root, 'app/src/ai/apply-runner.js'));
 const browserTools = require(path.join(root, 'app/src/ai/tools/browser.js'));
 // This run writes its documents to a scratch folder instead of the real applications directory, so
 // that scratch folder has to be uploadable too — otherwise the agent is refused for attaching a
@@ -129,6 +130,14 @@ say('=== transcript ===');
 
 try {
   const r = await loop.runAgent({
+    // THE RULES THE PRODUCT ACTUALLY SHIPS.
+    //
+    // This rig called runAgent directly and never passed systemExtra, so every standing rule added
+    // today was untested by it: read my_resume before escalating a fact, a dropdown is not a
+    // missing answer, try a school's FORMER name. On the real Ritual form the agent spent its last
+    // steps retrying "Toronto Metropolitan University" and never tried "Ryerson", because the rule
+    // telling it to was in a string this harness did not send.
+    systemExtra: applyRunner.APPLY_RULES,
     goal: `Prepare a job application at ${URL_} for the candidate.\n`
       + 'Work in this order:\n'
       + '1. check_duplicate FIRST, using the posting url. If it is a duplicate, finish immediately and say so.\n'
@@ -145,7 +154,9 @@ try {
     // `stopped (max_steps)` because it had no step left to say so.
     // Matches what apply-runner gives a real application. At 400,000 the real Ritual run stopped
     // at step 30 with the résumé attached and three fields left: out of budget, not ability.
-    limits: { maxSteps: 40, maxChars: 750000 },
+    // A real Greenhouse form has about fifteen fields, four of them type-ahead boxes that take a
+    // read and a choose each. Forty steps ran out with the résumé attached and School unset.
+    limits: { maxSteps: 55, maxChars: 750000 },
     deps: { generate: (a) => providerMod.run({ ...a, providerOverride: chosen }) },
     onStep: (s) => {
       const mark = s.refused ? 'REFUSED' : s.ok === false ? 'ERROR  ' : 'ok     ';

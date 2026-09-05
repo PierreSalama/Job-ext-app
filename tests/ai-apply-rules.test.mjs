@@ -93,5 +93,22 @@ test('a real application gets a budget that fits reference material', () => {
   const src = fs.readFileSync(path.join(root, 'app/src/ai/apply-runner.js'), 'utf8');
   assert.match(src, /const APPLY_CHARS = 750000/);
   assert.match(src, /\['browser', 'apply'\]\.includes\(toolset\)/, 'the sandbox self-test keeps the default');
-  assert.match(src, /\{ maxChars: APPLY_CHARS, \.\.\.limits \}/, 'an explicit caller limit must still win');
+  assert.match(src, /maxChars: APPLY_CHARS/, 'and the character budget with it');
+});
+
+test('the end-to-end rig sends the rules the product ships', () => {
+  // tools/apply-e2e.mjs called runAgent directly and never passed systemExtra, so every standing
+  // rule added on 2026-09-04 was untested by it. On the real Ritual form the agent spent its last
+  // steps retrying "Toronto Metropolitan University" and never tried "Ryerson", because the rule
+  // telling it to was in a string the harness did not send. A rig that exercises a different system
+  // than the one that ships is worse than no rig.
+  const rig = fs.readFileSync(path.join(root, 'tools/apply-e2e.mjs'), 'utf8');
+  assert.match(rig, /systemExtra: applyRunner\.APPLY_RULES/);
+  assert.match(rig, /require\(path\.join\(root, 'app\/src\/ai\/apply-runner\.js'\)\)/);
+});
+
+test('a real application gets the steps a real form needs', () => {
+  const src = fs.readFileSync(path.join(root, 'app/src/ai/apply-runner.js'), 'utf8');
+  assert.match(src, /const APPLY_STEPS = 55/);
+  assert.match(src, /maxSteps: APPLY_STEPS, \.\.\.limits/, 'an explicit caller limit must still win');
 });
