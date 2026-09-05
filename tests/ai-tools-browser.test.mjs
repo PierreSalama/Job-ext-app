@@ -260,6 +260,34 @@ test('the tool belt drives a real form', { skip: chromePath ? false : 'no Chrome
           'the page must have received the click, not just the keystrokes');
       });
 
+      await t.test('read_page shows a committed suggestion box as filled', async () => {
+        // Greenhouse keeps the chosen value in a rendered element and clears the input it searched
+        // with, so the accessibility tree showed School, Degree and Discipline as blank AFTER they
+        // were set. On a real Ritual run the agent filled all four type-ahead boxes, read the page,
+        // saw them empty, and filled all four again, then ran out of budget on the second pass.
+        const ref = (await call('query_ref', { selector: '#degree' })).result.match(/ref_\w+/)[0];
+        await call('choose_option', { ref, value: 'Doctorate' });
+        const tree = (await call('read_page', { interactive: true })).result;
+        assert.match(tree, /combobox\s+Degree\s+=\s+Doctorate/,
+          'the tree must carry the chosen value, or the agent redoes its own work');
+      });
+
+      await t.test('the annotation is one DOM sweep, not a call per node', () => {
+        // A per-node query on a page with forty controls turns every read_page into forty round
+        // trips. One query for the page, matched back by ref.
+        const src = fs.readFileSync(path.join(root, 'app/src/browser/cdp.js'), 'utf8');
+        const sweep = src.slice(src.indexOf('A COMMITTED react-select READS AS EMPTY'), src.indexOf('lastTree = out'));
+        assert.match(sweep, /querySelectorAll\('input\[role="combobox"\]/);
+        assert.equal((sweep.match(/await evaluate\(/g) || []).length, 1, 'exactly one page query');
+      });
+
+      await t.test('a failed sweep never takes read_page down with it', () => {
+        // Reading the page is the agent's eyes. A quirk in one widget must not blind it entirely.
+        const src = fs.readFileSync(path.join(root, 'app/src/browser/cdp.js'), 'utf8');
+        const sweep = src.slice(src.indexOf('A COMMITTED react-select READS AS EMPTY'), src.indexOf('lastTree = out'));
+        assert.match(sweep, /catch \(e\) \{ log\.warn/);
+      });
+
       await t.test('fill on a suggestion box says so instead of looping', async () => {
         const ref = (await call('query_ref', { selector: '#degree' })).result.match(/ref_\w+/)[0];
         const said = (await call('fill', { ref, text: "Master's Degree" })).result;

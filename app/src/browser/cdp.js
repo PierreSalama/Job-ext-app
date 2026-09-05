@@ -248,6 +248,37 @@ async function attachPage(opts = {}) {
       }
       out.push(entry);
     }
+    // A COMMITTED react-select READS AS EMPTY.
+    //
+    // Greenhouse keeps the chosen value in a rendered element and clears the input it searched
+    // with, so the accessibility tree shows School, Degree and Discipline as blank AFTER they were
+    // set. On a real Ritual run the agent filled all four type-ahead boxes, read the page, saw them
+    // empty, and filled all four again, then ran out of budget on the second pass.
+    //
+    // One DOM query for the whole page, matched back by ref, rather than a call per node.
+    try {
+      const committed = await evaluate(`(() => {
+        const out = {};
+        for (const el of document.querySelectorAll('input[role="combobox"], input[aria-autocomplete]')) {
+          let shown = null, box = el.parentElement;
+          for (let i = 0; i < 4 && box && !shown; i++, box = box.parentElement) {
+            shown = box.querySelector('[class*="singleValue"], [class*="single-value"], [class*="multiValue"], [class*="multi-value"]');
+          }
+          const text = shown && String(shown.textContent || '').trim();
+          if (text) out[el.id || el.name || ''] = text;
+        }
+        return out;
+      })()`);
+      if (committed && Object.keys(committed).length) {
+        for (const entry of out) {
+          if (entry.role !== 'combobox' || entry.value) continue;
+          const d = await describeRef(entry.ref).catch(() => null);
+          const key = d && (d.id || d.name);
+          if (key && committed[key]) entry.value = committed[key];
+        }
+      }
+    } catch (e) { log.warn(`combobox value sweep failed: ${e.message}`); }
+
     lastTree = out;
     return out;
   }
