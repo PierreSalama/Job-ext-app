@@ -15,7 +15,20 @@
  *   - anything the model isn't sure of, or that asks for consent//legal agreement → left for Pierre.
  *
  * Usage: node tools/ai-answer-parked.mjs --base http://host:port --token XXX [--min 0.8] [--dry]
+ *        [--ttl-days 7] [--cache <file>] [--no-cache]
+ *
+ * It REMEMBERS what it already asked. This pass runs every 30 minutes, and a question the model
+ * could not answer confidently stays parked, so without a memory the same questions went back to
+ * the model on every pass. Measured on the laptop 2026-09-23: 16 unchanged questions x 52 passes a
+ * day, about 830 Claude calls a day, which used up Pierre's WEEKLY Claude limit on 18-19 Sep. A
+ * question is now asked again only when its memory is older than --ttl-days, or when the profile
+ * or résumé has changed (both are part of the memory key, so a real edit re-opens every question).
  */
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+
 const args = process.argv.slice(2);
 const arg = (k, d = null) => { const i = args.indexOf('--' + k); return i >= 0 ? args[i + 1] : d; };
 // 7744 is the app's real port (config.js server.port); the 7746 this defaulted to was never
@@ -25,6 +38,26 @@ const BASE = arg('base', 'http://127.0.0.1:7744').replace(/\/$/, '');
 const TOKEN = arg('token', '');
 const MIN = Number(arg('min', '0.8'));
 const DRY = args.includes('--dry');
+const TTL_DAYS = Number(arg('ttl-days', '7'));
+const NO_CACHE = args.includes('--no-cache');
+const CACHE_FILE = arg('cache', path.join(path.dirname(fileURLToPath(import.meta.url)), 'ai-answer-parked.cache.json'));
+const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 24);
+
+// { [key]: { at: ISO, outcome: 'low'|'saved'|'junk', conf, question } }. A read failure means an
+// empty memory, never a crash: the worst case is one pass that asks everything, as before.
+function loadCache() {
+  if (NO_CACHE) return {};
+  try { return JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8')) || {}; } catch { return {}; }
+}
+function saveCache(cache) {
+  if (NO_CACHE || DRY) return;
+  const cutoff = Date.now() - TTL_DAYS * 864e5;
+  for (const [k, v] of Object.entries(cache)) if (!(Date.parse(v.at) >= cutoff)) delete cache[k];
+  try {
+    fs.writeFileSync(CACHE_FILE + '.tmp', JSON.stringify(cache, null, 1));
+    fs.renameSync(CACHE_FILE + '.tmp', CACHE_FILE);
+  } catch (e) { console.log(`  WARN could not write the question memory ${CACHE_FILE}: ${e.message}`); }
+}
 
 const H = { 'X-JAT-Token': TOKEN, 'Content-Type': 'application/json' };
 const api = async (p, opts = {}) => {
@@ -109,8 +142,21 @@ const main = async () => {
     required: ['answer', 'confidence', 'evidence'],
   };
 
+  // Same question, same options, same profile and résumé -> same answer. Anything else re-asks.
+  const contextKey = sha(JSON.stringify(profile.data || profile) + '\n' + resumeText);
+  const keyOf = (q) => sha([contextKey, String(q.question || '').trim().toLowerCase(),
+    String(q.fieldType || ''), JSON.stringify(q.options || [])].join('\n'));
+  const cache = loadCache();
+  const fresh = (k) => cache[k] && Date.now() - Date.parse(cache[k].at) < TTL_DAYS * 864e5;
+  const remembered = asks.filter(({ q }) => fresh(keyOf(q)));
+  if (remembered.length) console.log(`  REMEMBERED ${remembered.length} question(s) already asked in the last ${TTL_DAYS}d with this profile - not asking again`);
+  const remember = (q, outcome, conf) => {
+    cache[keyOf(q)] = { at: new Date().toISOString(), outcome, conf, question: String(q.question).slice(0, 160) };
+  };
+
   const accepted = [];
   for (const { q, companies } of asks) {
+    if (fresh(keyOf(q))) continue;
     const prompt = [
       'CANDIDATE PROFILE (JSON):', JSON.stringify(profile.data || profile, null, 1).slice(0, 3000),
       '', 'RÉSUMÉ:', resumeText.slice(0, 5000),
@@ -132,13 +178,14 @@ const main = async () => {
     const conf = Number(out?.confidence ?? 0);
     const ans = String(out?.answer ?? '').trim();
     const label = `${[...companies].slice(0, 2).join(',')} | ${String(q.question).slice(0, 58)}`;
-    if (!ans || conf < MIN) { console.log(`  LOW  (${conf.toFixed(2)}) ${label}`); continue; }
+    if (!ans || conf < MIN) { console.log(`  LOW  (${conf.toFixed(2)}) ${label}`); remember(q, 'low', conf); continue; }
     // LinkedIn ships its Easy Apply options with the form-element URN glued on, so "answer with
     // one of the given options" yields a job-specific identifier. The server refuses these at the
     // write boundary (db.isOpaqueTokenAnswer); refusing here too means the run REPORTS it as junk
     // instead of announcing a save the store then silently drops.
     if (/\burn:[a-z0-9][\w.-]*:/i.test(ans)) {
       console.log(`  JUNK (${conf.toFixed(2)}) ${label}\n         a scraped widget identifier, not an answer: ${JSON.stringify(ans.slice(0, 120))}`);
+      remember(q, 'junk', conf);
       continue;
     }
     // Print the answer IN FULL. This line is the only record of what goes into Pierre's permanent
@@ -146,12 +193,18 @@ const main = async () => {
     // to check was the one thing they could not see. Rejected answers stay short; accepted ones
     // are the ones that matter.
     console.log(`  OK   (${conf.toFixed(2)}) ${label}\n         ANSWER: ${JSON.stringify(ans)}\n         EVIDENCE: ${String(out.evidence).slice(0, 200)}`);
-    accepted.push({ question: q.question, value: ans, fieldType: q.fieldType || 'text' });
+    accepted.push({ question: q.question, value: ans, fieldType: q.fieldType || 'text', _q: q, _conf: conf });
   }
 
-  if (!accepted.length) { console.log('nothing confident enough to save'); return; }
+  if (!accepted.length) { saveCache(cache); console.log('nothing confident enough to save'); return; }
   if (DRY) { console.log(`DRY RUN — would save ${accepted.length}`); return; }
-  const r = await api('/auto-apply/intake', { method: 'POST', body: JSON.stringify({ answers: accepted }) });
+  const r = await api('/auto-apply/intake', {
+    method: 'POST', body: JSON.stringify({ answers: accepted.map(({ _q, _conf, ...a }) => a) }),
+  });
+  // Remembered only once the app has taken the answers: a failed intake throws above, so the next
+  // pass asks again instead of believing a save that never happened.
+  for (const a of accepted) remember(a._q, 'saved', a._conf);
+  saveCache(cache);
   console.log(`SAVED ${r.saved} answer(s); requeued ${r.requeued} job(s)`);
 };
 

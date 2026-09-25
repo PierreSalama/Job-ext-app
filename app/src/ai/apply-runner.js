@@ -202,7 +202,7 @@ async function start({
       const browserTools = openBelt();
       toolList = [
         ...browserTools,
-        ...makeJatTools({ profileId: key || null, peers: makePeers() }).tools,
+        ...makeJatTools({ profileId: key || null, peers: makePeers(), getRunId: () => (rec ? rec.runId : null) }).tools,
         ...makeDocumentTools().tools,
         // Escalation last so it can reach the live page for the auto-submit branch, and so the
         // autonomy mode chosen for THIS run is what `submit` obeys.

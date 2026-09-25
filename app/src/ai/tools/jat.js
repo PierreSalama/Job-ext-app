@@ -82,9 +82,23 @@ function employerKey({ url, company } = {}) {
 
 // Everything already engaged, indexed by employer key. Built once per call: the ledger is a few
 // thousand rows and this runs a handful of times per application, not per step.
-function engagedIndex() {
+// WHOSE HISTORY COUNTS. Measured 2026-09-05: with a second profile created, check_duplicate told
+// DAD that a job PIERRE had submitted was "already engaged". The jobs table carried no person at
+// all, so every applicant inherited every other applicant's history. On the real ledger that is
+// about five thousand jobs, and his dad would have been refused almost everywhere while the refusal
+// looked exactly like the system working.
+//
+// A row with no owner is read as the DEFAULT profile's. Every row that existed before v23 was
+// backfilled to the default, and a caller that does not name an owner leaves it null, so Pierre's
+// protection is unchanged in both directions. A second person simply starts clean.
+function engagedIndex(profileId) {
   const map = new Map();
-  for (const j of db.listJobs({ limit: 5000 })) {
+  let defaultId = null;
+  try { defaultId = db.ensureDefaultProfileId(); } catch { /* no profiles yet */ }
+  const mine = profileId || defaultId;
+  for (const j of db.listJobs({ limit: 5000, full: true })) {
+    const owner = j.profileId || j.profile_id || defaultId;
+    if (mine && owner && owner !== mine) continue;   // somebody else's application
     const tags = Array.isArray(j.tags) ? j.tags : [];
     const engaged = ENGAGED.has(j.status) || tags.includes('hand-applied') || tags.includes('BLOCKED-ON-PIERRE');
     if (!engaged) continue;
@@ -97,10 +111,10 @@ function engagedIndex() {
   return map;
 }
 
-function duplicateOf({ url, company, title } = {}) {
+function duplicateOf({ url, company, title, profileId } = {}) {
   const { key, via, slug } = employerKey({ url, company });
   if (!key) return null;
-  const idx = engagedIndex();
+  const idx = engagedIndex(profileId);
   const hits = idx.get(key);
   if (!hits || !hits.length) return null;
   const sameRole = hits.find((h) => norm(h.title) === norm(title));
@@ -174,13 +188,20 @@ function makeJatTools(opts = {}) {
     // Injected so this module never learns about HTTP, and so the peer sweep can be tested with no
     // network at all. Returns [{ name, engaged: [{company,title,status}] }] or throws per node.
     peers = null,
+    // Which agent run is calling, so a confirmed submission can be credited to it.
+    getRunId = null,
   } = opts;
   const pid = () => profileId || db.ensureDefaultProfileId();
 
   const tools = [
     {
       name: 'check_duplicate',
-      description: 'BEFORE writing any documents, check whether this employer has already been applied to. Pass the posting url and company.',
+      // The wording matters: the refusal below exists because the agent called this FIRST, before
+      // navigating, with an empty company. It still did exactly that on the 2026-09-05 run and
+      // burned a step recovering. Saying when to call it is cheaper than refusing afterwards.
+      description: 'AFTER opening the posting and BEFORE writing any documents, check whether this '
+        + 'employer has already been applied to. Needs the real posting url AND the company name as '
+        + 'the page writes it, so read the page first. Called with neither, it can compare nothing.',
       args: ['url', 'company', 'title'],
       run: async ({ url, company, title }) => {
         const { via, slug } = employerKey({ url, company });
@@ -192,7 +213,7 @@ function makeJatTools(opts = {}) {
           return 'CANNOT CHECK — no company name and no board slug in that url, so nothing was compared. '
             + 'Open the posting first, then call this again with the employer name and the real posting url.';
         }
-        const dup = duplicateOf({ url, company, title });
+        const dup = duplicateOf({ url, company, title, profileId: pid() });
         if (dup) return sayDuplicate(dup, 'this machine');
 
         // ASK THE OTHER MACHINES.
@@ -372,7 +393,15 @@ ${text}`;
           .filter((t, i, a) => a.indexOf(t) === i);
         const missing = clean(r.missing).slice(0, 14);
         const matched = clean(r.matched).slice(0, 14);
-        return `overlap score ${r.score}/100 (a crude token overlap, not a verdict)
+        // NO NUMBER.
+        //
+        // This used to report "overlap score 67/100". The number is dominated by how long a posting
+        // is and how many technologies it happens to name, so ranking real Canadian postings by it
+        // put "Enterprise Core Sales Engineer" at 91 and an AI Architect role at 100. Calling it
+        // crude in the same breath did not stop it being used as a ranking, by me, within the hour.
+        // The lists below are the part that carries information.
+        const band = r.score >= 55 ? 'a lot of overlap' : r.score >= 30 ? 'some overlap' : 'little overlap';
+        return `${band} with his real history, judged on words alone and easily wrong
 `
           + `  he has a record of: ${matched.join(', ') || '(nothing recognisable)'}
 `
@@ -451,6 +480,11 @@ ${text}`;
         if (!saved || saved.status !== 'submitted') {
           throw new Error(`the ledger stored status "${saved && saved.status}" instead of submitted — NOT recorded correctly`);
         }
+        // Credit the run. Without this ai_runs never linked to a job and the AI lane read 0.
+        try {
+          const rid = getRunId && getRunId();
+          if (rid && db.aiRunLinkJob) db.aiRunLinkJob(rid, jobId);
+        } catch (e) { log.warn(`could not link run to job: ${e.message}`); }
         log.info(`logged application ${company} / ${title} (${jobId})`);
         return `logged ${company} / ${title} as submitted (${jobId}), verified by read-back`;
       },

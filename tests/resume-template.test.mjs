@@ -56,3 +56,43 @@ test('the authored copy still wins where it exists', () => {
   const src = fs.readFileSync(path.join(root, 'app/src/ai/tools/documents.js'), 'utf8');
   assert.match(src, /existsSync\(AUTHORED_TEMPLATE\)/);
 });
+
+// The three tests above assert the SOURCE of documents.js. None of them reads a byte of a template,
+// so none would notice the head coming out empty, coming from the wrong file, or swallowing a whole
+// document. What ships to an employer is the actual bytes, so assert those.
+
+test('BEHAVIOUR: a missing template falls back to the BUNDLED one specifically, not to nothing', () => {
+  const gone = path.join(os.tmpdir(), 'definitely-not-here-resume-' + process.pid + '.html');
+  assert.equal(fs.existsSync(gone), false, 'precondition');
+  const head = docs.resumeHead(gone);
+  assert.ok(head.length > 0, 'an empty head is the blank-PDF failure this fallback exists to prevent');
+  assert.equal(head, docs.resumeHead(docs.BUNDLED_TEMPLATE),
+    'the fallback must land on the bundled template, byte for byte');
+});
+
+test('BEHAVIOUR: the bytes returned really are the template file, up to <body>', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'jat-tpl-'));
+  const f = path.join(tmp, 'custom.html');
+  const marker = 'jat-marker-' + process.pid;
+  fs.writeFileSync(f, `<!doctype html><html><head><style>.${marker}{color:red}</style></head><body>DROP ME</body></html>`, 'utf8');
+  try {
+    const head = docs.resumeHead(f);
+    assert.ok(head.includes(marker), 'the caller must get THIS file, not a cached or bundled one');
+    assert.ok(!head.includes('DROP ME'), 'everything from <body> on must be cut');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('BEHAVIOUR: a template with no <body> is an error, not the whole document as a head', () => {
+  // Silently returning the entire file would inline a second document into the résumé's head and
+  // produce something that renders as garbage rather than failing where anyone would look.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'jat-tpl-nobody-'));
+  const f = path.join(tmp, 'nobody.html');
+  fs.writeFileSync(f, '<!doctype html><html><head><title>no body here</title></head></html>', 'utf8');
+  try {
+    assert.throws(() => docs.resumeHead(f), /no <body>/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

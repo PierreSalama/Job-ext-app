@@ -45,6 +45,48 @@ export function urlLooksLikeSuccess(href = location.href) {
 // reject it.
 const MIN_CONFIRM_MS = 400;
 
+// ============================================================
+// SUBMIT-REJECTION: the page telling us, in words, that it did NOT accept the form.
+// ============================================================
+// Found live 2026-09-08 on an Ashby posting. The run clicked "Submit Application", the page
+// answered "Your form needs corrections. Missing entry for required field…", and the task was
+// filed as awaiting_review — the bucket whose whole meaning is "probably submitted, please
+// confirm". It was not a maybe. It was a no, in plain English, already captured in the
+// reject-detail diagnostic and then discarded.
+//
+// That mistake is expensive in three directions at once: the job is never retried, it sits in
+// Pierre's review queue as a false maybe (useless while he is away for eight hours), and the
+// honest-rate metric counts a rejection in the "maybe submitted" column.
+//
+// THE FALSE-POSITIVE DIRECTION IS THE DANGEROUS ONE. Calling a REAL submission a rejection makes
+// the queue retry it and Pierre applies to the same job twice, under his own name. So this is
+// deliberately narrow:
+//   • only text in a node that APPEARED after the click is considered (`newNodes`), never the
+//     static page copy — "* Required" is on virtually every ATS form before a click is made;
+//   • the phrases are whole complaints ("needs corrections", "missing entry for required field"),
+//     not the bare word "required";
+//   • and any hint of success in the same new nodes makes the whole thing ambiguous, which sends
+//     it back to awaiting_review — the honest maybe — rather than to either confident answer.
+const SUBMIT_REJECTED_RX = /(your\s*form\s*needs\s*corrections|missing\s*entry\s*for\s*required|please\s*(correct|fix|review)\s*the\s*(errors?|following|highlighted|fields?)|there\s*(were|are|was)\s*(some\s*)?(errors?|problems?)\s*(with\s*)?(your\s*)?(form|submission|application)|(this\s*)?field\s*is\s*required|required\s*fields?\s*(is|are)\s*(empty|missing|incomplete)|(unable|failed)\s*to\s*submit|submission\s*(failed|was\s*not\s*(sent|received))|veuillez\s*corriger|champ\s*(est\s*)?obligatoire)/i;
+
+// Returns the matched complaint (for the transcript and the queue's last_error) or null.
+// `newNodes` is the same array evaluateSubmitEvidence reads, so both verdicts are drawn from one
+// observation of the page rather than two that could disagree.
+export function submitRejectionInNewNodes(newNodes) {
+  if (!Array.isArray(newNodes)) return null;
+  for (const n of newNodes) {
+    if (!n) continue;
+    const t = String(n.text || '').replace(/\s+/g, ' ').trim();
+    // A node long enough to be the whole page is not a targeted error message, and matching one
+    // would mean matching any page that happens to contain a validation string somewhere.
+    if (!t || t.length > 800) continue;
+    if (SUCCESS_TEXT_RX.test(t)) return null;   // ambiguous — let the maybe stand
+    const hit = SUBMIT_REJECTED_RX.exec(t);
+    if (hit) return t.slice(0, 200);
+  }
+  return null;
+}
+
 function hasNewSuccessNode(newNodes) {
   if (!Array.isArray(newNodes)) return false;
   return newNodes.some((n) => {
@@ -117,4 +159,4 @@ export function nodeLooksLikeSuccess(node) {
   return t.length < 600 && SUCCESS_TEXT_RX.test(t);
 }
 
-export { SUCCESS_TEXT_RX, SUCCESS_URL_RX, NON_SUCCESS_URL_RX, MIN_CONFIRM_MS };
+export { SUCCESS_TEXT_RX, SUCCESS_URL_RX, NON_SUCCESS_URL_RX, MIN_CONFIRM_MS, SUBMIT_REJECTED_RX };

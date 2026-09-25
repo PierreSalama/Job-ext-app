@@ -25,8 +25,23 @@ const arg = process.argv[2] || '';
 // ledger. It exercises the half of the pipeline a live posting cannot: writing documents, filling
 // the fields, and submit PARKING instead of clicking. Filling a real employer's form with a test
 // run and abandoning it half-completed is not a thing to do to someone's application system.
-const USE_FIXTURE = arg === '--fixture' || !arg;
-const URL_ARG = USE_FIXTURE ? '' : arg;
+const FULL_AUTO = process.argv.includes('--auto');
+const args = process.argv.slice(2).filter((a) => a !== '--auto' && !a.startsWith('--provider='));
+const target = args[0] || '';
+const USE_FIXTURE = target === '--fixture' || !target;
+const URL_ARG = USE_FIXTURE ? '' : target;
+
+// FULL AUTO CLICKS SUBMIT FOR REAL. It is the one branch of this system that sends an application,
+// and it had never been run at all, which is its own kind of risk: an untested path that submits.
+//
+// It may only ever be pointed at the local fixture. Running it against a real posting would put an
+// application in a real employer's system from a TEST rig, which is unrecoverable and is not
+// something to discover by mistyping a flag.
+if (FULL_AUTO && !USE_FIXTURE) {
+  say('REFUSED: --auto submits for real, so it only runs against --fixture.');
+  say(`You pointed it at: ${URL_ARG}`);
+  process.exit(2);
+}
 
 // --- isolate everything -----------------------------------------------------
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'jat-e2e-'));
@@ -56,9 +71,13 @@ async function probe(n) {
   try { await providerMod.run({ kind: 'agent-step', providerOverride: n, system: 'One word.', prompt: 'Say READY.' }); return true; }
   catch { return false; }
 }
+// --provider=claude forces the FALLBACK. Worth having: every (unparsed) step in the recorded runs
+// belongs to claude-cli and none to codex, so the provider that takes over when Codex is briefly
+// out is the one that needs exercising, and the probe order alone will never pick it.
+const forced = (process.argv.find((a) => a.startsWith('--provider=')) || '').split('=')[1] || '';
 let chosen = null;
 say('=== provider probe ===');
-for (const n of ['codex', 'claude']) {
+for (const n of (forced ? [forced] : ['codex', 'claude'])) {
   const ok = await probe(n);
   say(`  ${n.padEnd(7)} ${ok ? 'USABLE' : 'unusable'}`);
   if (ok && !chosen) chosen = n;
@@ -75,7 +94,7 @@ let tools = [
   ...makeJatTools({}).tools,
   ...makeDocumentTools({ root: docsDir }).tools,
   ...makeEscalateTools({
-    autonomy: 'prepare',
+    autonomy: FULL_AUTO ? 'auto' : 'prepare',
     page: () => belt.page(),
     context: () => ({ url: belt.lastUrl() }),
     onBlock: (b) => blocks.push(b),
@@ -110,6 +129,31 @@ if (USE_FIXTURE) {
     <label for="why">Why do you want to work here?</label>
     <textarea id="why" aria-label="Why do you want to work here?"></textarea>
     <label for="salary">Salary expectations</label><input id="salary" aria-label="Salary expectations" type="text" />
+    <!-- THE TWO QUESTIONS THAT EXERCISE THE RAILS FIXED ON 2026-09-06.
+         Both are realistic for this posting: it is a Canadian role that names ERP integration, and
+         plenty of Canadian postings ask about US authorisation for cross-border work.
+
+         "US authorisation" must NOT come back Yes. He is a Canadian citizen who needs sponsorship
+         for a US role, and the deterministic floor answered Yes to exactly this until today.
+
+         "years with SAP" must NOT come back 3. estimateYears takes no subject, so the floor gave
+         the same number for every technology, including ones he has never touched.
+
+         WHAT BOTH ACTUALLY DID, run 2026-09-06:
+           US authorisation -> recallOk refused every harvested candidate, recall_answer said NOT
+             ANSWERED BEFORE, and the agent escalated with "only authorized to work in Canada, not
+             the US". Parked. That is the fix working end to end.
+           SAP years -> filled "0". Note WHERE that came from: recall had a stored 0 for a similar
+             SAP question. The floor gate was never reached, because the floor only runs when every
+             provider is down. So this run shows the SYSTEM is right, not that the floor fix is.
+
+         The US question parks the run before it reaches the SAP field, which is correct behaviour
+         and makes it the one this fixture exercises by default. Delete the usauth field to test
+         the years path instead. -->
+    <label for="usauth">Are you legally authorized to work in the United States without sponsorship?</label>
+    <input id="usauth" aria-label="Are you legally authorized to work in the United States without sponsorship?" type="text" />
+    <label for="saperp">How many years of experience do you have with SAP ERP integration?</label>
+    <input id="saperp" aria-label="How many years of experience do you have with SAP ERP integration?" type="text" />
     <fieldset><legend>Voluntary Self-Identification</legend>
       <label><input type="radio" name="gender" value="m" aria-label="Male" /> Male</label>
       <label><input type="radio" name="gender" value="f" aria-label="Female" /> Female</label>

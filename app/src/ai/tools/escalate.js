@@ -48,10 +48,65 @@ const KINDS = {
 // Three end-to-end runs in a row prepared a complete application and then parked on exactly this,
 // which would park most real Greenhouse and Ashby forms, since nearly all of them ask some version
 // of it. Escalating it is not caution. It is handing back work that was already done.
-const MOTIVATION_RX = /\b(why (do|are) you|why this|what (interests|excites|draws|attracts)|tell us (a bit )?about (yourself|why)|what (do you know|interests you) about|reason for applying|what makes you|interested in (joining|working)|cover letter)\b/i;
+// A MOTIVATION question is one the agent can write for itself, from the posting and the resume.
+// The guard below refuses to escalate one, because escalating PARKS THE APPLICATION.
+//
+// This was one long single-line regex until 2026-09-05. Three things were wrong with that, all
+// found by diffing it against Pierre's own live answer bank (4,543 rows) rather than by reading it:
+//
+//   1. It was English only, so "Pourquoi voulez-vous travailler ici?" was escalated and parked.
+//      Four real French questions in the bank, one of them bilingual, as Quebec postings are.
+//   2. Twenty more real questions were missed in ENGLISH: "why Wealthsimple?", "tell us why you
+//      would like to work with us", "what motivates you", "describe why ... a strong fit".
+//   3. Editing one 400-character line is how a clause gets dropped by accident. The first
+//      attempt at the fix above replaced "cover letter" instead of adding beside it, losing ten
+//      live questions. Nothing failed. One clause per line so that cannot happen quietly.
+//
+// Adding a clause is safe in one direction only: it makes the agent WRITE an answer instead of
+// parking. So a clause must never match a question asking for a FACT about the candidate. It
+// cannot, in practice, because FACT_RX is tested first and wins, but keep clauses narrow anyway.
+// Regex LITERALS, not strings. As strings these need doubled backslashes, and the first pass here
+// wrote them singly: '\b' is the backspace character, so every word boundary silently vanished and
+// node --check was perfectly happy. A literal has no escaping layer to get wrong.
+const MOTIVATION_SOURCES = [
+  /\bwhy (do|are) you\b/,                                                           // why do/are you
+  /\bwhy this\b/,                                                                   // why this
+  /\bwhy [a-z][\w.'-]{2,}\s*[?,]/,                                                  // why <Company>?
+  /\bwhat (interests|excites|draws|attracts)\b/,                                    // what interests/excites
+  /\bwhat (do you know|interests you) about\b/,                                     // what do you know about
+  /\bwhat makes you\b/,                                                             // what makes you
+  /\bwhat motivates you\b/,                                                         // what motivates you
+  /\bwhat is motivating you\b/,                                                     // what is motivating you
+  /\btell (us|me) (a bit )?about (yourself|why)\b/,                                 // tell us about yourself
+  /\btell (us|me) something about (yourself|you)\b/,                                // tell us something about
+  /\btell (us|me) why\b/,                                                           // tell us why
+  /\bdescribe (to \w+ )?why\b/,                                                     // describe why
+  /\breason for applying\b/,                                                        // reason for applying
+  /\breasons? why you\b/,                                                           // reasons why you
+  /\bmotivation to (join|apply|work)\b/,                                            // motivation to join/apply
+  /\binterested in (joining|working)\b/,                                            // interested in joining
+  /\binterest(ed)? in (this|the|our) (role|position|company|team|opportunity)\b/,   // interest in this role
+  /\b(strong|great|good) fit for (this|the|our)\b/,                                 // fit for this role
+  /\bwould like to work (with|for) (us|our)\b/,                                     // would like to work with us
+  /\bcover letter\b/,                                                               // cover letter
+  /\bpourquoi (?:voulez|souhaitez|d[\u00e9e]sirez)-vous/,                           // FR pourquoi voulez-vous
+  /\bqu['\u2019]est-ce qui vous (?:attire|int[\u00e9e]resse|motive|pla[i\u00ee]t)/, // FR qu'est-ce qui vous
+  /\bparlez-nous de vous\b/,                                                        // FR parlez-nous de vous
+  /\bpourquoi (ce poste|notre|nous)\b/,                                             // FR pourquoi ce poste
+  /\blettre de motivation\b/,                                                       // FR lettre de motivation
+];
+const MOTIVATION_RX = new RegExp(MOTIVATION_SOURCES.map((r) => r.source).join('|'), 'i');
 
 // A fact hiding inside a motivation-shaped question still has to be escalated.
-const FACT_RX = /\b(authoriz|sponsor|visa|citizen|permanent resident|clearance|salary|compensation|notice period|start date|graduat|degree|gpa|years? of experience|how many years)\b/i;
+// STEMS NEED \\w*, OR THE CLOSING \\b KILLS THEM. `\b(authoriz|sponsor|...|graduat)\b` could not match
+// "authorization", "sponsorship" or "graduated": the boundary requires a non-word character right
+// after the stem. Measured 2026-09-05, this rule answered rather than escalated:
+//   "Are you authorized to work in Canada?"        -> false
+//   "What is your work authorization status?"      -> false
+//   "Do you require sponsorship?"                  -> false
+// which is the whole point of the rule inverted. Same defect as HIGH_STAKES_RECALL in db.js,
+// found the same day by sweeping every pattern for stems sitting in front of a boundary.
+const FACT_RX = /\b(authori[sz]\w*|sponsor\w*|visa\w*|citizen\w*|permanent resident\w*|clearance|salary|compensation|notice period|start date|graduat\w*|degree|gpa|years? of experience|how many years|citoyennet\w*|l[\u00e9e]galement\s+autoris\w*|autoris\w*\s+(?:\w+\s+)?[\u00e0a]\s+travailler|parrainage|permis\s+de\s+travail|r[\u00e9e]sidence\s+permanente|salarial\w*|r[\u00e9e]mun[\u00e9e]ration|niveau\s+d['\u2019]\s*[\u00e9e]tudes|dipl[\u00f4o]me|ann[\u00e9e]es?\s+d['\u2019]\s*exp[\u00e9e]rience)/i;
 
 function makeEscalateTools(opts = {}) {
   const {
@@ -164,6 +219,54 @@ function makeEscalateTools(opts = {}) {
     return missing.length ? missing.join(' and ') : null;
   }
 
+  // ---------------------------------------------------------------------------
+  // Is there a human check on this page?
+  //
+  // The agent has never been able to SEE a CAPTCHA. `captcha` has had alert copy, a dashboard
+  // label and a block kind since the beginning, and nothing has ever raised one, because noticing
+  // a CAPTCHA was left to the model reading an accessibility tree that does not contain it. Recon
+  // on 2026-09-05 found reCAPTCHA on Ashby and hCaptcha on Lever.
+  //
+  // THE DISTINCTION THAT MATTERS: most ATS CAPTCHAs today are INVISIBLE. reCAPTCHA v3 and
+  // Enterprise score in the background with no widget and nothing for a human to do. Ritual's
+  // Greenhouse form is one of those. Blocking on those would park almost every Greenhouse and Ashby
+  // application for a human who has nothing to click. Only a challenge with a visible, interactive
+  // widget is a reason to stop.
+  // ---------------------------------------------------------------------------
+  const CAPTCHA_PROBE = `(() => {
+    const seen = [];
+    const vendorOf = (src) => /recaptcha/i.test(src) ? 'reCAPTCHA'
+      : /hcaptcha/i.test(src) ? 'hCaptcha'
+      : /turnstile|challenges\.cloudflare/i.test(src) ? 'Cloudflare Turnstile'
+      : /arkoselabs|funcaptcha/i.test(src) ? 'Arkose' : null;
+    for (const f of document.querySelectorAll('iframe')) {
+      const v = vendorOf(f.src || '');
+      if (!v) continue;
+      const r = f.getBoundingClientRect();
+      // THE BADGE IS NOT A CHALLENGE. Measured on the real forms 2026-09-05: Ritual's invisible
+      // reCAPTCHA Enterprise renders a 256x60 anchor frame inside .grecaptcha-badge whose parent
+      // carries grecaptcha-logo. That is the "protected by reCAPTCHA" branding and there is nothing
+      // to click. Lever's hCaptcha renders 749x485 frames under .h-captcha, which is a real one.
+      // Size alone marked both as challenges and would have parked every Greenhouse application.
+      const parentClass = String((f.parentElement && f.parentElement.className) || '');
+      const isBadge = !!f.closest('.grecaptcha-badge') || /grecaptcha-logo/.test(parentClass);
+      seen.push({ vendor: v, interactive: !isBadge && r.width > 40 && r.height > 20 });
+    }
+    for (const el of document.querySelectorAll('.g-recaptcha, .h-captcha, .cf-turnstile, [data-sitekey]')) {
+      const r = el.getBoundingClientRect();
+      if (r.width > 40 && r.height > 20) seen.push({ vendor: 'a human check', interactive: true });
+    }
+    const vendors = [...new Set(seen.map((x) => x.vendor))];
+    return { any: seen.length > 0, interactive: seen.some((x) => x.interactive), vendors };
+  })()`;
+
+  async function humanCheck() {
+    const p = page();
+    if (!p) return null;
+    try { return await p.evaluate(CAPTCHA_PROBE); }
+    catch (e) { log.warn(`captcha probe failed: ${e.message}`); return null; }
+  }
+
   async function stillEmpty() {
     const p = page();
     if (!p) return [];                                  // no browser attached: nothing to check
@@ -212,8 +315,14 @@ function makeEscalateTools(opts = {}) {
     {
       name: 'submit',
       // "which application is this?" cost a step on a real run. Say what is required, up front.
-      description: 'Submit the completed application. REQUIRES the company name and the job title, which '
-        + 'you already read off the posting. In Prepare mode this does not click, it hands the '
+      // The title is checked against the page, and on 2 of 3 runs on 2026-09-05 the agent passed
+      // its own resume headline instead: "Full-Stack Software Engineer" and "Software Engineer"
+      // against a posting reading "Software Developer, Platform". Each cost two steps to recover.
+      // Saying what the title must be is cheaper than refusing it afterwards.
+      description: 'Submit the completed application. REQUIRES the company name and the job title '
+        + 'EXACTLY as the POSTING writes them, copied from the page. Not the title on the resume '
+        + 'you just wrote, not a shortened or tidied version: both are checked against the page and '
+        + 'refused if they do not appear on it. In Prepare mode this does not click, it hands the '
         + 'finished form to the human.',
       args: ['company', 'title'],
       guard: ({ company }) => {
@@ -232,6 +341,15 @@ function makeEscalateTools(opts = {}) {
             + 'and read the employer and the role exactly as the posting writes them, then call '
             + 'submit again. Do not use a folder name or a guess.';
         }
+        // A human check the agent must never solve. Checked BEFORE the empty-field sweep, because
+        // if a person has to come to this page anyway there is no point listing fields first.
+        const check = await humanCheck();
+        if (check && check.interactive) {
+          return `NOT SUBMITTED. This page has ${check.vendors.join(' and ')} with a visible challenge, `
+            + 'which you must never solve or click. Use ask_human with kind "captcha" so a person can '
+            + 'tick it and press Submit themselves, then move on to a different application.';
+        }
+
         const blank = await stillEmpty();
         if (blank.length) {
           return `NOT SUBMITTED. ${blank.length} field(s) on this page are still empty: `
@@ -250,7 +368,9 @@ function makeEscalateTools(opts = {}) {
         if (!p) throw new Error('no browser page is attached, so nothing can be submitted');
         // Full auto: find the real submit control and press it.
         await p.readTree();
-        const hit = p.find('submit')[0] || p.find('apply')[0];
+        // find() returns null when no tree has been read; the readTree above rules that out, but
+        // the guard keeps this correct if the ordering above ever changes.
+        const hit = (p.find('submit') || [])[0] || (p.find('apply') || [])[0];
         if (!hit) throw new Error('no submit button found on this page — read_page and look again');
         await p.click(hit.ref);
         return `clicked "${hit.name}". Now read the page and CONFIRM it actually submitted before logging anything.`;

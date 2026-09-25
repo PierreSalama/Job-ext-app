@@ -1647,6 +1647,11 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
   border: 1px solid var(--border); border-radius: 2px; color: var(--body-text);
 }
 .via-badge.via-auto     { color: var(--primary2); border-color: color-mix(in srgb, var(--primary) 45%, transparent); background: var(--wash-06); }
+/* The agent loop, distinct from the extension executor. The two are compared at a glance on a
+   dense list, so they must not read as variants of one thing — but the palette has no spare hue and
+   a hand-picked hex breaks theming (the AI Apply CSS is asserted hex-free). So the difference is
+   carried by weight and fill against the same token, plus the 🧠 glyph, rather than by colour. */
+.via-badge.via-ai       { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 60%, transparent); background: color-mix(in srgb, var(--primary) 14%, transparent); font-weight: 600; }
 .via-badge.via-assisted { color: var(--primary2); border-color: color-mix(in srgb, var(--primary) 35%, transparent); border-style: dashed; background: var(--wash-06); }
 .via-badge.via-manual   { color: var(--muted); }
 .via-badge.via-pipeline { color: var(--primary2); border-color: color-mix(in srgb, var(--primary) 30%, transparent); border-style: dashed; }
@@ -2046,3 +2051,20 @@ tr.doc-active td:first-child { box-shadow: inset 2px 0 0 var(--primary); }
 .consent ul { line-height: 1.6; padding-left: 20px; }
 .consent li { margin: 7px 0; }
 .consent-actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+
+/* ---- AI Apply: "How it's doing" ------------------------------------------------------------
+   Four numbers and a per-engine table. The rate column is coloured because the failure this panel
+   exists to surface — an engine being called and failing 100% of the time, costing its full
+   timeout on every question — is invisible in a raw call count. */
+.ai-perf-grid   { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 14px; margin-bottom: 18px; }
+.ai-perf-stat   { padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--wash-04); }
+.ai-perf-stat .n { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; }
+.ai-perf-stat .l { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.ai-perf-tbl    { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ai-perf-tbl th { text-align: left; font-weight: 500; color: var(--muted); padding: 6px 10px; border-bottom: 1px solid var(--line); }
+.ai-perf-tbl td { padding: 7px 10px; border-bottom: 1px solid var(--line-soft, var(--line)); }
+.ai-perf-tbl .num { text-align: right; font-variant-numeric: tabular-nums; }
+.ai-perf-tbl .good { color: var(--success); }
+.ai-perf-tbl .mid  { color: var(--warn); }
+.ai-perf-tbl .bad  { color: var(--danger); }
+.ai-perf-note   { margin-top: 10px; font-size: 12px; }

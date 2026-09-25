@@ -70,6 +70,36 @@ const RULES = [
   // It is the same tell in a different sentence, and matching only the literal string he happened
   // to type is a rule that catches the one example and misses the habit.
   { id: 'excited', label: '"excited"', rx: /\bexcit(ed|ing)\b/gi, fix: 'say why the role is interesting, concretely' },
+
+  // ---- THE TELLS THAT GET A DOCUMENT READ AS MACHINE-WRITTEN --------------------------------
+  //
+  // Pierre's goal is interviews, and a recruiter who clocks a letter as generated stops reading.
+  // The rules above are the ones he named; these are the ones that actually give a document away.
+  // Each is a phrase a person does not reach for while writing about their own work, but that a
+  // language model reaches for constantly.
+  //
+  // DELIBERATELY ABSENT: robust, seamless, scalable, optimise. Those are ordinary engineering
+  // words in an engineering resume. This gate REFUSES the document, so a false positive is not a
+  // warning, it is a lost application. Every rule here had to be wrong in his voice, not merely
+  // common in prose.
+  { id: 'delve', label: 'delve', rx: /\bdelv(e|es|ed|ing)\b/gi, fix: 'say "look at", or just say the thing' },
+  { id: 'tapestry', label: 'rich tapestry / evolving landscape', rx: /\b(rich tapestry|(ever[- ])?evolving landscape)\b/gi, fix: 'cut it, name the actual thing' },
+  { id: 'testament', label: 'a testament to', rx: /\ba testament to\b/gi, fix: 'state the result instead' },
+  { id: 'writing-to', label: 'I am writing to', rx: /\bI am writing to\b/gi, fix: 'open with what you did, or what you want' },
+  { id: 'track-record', label: 'proven track record', rx: /\bproven track record\b/gi, fix: 'name one thing you actually shipped' },
+  { id: 'seasoned', label: 'seasoned professional', rx: /\bseasoned (professional|developer|engineer)\b/gi, fix: 'say how long, and on what' },
+  { id: 'fast-paced', label: 'fast-paced', rx: /\bfast[- ]paced\b/gi, fix: 'cut it, it says nothing' },
+  { id: 'wealth', label: 'wealth of experience', rx: /\bwealth of experience\b/gi, fix: 'name the experience' },
+  { id: 'ground-running', label: 'hit the ground running', rx: /\bhit the ground running\b/gi, fix: 'say what you could do in week one' },
+  { id: 'synergy', label: 'synergy', rx: /\bsynerg(y|ies|istic)\b/gi, fix: 'cut it' },
+  { id: 'spearhead', label: 'spearheaded', rx: /\bspearhead(ed|ing|s)?\b/gi, fix: 'say "led" or "built"' },
+  { id: 'todays', label: 'in today s ... world', rx: /\bin today.s (fast|rapidly|ever|competitive|digital|modern)/gi, fix: 'delete the preamble, start at the point' },
+  { id: 'worth-noting', label: 'it is worth noting', rx: /\bit(?:\u0027s| is) worth noting\b/gi, fix: 'just note it' },
+  { id: 'confident-that', label: 'I am confident that', rx: /\bI(?:\u0027m| am) confident that\b/gi, fix: 'state the fact you are confident about' },
+  { id: 'align-resonate', label: 'aligns with your / resonates with me', rx: /\b(align(s|ed)? (well )?with your|resonate[sd]? with (me|my))\b/gi, fix: 'say which part of the job you want, and why' },
+  { id: 'cutting-edge', label: 'cutting-edge / state-of-the-art', rx: /\b(cutting[- ]edge|state[- ]of[- ]the[- ]art|best[- ]in[- ]class)\b/gi, fix: 'name the technology' },
+  { id: 'formal-connective', label: 'furthermore / moreover', rx: /\b(furthermore|moreover)\b/gi, fix: 'start a new sentence, or use "also"' },
+  { id: 'not-only', label: 'not only ... but also', rx: /\bnot only\b[^.]{0,80}\bbut also\b/gi, fix: 'say both things plainly' },
 ];
 
 // Line and column of an offset, so a finding points at somewhere real in the file.

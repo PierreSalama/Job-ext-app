@@ -174,3 +174,77 @@ test('the runner marks a node that points back at this machine', () => {
   assert.match(src, /networkInterfaces/, 'nodes are configured by Tailscale address, not localhost');
   assert.match(src, /self: me\.has/);
 });
+
+// ---------------------------------------------------------------------------
+// Whose application is this?
+//
+// The jobs table has never carried a person, and neither has auto_apply_tasks. Only `qa` does. That
+// was fine while JAT served one applicant. It stops being fine the moment Pierre's dad uses it.
+//
+// Measured 2026-09-05, before the fix: with a second profile created, check_duplicate told DAD that
+// a job PIERRE had submitted was "already engaged". On the real ledger that is about five thousand
+// jobs, so his dad would have been refused almost everywhere, and the refusal would have looked
+// exactly like the system working correctly.
+// ---------------------------------------------------------------------------
+const askAs = (profileId, company, n) => {
+  const { makeJatTools: mk } = require(path.join(root, 'app/src/ai/tools/jat.js'));
+  return mk({ profileId }).tools.find((t) => t.name === 'check_duplicate')
+    .run({ url: `https://job-boards.greenhouse.io/${company}/${n}`, company, title: 'Engineer' });
+};
+
+test('a second applicant does not inherit the first one\'s history', async () => {
+  const mine = db.ensureDefaultProfileId();
+  const dad = db.saveProfile({ name: 'Dad', data: { fullName: 'Dad Salama' } });
+  const dadId = dad.id || dad.profile.id;
+  db.upsertJob({ company: 'Ownercorp', title: 'Dev', status: 'submitted', jobUrl: 'https://job-boards.greenhouse.io/ownercorp/1' });
+
+  assert.match(await askAs(mine, 'ownercorp', 2), /DUPLICATE/, 'his own application must still block him');
+  assert.match(await askAs(dadId, 'ownercorp', 2), /^fresh/, 'and must be invisible to a different applicant');
+});
+
+test('and does not pollute the first one either', async () => {
+  const mine = db.ensureDefaultProfileId();
+  const dad = db.saveProfile({ name: 'Dad2', data: {} });
+  const dadId = dad.id || dad.profile.id;
+  db.upsertJob({ company: 'Dadcorp', title: 'Dev', status: 'submitted', jobUrl: 'https://job-boards.greenhouse.io/dadcorp/1', profileId: dadId });
+
+  assert.match(await askAs(dadId, 'dadcorp', 2), /DUPLICATE/, 'his dad\'s own application blocks his dad');
+  assert.match(await askAs(mine, 'dadcorp', 2), /^fresh/, 'and leaves Pierre free to apply there');
+});
+
+test('a row with no owner counts as the default profile, so nothing changes for Pierre', () => {
+  // Every row that existed before the v23 migration was backfilled to the default profile, and a
+  // caller that names no owner leaves it null. Both must read as his, or he silently loses the
+  // duplicate protection that stops him applying somewhere twice.
+  const j = db.upsertJob({ company: 'Unowned', title: 'Dev', status: 'submitted', jobUrl: 'https://job-boards.greenhouse.io/unowned/1' }).job;
+  assert.equal(j.profileId, null, 'no owner recorded when none was given');
+  const src = fs.readFileSync(path.join(root, 'app/src/ai/tools/jat.js'), 'utf8');
+  assert.match(src, /const owner = j\.profileId \|\| j\.profile_id \|\| defaultId;/);
+});
+
+// The test above asserts the SOURCE LINE that treats an unowned row as the default profile's.
+// A regex over a file passes just as happily when the behaviour underneath it has broken, and the
+// whole point of this rule is that Pierre must not lose duplicate protection on the thousands of
+// rows that predate the v23 migration. So assert what actually happens, not what is written.
+test('BEHAVIOUR: an unowned row really does block Pierre, and only Pierre', async () => {
+  const mine = db.ensureDefaultProfileId();
+  const other = db.saveProfile({ name: 'Dad3', data: {} });
+  const otherId = other.id || other.profile.id;
+
+  const j = db.upsertJob({ company: 'Legacycorp', title: 'Dev', status: 'submitted', jobUrl: 'https://job-boards.greenhouse.io/legacycorp/1' }).job;
+  assert.equal(j.profileId, null, 'precondition: the row carries no owner, like every pre-v23 row');
+
+  assert.match(await askAs(mine, 'legacycorp', 2), /DUPLICATE/,
+    'an unowned row must still stop Pierre applying to that employer twice');
+  assert.match(await askAs(otherId, 'legacycorp', 2), /^fresh/,
+    'and must not be charged to a different applicant');
+});
+
+test('an existing row keeps the person who made it', () => {
+  // Set on creation only. A later touch by the other applicant must not silently reassign someone
+  // else's application history to them.
+  const src = fs.readFileSync(path.join(root, 'app/src/db.js'), 'utf8');
+  assert.match(src, /Set on creation only/);
+  assert.match(src, /ALTER TABLE jobs ADD COLUMN profile_id/);
+  assert.match(src, /UPDATE jobs SET profile_id = \? WHERE profile_id IS NULL/, 'the backfill must exist');
+});

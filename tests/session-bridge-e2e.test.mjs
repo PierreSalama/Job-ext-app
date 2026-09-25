@@ -63,7 +63,13 @@ test('full bridge: Dad\'s Firefox session → server → pull → injected & liv
     await (await fetch(base + '/session/bridge', { method: 'POST', headers: { 'X-JAT-Token': token, 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: true, firefoxProfilesRoot: ffRoot }) })).json();
 
     // 2. laptop pulls Dad's session over the API
-    const pulled = await bridge.fetchRemoteLinkedInSession({ baseUrl: base, token });
+    // 60s, not the 8s production default. This test launches a real headless Chrome and reads a
+    // real SQLite cookie store, and it runs on the applier laptop while that machine is also
+    // applying. It failed twice in full-suite runs on 2026-09-08 with error 'timeout' and passed
+    // both times when run alone. The assertion is about whether Dad's session transfers INTACT, not
+    // about how fast a loaded box can serve it, so the clock should not be what decides it. The
+    // production default stays at 8s, which is the right number for a real remote peer.
+    const pulled = await bridge.fetchRemoteLinkedInSession({ baseUrl: base, token, timeoutMs: 60000 });
     assert.equal(pulled.ok, true, pulled.error);
     assert.ok(pulled.cookies.some((c) => c.name === 'li_at' && c.value === LI_AT), 'pulled the real li_at');
 

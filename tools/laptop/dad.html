@@ -1,0 +1,195 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Job Applications</title>
+<!--
+  Ashraf's viewer.
+
+  It APPLIES TO NOTHING. It reads his own JAT instance and shows what the laptop has been doing on
+  his behalf, and it gives him one thing he genuinely cannot do from his own machine: sign in to
+  LinkedIn and Indeed.
+
+  Why the sign-in is a remote screen rather than a form here: a LinkedIn session is tied to the
+  browser and machine that created it. Logging in on his PC and shipping the cookies to the laptop
+  produces a session LinkedIn invalidates almost immediately - the supervisor notes say a real
+  one-time interactive login is the only kind that survives. So he drives the laptop's own browser:
+  the session is created there, natively, and never has to be carried anywhere.
+
+  The token this page uses is the VIEWER token. It cannot reach /exec. That is deliberate - the
+  page needs eyes and a keyboard, not a shell.
+-->
+<style>
+  :root { color-scheme: dark; --bg:#0e0e10; --card:#17171b; --line:#26262c; --ink:#e8e6e3; --muted:#8b8b93; --gold:#c9a227; --good:#6ee7a8; --bad:#ff8b8b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:22px 24px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  h1 { margin:0; font-size:20px; font-weight:600; letter-spacing:-.01em; }
+  .sub { color:var(--muted); font-size:13px; }
+  main { padding:24px; max-width:1100px; margin:0 auto; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:14px; margin-bottom:26px; }
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
+  .stat .n { font-size:30px; font-weight:600; letter-spacing:-.02em; }
+  .stat .l { font-size:12px; color:var(--muted); margin-top:4px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px; margin-bottom:22px; }
+  .card h2 { margin:0 0 4px; font-size:15px; font-weight:600; }
+  .card .hint { color:var(--muted); font-size:13px; margin-bottom:14px; }
+  table { width:100%; border-collapse:collapse; font-size:13.5px; }
+  th { text-align:left; font-weight:500; color:var(--muted); padding:7px 10px; border-bottom:1px solid var(--line); }
+  td { padding:9px 10px; border-bottom:1px solid #1e1e24; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:99px; font-size:11px; border:1px solid var(--line); }
+  .pill.done { color:var(--good); border-color:#2c5a44; }
+  .pill.wait { color:var(--gold); border-color:#5a4a1e; }
+  button { font:inherit; padding:9px 16px; border-radius:8px; border:1px solid var(--line); background:#1e1e24; color:var(--ink); cursor:pointer; }
+  button.primary { background:var(--gold); color:#1a1508; border-color:var(--gold); font-weight:600; }
+  button:disabled { opacity:.45; cursor:default; }
+  #screenWrap { position:relative; display:none; margin-top:14px; }
+  #screen { width:100%; border:1px solid var(--line); border-radius:8px; cursor:crosshair; display:block; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .muted { color:var(--muted); font-size:12.5px; }
+  .err { color:var(--bad); font-size:13px; }
+  input[type=text],input[type=password] { font:inherit; padding:9px 12px; border-radius:8px; border:1px solid var(--line); background:#101014; color:var(--ink); min-width:230px; }
+</style>
+
+<header>
+  <h1>Job Applications</h1>
+  <span class="sub" id="who">loading…</span>
+</header>
+
+<main>
+  <div class="grid" id="stats"></div>
+
+  <div class="card">
+    <h2>Sign in to LinkedIn or Indeed</h2>
+    <div class="hint">
+      This shows the applying computer's own screen. Signing in here creates the session on that
+      machine, which is the only kind that lasts - a login copied from another computer gets
+      rejected within a day.
+    </div>
+    <div class="row">
+      <button class="primary" id="btnScreen">Show the screen</button>
+      <button id="btnRefresh" disabled>Refresh</button>
+      <span class="muted" id="screenNote"></span>
+    </div>
+    <div id="screenWrap">
+      <img id="screen" alt="the applying computer's screen">
+      <div class="row" style="margin-top:12px">
+        <input type="text" id="typeBox" placeholder="type here, then press Send">
+        <button id="btnType">Send</button>
+        <button id="btnEnter">Press Enter</button>
+        <span class="muted">click the picture to click there</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Applications</h2>
+    <div class="hint">Everything the laptop has sent for you. Nothing is applied for from this page.</div>
+    <div id="apps">loading…</div>
+  </div>
+</main>
+
+<script>
+// Config is injected by the installer so this file carries no secret in the repo.
+const CFG = window.__DAD_CFG || { bridge: '', app: '', viewerToken: '', appToken: '', name: 'you' };
+
+const $ = (s) => document.querySelector(s);
+const esc = (v) => String(v ?? '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+
+async function bridge(path, opts = {}) {
+  const r = await fetch(CFG.bridge + path, {
+    ...opts,
+    headers: { 'x-jat-token': CFG.viewerToken, ...(opts.body ? { 'content-type': 'application/json' } : {}) },
+  });
+  if (!r.ok) throw new Error(path + ' → ' + r.status);
+  return r;
+}
+// Same origin, via the bridge. His browser never sees the instance token - the bridge holds it.
+async function app(path) {
+  const r = await fetch(CFG.bridge + '/dadapi' + path, { headers: { 'x-jat-token': CFG.viewerToken } });
+  if (!r.ok) throw new Error(path + ' → ' + r.status);
+  return r.json();
+}
+
+// ---- the numbers -------------------------------------------------------------------------------
+async function loadStats() {
+  try {
+    const q = await app('/queue?limit=5000');
+    const rows = q.items || [];
+    const by = (s) => rows.filter((r) => r.state === s).length;
+    const done = by('done'), failed = by('failed'), review = by('awaiting_review');
+    const denom = done + failed + review;
+    const cards = [
+      [done, 'applications sent'],
+      [by('parked') + by('queued'), 'waiting in line'],
+      [denom ? Math.round(done / denom * 100) + '%' : '-', 'went through'],
+      [rows.length, 'jobs looked at'],
+    ];
+    $('#stats').innerHTML = cards.map(([n, l]) =>
+      `<div class="stat"><div class="n">${esc(n)}</div><div class="l">${esc(l)}</div></div>`).join('');
+
+    const recent = rows.filter((r) => r.state === 'done')
+      .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt))).slice(0, 25);
+    $('#apps').innerHTML = recent.length ? `
+      <table><thead><tr><th>when</th><th>company</th><th>role</th><th>status</th></tr></thead>
+      <tbody>${recent.map((r) => {
+        const j = r.job || {};
+        return `<tr><td>${esc(String(r.updatedAt || '').slice(0, 10))}</td>
+          <td>${esc(j.company || '')}</td><td>${esc(j.title || '')}</td>
+          <td><span class="pill done">sent</span></td></tr>`;
+      }).join('')}</tbody></table>` : '<div class="muted">Nothing sent yet.</div>';
+  } catch (e) {
+    $('#stats').innerHTML = `<div class="err">Could not reach the applying computer. ${esc(e.message)}</div>`;
+    $('#apps').textContent = '';
+  }
+}
+
+// ---- the remote screen -------------------------------------------------------------------------
+let shown = false, natural = { w: 1920, h: 1080 };
+async function shot() {
+  const r = await bridge('/screen?scale=0.6');
+  const blob = await r.blob();
+  const img = $('#screen');
+  const old = img.src;
+  img.src = URL.createObjectURL(blob);
+  if (old.startsWith('blob:')) setTimeout(() => URL.revokeObjectURL(old), 1500);
+}
+$('#btnScreen').onclick = async () => {
+  try {
+    const h = await (await bridge('/health')).json();
+    const [w, hh] = String(h.screen || '1920x1080').split('x').map(Number);
+    natural = { w: w || 1920, h: hh || 1080 };
+    await shot();
+    shown = true;
+    $('#screenWrap').style.display = 'block';
+    $('#btnRefresh').disabled = false;
+    $('#screenNote').textContent = h.foreground ? ('showing: ' + h.foreground) : '';
+  } catch (e) { $('#screenNote').innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+};
+$('#btnRefresh').onclick = () => shot().catch(() => {});
+
+// A click on the picture maps back to real screen coordinates. The image is scaled to fit the
+// page, so the ratio between the element's rendered width and the real screen width is the factor.
+$('#screen').onclick = async (ev) => {
+  if (!shown) return;
+  const r = ev.target.getBoundingClientRect();
+  const x = Math.round((ev.clientX - r.left) / r.width * natural.w);
+  const y = Math.round((ev.clientY - r.top) / r.height * natural.h);
+  await bridge('/click', { method: 'POST', body: JSON.stringify({ x, y }) }).catch(() => {});
+  setTimeout(() => shot().catch(() => {}), 700);
+};
+$('#btnType').onclick = async () => {
+  const t = $('#typeBox').value;
+  if (!t) return;
+  await bridge('/type', { method: 'POST', body: JSON.stringify({ text: t }) }).catch(() => {});
+  $('#typeBox').value = '';
+  setTimeout(() => shot().catch(() => {}), 700);
+};
+$('#btnEnter').onclick = async () => {
+  await bridge('/type', { method: 'POST', body: JSON.stringify({ text: '{ENTER}' }) }).catch(() => {});
+  setTimeout(() => shot().catch(() => {}), 900);
+};
+
+$('#who').textContent = 'for ' + CFG.name;
+loadStats();
+setInterval(loadStats, 60000);
+</script>

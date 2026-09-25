@@ -20,6 +20,7 @@
 const db = require('../db');
 const fit = require('../fit');
 const shape = require('../answer-shape');
+const priorEmployment = require('./prior-employment');
 
 // ---- profile field access (mirror prompts.js profileBlock's d = profile.data || profile) ----
 function pdata(profile) {
@@ -116,6 +117,129 @@ function result(answer, confidence, options) {
 }
 
 // ---- years-of-experience estimate (NEVER a URL; always a number) ----
+// WHOSE THREE YEARS? THE FLOOR DID NOT ASK.
+//
+// estimateYears() takes a profile and a resume and returns ONE number. It takes no subject at all,
+// so the branch below handed that number to every "how many years of X" question whatever X was.
+// Verified 2026-09-05 against a profile holding yearsExperience '3' and a resume reading React,
+// Node, TypeScript, Python, Postgres, BSc Computer Science:
+//
+//     "How many years of anesthesiology experience do you have?"        -> 3
+//     "How many years of relevant structural engineering experience..." -> 3
+//     "How many years of work experience do you have with COBOL?"       -> 3
+//
+// Three years of anesthesiology is a false statement, typed into a real application, by a rail
+// whose whole purpose is to answer only what it can ground.
+//
+// The rule now: a question naming a SPECIFIC subject is answered only when that subject actually
+// appears in the resume or profile. A generic one ("how many years of professional software
+// development experience") still answers from the global number, because that is what the number
+// means. When the subject is named and unsupported the floor returns null, which is NOT the same
+// as answering 0: null defers to the AI, which reads the whole resume and can tell "he has never
+// done this" apart from "the resume does not spell it out". Guessing 0 would understate real
+// experience just as readily as 3 overstates it.
+//
+// Words carrying no subject of their own. Everything else is treated as a claim needing evidence.
+const YEARS_GENERIC = new Set([
+  'years', 'year', 'yrs', 'experience', 'experiences', 'work', 'working', 'worked', 'professional',
+  'professionally', 'total', 'overall', 'relevant', 'related', 'industry', 'commercial', 'full',
+  'time', 'hands', 'on', 'using', 'use', 'with', 'of', 'do', 'you', 'have', 'how', 'many', 'much',
+  'long', 'does', 'your', 'the', 'an', 'in', 'and', 'or', 'for', 'to', 'at', 'as', 'is', 'are',
+  'please', 'select', 'approximately', 'about', 'least', 'minimum', 'combined', 'cumulative',
+  'software', 'development', 'developing', 'developer', 'engineer', 'engineering', 'programming',
+  'coding', 'technical', 'technology', 'tech', 'computer', 'science', 'field', 'role', 'roles',
+  'position', 'job', 'career', 'post', 'graduate', 'this', 'that', 'any', 'other', 'similar',
+  // Role descriptors, not technologies. He is a full-stack developer, so "how many years of
+  // frontend development experience" is asking about the same three years the number already
+  // means. Withholding on these was the gate reading a job title as an unevidenced claim.
+  'frontend', 'backend', 'fullstack', 'front', 'back', 'end', 'stack', 'web', 'app', 'apps',
+  // Question chrome. "excluding internships" is not a technology, and neither is a scraped option
+  // list ("select experience none 1 year 2 years").
+  'excluding', 'including', 'internship', 'internships', 'none', 'plus', 'above', 'below', 'years',
+]);
+
+// The subject terms a years question is actually asking about.
+function yearsSubjects(question) {
+  const toks = String(question || '').toLowerCase().match(/[a-z][a-z0-9+#.]{1,}/g) || [];
+  return toks.filter((t) => {
+    if (t.length < 2 || YEARS_GENERIC.has(t)) return false;
+    // A FIELD ID IS NOT A SUBJECT. Forms leave their own element names in the scraped label, so
+    // "how many years of software development experience do you have? * q_e7eba7a812f5..." was
+    // read as asking about something called q_e7eba7a8 and withheld, though it is the plainest
+    // generic question there is. Live: two rows in the bank looked exactly like that.
+    if (/^(?:q|question|field)_/.test(t)) return false;
+    if (t.length >= 12 && /^[0-9a-f.]+$/.test(t)) return false;   // a bare hex id
+    return true;
+  });
+}
+
+// Is any of them evidenced? One hit is enough: "React Native" counts as supported by a resume that
+// says React, and deciding otherwise is the AI's job, not the floor's.
+function subjectSupported(subjects, haystack) {
+  const hay = String(haystack || '').toLowerCase();
+  // Punctuation is not identity. The resume writes "Node.js" and forms ask about "nodejs", so
+  // compare with dots and hyphens stripped from BOTH sides as well as literally.
+  const flat = hay.replace(/[.\-]/g, '');
+  // A dotted or suffixed name also matches on its stem, but the stem has to be 3+ characters:
+  // "c#" reduced to "c" would match every resume ever written, and no years of C# is the right
+  // answer for someone who has not used it.
+  return subjects.some((t) => {
+    if (hay.includes(t)) return true;
+    const bare = t.replace(/[.\-]/g, '');
+    if (bare.length >= 3 && flat.includes(bare)) return true;
+    const stem = t.split(/[.+#]/)[0];
+    return stem.length >= 3 && hay.includes(stem);
+  });
+}
+
+// HIS AUTHORIZATION IS CANADIAN. THE QUESTION IS NOT ALWAYS ABOUT CANADA.
+//
+// parseAuthorization() reads authorizedToWorkInCanada / needSponsorship / country from the profile
+// and returns one authorized/needsSponsorship pair. The two branches below then applied that pair
+// to whatever jurisdiction the question named. Verified 2026-09-05 against his real profile:
+//
+//     "Are you legally authorized to work in the United States?"       -> Yes
+//     "Are you legally authorized to work in the US without sponsorship?" -> Yes
+//     "Do you require sponsorship to work in the United States?"       -> No
+//     "Are you authorized to work in the UK?"                          -> Yes
+//
+// He is a Canadian citizen and needs sponsorship for a US role. Every one of those is a false
+// statement on a real application, and the wrong-signed ones ("No, I do not require sponsorship")
+// are the kind a company discovers after an offer.
+//
+// The recall path was taught this on 2026-09-04, which is why HIGH_STAKES_RECALL refuses a
+// harvested work-authorisation answer. That fix stopped an old wrong answer being replayed. It
+// could not stop this one, because the floor generates it fresh every time.
+//
+// So: a question naming a jurisdiction the profile does not cover is not answered here at all.
+// null parks it and asks him, which is the only honest option, since nothing on file says whether
+// he holds any status outside Canada.
+//
+// A question naming NO jurisdiction is left exactly as it was. The floor cannot see the job, so it
+// cannot know where the role is, and changing that behaviour would park most of a Canadian search
+// to guard against the minority of US postings. That residual is real and is Pierre's to weigh.
+const FOREIGN_JURISDICTION_RX = /\b(?:united states|u\.?s\.?a\b|america|american|united kingdom|great britain|britain|england|scotland|ireland|australia|new zealand|germany|france|spain|italy|india|singapore|japan|china|mexico|brazil|netherlands|switzerland|sweden|poland|european union|uk|eea|schengen)\b/i;
+// A bare "us" is the pronoun far more often than the country ("tell us", "work with us"), so the
+// country reading is accepted only when the ORIGINAL question capitalised it. The word boundaries
+// are load-bearing twice over: without them this matches the "US" inside "STATUS", and forms
+// shout their labels constantly.
+// US-SPECIFIC IMMIGRATION TERMS NAME A JURISDICTION WITHOUT NAMING THE COUNTRY.
+// "do you require sponsorship for employment visa status (e.g., h-1b visa status)" mentions no
+// country at all, and was answered "No" from his Canadian profile. An H-1B question is a US
+// question by construction, and "no, I do not require sponsorship" is the exact false statement
+// that surfaces after an offer. Only unambiguous terms belong here: OPT and CPT are left out
+// because "opt" is an ordinary English word ("opt in", "opt out").
+// A generic "sponsorship for employment visa status" is NOT here, deliberately. It is the standard
+// phrasing on Canadian postings too, one of them bilingual with a French half, and for those "No"
+// is both correct and useful. Only US-specific machinery parks: naming H-1B or TN says which
+// country is being asked about even when the question never does.
+const US_VISA_RX = /\b(?:h-?1-?b|h4-?ead|tn visa|e-?3 visa|f-?1 visa|j-?1 visa|l-?1 visa|green card|uscis|i-9|employment authorization document|ead)\b/i;
+const US_TOKEN_RX = /\bU\.?S\.?\b/;
+function namesForeignJurisdiction(question) {
+  const s = String(question || '');
+  return FOREIGN_JURISDICTION_RX.test(s) || US_TOKEN_RX.test(s) || US_VISA_RX.test(s);
+}
+
 function estimateYears(profile, resume) {
   const d = pdata(profile);
   const ye = firstNonEmpty(d.yearsExperience);
@@ -160,9 +284,33 @@ const NOT_AUTHORIZED_RX = /\b(?:not|never|un)\s*(?:authoriz\w*|authoris\w*|eligi
 
 // → { authorized: true|false|null, needsSponsorship: true|false|null }
 // null means "the profile does not say" — the caller must then park, never guess.
+// A YES/NO PROFILE FIELD, AND THE "N/A" TRAP.
+//
+// These allow a leading word ("No, I do not require sponsorship") but the single letters have to
+// stand alone. The old form was /^\s*(?:no|non|false|n)\b/i, where the bare "n" alternative
+// matches the "N" of "N/A" and the boundary is satisfied by the slash. So a field reading N/A
+// parsed as a confident No, which on the authorisation side means answering "no, I am not
+// authorized to work in Canada". Found 2026-09-05 while widening this to read the other fields.
+const FIELD_NO_RX = /^\s*(?:no|non|false)\b|^\s*n\s*$/i;
+const FIELD_YES_RX = /^\s*(?:yes|oui|true)\b|^\s*y\s*$/i;
+
 function parseAuthorization(profile) {
   const d = pdata(profile);
-  const sponsorField = firstNonEmpty(d.sponsorshipRequired);
+  // READ EVERY FIELD HE ACTUALLY FILLED IN.
+  //
+  // This used to read sponsorshipRequired, workAuthorization and citizenship, and nothing else.
+  // His live profile holds none of the first and last, and five other work-authorisation fields it
+  // never looked at: authorizedToWork, authorizedToWorkInCanada, needSponsorship, requireSponsorship
+  // and visaSponsorship, all filled, all unambiguous. Everything rested on one free-text sentence
+  // in workAuthorization. Verified 2026-09-05: delete that one field and every work-authorisation
+  // question returns null, though four fields on the same profile answer it plainly.
+  //
+  // The failure was safe, since it parks rather than misstating. It also meant a reworded profile
+  // would silently park the most-asked question class in his search.
+  //
+  // These names are Canada-specific by construction, which is fine: namesForeignJurisdiction now
+  // turns a US or UK question away before either branch reaches this.
+  const sponsorField = firstNonEmpty(d.sponsorshipRequired, d.needSponsorship, d.requireSponsorship, d.visaSponsorship);
   const authField = firstNonEmpty(d.workAuthorization, d.citizenship);
   const blob = `${sponsorField} ${authField}`.trim();
 
@@ -175,14 +323,22 @@ function parseAuthorization(profile) {
   }
   // A bare yes/no in the dedicated sponsorship field is unambiguous.
   if (needsSponsorship == null && sponsorField) {
-    if (/^\s*(?:no|non|false|n)\b/i.test(sponsorField)) needsSponsorship = false;
-    else if (/^\s*(?:yes|oui|true|y)\b/i.test(sponsorField)) needsSponsorship = true;
+    if (FIELD_NO_RX.test(sponsorField)) needsSponsorship = false;
+    else if (FIELD_YES_RX.test(sponsorField)) needsSponsorship = true;
   }
 
   let authorized = null;
   if (authField) {
     if (NOT_AUTHORIZED_RX.test(authField)) authorized = false;
     else if (AUTHORIZED_RX.test(authField)) authorized = true;
+  }
+  // A bare yes/no in a dedicated authorisation field is unambiguous, exactly as it is for
+  // sponsorship above. AUTHORIZED_RX looks for words like "authorized" or "citizen", so a plain
+  // "Yes" matched neither pattern and fell through to null.
+  if (authorized == null) {
+    const authYesNo = firstNonEmpty(d.authorizedToWorkInCanada, d.authorizedToWork);
+    if (FIELD_NO_RX.test(authYesNo)) authorized = false;
+    else if (FIELD_YES_RX.test(authYesNo)) authorized = true;
   }
   // The two facts imply each other: needing no sponsorship means being authorized, and
   // being authorized (with nothing said about sponsorship) means none is required.
@@ -234,9 +390,34 @@ function answer(question, ctx = {}) {
   if (Array.isArray(opts) && opts.some((o) => String(o).trim().toLowerCase() === String(out.answer).trim().toLowerCase())) return out;
   try {
     if (!shape.answerFitsQuestion(question, out.answer, opts)) return null;
+    // A BARE YES/NO IS NOT AN ANSWER TO A QUESTION THAT WANTS PROSE.
+    //
+    // Measured against the live bank 2026-09-05: 63 real questions were answered "Yes" or "No"
+    // although their shape is free text. Most were merely useless. Some were not:
+    //
+    //   "this role requires you to already be eligible to work in canada.
+    //    what is your current work status in canada"                          -> "No"
+    //   "What is your preferred work arrangement (remote, hybrid, or onsite)?" -> "Yes"
+    //   "please explain your immigration/work authorization status in canada"  -> "Yes"
+    //   "current location, we use this to determine whether we can legally
+    //    employ you in the entity where you are located"                       -> "Yes"
+    //
+    // The first of those types "No" into a box asking for his work status, which reads as a man
+    // saying he is not eligible to work in Canada. The last types "Yes" into a location field.
+    //
+    // Only the option-less case is guarded. When the field HAS options, result() already refused
+    // anything that did not match one, and the verbatim-option check above has already returned.
+    //
+    // null here is cheap: it means the floor declines and the AI answers instead, which is what
+    // the floor being a FLOOR means. It is not a park.
+    const bare = /^(?:yes|no)\s*[.!]?$/i.test(String(out.answer).trim());
+    if (bare && !(Array.isArray(opts) && opts.length) && shape.questionShape(question) === 'text') return null;
   } catch { /* a guard must never take down the floor */ }
   return out;
 }
+
+// See the start-date branch: one default, phrased for whichever way the question is asked.
+const DEFAULT_NOTICE = '2 weeks';
 
 function answerRaw(question, ctx = {}) {
   const q = String(question || '');
@@ -251,9 +432,20 @@ function answerRaw(question, ctx = {}) {
   // to the user (mirrors the prompt's "ONLY answer if the profile explicitly contains").
   if (db.isSensitiveKey(q)) return null;
 
+  // ---------- PRIOR EMPLOYMENT AT THIS COMPANY ----------
+  // Checked early: "have you previously worked for X" carries no education words, but "worked"
+  // collides with the years-of-experience rules further down, which would answer it with a number.
+  // Grounded against his real employers — see prior-employment.js for why it is not a blanket No.
+  const prior = priorEmployment.answerPriorEmployment(q, { profile, resume, job: ctx.job, options });
+  if (prior) return prior;
+
   // ---------- EDUCATION (check before YEARS so "years of post-secondary education"
   // about a *degree* resolves as education, and before residency) ----------
-  if (/\b(degree|bachelor|master|phd|doctorate|diploma|education|graduat|undergrad|post.?secondary|qualification)\b/.test(lc)) {
+  // `graduat` and `undergrad` are STEMS: the closing \\b cannot be satisfied by "graduated" or
+  // "undergraduate", so both branches were dead and this rule missed "when did you graduate",
+  // "graduation year" and "undergraduate studies". Swept 2026-09-05 alongside the same defect in
+  // HIGH_STAKES_RECALL (db.js) and FACT_RX (escalate.js).
+  if (/\b(degree|bachelor|master|phd|doctorate|diploma|education|graduat\w*|undergrad\w*|post.?secondary|qualification)/.test(lc)) {
     const have = profileEduRank(profile, resume);
     if (have > 0) {
       const asked = eduRank(lc);
@@ -271,8 +463,15 @@ function answerRaw(question, ctx = {}) {
   // ---------- YEARS OF EXPERIENCE (must be a NUMBER, never a URL) ----------
   if (/\b(years?|how long|how many)\b/.test(lc) && /\b(experience|exp|worked|using|with|of)\b/.test(lc)) {
     const n = estimateYears(profile, resume);
-    if (n != null && Number.isFinite(n)) return result(String(n), 0.75, options);
-    return null;
+    if (n == null || !Number.isFinite(n)) return null;
+    // See YEARS_GENERIC above: the number is only his to give when the question is generic, or
+    // names something he can actually be shown to have done.
+    const subjects = yearsSubjects(q);
+    if (subjects.length) {
+      const hay = `${resume} ${JSON.stringify(pdata(profile) || {})}`;
+      if (!subjectSupported(subjects, hay)) return null;
+    }
+    return result(String(n), 0.75, options);
   }
 
   // ---------- SPONSORSHIP (polarity-aware — runs BEFORE plain work-authorization) ----------
@@ -281,6 +480,8 @@ function answerRaw(question, ctx = {}) {
   //   asks "do you REQUIRE sponsorship"  → Yes iff he needs it        (he does not → No)
   //   asks "are you AUTHORIZED / do you HOLD"   → Yes iff authorized  (he is → Yes)
   if (SPONSOR_TOPIC_RX.test(lc)) {
+    // See namesForeignJurisdiction above: his Canadian status does not answer a US or UK question.
+    if (namesForeignJurisdiction(q)) return null;
     const { authorized, needsSponsorship } = parseAuthorization(profile);
     const asksHave = ASKS_HAVE_RX.test(lc);
     const asksNeed = ASKS_NEED_RX.test(lc);
@@ -298,6 +499,7 @@ function answerRaw(question, ctx = {}) {
 
   // ---------- AUTHORIZED TO WORK ----------
   if (/\b(authori[sz]ed|eligible|legally|right to work|permitted|unrestricted)\b/.test(lc) && /\b(work|employ)\b/.test(lc)) {
+    if (namesForeignJurisdiction(q)) return null;   // same rule as the sponsorship branch above
     const { authorized } = parseAuthorization(profile);
     if (authorized == null) return null;   // legal/work-auth: answer ONLY from profile, else park
     return result(authorized ? 'Yes' : 'No', 0.85, options);
@@ -372,8 +574,20 @@ function answerRaw(question, ctx = {}) {
     const d = pdata(profile);
     const np = firstNonEmpty(d.noticePeriod, d.availability);
     if (np) return result(np, 0.8, options);
-    if (/\bnotice\b/.test(lc)) return result('2 weeks', 0.75, options);
-    return result('Immediately', 0.7, options); // available to start
+    // ONE DEFAULT, NOT TWO THAT CONTRADICT EACH OTHER.
+    //
+    // This answered "2 weeks" to a notice question and "Immediately" to a start-date one, from
+    // the same branch, on the same run. Both cannot be true: owing two weeks of notice is exactly
+    // what makes an immediate start impossible. Two employers asking in different words got
+    // different promises.
+    //
+    // Neither string was ever a fact about him, and noticePeriod is unset on his profile. But his
+    // own answers are not silent: the live bank holds "2 weeks from offer" five times, "2 weeks
+    // notice" twice, "2 weeks" twice and "About 2 weeks after accepting" twice. Eleven rows in his
+    // own words, none of them saying immediately. The two-week reading has a source. The other has
+    // none. A profile noticePeriod or availability still overrides both, as before.
+    if (/\bnotice\b/.test(lc)) return result(DEFAULT_NOTICE, 0.75, options);
+    return result(`${DEFAULT_NOTICE} from offer`, 0.7, options);
   }
 
   // Matched no high-confidence rule → null so the caller parks rather than guessing.

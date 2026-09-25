@@ -429,7 +429,8 @@ function createAtsBoardsService({ ingestJobs, broadcast = () => {}, db, fetchFn 
           const done = db.discoveryBatchComplete(batchId, {
             status: 'ok', found: jobs.length, accepted: intake.enqueued || 0,
             duplicates: intake.duplicates || 0, rejected: intake.rejected || 0,
-            diagnostics: { engine: `${ats}-api`, token },
+            // See index.js: the reason tally is what makes a zero-accept batch diagnosable.
+            diagnostics: { engine: `${ats}-api`, token, rejectReasons: intake.rejectReasons || {} },
           });
           broadcast('discovery.updated', { batch: done });
         } catch (e) { logger.warn(`discoveryBatchComplete failed for ${key}:`, e?.message || e); }

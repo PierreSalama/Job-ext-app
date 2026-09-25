@@ -106,6 +106,76 @@ async function waitForCdp(host, port, timeoutMs = 20000) {
   throw new Error(`CDP never came up on ${host}:${port} (${lastErr})`);
 }
 
+
+// WHICH PROFILE IS THE BROWSER ON THIS PORT RUNNING?
+//
+// Two ways to ask, and the order matters.
+//
+// Browser.getBrowserCommandLine is the tidy one, but Chrome refuses it unless the browser was
+// started with --enable-automation. Adding that flag would make identification easy and make
+// CLOUDFLARE WORSE - it is one of the fingerprints bot detection looks for, and getting past
+// Cloudflare is the entire reason adoption is worth having. Trading a CAPTCHA for a tidy API call
+// is a bad trade, so the flag stays off.
+//
+// The OS knows anyway. The process listening on the port has the --user-data-dir right there in its
+// command line, it costs one local query, and it adds nothing at all to what a website can see.
+async function profileDirOnPort(host, port, wsUrl) {
+  // 1. free, when the browser happens to allow it
+  if (wsUrl) {
+    try {
+      const cdp = await openCdp(wsUrl);
+      try {
+        const r = await cdp.send('Browser.getBrowserCommandLine', {});
+        const argv = (r && Array.isArray(r.arguments)) ? r.arguments : [];
+        const a = argv.find((x) => String(x).startsWith('--user-data-dir='));
+        if (a) return String(a).slice('--user-data-dir='.length).replace(/^"|"$/g, '');
+      } finally { try { cdp.close(); } catch { /* already closed */ } }
+    } catch { /* fall through to the OS */ }
+  }
+  // 2. ask the operating system, which is always allowed to know
+  if (process.platform !== 'win32') return '';
+  // execFile, NOT execFileSync. The sync form blocks Node's event loop for as long as PowerShell
+  // takes to start, and this runs inside launchChrome on the app's main thread. Measured
+  // 2026-09-08: two agent runs sat at step 0 with no browser and no model call for ten minutes
+  // apiece, because the whole loop was parked waiting on a subprocess.
+  const { execFile } = require('child_process');
+  const ps = `$c = Get-NetTCPConnection -LocalPort ${Number(port)} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; `
+    + 'if ($c) { (Get-CimInstance Win32_Process -Filter ("ProcessId=" + $c.OwningProcess)).CommandLine }';
+  const out = await new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    const child = execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps],
+      { encoding: 'utf8', timeout: 8000, windowsHide: true },
+      (err, stdout) => finish(err ? '' : String(stdout || '')));
+    // Belt and braces: if the callback never fires we still return, rather than leaving the
+    // caller awaiting a promise that resolves never.
+    setTimeout(() => { try { child.kill(); } catch { /* already gone */ } finish(''); }, 9000);
+  });
+  // Two shapes, and they need different rules. Chrome quotes the path when it contains a space and
+  // leaves it bare otherwise, and both appear on this machine. A single ("?)([^"]+)\1 pattern reads
+  // the bare form greedily and swallows the following argument — it returned
+  // `C:\Users\laptop\chrome-default --no-first-run`, which matches no profile and so silently
+  // refuses to adopt the very browser it was asked about.
+  const m = /--user-data-dir=(?:"([^"\r\n]+)"|(\S+))/.exec(out);
+  return m ? String(m[1] || m[2] || '').trim() : '';
+}
+
+// A port nobody is listening on. Tried by actually binding it, which is the only honest test.
+function portIsFree(host, port) {
+  return new Promise((resolve) => {
+    const srv = require('net').createServer();
+    srv.once('error', () => resolve(false));
+    srv.listen(port, host, () => srv.close(() => resolve(true)));
+  });
+}
+async function findFreePort(host, from, span = 40) {
+  for (let p = from + 1; p <= from + span; p++) {
+    if (p > 65000) break;
+    if (await portIsFree(host, p)) return p;
+  }
+  return null;
+}
+
 async function launchChrome(opts = {}) {
   const {
     profileId = 'default',
@@ -136,6 +206,56 @@ async function launchChrome(opts = {}) {
     'about:blank',
   ];
 
+  // IS SOMEBODY ELSE ALREADY ON THIS PORT?
+  //
+  // Ports are a hash of the profile id into 60 slots, so two people collide about 1.7% of the time.
+  // But a stale Chrome from a previous run does it just as well, without any collision at all.
+  //
+  // Either way the failure is silent and bad: spawn starts a Chrome that CANNOT bind the debugging
+  // port because it is taken, waitForCdp then succeeds because the OTHER browser answers, and the
+  // belt drives somebody else's Chrome. With two people using this, that is an application going
+  // out from the wrong person's logged-in accounts.
+  //
+  // We have not launched yet, so anything answering here is not ours. Refuse loudly. A false
+  // refusal is recoverable and visible; a silent wrong-browser attachment is neither.
+  // ...BUT "NOT OURS" AND "OURS, LEAKED" ARE DIFFERENT THINGS, and the comment above already named
+  // both while treating them the same. Measured 2026-09-08: an agent run finished successfully,
+  // left its browser running, and every subsequent run refused here. Reaping the leftover frees the
+  // port but throws away the profile's Cloudflare clearance with it, so the next run hits the wall
+  // instead - trading one failure for another.
+  //
+  // So: ask the browser on that port what user-data-dir it is running. Chrome answers over the
+  // protocol itself (Browser.getBrowserCommandLine), no OS process spelunking. If it is OUR profile
+  // it is our own leak and we ADOPT it, keeping the session and its cookies. Anything else, or any
+  // failure to prove identity, still refuses exactly as before - the wrong-browser hazard is real
+  // and proof is required to bypass it, never assumption.
+  let existing = null;
+  try { existing = await waitForCdp(host, port, 1200); } catch { /* free, as expected */ }
+  if (existing) {
+    const seen = await profileDirOnPort(host, port, existing.webSocketDebuggerUrl);
+    const mine = !!seen && path.resolve(seen) === path.resolve(userDataDir);
+    if (!seen) log.warn(`could not identify the Chrome on port ${port}`);
+    if (mine) {
+      // Ours. Adopting is strictly better than killing it: the profile keeps whatever the human did
+      // in it, which on Indeed is the difference between a working session and another CAPTCHA wall.
+      log.info(`adopting our own leaked chrome profile=${profileId} port=${port}`);
+      return { proc: null, adopted: true, port, host, userDataDir, chromePath };
+    }
+    // NOT PROVABLY OURS: RELOCATE, DO NOT REFUSE. Someone else's Chrome (or one we cannot identify)
+    // on the port is no reason to stop the whole lane and raise a human block. Nothing is closed or
+    // touched; we simply launch our own browser on the next FREE port and attach to that one. The
+    // caller must use the returned handle.port, never the port it asked for.
+    const alt = opts.noRelocate ? null : await findFreePort(host, port);
+    if (!alt) {
+      throw new Error(`port ${port} is already serving a Chrome that is not ours (profile ${profileId}). `
+        + (seen ? `It is running ${seen}. ` : 'Its identity could not be proven. ')
+        + 'No free automation port was found either. Refusing rather than driving a '
+        + 'session that is not ours.');
+    }
+    log.warn(`port ${port} is held by a Chrome that is not ours; relocating profile=${profileId} to ${alt}`);
+    return launchChrome({ ...opts, port: alt, noRelocate: true });
+  }
+
   const proc = spawn(chromePath, args, { stdio: 'ignore', detached: false });
   proc.on('error', (e) => log.error('chrome spawn failed', e.message));
 
@@ -152,11 +272,54 @@ async function launchChrome(opts = {}) {
 async function killChrome(handle) {
   if (!handle) return;
   const { proc, host = '127.0.0.1', port } = handle;
+  // NEVER CLOSE A BROWSER WE ADOPTED. We did not open it, and the whole reason adopting beats
+  // killing is that the profile carries state a human paid for - a signed-in Indeed session, a
+  // Cloudflare clearance cookie. Closing it here would hand back exactly the wall that adoption
+  // exists to avoid, and the next run would ask Pierre to solve another CAPTCHA.
+  if (handle.adopted) {
+    if (log && log.info) log.info(`leaving the adopted chrome on port ${port} running`);
+    return;
+  }
   // Ask politely first so the profile is flushed cleanly, then make sure.
   try { await cdpHttp(host, port, '/json/close'); } catch { /* not fatal */ }
   try { proc && proc.kill(); } catch { /* already gone */ }
   await sleep(150);
   try { if (proc && !proc.killed) proc.kill('SIGKILL'); } catch { /* fine */ }
+}
+
+// ---------------------------------------------------------------------------
+// GREENHOUSE EMBEDS
+//
+// Many companies (Lyft/careerpuck, Stripe, D2L, Samsara, Databricks, Brex, Elastic, Pinterest,
+// Coinbase, Asana ...) host the posting on their own page and drop Greenhouse's form in a
+// cross-origin <iframe id="grnhse_iframe">. The accessibility tree of the TOP document never lists
+// fields inside it, so read_page/find saw nothing to fill and 50+ runs parked. The form is
+// addressable if we simply open the iframe's own URL as the top-level page, so do that.
+// Pure function so it is testable without a browser.
+// ---------------------------------------------------------------------------
+function greenhouseEmbedUrl({ href = '', iframes = [], scripts = [] } = {}) {
+  let u;
+  try { u = new URL(href); } catch { return null; }
+  // Already on Greenhouse's own form: nothing to unwrap.
+  if (/(^|\.)greenhouse\.io$/i.test(u.hostname)) return null;
+  const isJobApp = (x) => /greenhouse\.io\/embed\/job_app/i.test(String(x || ''));
+  const direct = iframes.find(isJobApp);
+  if (direct) { try { return new URL(direct, href).toString(); } catch { /* fall through */ } }
+  const jid = u.searchParams.get('gh_jid') || u.searchParams.get('gh_jid[]');
+  let board = null;
+  for (const src of [...iframes, ...scripts]) {
+    const m = /greenhouse\.io\/[^"'\s]*[?&]for=([A-Za-z0-9_-]+)/i.exec(String(src || ''));
+    if (m) { board = m[1]; break; }
+  }
+  if (jid && board) {
+    return `https://job-boards.greenhouse.io/embed/job_app?for=${encodeURIComponent(board)}&token=${encodeURIComponent(jid)}`;
+  }
+  // careerpuck.com/job-board/<board>/job/<id> is a Greenhouse board wrapper.
+  const cp = /^\/job-board\/([A-Za-z0-9_-]+)\/job\/(\d+)/.exec(u.pathname);
+  if (/(^|\.)careerpuck\.com$/i.test(u.hostname) && cp) {
+    return `https://job-boards.greenhouse.io/embed/job_app?for=${encodeURIComponent(cp[1])}&token=${cp[2]}`;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +354,10 @@ async function attachPage(opts = {}) {
   // that cost three fields on the Greenhouse forms overnight. Callers re-read before acting.
   let refs = new Map();
   let refSeq = 0;
-  let lastTree = [];
+  // null means NO tree has been read on the current document. Empty-array would be
+  // indistinguishable from "read it, matched nothing", and find() answering [] to both is how a
+  // missing read_page gets misreported to the agent as a missing element.
+  let lastTree = null;
 
   async function evaluate(expression, { awaitPromise = true, returnByValue = true } = {}) {
     const r = await cdp.send('Runtime.evaluate', {
@@ -208,21 +374,62 @@ async function attachPage(opts = {}) {
     try { return await evaluate('document.readyState'); } catch { return 'unknown'; }
   }
 
+  // If this top-level page merely frames a Greenhouse form, open the form itself. Polls briefly
+  // because the embed script injects the iframe after load. Never loops: one hop per document.
+  let unwrappedFrom = '';
+  async function unwrapEmbed({ waitMs = 4000 } = {}) {
+    let href = '';
+    try { href = await evaluate('location.href'); } catch { return null; }
+    if (!href || href === unwrappedFrom || /^about:|^chrome/i.test(href)) return null;
+    const deadline3 = Date.now() + waitMs;
+    let target = null;
+    for (;;) {
+      let info = null;
+      try {
+        info = await evaluate(`(() => ({
+          href: location.href,
+          iframes: [...document.querySelectorAll('iframe')].map((f) => f.getAttribute('src') || f.src || ''),
+          scripts: [...document.querySelectorAll('script[src]')].map((f) => f.src),
+        }))()`);
+      } catch { return null; }
+      target = greenhouseEmbedUrl(info);
+      const mightEmbed = /[?&]gh_jid=/i.test(href) || /careerpuck\.com/i.test(href) || (info && info.iframes.some((x) => /greenhouse/i.test(x)));
+      if (target || !mightEmbed || Date.now() > deadline3) break;
+      await sleep(400);
+    }
+    if (waitMs > 0 || target) unwrappedFrom = href;
+    if (!target || target === href) return null;
+    log.info(`greenhouse embed: opening ${target} directly (was ${href})`);
+    const res = await cdp.send('Page.navigate', { url: target });
+    if (res.errorText) { log.warn(`greenhouse unwrap failed: ${res.errorText}`); return null; }
+    lastTree = null;
+    const dl = Date.now() + 20000;
+    while (Date.now() < dl) { if (await readyState() === 'complete') break; await sleep(120); }
+    await sleep(350);
+    unwrappedFrom = await evaluate('location.href').catch(() => target);
+    return target;
+  }
+
   async function navigate(url, { waitMs = 20000, settleMs = 350 } = {}) {
     const res = await cdp.send('Page.navigate', { url });
     if (res.errorText) throw new Error(`navigate failed: ${res.errorText}`);
+    // The old document is gone, and with it every ref in lastTree. Leaving it set let find()
+    // answer from the PREVIOUS page and hand back refs into a destroyed document.
+    lastTree = null;
     const deadline2 = Date.now() + waitMs;
     while (Date.now() < deadline2) {
       if (await readyState() === 'complete') break;
       await sleep(120);
     }
     await sleep(settleMs); // let first-paint / framework hydration land before anyone reads
-    return { url: await evaluate('location.href') };
+    const unwrapped = await unwrapEmbed().catch(() => null);
+    return { url: await evaluate('location.href'), ...(unwrapped ? { unwrappedFrom: url } : {}) };
   }
 
   // Flatten the accessibility tree into the shape the agent reasons over. This is the direct
   // replacement for the extension's read_page: role, accessible name, value, and a ref to act on.
   async function readTree({ interactiveOnly = false, max = 4000 } = {}) {
+    await unwrapEmbed({ waitMs: 0 }).catch(() => null);   // the agent may have clicked into an embed page
     const { nodes = [] } = await cdp.send('Accessibility.getFullAXTree', {});
     refs = new Map();
     refSeq = 0;
@@ -288,6 +495,7 @@ async function attachPage(opts = {}) {
   function find(query) {
     const q = String(query || '').trim().toLowerCase();
     if (!q) return [];
+    if (lastTree === null) return null;   // no read_page since the last navigation
     const scored = [];
     for (const n of lastTree) {
       if (!n.ref) continue;
@@ -563,9 +771,56 @@ async function attachPage(opts = {}) {
     try { await cdp.send('DOM.scrollIntoViewIfNeeded', { backendNodeId }); } catch { /* best effort */ }
   }
 
+  // A CONTROL WITH NO BOX IS CLICKED BY ITS LABEL.
+  //
+  // Ashby and Lever both render consent boxes as a styled control whose real <input> is visually
+  // hidden (opacity 0, zero size, or off-screen). Recon on 2026-09-05 found 2 such checkboxes on
+  // Ashby and 18 checkboxes plus 11 radios on Lever. click() dispatches a real mouse event at the
+  // element's box centre, and a hidden input has no usable box, so the event lands nowhere and the
+  // box stays unticked in silence. That is exactly how a required consent gets missed.
+  //
+  // A person does not click the input either. They click the label. So do that: hand the label
+  // back as the thing to click, which the browser then forwards to the control.
+  async function labelTargetFor(ref) {
+    try {
+      const found = await onNode(ref, `function () {
+        const r = this.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) return null;          // it has a box, click it normally
+        const labels = [];
+        if (this.id) {
+          const l = document.querySelector('label[for="' + CSS.escape(this.id) + '"]');
+          if (l) labels.push(l);
+        }
+        const wrapping = this.closest('label');
+        if (wrapping) labels.push(wrapping);
+        for (const l of labels) {
+          const lr = l.getBoundingClientRect();
+          if (lr.width > 0 && lr.height > 0) {
+            l.scrollIntoView({ block: 'center' });
+            const b = l.getBoundingClientRect();
+            return { x: b.left + b.width / 2, y: b.top + b.height / 2, via: l.textContent.trim().slice(0, 40) };
+          }
+        }
+        return { none: true };
+      }`);
+      return found;
+    } catch { return null; }
+  }
+
   async function click(target) {
     let x, y;
     if (typeof target === 'string') {
+      const viaLabel = await labelTargetFor(target);
+      if (viaLabel && viaLabel.none) {
+        throw new Error('that control is not visible and has no clickable label, so it cannot be clicked');
+      }
+      if (viaLabel && typeof viaLabel.x === 'number') {
+        const base2 = { x: viaLabel.x, y: viaLabel.y, button: 'left', clickCount: 1, buttons: 1 };
+        await cdp.send('Input.dispatchMouseEvent', { ...base2, type: 'mouseMoved', buttons: 0 });
+        await cdp.send('Input.dispatchMouseEvent', { ...base2, type: 'mousePressed' });
+        await cdp.send('Input.dispatchMouseEvent', { ...base2, type: 'mouseReleased', buttons: 0 });
+        return { x: viaLabel.x, y: viaLabel.y, viaLabel: viaLabel.via };
+      }
       await scrollIntoView(target);
       ({ x, y } = await boxCenter(target));
     } else {
@@ -633,7 +888,7 @@ async function attachPage(opts = {}) {
   return {
     targetId: target.id,
     raw: cdp,
-    navigate, readTree, find, queryRef, queryRefAll, describeRef, isPasswordRef, labelContext,
+    navigate, unwrapEmbed, readTree, find, queryRef, queryRefAll, describeRef, isPasswordRef, labelContext,
     click, focus, fill, pressKey, setFiles,
     screenshot, evaluate, text, boxCenter, scrollIntoView, readyState,
     isSelectRef, listOptions, selectOption, isComboRef, pickSuggestion,
@@ -644,5 +899,5 @@ async function attachPage(opts = {}) {
 
 module.exports = {
   findChrome, profileDir, setProfileRoot, profileRoot, profileIsInitialised,
-  launchChrome, killChrome, attachPage, listPages, waitForCdp,
+  launchChrome, killChrome, attachPage, greenhouseEmbedUrl, findFreePort, listPages, waitForCdp,
 };

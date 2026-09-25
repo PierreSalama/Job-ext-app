@@ -68,6 +68,21 @@ function buildSearchUrl(board, keyword, location, opts = {}) {
   const wt = modes.length ? `&f_WT=${modes.map((m) => LINKEDIN_WT[m]).join('%2C')}` : '';
   // Freshness → f_TPR=r<seconds> (newest-first ramp). Omitted when no tier is supplied.
   const tpr = freshnessSeconds != null ? `&f_TPR=r${Number(freshnessSeconds)}` : '';
+  // BROKEN AGAINST LIVE LINKEDIN SINCE ABOUT 2026-09-03, and the URL is where it starts.
+  //
+  // LinkedIn rolled out AI-powered job search. This URL now redirects to /jobs/search-results/,
+  // silently drops `location` and `sortBy=DD`, and the page says so: "You're now using AI-powered
+  // job search. Some filters may no longer be available." The results are still there - checked by
+  // hand on 2026-09-08, 99+ Easy Apply results - but discover.js looks for the old card selectors,
+  // finds none, and reports found:0, which is indistinguishable from a genuinely empty search.
+  //
+  // Measured: LinkedIn discovery produced 12 to 50 jobs a day until 2026-09-02 and exactly zero on
+  // every day after, while Indeed kept working. The lane still spent 8 searches an hour of the
+  // budget that exists to protect an account restricted in August, for nothing.
+  //
+  // `autoApply.boards` was set to ["indeed"] on 2026-09-08 to stop that bleed. Fixing this properly
+  // needs the real new DOM, which cannot be read from the applier profile (no CDP, by design), so
+  // it needs Pierre at the machine. Do not guess selectors from a screenshot.
   return `https://www.linkedin.com/jobs/search/?${al}keywords=${kw}&sortBy=DD&location=${loc}${wt}${tpr}`;
 }
 

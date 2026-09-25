@@ -16,7 +16,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import os from 'node:os';
 
+const require = createRequire(import.meta.url);
 const here = path.dirname(fileURLToPath(import.meta.url));
 const read = (...p) => fs.readFileSync(path.join(here, '..', ...p), 'utf8');
 const db = read('app', 'src', 'db.js');
@@ -79,4 +82,53 @@ test('the default bound is a full day, not something twitchy', () => {
   const fn = db.slice(db.indexOf('function expireWalledTasks'));
   assert.match(fn.slice(0, 400), /olderThanHours = 24/,
     'shorter than a day risks re-creating the 07-20 data loss on a slow-lifting wall');
+});
+
+// The tests above assert the SQL as text and run `retires`, a local mirror of the same predicate.
+// A mirror agrees with the real query by construction, and the text assertions cannot tell whether
+// the query is ever reached or what it actually does to a row. Both directions matter here and
+// both have already gone wrong in production: retiring too eagerly destroyed 40+ never-attempted
+// jobs in ten minutes on 2026-07-20, and not retiring at all starved discovery for 18 hours.
+// expireWalledTasks is exported, so run it against a real ledger.
+test('BEHAVIOUR: a day-old wall retires, a fresh one and a due task do not', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jat-walled-'));
+  const ledger = require(path.join(here, '..', 'app', 'src', 'db.js'));
+  const { Database } = require(path.join(here, '..', 'app', 'node_modules', 'node-sqlite3-wasm'));
+  ledger.open(dir);
+
+  // created_at is set by the ledger and there is no API to backdate it, so reach in with a
+  // short-lived second handle — the pattern rank-punish.test.mjs already uses for decay_at.
+  const backdate = (taskId, ms) => {
+    const h = new Database(path.join(dir, 'jat.db'));
+    try { h.run('UPDATE auto_apply_tasks SET created_at = ? WHERE id = ?', [new Date(Date.now() - ms).toISOString(), taskId]); }
+    finally { h.close(); }
+  };
+
+  try {
+    const mk = (n, { deferHours, ageHours }) => {
+      const url = `https://ca.indeed.com/viewjob?jk=walled${n}`;
+      const { job } = ledger.upsertJob({ title: 'Dev', company: `Co ${n}`, jobUrl: url, status: 'started', source: 'indeed' }, { manual: true });
+      const t = ledger.queueAdd(job.id, { mode: 'auto', force: true });
+      ledger.queuePatch(t.id, { state: 'queued', scheduledAt: new Date(Date.now() + deferHours * HOUR).toISOString() });
+      backdate(t.id, ageHours * HOUR);
+      return t.id;
+    };
+
+    const walledSixDays = mk(1, { deferHours: 1, ageHours: 6 * 24 });   // the live Indeed case
+    const walledTwoHours = mk(2, { deferHours: 1, ageHours: 2 });       // transient — must survive
+    const oldButDue = mk(3, { deferHours: -1, ageHours: 30 * 24 });     // ancient but dispatchable
+
+    const retired = ledger.expireWalledTasks({ olderThanHours: 24 });
+    const stateOf = (id) => ledger.queueList({}).find((t) => t.id === id)?.state;
+
+    assert.equal(retired, 1, 'exactly one task qualified');
+    assert.equal(stateOf(walledSixDays), 'skipped', 'a wall that never lifted must stop holding a queue slot');
+    assert.equal(stateOf(walledTwoHours), 'queued',
+      'THE 2026-07-20 PROTECTION: a transient wall must still defer and retry, never be discarded');
+    assert.equal(stateOf(oldButDue), 'queued',
+      'past its scheduled time means dispatchable — age alone must never retire a task');
+  } finally {
+    try { ledger.close(); } catch { /* already closed */ }
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* temp */ }
+  }
 });

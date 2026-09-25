@@ -91,3 +91,77 @@ test('API providers report unavailable without a key (no network call)', async (
   await assert.rejects(() => anthropic.generate({ prompt: 'hi', cfg: {} }), /no Anthropic API key/);
   await assert.rejects(() => openai.generate({ prompt: 'hi', cfg: {} }), /no OpenAI API key/);
 });
+
+// ---------------------------------------------------------------------------
+// THE UNREACHABLE PEER
+//
+// Measured on the applier laptop 2026-09-05, in its own ai log: of the last 50 calls, 16 were
+// 'remote' failing with "cannot reach the peer", each taking 10.8 to 13.8 seconds, then codex
+// failing instantly on quota, then claude-cli answering in about 7. The peer is Pierre's PC and
+// the app there was not running. Two thirds of every agent step was spent waiting on it.
+//
+// Nothing was broken in the sense of throwing: the chain fell through and the call was served.
+// That is exactly why nobody noticed. It only shows up as a number.
+// ---------------------------------------------------------------------------
+const REMOTE_ON = {
+  order: ['remote', 'chatgpt', 'claude', 'local'],
+  remote: { enabled: true, url: 'http://100.78.234.94:7744' },
+  claude: { useSubscription: true },
+  chatgpt: { useSubscription: true },
+  local: { enabled: false },
+};
+
+test('a peer that could not be REACHED leaves the chain for a cooldown', () => {
+  provider._clearOutcomes();
+  assert.deepEqual(names(provider.buildAttempts(REMOTE_ON, {})), ['remote', 'codex', 'claude-cli'],
+    'baseline: the peer leads the chain');
+
+  provider.noteOutcome('remote', false, { code: 'REMOTE_NET', message: 'cannot reach the peer' });
+  assert.deepEqual(names(provider.buildAttempts(REMOTE_ON, {})), ['codex', 'claude-cli'],
+    'after one unreachable call the peer is skipped, and nothing else changes');
+});
+
+test('a peer that ANSWERED, even with an error, stays in the chain', () => {
+  // The distinction is the whole point. A peer that replied is alive, and quietly dropping it
+  // would hide a token or version problem worth seeing.
+  for (const code of ['REMOTE_HTTP', 'REMOTE_AUTH', 'REMOTE_BADJSON', 'REMOTE_ERR']) {
+    provider._clearOutcomes();
+    provider.noteOutcome('remote', false, { code, message: code });
+    assert.equal(names(provider.buildAttempts(REMOTE_ON, {}))[0], 'remote', `${code} must not trip the breaker`);
+  }
+});
+
+test('a peer that worked is not penalised', () => {
+  provider._clearOutcomes();
+  provider.noteOutcome('remote', true);
+  assert.equal(names(provider.buildAttempts(REMOTE_ON, {}))[0], 'remote');
+});
+
+test('the cooldown lapses, and the peer gets another real chance', () => {
+  provider._clearOutcomes();
+  provider.noteOutcome('remote', false, { code: 'REMOTE_NET', message: 'cannot reach the peer' });
+  assert.equal(provider.remoteCoolingDown(), true, 'cooling down right now');
+  assert.equal(provider.remoteCoolingDown(Date.now() + provider.REMOTE_COOLDOWN_MS - 1000), true,
+    'still cooling down just inside the window');
+  assert.equal(provider.remoteCoolingDown(Date.now() + provider.REMOTE_COOLDOWN_MS + 1000), false,
+    'past the window the peer is tried again, and one real call decides');
+});
+
+test('the breaker never empties the chain', () => {
+  // A thin client whose only provider IS the peer must still call it. Failing instantly with no
+  // attempt at all is worse than waiting for a timeout.
+  provider._clearOutcomes();
+  const only = {
+    order: ['remote'],
+    remote: { enabled: true, url: 'http://100.78.234.94:7744' },
+    claude: { useSubscription: false },
+    chatgpt: { useSubscription: false },
+    local: { enabled: false },
+  };
+  assert.deepEqual(names(provider.buildAttempts(only, {})), ['remote']);
+  provider.noteOutcome('remote', false, { code: 'REMOTE_NET', message: 'cannot reach the peer' });
+  assert.equal(provider.remoteCoolingDown(), true, 'the breaker is tripped');
+  assert.deepEqual(names(provider.buildAttempts(only, {})), ['remote'],
+    'and it is still attempted, because there is nothing else');
+  provider._clearOutcomes();
+});

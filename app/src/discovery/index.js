@@ -234,7 +234,10 @@ function createDiscoveryService({ ingestJobs, broadcast = () => {}, runner = def
       const status = jobs.length ? 'ok' : 'empty';
       const done = db.discoveryBatchComplete(batch.id, {
         status, found: jobs.length, accepted: intake.enqueued || 0, duplicates: intake.duplicates || 0,
-        rejected: intake.rejected || 0, diagnostics: { engine: 'python-jobspy', normalized: jobs.length },
+        rejected: intake.rejected || 0,
+        // rejectReasons turns "found 20, accepted 0" into a sentence. Without it there is no way to
+        // tell a correctly-filtered batch of off-target roles from a filter that has gone wrong.
+        diagnostics: { engine: 'python-jobspy', normalized: jobs.length, rejectReasons: intake.rejectReasons || {} },
       });
       // EASY-APPLY SUPPLY: under easyApplyOnly, a SUCCESSFUL JobSpy batch is still mostly unusable.
       // JobSpy scrapes public search results, which do not expose LinkedIn/Indeed's one-click-apply

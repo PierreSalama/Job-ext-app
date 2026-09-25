@@ -74,7 +74,7 @@ async function openSignin(profileId, { url = SIGNIN_TARGETS[0], isRunning = () =
 
   // Best effort: land them on the sign-in page. A failure here is not a failure of the window.
   try {
-    const page = await cdp.attachPage({ port: signinPortFor(key) });
+    const page = await cdp.attachPage({ port: handle.port || signinPortFor(key) });
     await page.navigate(url, { waitMs: 25000 });
     page.close();
   } catch (e) {

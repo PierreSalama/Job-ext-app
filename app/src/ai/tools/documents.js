@@ -75,12 +75,14 @@ function resumeHead(templatePath = RESUME_TEMPLATE) {
   return raw.slice(0, i);
 }
 
-function renderPdf(htmlPath, pdfPath, { timeoutMs = 60000 } = {}) {
-  const chrome = cdp.findChrome();
-  if (!chrome) throw new Error('Chrome not found, so no PDF can be rendered');
+// ONE attempt at printing. Resolves with the byte count, or 0 when Chrome did nothing.
+function renderPdfOnce(chrome, htmlPath, pdfPath, { timeoutMs, headlessFlag, profileDir }) {
   return new Promise((resolve, reject) => {
+    try { fs.rmSync(pdfPath, { force: true }); } catch { /* a stale file must not pass as success */ }
+    const started = Date.now();
     const child = spawn(chrome, [
-      '--headless', '--disable-gpu', '--no-pdf-header-footer',
+      headlessFlag, '--disable-gpu', '--no-pdf-header-footer',
+      `--user-data-dir=${profileDir}`,
       `--print-to-pdf=${pdfPath}`, htmlPath,
     ], { windowsHide: true });
     let err = '';
@@ -89,13 +91,59 @@ function renderPdf(htmlPath, pdfPath, { timeoutMs = 60000 } = {}) {
     child.on('error', (e) => { clearTimeout(timer); reject(e); });
     child.on('close', () => {
       clearTimeout(timer);
-      // Chrome exits 0 while writing nothing when the input path is wrong, so trust the FILE.
+      // Chrome exits 0 while writing nothing, so trust the FILE and never the exit code.
       let size = 0;
       try { size = fs.statSync(pdfPath).size; } catch { /* stays 0 */ }
-      if (size < 1000) return reject(new Error(`PDF was not written (${size} bytes). ${err.trim().slice(0, 200)}`));
-      resolve(size);
+      resolve({ size, ms: Date.now() - started, err: err.trim() });
     });
   });
+}
+
+// RETRY, because a single attempt is not evidence of anything on this machine.
+//
+// Measured on the laptop 2026-09-08, printing the SAME html to the SAME destination three times in
+// a row with nothing changed between attempts:
+//
+//     attempt 1: exit=0 bytes=0      in  996ms
+//     attempt 2: exit=0 bytes=30579  in 7263ms
+//     attempt 3: exit=0 bytes=0      in  594ms
+//
+// Chrome reports success and writes nothing, with EMPTY stderr, roughly two times in three. The
+// failures come back in under a second and the success takes seven or more, so Chrome is not even
+// starting the print on a failed attempt. I have not root-caused why. What is certain is that the
+// old code took one swing and reported "PDF was not written (0 bytes)" with no explanation, and
+// that a résumé is the thing the whole application hangs on.
+//
+// So try several times, vary the headless flag across attempts in case the failure is specific to
+// one of them, and give every attempt its own throwaway profile so no two can collide. A retry is
+// the right shape regardless of the cause: a subprocess that exits 0 having done nothing has told
+// us nothing, and asking again is cheap next to losing the application.
+function renderPdf(htmlPath, pdfPath, { timeoutMs = 60000, attempts = 4 } = {}) {
+  const chrome = cdp.findChrome();
+  if (!chrome) throw new Error('Chrome not found, so no PDF can be rendered');
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'jat-pdf-'));
+  return (async () => {
+    const tried = [];
+    try {
+      for (let i = 0; i < attempts; i++) {
+        const r = await renderPdfOnce(chrome, htmlPath, pdfPath, {
+          timeoutMs,
+          // Alternate: --headless is the alias, --headless=new names the mode explicitly.
+          headlessFlag: i % 2 === 0 ? '--headless' : '--headless=new',
+          profileDir: path.join(base, `p${i}`),
+        });
+        if (r.size >= 1000) {
+          if (i > 0) log.warn(`PDF rendered on attempt ${i + 1} of ${attempts} (earlier attempts wrote nothing)`);
+          return r.size;
+        }
+        tried.push(`#${i + 1} ${r.size}b/${r.ms}ms${r.err ? ' ' + r.err.slice(0, 80) : ''}`);
+        await new Promise((r2) => setTimeout(r2, 400));
+      }
+    } finally {
+      try { fs.rmSync(base, { recursive: true, force: true }); } catch { /* temp profiles, best effort */ }
+    }
+    throw new Error(`PDF was not written after ${attempts} attempts: ${tried.join('; ')}`);
+  })();
 }
 
 function makeDocumentTools(opts = {}) {
@@ -127,7 +175,10 @@ function makeDocumentTools(opts = {}) {
         + 'WORDING ONLY. Never add a skill, a tool, a title or a number the candidate does not '
         + 'already have. If the posting wants something he lacks, leave it out. '
         + 'Write date ranges as "2024 to Present": the dash a resume would normally use is banned, '
-        + 'and the comma that gets substituted for it reads as a typo. Pass company and '
+        + 'and the comma that gets substituted for it reads as a typo. TWO THINGS FAIL THE VOICE '
+        + 'CHECK MORE THAN ANYTHING ELSE, and a failure means writing the whole document again: an '
+        + 'em dash ANYWHERE (use a comma or a full stop) and the word "excited" (say what about the '
+        + 'work is interesting, concretely). Pass company and '
         + 'bodyHtml: a complete <body>...</body> element, not a fragment and not a whole document. '
         + 'Renders a PDF and returns the path you must give attach_file. REFUSED if the writing '
         + 'breaks the house rules.',

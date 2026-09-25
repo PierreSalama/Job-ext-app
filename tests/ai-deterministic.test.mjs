@@ -75,11 +75,21 @@ test('education: a Bachelor\'s holder answers "do you hold a Master\'s?" = No (h
 });
 
 test('years-of-experience returns a NUMBER, never a URL', () => {
-  const r = deterministic.answer('How many years of experience do you have with Java?', ctx());
+  // Asked GENERICALLY on purpose. This test is about the SHAPE of the answer, and it used to ask
+  // about Java, which this fixture's resume ("Software Engineer 2019-present. B.Sc. Computer
+  // Science") says nothing about. Since 2026-09-05 the floor withholds a number when the question
+  // names a subject it cannot evidence, so that phrasing now tests the subject gate by accident
+  // rather than the shape. See years-subject-gate.test.mjs, which tests the gate deliberately.
+  const r = deterministic.answer('How many years of professional experience do you have?', ctx());
   assert.ok(r, 'an answer is returned');
   assert.match(r.answer, /^\d+$/, 'the answer is a bare number');
   assert.doesNotMatch(r.answer, /https?:\/\/|www\.|\.com/i, 'never a URL/link for a quantity question');
   assert.equal(r.answer, '5', 'reads the profile yearsExperience');
+});
+
+test('...and withholds it when the question names something the resume cannot support', () => {
+  // The other half of the rule above, pinned here so this file cannot drift back on its own.
+  assert.equal(deterministic.answer('How many years of experience do you have with Java?', ctx()), null);
 });
 
 test('preferred language defaults to English', () => {

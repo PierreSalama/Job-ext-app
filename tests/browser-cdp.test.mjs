@@ -118,6 +118,83 @@ describeBrowser('CDP harness drives a real Chrome end to end', async (t) => {
       assert.equal(page.find('Social insurance number').length, 0);
     });
 
+    // Found 2026-09-07 doing read-only recon on a live Workable posting. `find` answers from
+    // `lastTree`, which only readTree writes and NOTHING used to clear. So after navigating to a
+    // new job, find kept answering from the PREVIOUS page and handed back refs into a document
+    // that no longer exists — a click on one of those is a click on nothing, or worse on whatever
+    // the stale backendNodeId now resolves to. And with no tree read at all it returned an empty
+    // array, which the tool layer reported as "no match, the label may differ", sending the agent
+    // hunting for a wording problem instead of calling read_page.
+    await t.test('navigating invalidates the tree so find cannot answer from the old page', async () => {
+      const other = path.join(tmp, 'other.html');
+      fs.writeFileSync(other, '<!doctype html><html><head><meta charset="utf-8"><title>Other</title></head>'
+        + '<body><button type="button">Totally Different Button</button></body></html>', 'utf8');
+
+      await page.readTree();
+      assert.ok(page.find('Submit Application').length > 0, 'precondition: found on the first page');
+
+      await page.navigate('file:///' + other.replace(/\\/g, '/'));
+      assert.equal(page.find('Submit Application'), null,
+        'after a navigation find must say "nothing read yet", not serve the old page');
+      assert.equal(page.find('Totally Different Button'), null,
+        'that is true for labels on the NEW page too, until it is read');
+
+      await page.readTree();
+      assert.equal(page.find('Submit Application').length, 0,
+        'once read, a label that is genuinely gone is an empty array, not null');
+      assert.ok(page.find('Totally Different Button').length > 0, 'and the new page is findable');
+
+      await page.navigate('file:///' + fixture.replace(/\\/g, '/'));
+      await page.readTree();
+    });
+
+    // THE REQUIRED CONSENT BOX. Ashby and Lever hide the real <input> and paint a styled box next
+    // to a label; the input has no rect at all, so a click at its centre lands nowhere and reports
+    // success. A required consent box that never ticks is an application that silently will not
+    // submit. This behaviour was covered only by two regexes over cdp.js — which cannot tell you
+    // whether the box actually ends up checked.
+    await t.test('a hidden consent box is ticked through its label, and an orphan one is refused', async () => {
+      const consent = path.join(tmp, 'consent.html');
+      fs.writeFileSync(consent, '<!doctype html><html><head><meta charset="utf-8"><title>Consent</title></head><body>'
+        // wrapping label, the Ashby shape
+        + '<label><input id="wrapped" type="checkbox" required style="display:none"> I agree to the privacy policy</label>'
+        // label[for=...], the Lever shape
+        + '<input id="forred" type="checkbox" required style="display:none">'
+        + '<label for="forred">I consent to being contacted</label>'
+        // no box AND no label: must be refused loudly
+        + '<input id="orphan" type="checkbox" style="display:none">'
+        // an ordinary visible checkbox must still be clicked directly
+        + '<label for="plain">Subscribe</label><input id="plain" type="checkbox">'
+        + '</body></html>', 'utf8');
+      await page.navigate('file:///' + consent.replace(/\\/g, '/'));
+
+      const checked = (sel) => page.evaluate("document.querySelector('" + sel + "').checked");
+
+      for (const [id, shape] of [['wrapped', 'a wrapping label'], ['forred', 'a label[for]']]) {
+        const ref = await page.queryRef('#' + id);
+        assert.ok(ref, `precondition: ${id} is reachable by selector`);
+        assert.equal(await checked('#' + id), false, 'precondition: it starts unchecked');
+        const r = await page.click(ref);
+        assert.ok(r && r.viaLabel, `${shape} must be what got clicked, not the invisible input`);
+        assert.equal(await checked('#' + id), true,
+          `THE POINT: the required consent box must actually end up checked (${shape})`);
+      }
+
+      const orphan = await page.queryRef('#orphan');
+      await assert.rejects(() => page.click(orphan), /no clickable label/,
+        'with no box and no label it must fail loudly, not report a click that did nothing');
+      assert.equal(await checked('#orphan'), false);
+
+      // A control that HAS a box is still clicked normally — the label path must not take over.
+      const plain = await page.queryRef('#plain');
+      const pr = await page.click(plain);
+      assert.ok(!pr || !pr.viaLabel, 'a visible checkbox must be clicked directly, not via its label');
+      assert.equal(await checked('#plain'), true);
+
+      await page.navigate('file:///' + fixture.replace(/\\/g, '/'));
+      await page.readTree();
+    });
+
     await t.test('fill types the value AND blurs, so framework state commits', async () => {
       await page.readTree();
       const ref = page.find('Phone number')[0].ref;
@@ -216,4 +293,52 @@ test('two profiles get two separate browsers on two ports', { skip: !chromePath 
     await cdpMod.killChrome(a);
     await cdpMod.killChrome(b);
   }
+});
+
+test('a browser we cannot prove is ours on our port is left alone and we relocate to a free port', async () => {
+  // Old behaviour refused and raised a human block ("Chrome already running on the automation port").
+  // Now nothing is killed or driven: we launch our own Chrome on the next free port and report it.
+  const http = await import('node:http');
+  const srv = http.createServer((q, r) => {
+    r.writeHead(200, { 'Content-Type': 'application/json' });
+    r.end(JSON.stringify({ webSocketDebuggerUrl: 'ws://127.0.0.1:9297/devtools/browser/x' }));
+  });
+  await new Promise((r) => srv.listen(9297, '127.0.0.1', r));
+  let h;
+  try {
+    h = await cdpMod.launchChrome({ profileId: 'guard-test', port: 9297, headless: true });
+    assert.notEqual(h.port, 9297, 'must not drive or share the foreign port');
+    assert.ok(h.port > 9297, 'relocated to a higher free port');
+    assert.ok(!h.adopted);
+    const pages = await cdpMod.listPages('127.0.0.1', h.port);
+    assert.ok(pages.length > 0, 'our own browser answers on the new port');
+  } finally {
+    if (h) await cdpMod.killChrome(h);
+    await new Promise((r) => srv.close(r));
+  }
+  // With relocation disabled the old refusal still holds.
+  const srv2 = http.createServer((q, r) => { r.writeHead(200, { 'Content-Type': 'application/json' }); r.end(JSON.stringify({ webSocketDebuggerUrl: 'ws://127.0.0.1:9297/x' })); });
+  await new Promise((r) => srv2.listen(9297, '127.0.0.1', r));
+  try {
+    await assert.rejects(
+      () => cdpMod.launchChrome({ profileId: 'guard-test', port: 9297, headless: true, noRelocate: true }),
+      /already serving a Chrome that is not ours/);
+  } finally { await new Promise((r) => srv2.close(r)); }
+});
+
+test('the staleness probe uses a SHORT timeout, not the launch one', () => {
+  // waitForCdp takes a number, not an options object. Passing { timeoutMs: 1200 } makes the
+  // deadline NaN, the loop never runs, the probe always reports "free", and the guard silently
+  // never fires while looking exactly like it works. That was the first version of this.
+  const src = fs.readFileSync(new URL('../app/src/browser/cdp.js', import.meta.url), 'utf8');
+  assert.match(src, /await waitForCdp\(host, port, 1200\)/);
+  assert.doesNotMatch(src, /waitForCdp\([^)]*\{\s*timeoutMs/, 'never pass an options object here');
+});
+
+test('two profiles get separate Chrome user-data directories', () => {
+  // Separate ledgers are useless if both people share one logged-in browser.
+  const a = cdpMod.profileDir('prof_aaaa1111-2222-3333-4444-555566667777');
+  const b = cdpMod.profileDir('prof_bbbb1111-2222-3333-4444-555566667777');
+  assert.notEqual(a, b);
+  assert.match(a, /chrome-prof_aaaa1111/);
 });

@@ -18,23 +18,18 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
 const read = (...p) => fs.readFileSync(path.join(here, '..', ...p), 'utf8');
 const server = read('app', 'src', 'server.js');
 const bg = read('extension', 'background.js');
 
-// Rebuild the server's host reducer so both sides can be checked against the same inputs.
-const MULTI = new Set(['co.uk', 'com.au', 'co.jp', 'co.nz', 'co.in', 'com.br', 'co.za', 'com.mx', 'org.uk', 'gov.uk']);
-function registrableDomainOf(url) {
-  try {
-    const h = new URL(String(url)).hostname.replace(/^www\./, '').toLowerCase();
-    const parts = h.split('.').filter(Boolean);
-    if (parts.length <= 2) return h;
-    const last2 = parts.slice(-2).join('.');
-    return MULTI.has(last2) ? parts.slice(-3).join('.') : last2;
-  } catch { return ''; }
-}
+// Take the REAL function, not a copy. This file used to restate registrableDomainOf byte for byte
+// along with its own multi-part TLD set, so it agreed with server.js by construction and would
+// have kept passing through any change to either.
+const { registrableDomainOf } = require(path.join(here, '..', 'app', 'src', 'server.js'));
 
 test('every Indeed subhost reduces to the one key the breaker uses', () => {
   for (const u of ['https://ca.indeed.com/viewjob?jk=abc',

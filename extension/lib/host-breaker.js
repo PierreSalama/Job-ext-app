@@ -89,6 +89,23 @@ export function trippedEntry(prev, kind, now, cooldownMs = HOST_BREAKER_COOLDOWN
 // shouldDispatchHost() compares against `until` and does not care whether an entry is present.
 export const HOST_BREAKER_FORGET_MS = 12 * 60 * 60 * 1000;
 
+// PURE: the entry a host deserves after it BEHAVED - i.e. an application just went through on it.
+// Returns null, meaning "forget this host", because a site that accepts a submission is not walling
+// us and its hit count should not follow it into the next wall.
+//
+// THE BUG THIS FIXES. `trippedEntry` doubles the cooldown per consecutive hit (20m, 40m, 80m, 160m,
+// 320m, capped 6h) and the comment beside it says "`hits` resetting on success keeps recovery
+// fast". Nothing ever reset them. The ONLY path back to zero was shouldForget's twelve quiet hours,
+// which a busy host never gets, so the counter only ever ratcheted up.
+//
+// Live 2026-09-08: Indeed reached three hits, which prices the next wall at 160 minutes and the one
+// after at 320. Every runnable job in the queue that day was on Indeed, and Indeed had ALSO accepted
+// 112 submissions all-time. A host that mostly works was being priced like one that never does, and
+// the node would have spent most of an unattended night silent.
+export function behavedEntry() {
+  return null;
+}
+
 // PURE: should this entry be forgotten entirely? (Cooled down AND quiet since its last trip.)
 export function shouldForget(entry, now, forgetMs = HOST_BREAKER_FORGET_MS) {
   if (!entry) return true;

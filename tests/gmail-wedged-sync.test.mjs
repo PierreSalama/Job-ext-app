@@ -14,8 +14,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
 const src = fs.readFileSync(path.join(here, '..', 'app', 'src', 'gmail.js'), 'utf8');
 
 test('the busy guard is bounded by how long the current sync has been running', () => {
@@ -44,7 +46,13 @@ test('a wedged run is taken over, and the takeover is recorded not silent', () =
 
 // The arithmetic of the guard, so the intent is pinned independently of the source text.
 test('guard arithmetic: blocks a live sync, releases a wedged one', () => {
-  const STALE = 15 * 60 * 1000;
+  // Take the bound from the MODULE, not a copy. This test used to define its own 15 minutes, so
+  // widening the real constant to hours would have left every test in this file green while a
+  // wedged sync went on blocking Gmail for exactly as long as the bug it exists to end.
+  const gmail = require(path.join(here, '..', 'app', 'src', 'gmail.js'));
+  const STALE = gmail.SYNC_STALE_MS;
+  assert.equal(typeof STALE, 'number', 'the bound must be exported so this test cannot drift from it');
+  assert.equal(STALE, 15 * 60 * 1000, 'and 15 minutes is the agreed bound — change this deliberately');
   const blocked = (syncing, startedAt, now) => syncing && (now - startedAt) < STALE;
   const now = 1_000_000_000;
 

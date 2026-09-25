@@ -131,6 +131,25 @@ function buildAttempts(s, { prose, modelOverride, providerOverride }) {
       attempts.push({ name: 'ollama', model, run: (a) => ollama.generate({ ...a, model, timeoutMs: cfg.timeoutMs, cfg }) });
     }
   }
+  // A PEER THAT CANNOT BE REACHED IS NOT WORTH 12 SECONDS ON EVERY CALL.
+  //
+  // Measured on the applier laptop 2026-09-05, in its own ai log: of the last 50 calls, 16 were
+  // 'remote' failing with "cannot reach the peer at http://100.78.234.94:7744", each taking 10.8
+  // to 13.8 seconds, followed by codex failing instantly on quota, followed by claude-cli
+  // answering in 6.4 to 7.6 seconds. The peer is Pierre's PC and the app there was simply not
+  // running. So two thirds of the latency of every single agent step was a dead peer timing out.
+  //
+  // REMOTE_NET and REMOTE_TIMEOUT are deliberately absent from HARD_FAIL, because a peer that is
+  // briefly unreachable is transient and must not be reported as permanently dead. That is right
+  // for the status card and wrong for the call chain: "transient" is not a reason to pay the
+  // timeout again on the very next call. Same shape as the codex quota block, which stopped
+  // spawning a doomed subprocess once it knew the answer.
+  //
+  // Never empties the chain. If the peer is the only thing configured, it is still attempted,
+  // because failing instantly with no attempt at all is worse than waiting.
+  if (remoteCoolingDown() && attempts.some((a) => a.name !== 'remote')) {
+    return attempts.filter((a) => a.name !== 'remote');
+  }
   return attempts;
 }
 
@@ -150,6 +169,20 @@ let lastStatus = { checkedAt: 0, valid: false };
 // spawn) and cannot be fooled by a healthy binary with dead credentials.
 // ---------------------------------------------------------------------------
 const lastOutcome = new Map();   // attempt name → { ok, at, code, message }
+
+// How long to leave an unreachable peer out of the chain before trying it again. Getting this
+// wrong in the long direction costs nothing much: the call is served by the next provider, which
+// is what was already happening. Getting it wrong short costs the full connect timeout again. So
+// it leans long. After it lapses the peer is simply back in the chain, and one real call decides.
+const REMOTE_COOLDOWN_MS = 5 * 60 * 1000;
+// Only "nothing answered" counts. A peer that replied with an error, rejected the token, or sent
+// bad JSON is alive, and skipping it would hide a problem worth seeing.
+const REMOTE_UNREACHABLE = new Set(['REMOTE_NET', 'REMOTE_TIMEOUT']);
+function remoteCoolingDown(nowMs = Date.now()) {
+  const o = lastOutcome.get('remote');
+  if (!o || o.ok || !REMOTE_UNREACHABLE.has(o.code)) return false;
+  return nowMs - o.at < REMOTE_COOLDOWN_MS;
+}
 
 // Failures that mean "this provider cannot answer until a human fixes it". Everything else
 // (timeouts, empty output, transient CLI exits, a peer that was briefly unreachable) is noise
@@ -268,11 +301,11 @@ function tryDeterministic({ kind, deterministicCtx }) {
     const det = deterministic.answer(deterministicCtx.question, deterministicCtx);
     if (det && det.answer) {
       const json = { answer: det.answer, confidence: det.confidence, refuse: false, reason: 'deterministic floor (no model)' };
-      try { db.aiLog({ provider: 'deterministic', model: 'rules', kind, ms: Date.now() - started, ok: true, promptChars: deterministicCtx.question.length, responseChars: det.answer.length }); } catch {}
+      try { db.aiLog({ jobId, provider: 'deterministic', model: 'rules', kind, ms: Date.now() - started, ok: true, promptChars: deterministicCtx.question.length, responseChars: det.answer.length }); } catch {}
       return { text: det.answer, json, provider: 'deterministic', model: 'rules' };
     }
   } catch (e) {
-    try { db.aiLog({ provider: 'deterministic', model: 'rules', kind, ms: Date.now() - started, ok: false, error: String(e.message || e).slice(0, 300) }); } catch {}
+    try { db.aiLog({ jobId, provider: 'deterministic', model: 'rules', kind, ms: Date.now() - started, ok: false, error: String(e.message || e).slice(0, 300) }); } catch {}
   }
   return null;
 }
@@ -280,7 +313,7 @@ function tryDeterministic({ kind, deterministicCtx }) {
 // kind: short label for the log ('fit-score', 'cover-letter', …)
 // prose: true → prefer the local prose model when local is used
 // deterministic: optional no-model floor ctx for answer-question (see tryDeterministic)
-async function run({ kind, prompt, system, schema, prose = false, modelOverride = null, providerOverride = null, deterministic: deterministicCtx = null }) {
+async function run({ kind, prompt, system, schema, prose = false, modelOverride = null, providerOverride = null, deterministic: deterministicCtx = null, jobId = null }) {
   const s = db.getSettings().ai;
   if (s.disabled) {
     // AI is off: the deterministic no-model floor still answers the grounded questions
@@ -310,12 +343,12 @@ async function run({ kind, prompt, system, schema, prose = false, modelOverride 
     try {
       const result = await att.run({ prompt, system, schema });
       noteOutcome(att.name, true);
-      db.aiLog({ provider: att.name, model: att.model, kind, ms: Date.now() - started, ok: true, promptChars: prompt.length, responseChars: result.text.length });
+      db.aiLog({ jobId, provider: att.name, model: att.model, kind, ms: Date.now() - started, ok: true, promptChars: prompt.length, responseChars: result.text.length });
       return { ...result, provider: att.name, model: att.model };
     } catch (e) {
       // Record the REAL outcome before anything else — this is what makes /ai/status honest.
       noteOutcome(att.name, false, e);
-      db.aiLog({ provider: att.name, model: att.model, kind, ms: Date.now() - started, ok: false, error: String(e.message || e).slice(0, 300), promptChars: prompt.length });
+      db.aiLog({ jobId, provider: att.name, model: att.model, kind, ms: Date.now() - started, ok: false, error: String(e.message || e).slice(0, 300), promptChars: prompt.length });
       log.warn(`${att.name} failed for ${kind}:`, e.code || '', e.message);
       errors.push({ provider: att.name, code: e.code, message: e.message });
     }
@@ -330,4 +363,4 @@ async function run({ kind, prompt, system, schema, prose = false, modelOverride 
   throw err;
 }
 
-module.exports = { run, statusAll, resolveOrder, buildAttempts, clearHwCache, noteOutcome, outcomes, honest, remoteUsable, HARD_FAIL, _clearOutcomes };
+module.exports = { run, statusAll, resolveOrder, buildAttempts, clearHwCache, noteOutcome, outcomes, honest, remoteUsable, remoteCoolingDown, REMOTE_COOLDOWN_MS, HARD_FAIL, _clearOutcomes };

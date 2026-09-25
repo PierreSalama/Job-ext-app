@@ -27,6 +27,8 @@ const remoteAi = require('./ai/remote');
 const applyRunner = require('./ai/apply-runner');
 const jatTools = require('./ai/tools/jat');
 const answerAudit = require('./answer-audit');
+const guardrails = require('./ai/guardrails');   // lowestSalaryIn + SALARY_FIELD_RX for the autofill bundle
+const answerShape = require('./answer-shape');    // staleStartDate for the autofill bundle
 const profileBrowsers = require('./ai/profile-browsers');
 const { extractText } = require('./ai/extract');
 const hardware = require('./hardware');
@@ -43,9 +45,29 @@ const HOST_RX = /^(localhost|127\.0\.0\.1)(:\d+)?$/i;
 // With LAN remote access ON, also accept PRIVATE-RANGE host headers (the LAN IP another machine
 // on the same network dials). Public hostnames stay rejected — the rebinding guard's whole point.
 const LAN_HOST_RX = /^(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|100\.\d{1,3}\.\d{1,3}\.\d{1,3})(:\d+)?$/;
+// The empty catch below is deliberate - the guard must FAIL CLOSED, and a settings read that throws
+// is not permission to serve a request. But it must not fail SILENTLY.
+//
+// Live 2026-09-08: a stale jat.db.lock made db.getSettings() throw, so every remote request came
+// back "403 bad host" while the app sat there listening. The 403 says the caller dialled a hostname
+// the rebinding guard rejects, which was false and sent the investigation into networking for ten
+// minutes. The real fault was a 500 one layer down, visible on localhost the whole time.
+//
+// So say so, once a minute at most, because a broken settings read means EVERY request takes this
+// path and an unthrottled log would bury the machine.
+let _lastHostGuardWarn = 0;
+// Throttle for the /queue/next "handed out nothing" line below.
+let _lastQueueNextWarn = 0;
 function hostAllowed(hostHeader) {
   if (HOST_RX.test(hostHeader)) return true;
-  try { if (db.getSettings().server.remoteAccess && LAN_HOST_RX.test(hostHeader)) return true; } catch {}
+  try {
+    if (db.getSettings().server.remoteAccess && LAN_HOST_RX.test(hostHeader)) return true;
+  } catch (e) {
+    if (Date.now() - _lastHostGuardWarn > 60000) {
+      _lastHostGuardWarn = Date.now();
+      log.error(`host guard could not read settings, so every remote request is being refused as "bad host": ${e?.message || e}`);
+    }
+  }
   return false;
 }
 
@@ -71,6 +93,16 @@ const extLink = {
   id: '',               // chrome.runtime.id (which unpacked copy is loaded)
   seenAt: 0,            // ms epoch of the last report
   reloadToken: '',      // armed, unacknowledged reload request (idempotency key)
+  // FORGET THE WALLS. The extension's bot-challenge breaker is persisted in its own storage, which
+  // nothing outside the extension can reach. That became a deadlock on 2026-09-08: indeed.com was
+  // held by an escalated wall-count, the whole 42-job queue was on indeed.com, and the rule that
+  // clears the count needs a dispatch to fire - which the wall prevents. The breaker was holding on
+  // hour-old evidence while a run had already reached the site's form without a challenge.
+  //
+  // So the app can ask the extension to forget its walls. Same armed-token shape as the reload
+  // above, for the same reason: the request must be idempotent across the extension's polling.
+  clearBreakerToken: '',
+  clearBreakerArmedAt: 0,
   reloadArmedAt: 0,
   lastReloadAt: 0,      // last time a reload was ARMED — drives the rate limit
   ack: null,            // { token, state, detail, at } — what the extension did with it
@@ -285,6 +317,27 @@ const HOME_MARKERS = {
   canada: /\bcanada\b|\bontario\b|\bqu[eé]bec\b|\balberta\b|\bbritish columbia\b|\bmanitoba\b|\bsaskatchewan\b|\bnova scotia\b|\bnew brunswick\b|\bnewfoundland\b|\bprince edward\b|\byukon\b|\bnunavut\b|,\s*(on|qc|ab|bc|mb|sk|ns|nb|nl|pe|yt|nt|nu)\b|\bgta\b|\bgreater toronto\b/i,
 };
 const FOREIGN_MARKERS = /\bunited kingdom\b|\bengland\b|\bscotland\b|\bwales\b|,\s*uk\b|\(uk\)|\bunited states\b|,\s*usa?\b|\bindia\b|\baustralia\b|\bsingapore\b|\bireland\b|\bnetherlands\b|\bgermany\b|\bpoland\b|\bphilippines\b|\bpakistan\b|\bnew zealand\b|\bsouth africa\b|\bbrazil\b|\bmexico\b|\bspain\b|\bportugal\b|\bromania\b|\bukraine\b|\bnigeria\b|\bkenya\b|\bemirates\b|\bdubai\b/i;
+// US STATE CODES, WHICH IS HOW AMERICAN POSTINGS ACTUALLY WRITE THEIR LOCATION.
+//
+// The clamp above was built on 2026-08-10 for a run of UK roles, and those spell out "United
+// Kingdom". American postings almost never say "United States": they say "Ann Arbor, MI" or
+// "Alpharetta, GA 30004". So the clamp read every one of them as unknown and let it through.
+//
+// Live 2026-09-06: 357 US-located jobs in the store, 70 of which entered the auto-apply queue and
+// 51 finished as done. He is a Canadian citizen who needs sponsorship for a US role, so those are
+// waste at best. They are also where the dangerous questions come from: every "are you authorized
+// to work in the United States" and every H-1B question in his bank arrived on one of these.
+//
+// CALIFORNIA IS LEFT OUT ON PURPOSE. "CA" is both California and the ISO code for Canada, and the
+// store holds 162 locations ending in ", CA". 138 of them are Canadian and already caught by a
+// home marker ("Toronto, ON, CA"). The rest split into obvious California ("Goleta, CA 93117")
+// and the genuinely unresolvable ("Remote, CA", "BC, CA"). So California counts only when a US
+// ZIP follows it, and a bare ", CA" is left alone. That is the same fail-open choice the comment
+// above makes, for the same reason: starving the queue is worse than an occasional foreign job.
+//
+// Measured before committing: this takes the clamp from 136 rejections to 470, and rejects ZERO
+// jobs whose location names anywhere Canadian.
+const US_STATE_MARKERS = /,\s*(?:al|ak|az|ar|co|ct|de|fl|ga|hi|id|il|in|ia|ks|ky|la|me|md|ma|mi|mn|ms|mo|mt|ne|nv|nh|nj|nm|ny|nc|nd|oh|ok|or|pa|ri|sc|sd|tn|tx|ut|vt|va|wa|wv|wi|wy|dc)\b|,\s*ca\s+\d{5}\b/i;
 
 // True only when the location names a foreign place AND names nothing local. "London Area, United
 // Kingdom" is foreign; "London, Ontario" is not, because Ontario is a home marker — the ambiguity
@@ -295,7 +348,7 @@ function foreignLocation(location, country) {
   const home = HOME_MARKERS[String(country || '').trim().toLowerCase()];
   if (!home) return false;                             // country we don't model → never reject
   if (home.test(loc)) return false;                    // says it's local → local wins
-  return FOREIGN_MARKERS.test(loc);
+  return FOREIGN_MARKERS.test(loc) || US_STATE_MARKERS.test(loc);
 }
 
 function jobFit(jobOrTitle, aa) {
@@ -424,6 +477,30 @@ function ingestDiscoveredJobs(source, jobs, { providerName = 'browser', batchId 
   // Ingesting external postings then is what keeps it earning at a lower rate instead of idling.
   const easyApplyOnly = s.easyApplyOnly !== false && !db.easyApplyCooledDown() && !db.easyApplySupplyExhausted();
   let enqueued = 0, rejected = 0, punished = 0, duplicates = 0;
+  // WHY each posting was rejected, not just how many. Measured 2026-09-08: four ATS batches in a
+  // row reported "found 20, accepted 0" and there was no way to tell whether the filters were
+  // working correctly on genuinely off-target roles or silently discarding every good one. The
+  // whole queue was down to a single host by then, so knowing which gate was doing the rejecting
+  // was the difference between "supply is fine, the postings are wrong" and "a filter is broken".
+  //
+  // Reasons carry specifics (a company name, a salary figure), so they are normalised down to the
+  // GATE that fired before counting - otherwise every posting produces its own unique key and the
+  // tally is as useless as the bare number was.
+  const rejectReasons = {};
+  const noteReject = (reason) => {
+    rejected++;
+    const r = String(reason || 'unknown');
+    const gate = /above your level cap/.test(r) ? 'above-level-cap'
+      : /academic\/research/.test(r) ? 'academic-role'
+      : /excluded keyword/.test(r) ? 'excluded-keyword'
+      : /excluded company/.test(r) ? 'excluded-company'
+      : /excluded location/.test(r) ? 'excluded-location'
+      : /^outside /.test(r) ? 'outside-country'
+      : /below your salary floor/.test(r) ? 'below-salary-floor'
+      : /matches none of your keywords/.test(r) ? 'title-keyword-miss'
+      : r;
+    rejectReasons[gate] = (rejectReasons[gate] || 0) + 1;
+  };
   const ranked = [];
   // WATCHLIST — checked BEFORE jobFit, deliberately. A watched company is one where Pierre has a
   // relationship (Syntronic: phone screen 2026-07-23, recruiter Adam Ortner), and "anything they
@@ -443,13 +520,13 @@ function ingestDiscoveredJobs(source, jobs, { providerName = 'browser', batchId 
   }
 
   for (const jd of (Array.isArray(jobs) ? jobs : []).slice(0, 100)) {
-    if (!jd || !jd.jobUrl) { rejected++; continue; }
+    if (!jd || !jd.jobUrl) { noteReject('no job url'); continue; }
     const verdict = jobFit(jd, s);
-    if (!verdict.ok) { rejected++; continue; }
+    if (!verdict.ok) { noteReject(verdict.reason); continue; }
     // Fix 5(b) + CONFIRMED ROOT CAUSE: in Easy-Apply-only mode, drop postings that are not
     // known/likely Easy Apply — non-LinkedIn boards AND the JobSpy LinkedIn 'unknown'/'external'
     // flood — so they never dominate the queue (they'd only be skipped at dispatch anyway).
-    if (!easyApplyIngestEligible(source || jd.source, easyApplyOnly, jd)) { rejected++; continue; }
+    if (!easyApplyIngestEligible(source || jd.source, easyApplyOnly, jd)) { noteReject('easy-apply-only: not one-click'); continue; }
     const probe = { id: null, title: jd.title, company: jd.company, jobUrl: jd.jobUrl, location: jd.location, source: source || jd.source || null };
     let isP = false, rank = 0;
     try { const pid = db.resolveProfileId(probe.source); isP = db.isPunished(probe, pid); rank = isP ? -1 : db.rankJob(probe, pid); } catch {}
@@ -514,7 +591,7 @@ function ingestDiscoveredJobs(source, jobs, { providerName = 'browser', batchId 
 
   broadcast('queue.updated', { action: 'discover', provider: providerName, batchId });
   broadcast('jobs.updated', { action: 'discover', provider: providerName, batchId });
-  return { enqueued, rejected, punished, duplicates, watchAlerts };
+  return { enqueued, rejected, punished, duplicates, watchAlerts, rejectReasons };
 }
 
 function withinWindow(settings) {
@@ -866,10 +943,36 @@ async function queueNext(force = false, skipHosts = null) {
   // Work authorisation, sponsorship, citizenship and clearance never travel in this bundle. The
   // structured profile still carries his true, self-entered answers, and anything not covered by
   // that parks the application for him rather than being guessed at.
+  //
+  // THE SALARY FLOOR DID NOT REACH THIS PATH EITHER.
+  //
+  // guardrails.js refuses to let the AI agent type a number below his floor, and that guard is
+  // real, but it only wraps the agent's `fill` tool. These harvested fields go straight to the
+  // extension, which matches them against the page itself, so nothing checked them at all.
+  //
+  // Live on the laptop 2026-09-06, with autoApply.salaryFloor set to 90000 and his profile reading
+  // "CAD 100,000-110,000": six distinct harvested answers were being shipped that start at 85,000.
+  //     "85000"                                    what is your desired annual base salary
+  //     "85000-110000"                             what are your salary requirements
+  //     "Desired base salary: CAD 85,000-110,000." to help us understand your expectations
+  //
+  // Fixing those seven rows by hand would not have held, because the next one harvested tomorrow
+  // ships again. The floor belongs on the path, not in the data.
+  //
+  // salaryBelowFloor is the agent guard's own rule, exported rather than reimplemented, because two
+  // copies of a policy are two policies. One of the live rows here
+  // has a neutral label ("to help us understand your expectations") and only its VALUE says salary.
+  // lowestSalaryIn accepts only 4-7 digit numbers between 20,000 and 1,000,000, so years of
+  // experience, dates, counts and phone numbers all return null and are untouched.
+  const salaryFloor = Number(s.autoApply && s.autoApply.salaryFloor) || 0;
+  const belowFloor = (f) => guardrails.salaryBelowFloor(f.label || f.key || '', f.value, salaryFloor) !== null;
+  // ...and the same for a start date that has already passed. Thirteen live rows held one. This
+  // bundle is the path with no recall in it, so recallOk's copy of the rule never runs here.
+  const staleDate = (f) => answerShape.staleStartDate(f.label || f.key || '', f.value);
   const harvestedAll = db.profileFieldList(profileId).filter((f) => f.value);
-  const harvested = harvestedAll.filter((f) => !db.isHighStakesQuestion(f.label || f.key || ''));
+  const harvested = harvestedAll.filter((f) => !db.isHighStakesQuestion(f.label || f.key || '') && !belowFloor(f) && !staleDate(f));
   const withheld = harvestedAll.length - harvested.length;
-  if (withheld) log.info(`autofill bundle: withheld ${withheld} harvested work-authorisation answer(s) from ${job.company || 'this job'}`);
+  if (withheld) log.info(`autofill bundle: withheld ${withheld} harvested answer(s) (work authorisation, self-ID, below the salary floor, or a start date already past) from ${job.company || 'this job'}`);
   const siteCfg = s.sites?.[String(job.source || '').toLowerCase()] || {};
   let mode = siteCfg.mode || task.mode || s.mode;
 
@@ -1138,6 +1241,7 @@ async function handle(req, res, parsed) {
       // Present ONLY while a reload is armed and unacknowledged. The token makes the request
       // idempotent: the extension records the token it acted on and ignores a repeat.
       ...(extLink.reloadToken ? { extReload: { token: extLink.reloadToken, armedAt: extLink.reloadArmedAt } } : {}),
+      ...(extLink.clearBreakerToken ? { extClearBreaker: { token: extLink.clearBreakerToken, armedAt: extLink.clearBreakerArmedAt } } : {}),
     });
   }
   if (req.method === 'POST' && pathname === '/pair') {
@@ -1512,6 +1616,30 @@ async function handle(req, res, parsed) {
     const qa = db.qaLookup(pid, q);
     const pfn = pf ? { ...pf, answer: pf.value } : null;
     const match = (pfn && qa) ? (pfn.score >= qa.score ? pfn : qa) : (pfn || qa);
+    // THE THIRD PATH THE SALARY FLOOR DID NOT REACH.
+    //
+    // executor.js calls this endpoint to fill a field directly (content/executor.js:1537 and
+    // :2233). Whatever comes back is typed. Both halves of the answer here are already gated for
+    // work authorisation and self-ID, because qaLookup and profileFieldLookup both run recallOk.
+    // Neither knows anything about money.
+    //
+    // Live 2026-09-06 against a floor of 90,000: 72 rows in the answer bank sit below it and the
+    // shape gate would serve 64, among them a flat "85,000." and "CAD 85,000 annually." for
+    // "desired salary?". The agent's fill tool refuses those, the autofill bundle now withholds
+    // them, and this endpoint handed them straight to the executor.
+    //
+    // Same exported rule as both of those, deliberately. This is the third place tonight where a
+    // correct policy simply did not reach a path, and a fourth copy of it would be a fourth
+    // chance to miss one.
+    if (match && match.answer != null) {
+      let floor = 0;
+      try { floor = Number(db.getSettings().autoApply.salaryFloor) || 0; } catch { /* unset */ }
+      const low = guardrails.salaryBelowFloor(q, match.answer, floor);
+      if (low !== null) {
+        log.info(`qa/lookup: withholding a remembered ${low.toLocaleString()} for "${String(q).slice(0, 60)}" — below the ${floor.toLocaleString()} floor`);
+        return sendJson(res, 200, { ok: true, match: null });
+      }
+    }
     return sendJson(res, 200, { ok: true, match });
   }
   if (req.method === 'DELETE' && (jm = m(/^\/qa\/([^/]+)$/))) {
@@ -1896,7 +2024,27 @@ async function handle(req, res, parsed) {
     // Sent by the pump so a walled job is never claimed in the first place (see queueNext).
     const skipHosts = new Set(String(parsed.searchParams.get('skipHosts') || '')
       .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
-    return sendJson(res, 200, { ok: true, ...(await queueNext(parsed.searchParams.get('force') === '1', skipHosts)) });
+    const result = await queueNext(parsed.searchParams.get('force') === '1', skipHosts);
+    // WHO IS REFUSING THE WORK, THE APP OR THE EXTENSION?
+    //
+    // Twice on 2026-09-08 the node sat with 42 runnable jobs, the app willing to hand any of them
+    // out, the service worker checking in every minute, and NOTHING dispatching for 40 minutes. From
+    // the app's side those two situations look identical: an extension that never asks, and an
+    // extension that asks while excluding every host it could be given. They need opposite fixes,
+    // and there was no way to tell them apart without guessing - which is what I did, twice.
+    //
+    // So record the ask. Only when the pump got nothing, and at most once a minute, because a busy
+    // node polls this constantly and an unthrottled line would drown the log it is meant to clarify.
+    if (!result.task) {
+      const nowMs = Date.now();
+      if (nowMs - _lastQueueNextWarn > 60000) {
+        _lastQueueNextWarn = nowMs;
+        log.info(`/queue/next handed out nothing: reason=${result.reason || 'none'}`
+          + ` skipHosts=[${[...skipHosts].join(',') || 'none'}]`
+          + ` passedOver=${JSON.stringify(result.passedOver || null)}`);
+      }
+    }
+    return sendJson(res, 200, { ok: true, ...result });
   }
   if (req.method === 'POST' && pathname === '/queue') {
     const body = await readJson(req);
@@ -2008,6 +2156,25 @@ async function handle(req, res, parsed) {
     const result = ingestDiscoveredJobs(body.source, jobs, {
       providerName: body.provider || 'browser', batchId: body.batchId || null,
     });
+    // THE ONE DISCOVERY LANE NOBODY COULD SEE INTO.
+    //
+    // This is the extension's own search: it opens a real search page in Pierre's logged-in
+    // session and posts what it scraped. It is also the lane that spends the LinkedIn search
+    // budget - 8 of 8 in an hour, measured 2026-09-08 - while the runnable queue held zero
+    // LinkedIn jobs and was 100% Indeed, which left the node helpless the moment Indeed started
+    // serving Cloudflare.
+    //
+    // The reject reasons were already being computed here. They were simply thrown away, because
+    // this caller passes batchId:null and the tally is only ever persisted onto a batch. So a
+    // search could bring back thirty jobs, drop all thirty, and leave no trace anywhere.
+    //
+    // Logged only when a search FOUND something and kept none of it, which is the case worth
+    // explaining. A search that legitimately found nothing says so through its own telemetry.
+    if (jobs.length && !result.enqueued) {
+      log.info(`/queue/discover kept nothing from ${body.source || 'unknown'}: ${jobs.length} found,`
+        + ` ${result.duplicates || 0} already known, ${result.rejected || 0} filtered`
+        + ` ${JSON.stringify(result.rejectReasons || {})}`);
+    }
     return sendJson(res, 200, { ok: true, ...result, filtered: result.rejected });
   }
   // The deduped list of questions parked jobs are waiting on (the intake form).
@@ -2346,6 +2513,31 @@ async function handle(req, res, parsed) {
   // ---- AI ----
   if (req.method === 'GET' && pathname === '/ai/status') {
     return sendJson(res, 200, { ok: true, ...(await provider.statusAll(parsed.searchParams.get('force') === '1')) });
+  }
+  // "Is the AI approach working?" behind one GET. Windowed on purpose — the lifetime provider
+  // totals are dominated by history and still read as broken after the chain has been fixed.
+  // WHAT THE AI DID FOR ONE APPLICATION.
+  //
+  // The per-job counterpart to /ai/usage. Opening an application and seeing which questions were
+  // answered, by which model, how long each took and which failed is the difference between
+  // trusting the pipeline and hoping.
+  if (req.method === 'GET' && pathname.startsWith('/jobs/') && pathname.endsWith('/ai')) {
+    const jobId = pathname.slice('/jobs/'.length, -'/ai'.length);
+    const items = db.aiLogForJob(jobId, Number(parsed.searchParams.get('limit')) || 200);
+    const ok = items.filter((x) => x.ok).length;
+    return sendJson(res, 200, {
+      ok: true,
+      jobId,
+      calls: items.length,
+      okCalls: ok,
+      failed: items.length - ok,
+      totalMs: items.reduce((a, x) => a + (x.ms || 0), 0),
+      items,
+    });
+  }
+  if (req.method === 'GET' && pathname === '/ai-apply/performance') {
+    const days = Number(parsed.searchParams.get('days')) || 7;
+    return sendJson(res, 200, { ok: true, ...db.aiPerformance({ days }) });
   }
   if (req.method === 'GET' && pathname === '/ai/usage') {
     return sendJson(res, 200, { ok: true, usage: db.aiUsage(), recent: db.aiLogList(50) });
@@ -2835,6 +3027,28 @@ async function handle(req, res, parsed) {
     broadcast('jobs.updated', { action: 'import' });
     return sendJson(res, 200, { ok: true, ...r });
   }
+  // Ask the extension to forget every host in its bot-challenge breaker. Use when a host is known to
+  // be serving normally again and the persisted wall-count is stale - the count escalates 20m → 40m
+  // → 80m → 160m → 320m → 6h, and on a single-host queue that is the difference between a working
+  // night and a silent one.
+  if (req.method === 'POST' && pathname === '/ext/clear-breaker') {
+    if (extLink.clearBreakerToken) {
+      return sendJson(res, 200, { ok: true, already: true, token: extLink.clearBreakerToken });
+    }
+    extLink.clearBreakerToken = `cb_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    extLink.clearBreakerArmedAt = Date.now();
+    log.info(`ext clear-breaker armed (token ${extLink.clearBreakerToken})`);
+    return sendJson(res, 200, { ok: true, token: extLink.clearBreakerToken });
+  }
+  if (req.method === 'POST' && pathname === '/ext/clear-breaker-ack') {
+    const body = await readJson(req);
+    const token = String(body.token || '');
+    if (!token || token !== extLink.clearBreakerToken) return sendJson(res, 409, { ok: false, error: 'stale or unknown token' });
+    extLink.clearBreakerToken = '';
+    extLink.clearBreakerArmedAt = 0;
+    log.info(`ext clear-breaker ack: cleared ${Number(body.cleared) || 0} host(s) — ${String(body.detail || '').slice(0, 160)}`);
+    return sendJson(res, 200, { ok: true, cleared: Number(body.cleared) || 0 });
+  }
   if (req.method === 'POST' && pathname === '/backup') {
     const dest = db.backupNow('manual-' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19));
     return sendJson(res, dest ? 200 : 500, { ok: !!dest, path: dest });
@@ -2921,4 +3135,6 @@ function stopServer() {
   if (server) { try { server.close(); } catch {} server = null; }
 }
 
-module.exports = { startServer, stopServer, broadcast, getToken, rescanAllFolders, startFolderWatchers, ingestDiscoveredJobs, jobFit, easyApplyIngestEligible, queueNext, hostAllowed };
+// registrableDomainOf is exported for the tests. skip-walled-hosts kept a byte-for-byte copy of it
+// AND its own copy of the multi-part TLD set, so neither could ever disagree with this file.
+module.exports = { startServer, stopServer, broadcast, getToken, rescanAllFolders, startFolderWatchers, ingestDiscoveredJobs, jobFit, easyApplyIngestEligible, queueNext, hostAllowed, registrableDomainOf };

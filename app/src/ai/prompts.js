@@ -51,6 +51,8 @@ function profileBlock(profile) {
 function fitScore({ job, profile, resumeText }) {
   return {
     kind: 'fit-score',
+    // Which application this call served, so ai_log can be read per job.
+    jobId: job && job.id,
     system: SYSTEM_BASE,
     prompt:
 `Score how well this candidate fits this job, 0-100. Be honest: if the profile/resume is sparse or the overlap is weak, score below 50. Identify concrete strengths and gaps grounded ONLY in the provided material.
@@ -81,6 +83,8 @@ ${clip(resumeText, 6000) || '(no resume on file)'}`,
 function coverLetter({ job, profile, resumeText, tone }) {
   return {
     kind: 'cover-letter',
+    // Which application this call served, so ai_log can be read per job.
+    jobId: job && job.id,
     prose: true,
     system: SYSTEM_BASE,
     prompt:
@@ -108,6 +112,8 @@ Return ONLY the letter text.`,
 function tailorResume({ job, resumeText, profile }) {
   return {
     kind: 'tailor-resume',
+    // Which application this call served, so ai_log can be read per job.
+    jobId: job && job.id,
     prose: true,
     system: SYSTEM_BASE,
     prompt:
@@ -137,6 +143,8 @@ function answerQuestion({ question, fieldType, options, job, profile, qaHistory,
     .join('\n');
   return {
     kind: 'answer-question',
+    // Which application this call served, so ai_log can be read per job.
+    jobId: job && job.id,
     system: SYSTEM_BASE,
     prompt:
 `You are filling out a job application form on behalf of the candidate. Answer ONE question.
@@ -220,6 +228,8 @@ ${clip(body, 4000)}`,
 function summarizeJob({ job }) {
   return {
     kind: 'summarize-job',
+    // Which application this call served, so ai_log can be read per job.
+    jobId: job && job.id,
     system: SYSTEM_BASE,
     prompt:
 `Summarize this job posting in 3-5 bullet points (what the role actually is, seniority, stack/skills, comp if stated, anything unusual). Then one line: "Red flags: ..." listing any concerning patterns (or "none obvious").

@@ -614,6 +614,52 @@ test('different arguments are not a repeat', async () => {
   assert.equal(db2.steps.filter((s) => s.tool === '(repeating)').length, 0);
 });
 
+// A CHALLENGE YOU CANNOT AUDIT IS HALF A FEATURE. The challenged step used to store `args: {}`, so
+// the summary the model was pulled up on vanished. Trying to decide whether one particular
+// challenge on 2026-09-05 was a true catch or a false positive, there was nothing left to read.
+// Same reasoning as the challenged-done test below: `(unparsed)` was the commonest step in the
+// recorded runs and stored nothing but its own complaint, so nobody could see what the model had
+// actually replied with. Prose around the JSON and a markdown fence need different fixes.
+test('an unparseable reply is kept, so the commonest failure can be diagnosed', async () => {
+  const db2 = memStore();
+  await loop.runAgent({
+    goal: 'x',
+    tools: sandbox.safe,
+    limits: { maxSteps: 6 },
+    deps: {
+      db: db2,
+      generate: scripted([
+        'I will now fill in the application form and attach the resume.',
+        fin('finished properly'),
+      ]),
+    },
+  });
+  const un = db2.steps.find((s) => s.tool === '(unparsed)');
+  assert.ok(un, 'the unparseable reply must be recorded');
+  assert.match(String(un.args && un.args.rejectedReply), /fill in the application form/,
+    'and it must keep the text, not just the complaint');
+});
+
+test('a challenged done keeps the summary it rejected', async () => {
+  const db2 = memStore();
+  await loop.runAgent({
+    goal: 'x',
+    tools: sandbox.safe,
+    deps: {
+      db: db2,
+      generate: scripted([
+        act('echo', { text: 'working' }),
+        fin('The application was submitted successfully to Acme.'),
+        fin('Prepared the Acme application; nothing was sent.'),
+      ]),
+    },
+  });
+  const challenge = db2.steps.find((s) => s.tool === '(done-challenged)');
+  assert.ok(challenge, 'the false submit claim must be challenged');
+  assert.match(String(challenge.args && challenge.args.rejectedSummary), /submitted successfully/,
+    'the rejected summary must be kept, or the challenge cannot be audited afterwards');
+});
+
 test('a repeat notice is not counted as a tool failure', async () => {
   // `(repeating)` starts with a bracket for the same reason `(unparsed)` does: it is the loop
   // talking to itself, and counting it as a tool error would corrupt the dispute check.
@@ -621,6 +667,36 @@ test('a repeat notice is not counted as a tool failure', async () => {
     new URL('../app/src/ai/agent-loop.js', import.meta.url), 'utf8'));
   assert.match(src, /tool: '\(repeating\)'/);
   assert.match(src, /!String\(x\.tool\)\.startsWith\('\('\)/, 'the dispute filter must exclude it');
+});
+
+// The test above reads agent-loop.js as text, and disputeSummary is exported and driven directly
+// three times higher up this very file. The failure it guards is specific and quiet: if a
+// bracketed self-notice counts as a real tool failure, the model's "every tool failed" claim
+// becomes TRUE by the loop's own arithmetic and the dispute silently does not fire. A regex cannot
+// see that; the function can be asked.
+test('BEHAVIOUR: a bracketed self-notice does not make a false tool-outage claim look true', () => {
+  const claim = 'No such tool available — every subsequent tool call failed, so I stopped.';
+
+  // Only real tool steps, all successful: the claim is contradicted and must be disputed.
+  const clean = [
+    { tool: 'read_page', ok: true },
+    { tool: 'fill', ok: true },
+  ];
+  assert.ok(loop.disputeSummary(claim, clean), 'precondition: this claim is disputable');
+
+  // Same run, but the loop also recorded its own notices. They are not tool outcomes, so the
+  // dispute must STILL fire. Counting them is exactly what silenced it before.
+  for (const notice of ['(repeating)', '(unparsed)', '(done-challenged)']) {
+    const withNotice = [...clean, { tool: notice, ok: false }];
+    assert.ok(loop.disputeSummary(claim, withNotice),
+      `a ${notice} step must not be read as evidence that the tools really did fail`);
+  }
+
+  // And the guard must not swing the other way: a REAL tool failure is genuine evidence, so the
+  // same claim is no longer flatly contradicted and must not be disputed.
+  const realFailure = [...clean, { tool: 'click', ok: false }];
+  assert.equal(loop.disputeSummary(claim, realFailure), null,
+    'a real tool failure makes the claim defensible — disputing it would be a false positive');
 });
 
 // ---------------------------------------------------------------------------

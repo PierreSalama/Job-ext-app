@@ -20,7 +20,7 @@ import { isSubmitClick } from './signals/intent.js';
 // baseline phrase set before.successText (and so disabled the textBecameSuccess path). It must be
 // imported explicitly: that trace sits inside a try/catch, so a missing binding would be swallowed
 // and the diagnostic would silently never emit.
-import { pageTextLooksLikeSuccess, urlLooksLikeSuccess, evaluateSubmitEvidence, SUCCESS_TEXT_RX } from './signals/success.js';
+import { pageTextLooksLikeSuccess, urlLooksLikeSuccess, evaluateSubmitEvidence, submitRejectionInNewNodes, SUCCESS_TEXT_RX } from './signals/success.js';
 import { qsa, isProbablyVisible, compactText } from './lib/dom.js';
 import { redactValue, redactLabel } from './lib/redact.js';
 import { planReplay, resolveStepAnswer, paceDelay, classifyDivergence, resolveLocator, recoveryFingerprint, shouldResetPageActionBreaker } from './replay.js';
@@ -1313,9 +1313,26 @@ function findUploadResumeAffordance(root) {
 
 // Does this step show a résumé REQUIREMENT ("A resume is required", "Resume*")? Scans the
 // scope text (and any inline error). Guarded.
+// IS A RESUME REQUIRED HERE?
+//
+// This asked the page's TEXT and nothing else, through pageRequiresResume(). That reads whatever
+// phrasing a site happens to use, and it misses the one place the answer is stated unambiguously:
+// the file input's own `required` attribute.
+//
+// Measured on a live Ashby form 2026-09-08. `_systemfield_resume` is `required` in the DOM, labelled
+// simply "Resume", and styled to 1x1 pixels. The text heuristic saw nothing, so the executor logged
+// `required=false`, treated the resume as optional, submitted without one, and Ashby answered
+// "Missing entry for required field: Resume". That posting then sat in the review queue as a
+// maybe-submitted application. 34 rows were in that state when this was found, every one on Ashby.
+//
+// So ask the element first and fall back to the text. This can only ADD true cases: a form that
+// genuinely does not require a resume has no required file input to find, and the old heuristic
+// still runs for sites that mark the requirement in prose rather than on the control.
 function resumeRequiredOnPage(root) {
   try {
     const scope = root || document;
+    const inputs = findResumeFileInputs(scope);
+    if (inputs.some((el) => el.required === true || el.getAttribute('aria-required') === 'true')) return true;
     const txt = compactText(scope.innerText || scope.textContent || '').slice(0, 4000);
     return pageRequiresResume(txt);
   } catch { return false; }
@@ -1379,7 +1396,32 @@ async function handleResumePage(root, resume) {
       syntheticClick(choice);
       try { if (choice.tagName === 'INPUT' && !choice.checked) { choice.checked = true; choice.dispatchEvent(new Event('input', { bubbles: true })); choice.dispatchEvent(new Event('change', { bubbles: true })); } } catch {}
       await sleep(250);
-      return { acted: true, attached: 0, satisfied: true, park: null };
+
+      // VERIFY THE SELECTION, DO NOT ASSUME IT.
+      //
+      // This used to return satisfied:true the moment it had clicked something, without ever
+      // checking that a resume was now selected. On Ashby that is simply false: there are no
+      // saved-resume cards at all, the "saved" elements are false positives from the LinkedIn-shaped
+      // selector, the click lands on nothing, and the run proceeds to submit with no resume.
+      //
+      // Live on Supabase and MaintainX 2026-09-08: `saved=7 selected=false ... → action=select`,
+      // then a submit, then "Your form needs corrections. Missing entry for required field: Resume".
+      // Ashby then re-renders the form EMPTY, so its error list names every required field including
+      // Name and Email, which is why this looked for hours like a filling bug rather than a resume
+      // that was never attached. 34 applications sat in the review queue in exactly that state.
+      //
+      // A file input plus resume bytes is a real second chance, and attaching through DataTransfer
+      // was confirmed to work on a live Ashby form before this was written. So: check, and fall back.
+      const after = findSavedResumeControls(root);
+      if (after.anySelected) return { acted: true, attached: 0, satisfied: true, park: null };
+      vlog('resume', 'select clicked but NOTHING is selected — falling back to attach');
+      if (fileInputPresent && haveResumeBytes) {
+        const att = await tryAttachResume(root, resume);
+        vlog('resume', `select→attach fallback → attached=${att.attached} ${att.attached > 0 ? 'OK' : 'FAIL'}`);
+        if (att.attached > 0) return { acted: true, attached: att.attached, satisfied: true, park: null };
+      }
+      // Nothing selected and nothing attached. Say so, rather than claiming the step is done.
+      return { acted: true, attached: 0, satisfied: false, park: null };
     }
     return { acted: false, attached: 0, satisfied: false, park: null };
   }
@@ -4461,7 +4503,33 @@ export async function run(task, context, helpers) {
         finished = true;
         continue;
       }
-      // Submit was clicked but NOT proven. Do not fabricate a done. Report
+      // Submit was clicked but NOT proven. Before filing it as the honest maybe, check whether the
+      // page actually ANSWERED — a validation complaint that appeared after the click is not a
+      // maybe, it is a no, and awaiting_review is the one bucket that cannot represent it.
+      //
+      // Live 2026-09-08, Ashby: "Your form needs corrections. Missing entry for required field…"
+      // came back in a new node and the task was still filed as submitted-but-unverified. It went
+      // into Pierre's review queue instead of being retried, while he was away and could not look.
+      const rejection = submitRejectionInNewNodes(newConfirmationNodes(submitBaseline));
+      if (rejection) {
+        vlog('submit', `→ REJECTED by the page: "${rejection.slice(0, 120)}"`);
+        logLine('warn', `the site rejected the form: ${rejection.slice(0, 120)}`);
+        setStatus('Form rejected — will retry');
+        // 'failed' (not awaiting_review, not parked): db.js classifies this text as submit_rejected
+        // with action 'retry', so the queue re-dispatches it. A re-scan sees the fields the site
+        // just marked invalid, which is a real chance at a different outcome — unlike parking it
+        // for a human who is not there.
+        report({
+          state: 'failed',
+          lastError: `the site rejected the submission: ${rejection.slice(0, 160)}`,
+          transcriptAppend: { note: `submit rejected by the page — ${rejection.slice(0, 160)}` },
+        });
+        clearSubmitIntent();
+        finalState = 'failed';
+        finished = true;
+        continue;
+      }
+      // No answer from the page either way. Do not fabricate a done. Report
       // submitted-but-unverified so the user confirms it, rather than trusting it.
       // [TRACE 9] submit clicked but unproven → awaiting_review (never minted done).
       vlog('submit', `→ AWAITING_REVIEW (unverified: ${verdict.reason})`);
@@ -4511,6 +4579,12 @@ export async function run(task, context, helpers) {
     parkReason: S.lastReport?.parkReason || null,
     pendingQuestions: S.lastReport?.pendingQuestions || [],
     submissionEvidence: S.lastReport?.submissionEvidence || null,
+    // Did we actually reach a real application form on this host? Reported so the pump can clear
+    // the host's bot-challenge count: latching onto the form is direct proof the site SERVED us,
+    // which is the exact opposite of walling us. Submitting is not the right test for that - a run
+    // can reach the form and stop on an unanswerable question, and the site was still perfectly
+    // willing. See noteHostBehaved in background.js.
+    everHadForm: !!everHadForm,
     routeState: S.routeState || 'unknown',
     // Echo the route so background.js's reconcile preserves it on a loop-exit skip whose
     // fire-and-forget report() was dropped (otherwise → "skipped without a diagnostic").

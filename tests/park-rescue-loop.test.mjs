@@ -108,3 +108,61 @@ test('the incident is documented where the next person will look', () => {
   assert.match(fn, /hot loop/i);
   assert.match(fn, /401|budget/i, 'the symptom that made it findable');
 });
+
+// ---------------------------------------------------------------------------
+// A park that records NO question cannot be answered by anybody
+//
+// Live on the laptop 2026-09-05: 15 tasks parked with a reason reading "needs 1 answer(s)" or
+// "needs 2 answer(s)" and pending_questions EMPTY. The question list was lost between the executor
+// detecting it and the park being written. Pierre cannot answer a question nobody recorded, the
+// agent cannot either, and the rescue above never fires because it requires pending questions to
+// exist. So they sat in the needs-you queue looking like work waiting on him, for ever.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// A park that records NO question cannot be answered by anybody
+//
+// Live on the laptop 2026-09-05: 15 tasks parked with a reason reading "needs 1 answer(s)" or
+// "needs 2 answer(s)" and pending_questions EMPTY. Pierre cannot answer a question nobody recorded,
+// the agent cannot either, and the rescue above never fires because it requires pending questions
+// to exist. They sat in the needs-you queue looking like work waiting on him.
+//
+// The storage boundary ALREADY refuses to create that state, so those 15 are legacy rows from an
+// older build. The two halves are therefore tested differently: the guard is tested behaviourally
+// here, and the legacy sweep is asserted to exist and was verified against the live laptop, because
+// a fixture cannot produce a row the API refuses to write.
+// ---------------------------------------------------------------------------
+test('the storage boundary refuses to park a task with no actionable question', () => {
+  const job = db.upsertJob({ title: 'No questions recorded', company: 'NoQ', source: 'greenhouse', status: 'started', jobUrl: 'https://job-boards.greenhouse.io/noq/1' }).job;
+  const t = db.queueAdd(job.id, { mode: 'auto' });
+  db.queuePatch(t.id, { state: 'parked', parkReason: 'needs 2 answer(s)', pendingQuestions: [] });
+
+  const after = db.queueGet(t.id);
+  assert.equal(after.state, 'failed', 'a park nobody can act on must not be written as parked');
+  assert.match(String(after.lastError), /needs 2 answer/, 'and the reason survives as the error');
+  assert.equal(after.parkReason, null);
+});
+
+test('a park with a real unanswered question still waits for him', () => {
+  // The sweep must only ever touch parks with NOTHING recorded. A genuine unanswered question is
+  // work for Pierre, not something to requeue into the same wall.
+  const job = db.upsertJob({ title: 'Real question', company: 'RealQ', source: 'greenhouse', status: 'started', jobUrl: 'https://job-boards.greenhouse.io/realq/1' }).job;
+  const t = db.queueAdd(job.id, { mode: 'auto' });
+  db.queuePatch(t.id, {
+    state: 'parked',
+    parkReason: 'needs 1 answer(s)',
+    pendingQuestions: [{ question: 'How many years of experience do you have with Kubernetes?' }],
+  });
+  db.queueRetryParked();
+  assert.equal(db.queueGet(t.id).state, 'parked');
+});
+
+test('the legacy sweep exists, is bounded, and only fires with nothing recorded', () => {
+  const src = fs.readFileSync(new URL('../app/src/db.js', import.meta.url), 'utf8');
+  const sweep = src.slice(src.indexOf('A PARK THAT RECORDS NO QUESTION'), src.indexOf('if (pend.length && stillMissing.length === 0)'));
+  // A plain string check, not a regex: matching a source line that IS a regex through another
+  // regex is how the last three of these got written wrong.
+  assert.ok(sweep.includes('needs ' + String.fromCharCode(92) + 'd+ answer'),
+    'it matches the reason those rows carry');
+  assert.match(sweep, /!pend\.length && claimsAnswers/, 'only when NOTHING was recorded');
+  assert.match(sweep, /MAX_PARK_RESCUES/, 'bounded like the answerable rescue, or it loops for ever');
+});

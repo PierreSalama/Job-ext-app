@@ -200,7 +200,32 @@ const COMMON_AFTER = new Set([
 ]);
 const NAMED_AFTER_RX = /\b(?:at|for|about|with|by|from|to|of|joining|join)\s+([a-z0-9][a-z0-9'’&.-]{1,30})/g;
 
+// "HOW DID YOU HEAR ABOUT US?" HAS THE SAME TRUE ANSWER AT EVERY COMPANY.
+//
+// The answer is the channel the candidate found the posting through (LinkedIn, a job board), which
+// says nothing about any employer, so a stored "how did you hear about us" answer serving
+// "how did you hear about Stripe?" is not a cross-company leak. The brand gate read the company
+// name as a mismatch anyway and refused the recall, so the question parked as ungroundable even
+// with a saved answer in the bank. Deliberately narrow: only the where/how-you-found-out family.
+const HEARD_ABOUT_RX = /\b(?:how|where)\s+(?:did|do)\s+you\s+(?:first\s+|initially\s+)?(?:hear|heard|find|found|learn|learned|discover|come\s+across)\b|\bhow\s+you\s+(?:heard|found|learned)\b|\bsource\s+of\s+(?:this\s+)?(?:application|referral)\b/i;
+function isHeardAboutQuestion(q) { return HEARD_ABOUT_RX.test(String(q == null ? '' : q)); }
+
+// Does this stored question name a specific company? Only a GENERIC one ("...hear about us?") may
+// serve another company's form. A memory that names Geotab stays Geotab's (recall-brand-guard).
+function namesACompany(question) {
+  if (brandTokens(question).size) return true;
+  const stored = String(question == null ? '' : question).toLowerCase();
+  let mm; NAMED_AFTER_RX.lastIndex = 0;
+  while ((mm = NAMED_AFTER_RX.exec(stored))) {
+    const cand = mm[1].replace(/[.'’-]+$/, '');
+    if (cand.length < 2 || NON_BRAND.has(cand) || COMMON_AFTER.has(cand) || /^\d+$/.test(cand)) continue;
+    return true;
+  }
+  return false;
+}
+
 function brandConflict(askedQuestion, storedQuestion) {
+  if (isHeardAboutQuestion(askedQuestion) && isHeardAboutQuestion(storedQuestion) && !namesACompany(storedQuestion)) return false;
   const a = brandTokens(askedQuestion);
   const b = brandTokens(storedQuestion);
 
@@ -393,7 +418,39 @@ function recallAllowed(askedQuestion, storedQuestion, storedAnswer, options) {
   return answerFitsQuestion(askedQuestion, storedAnswer, options);
 }
 
+// A START DATE IN THE PAST IS ALWAYS WRONG.
+//
+// Live in the bank 2026-09-06: THIRTEEN start-date answers holding dates already gone, and every
+// one of them would be served.
+//
+//     2026-07-11   "date you can start"
+//     2026-07-23   "earliest start date"
+//     2026-08-26   "what is your desired start date"
+//
+// Each was true on the day it was captured, which is exactly why nothing caught it: the shape gate
+// asks whether a date answers a date question, and it does. An application saying he can start two
+// months ago reads as carelessness to a recruiter and is rejected outright by a form that
+// validates the field.
+//
+// Deliberately narrow. Only forward-looking questions are checked. A date of birth, a graduation
+// date and a "today's date" field are all CORRECTLY in the past, and none of them match this.
+const START_DATE_Q_RX = /\b(?:start date|starting date|date you can start|available to (?:start|onboard|begin|join)|date available|availability date|first available|earliest (?:available )?(?:start|date)|desired start|ideal start|when can you start|date de d[\u00e9e]but)/i;
+// ISO only. A bare "03/04/2026" is ambiguous between March and April depending on the form's
+// locale, and guessing wrong turns a valid answer into a refused one, so those are left alone.
+const ISO_DATE_RX = /^\s*(\d{4})-(\d{2})-(\d{2})\s*$/;
+function staleStartDate(question, answer, today = new Date()) {
+  if (!START_DATE_Q_RX.test(String(question || ''))) return false;
+  const m = ISO_DATE_RX.exec(String(answer == null ? '' : answer));
+  if (!m) return false;
+  // Compared as strings, so no timezone can move the boundary by a day.
+  const iso = `${m[1]}-${m[2]}-${m[3]}`;
+  const t = today instanceof Date ? today : new Date(today);
+  const todayIso = `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+  return iso < todayIso;
+}
 module.exports = {
+  isHeardAboutQuestion,
+  staleStartDate,
   brandTokens, brandConflict, isBrandToken,
   questionShape, operativeClause,
   looksYesNo, isYes, isNo, looksDate, looksNumeric, looksLocation,

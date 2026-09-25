@@ -36,6 +36,29 @@ const SELF_ID_RX = new RegExp([
   'race\\b', 'ethnicit', 'hispanic', 'latino', '\\bveteran\\b', 'military status',
   'disabilit', '\\bdisabled\\b', 'diversity survey', 'self[- ]?identif', 'equal employment',
   '\\beeo\\b', 'protected veteran', 'demographic',
+  // CANADA. The list above is written for US forms. "Visible minority" is the term the Employment
+  // Equity Act uses, it is on Canadian applications constantly, and none of the equity groups it
+  // names were here. Measured 2026-09-05: "Do you identify as a member of a visible minority?" was
+  // NOT caught by this pattern.
+  'visible minorit', 'employment equity', '\\baboriginal\\b', '\\bindigenous\\b',
+  'first nations', '\\bmétis\\b', '\\bmetis\\b', '\\binuit\\b',
+  // FRENCH. Montreal is his second location priority and Quebec forms ask in French only. Every
+  // one of these returned false before.
+  'origine ethnique', 'appartenance ethnique', 'minorité visible', 'auto[- ]?identif',
+  'identification volontaire', '\\bautochtone', '\\bhandicap', '\\bgenre\\b',
+  'équité en matière d', 'orientation sexuelle', '\\bvétéran',
+  // PRONOUNS. Found 2026-09-05 in the live parked queue, not by reading this list: three tasks
+  // on the laptop were STRANDED on 'Preferred pronouns', 'Pronouns *' and a long opt-in blurb,
+  // and ten distinct pronoun fields sit in the answer bank. A pronoun field is a voluntary
+  // identity disclosure like every other entry here, and nothing on file says what his are, so
+  // the agent has no source to fill it from. Matching it turns a stranded application into a
+  // submitted one with the field left blank, which is what skip_self_id is for.
+  //
+  // The word boundaries are load-bearing. 'pronoun' is a prefix of 'pronounce', and 'how do we
+  // pronounce your name?' is a real question on four live postings that the agent SHOULD answer,
+  // his name being a fact about him. Verified against the bank: 10 pronoun fields matched, all
+  // four name-pronunciation questions left alone.
+  '\\bpronouns?\\b', '\\bpronoms?\\b',
 ].join('|'), 'i');
 
 // An ATS that demands an account before a single field can be filled. Building a tailored résumé
@@ -55,6 +78,28 @@ function lowestSalaryIn(text) {
 
 const SALARY_FIELD_RX = /salary|compensation|expected pay|base pay|desired pay|rate expectation/i;
 
+// THE ONE SALARY RULE, SHARED BY BOTH PATHS TO A FORM.
+//
+// The agent's `fill` tool is one way a number reaches a real application. The autofill bundle that
+// server.js ships to the extension is the other, and it had no floor check at all: live on
+// 2026-09-06, with the floor set to 90,000 and his profile reading "CAD 100,000-110,000", **79**
+// harvested answers were being shipped that bottom out at 85,000.
+//
+// Exported rather than reimplemented there, because two copies of a policy are two policies.
+// That is exactly how the work-authorisation gate came to cover recall but not the bundle.
+//
+// `unreadable` is the agent-only case: when the page could not be read at all, the SHAPE of the
+// value has to stand in for the label. lowestSalaryIn accepts only 4-7 digit numbers between
+// 20,000 and 1,000,000, so years of experience, dates, counts and phone numbers return null and
+// are never touched by this.
+function salaryBelowFloor(label, value, floor, { unreadable = false } = {}) {
+  if (!(Number(floor) > 0)) return null;
+  const looksSalary = SALARY_FIELD_RX.test(String(label || '')) || SALARY_FIELD_RX.test(String(value || ''));
+  if (!looksSalary && !unreadable) return null;
+  const low = lowestSalaryIn(value);
+  return low !== null && low < Number(floor) ? low : null;
+}
+
 // ---------------------------------------------------------------------------
 // The policy. Returns a refusal STRING, or null to allow.
 // ---------------------------------------------------------------------------
@@ -66,14 +111,20 @@ function makePolicy(opts = {}) {
     allowAccountWalls = false,
   } = opts;
 
+  // Returns the label text, or NULL when the page could not be asked at all. The difference
+  // matters for the salary floor below: "this field is not a salary field" and "we could not tell
+  // what this field is" must not be treated the same way, or the money guard fails open on any
+  // detached node or CDP hiccup.
   async function labelFor(ref) {
     const p = page();
-    if (!p || !ref) return '';
+    if (!p || !ref) return null;
     try {
-      const own = await p.describeRef(String(ref)).catch(() => ({}));
-      const ctx = await p.labelContext(String(ref)).catch(() => '');
+      let asked = 0;
+      const own = await p.describeRef(String(ref)).then((v) => { asked++; return v; }).catch(() => ({}));
+      const ctx = await p.labelContext(String(ref)).then((v) => { asked++; return v; }).catch(() => '');
+      if (!asked) return null;                       // both lookups failed — we know nothing
       return `${own.ariaLabel || ''} ${own.name || ''} ${own.id || ''} ${ctx}`;
-    } catch { return ''; }
+    } catch { return null; }
   }
 
   return async function policy(toolName, args = {}) {
@@ -103,9 +154,14 @@ function makePolicy(opts = {}) {
     // --- do not underprice him ---------------------------------------------
     if (toolName === 'fill' && salaryFloor > 0 && args.text) {
       const label = await labelFor(args.ref);
-      if (SALARY_FIELD_RX.test(label) || SALARY_FIELD_RX.test(String(args.text))) {
-        const low = lowestSalaryIn(args.text);
-        if (low !== null && low < salaryFloor) {
+      // A null label means the page could not be read. Fall back to the SHAPE of the value:
+      // lowestSalaryIn only accepts 4-7 digit numbers between 20,000 and 1,000,000, so years of
+      // experience, dates, counts and phone numbers all return null and are unaffected. Refusing
+      // here is the safe direction — it escalates to a human instead of naming a number.
+      const unreadable = label === null;
+      {
+        const low = salaryBelowFloor(label, args.text, salaryFloor, { unreadable });
+        if (low !== null) {
           return `refused by policy: ${low.toLocaleString()} is below his floor of ${salaryFloor.toLocaleString()}. `
             + 'Never offer less than the floor. If the posting genuinely requires a lower number, '
             + 'raise it with ask_human instead of deciding it.';
@@ -153,4 +209,4 @@ function wrapTools(tools, policy, { onRefusal = () => {} } = {}) {
   }));
 }
 
-module.exports = { makePolicy, wrapTools, lowestSalaryIn, SELF_ID_RX, ACCOUNT_WALL_RX, SALARY_FIELD_RX };
+module.exports = { makePolicy, wrapTools, lowestSalaryIn, salaryBelowFloor, SELF_ID_RX, ACCOUNT_WALL_RX, SALARY_FIELD_RX };

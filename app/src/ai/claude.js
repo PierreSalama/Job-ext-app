@@ -153,7 +153,8 @@ async function generate({ prompt, system, schema, model, timeoutMs = 120000 }) {
   // code path that forgets, all still get Sonnet. Note the previous behaviour: `model` was allowed
   // to be null, which means "whatever the CLI defaults to today" — the quiet way an Opus-priced
   // sweep over 1,400 emails would have happened.
-  const picked = modelPolicy.enforce(model);
+  // `schema` decides the tier: a shape can go to the cheap model, prose stays on Sonnet.
+  const picked = modelPolicy.enforce(model, { schema });
   if (picked.overridden) log.info(picked.reason);
 
   const args = ['-p', '--output-format', 'json'];

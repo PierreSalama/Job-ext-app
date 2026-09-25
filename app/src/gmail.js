@@ -522,4 +522,7 @@ function staleness(h = health(), s = db.getSettings().gmail) {
   return { stale: hours >= STALE_AFTER_HOURS, hours };
 }
 
-module.exports = { startAuth, syncNow, status, health, staleness, markNotified, STALE_AFTER_HOURS };
+// SYNC_STALE_MS is exported for the tests only. The wedged-sync suite used to hardcode its own
+// copy of 15 minutes, so widening the real constant would have released a wedge hours late with
+// every test still green.
+module.exports = { startAuth, syncNow, status, health, staleness, markNotified, STALE_AFTER_HOURS, SYNC_STALE_MS };

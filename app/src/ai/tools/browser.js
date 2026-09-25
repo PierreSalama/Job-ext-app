@@ -140,8 +140,8 @@ function makeBrowserTools(opts = {}) {
   async function ensure() {
     if (page) return page;
     handle = await cdp.launchChrome({ profileId, port, headless });
-    page = await cdp.attachPage({ port });
-    log.info(`browser ready for ${profileId} on ${port}`);
+    page = await cdp.attachPage({ port: handle.port || port });
+    log.info(`browser ready for ${profileId} on ${handle.port || port}`);
     return page;
   }
 
@@ -182,6 +182,9 @@ function makeBrowserTools(opts = {}) {
       run: async ({ query }) => {
         const p = await ensure();
         const hits = p.find(query);
+        // null (not empty) means nothing has been read on this document yet. Telling the agent
+        // "the label may differ" there sends it hunting for a wording problem that does not exist.
+        if (hits === null) return `nothing read yet on this page — call read_page first, then find "${query}"`;
         if (!hits.length) return `no match for "${query}" — read_page again, the label may differ`;
         return clip(renderTree(hits));
       },
@@ -222,12 +225,14 @@ function makeBrowserTools(opts = {}) {
     },
     {
       name: 'click',
-      description: 'Click the element with this ref.',
+      description: 'Click the element with this ref. A checkbox or radio whose input is styled '
+        + 'invisible is clicked by its label instead, the way a person would, so consent boxes on '
+        + 'Ashby and Lever actually tick.',
       args: ['ref'],
       run: async ({ ref }) => {
         const p = await ensure();
-        await p.click(String(ref));
-        return `clicked ${ref}`;
+        const r = await p.click(String(ref));
+        return r && r.viaLabel ? `clicked ${ref} via its label "${r.viaLabel}"` : `clicked ${ref}`;
       },
     },
     {

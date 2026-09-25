@@ -42,10 +42,17 @@ test.before(() => {
 test.after(() => { try { db.close(); fs.rmSync(dir, { recursive: true, force: true }); } catch {} });
 
 // ---- the real stored answers, as captured from the Geotab / Robinhood applications ----
+// Sixty days out, recomputed on every run.
+const FUTURE_DATE = new Date(Date.now() + 60 * 86400000).toISOString().slice(0, 10);
+
 const GEOTAB = [
   ['How did you hear about Geotab?', 'LinkedIn'],
   ['Do you currently work for a partner or reseller of Geotab?', 'No'],
-  ['What date would you be available to onboard with Geotab?', '2026-07-20'],
+  // A DATE THAT DOES NOT AGE. This was the real live value, 2026-07-20, and on 2026-09-06 it
+  // aged into the past and this test started failing: answer-shape.staleStartDate refuses a start
+  // date that has already gone, which is correct and has nothing to do with what this file tests.
+  // Computed forward instead, so the fixture cannot rot again.
+  ['What date would you be available to onboard with Geotab?', FUTURE_DATE],
 ];
 const ROBINHOOD = [
   ['Have you ever worked for Robinhood or any of its subsidiaries?', 'No'],
@@ -76,6 +83,18 @@ test('a Geotab-stored answer is never recalled for the same question about 1Pass
 test("a Robinhood-stored answer is never recalled for 1Password's version of it", () => {
   const hit = db.qaLookup(pid, 'Have you ever worked for 1Password or any of its subsidiaries?');
   assert.equal(hit, null, `must not recall Robinhood's answer (${hit && hit.answer})`);
+});
+
+test('a start date that has passed is refused even for the right company', () => {
+  // The company gate and the stale-date gate are independent, and this is the corner where they
+  // meet: Geotab asking its own question, with an answer that has simply gone out of date.
+  // A question of its own, so this cannot overwrite the shared Geotab row the next test reads.
+  // The first draft reused it and broke that test instead, which is a fair warning about how much
+  // state these share.
+  const Q = 'What is your earliest available start date at Geotab?';
+  db.qaRecord({ profileId: pid, question: Q, answer: '2026-07-20', source: 'greenhouse' });
+  const hit = db.qaLookup(pid, Q);
+  assert.equal(hit, null, 'right company, but the date is in the past');
 });
 
 test('the SAME company still recalls its own answer (the gate is not a blanket refusal)', () => {

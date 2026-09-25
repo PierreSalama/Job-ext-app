@@ -33,12 +33,26 @@ test('an empty / missing model resolves to Sonnet, never to the CLI default', ()
 });
 
 test('a non-Sonnet model is forced to Sonnet, and says so', () => {
-  for (const m of ['opus', 'claude-opus-5', 'haiku', 'claude-haiku-4-5-20251001', 'gpt-5.4']) {
+  // Haiku moved OUT of this list on 2026-09-07. It is now a legitimate tier for calls that carry a
+  // schema — the output is a validated shape, so a weaker model that gets it wrong is caught rather
+  // than believed. Everything else in the list is still refused, and Opus above all: this module
+  // exists because `model` was once allowed to be null, meaning "whatever the CLI defaults to".
+  for (const m of ['opus', 'claude-opus-5', 'gpt-5.4', 'llama3']) {
     const r = policy.enforce(m);
     assert.equal(r.model, 'sonnet', `${m} must not reach the CLI`);
     assert.equal(r.overridden, true);
-    assert.match(r.reason, /Sonnet-only/, 'an override must be loggable, not silent');
+    assert.match(r.reason, /forced to/i, 'an override must be loggable, not silent');
+    assert.match(r.reason, new RegExp(m.replace(/[.*+?^${}()|[]" + B + B + "]/g, '\$&')), 'and must name what was asked for');
   }
+});
+
+test('PROSE still cannot be cheapened, whatever the caller asks for', () => {
+  // The half of the tiering rule that protects interviews: a call with no schema is free text a
+  // recruiter reads. Asking for a cheap model there must not silently succeed... unless it is an
+  // EXPLICIT haiku request, which is honoured because a caller naming a model means it.
+  assert.equal(policy.enforce('gpt-5.4', {}).model, 'sonnet');
+  assert.equal(policy.enforce(null, {}).model, 'sonnet');
+  assert.equal(policy.enforce('', {}).model, 'sonnet');
 });
 
 test('a Sonnet model passes through untouched, alias or full id', () => {
@@ -178,7 +192,9 @@ test('the clamp is applied INSIDE the CLI provider, so no call site can bypass i
   // Enforcing per-call-site would mean the rule holds until someone adds a new one. Enforcing at
   // the provider means there is exactly one door.
   const src = read('app', 'src', 'ai', 'claude.js');
-  assert.match(src, /modelPolicy\.enforce\(model\)/, 'claude.js clamps the requested model');
+  // The options argument was added for schema-based tiering, so this matches the CALL rather than
+  // one exact spelling of it. What matters is that claude.js clamps through the policy at all.
+  assert.match(src, /modelPolicy\.enforce\(model/, 'claude.js clamps the requested model');
   assert.match(src, /args\.push\('--model', picked\.model\)/, 'and passes the CLAMPED model, not the requested one');
   assert.doesNotMatch(src, /if \(model\) args\.push\('--model', model\)/,
     'the old "pass through whatever was asked, or nothing" path must be gone');
@@ -190,6 +206,55 @@ test('the CLI is never invoked without an explicit --model', () => {
   const gen = src.slice(src.indexOf('async function generate('));
   const argsBlock = gen.slice(gen.indexOf("const args = ["), gen.indexOf('return new Promise'));
   assert.doesNotMatch(argsBlock, /if \(.*model.*\)\s*args\.push\('--model'/, 'the --model flag is unconditional');
+});
+
+// Every assertion above about claude.js greps the FILE. They stay, because "the old pass-through
+// path must be gone" is genuinely a statement about source. But none of them proves the clamp is
+// reached: rewire generate() to build its args somewhere else and they all keep passing while an
+// Opus-priced sweep runs over 1,400 of Pierre's emails. So capture the argv the CLI is actually
+// spawned with.
+test('BEHAVIOUR: the CLI is spawned with the CLAMPED model, whatever the caller asked for', async (t) => {
+  const cp = require('child_process');
+  const realSpawn = cp.spawn;
+  const realSpawnSync = cp.spawnSync;
+  const seen = [];
+
+  // discoverCli() shells out to where/which. Answer with a path that certainly exists, so this
+  // test does not depend on the Claude CLI being installed on the machine running it.
+  cp.spawnSync = () => ({ status: 0, stdout: process.execPath, stderr: '' });
+  cp.spawn = (cmd, args) => {
+    // A COPY, deliberately. Capturing the array by reference lets any push AFTER the spawn call
+    // mutate what this test later inspects — which made an earlier version of this test pass while
+    // the flag was being appended too late for the CLI to ever receive it.
+    seen.push(args.slice());
+    const { EventEmitter } = require('events');
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    setImmediate(() => {
+      child.stdout.emit('data', JSON.stringify({ result: '{"ok":true}' }));
+      child.emit('close', 0);
+    });
+    return child;
+  };
+  t.after(() => { cp.spawn = realSpawn; cp.spawnSync = realSpawnSync; });
+
+  // Required AFTER the patch: claude.js destructures spawn at module load.
+  const claude = require(path.join(here, '..', 'app', 'src', 'ai', 'claude.js'));
+  const sonnet = policy.enforce(null).model;
+
+  for (const asked of ['claude-opus-5', 'opus', null, undefined, '']) {
+    seen.length = 0;
+    await claude.generate({ prompt: 'hi', model: asked }).catch(() => {});
+    assert.equal(seen.length, 1, `one spawn for model=${JSON.stringify(asked)}`);
+    const args = seen[0];
+    const at = args.indexOf('--model');
+    assert.ok(at >= 0, '--model must always be passed, never left to the CLI default');
+    assert.equal(args[at + 1], sonnet,
+      `asked for ${JSON.stringify(asked)} and the CLI must still be told ${sonnet}`);
+    assert.ok(!args.some((a) => /opus/i.test(String(a))), 'no argument may name Opus');
+  }
 });
 
 test('the sweep asks for no model at all, and still gets Sonnet', () => {

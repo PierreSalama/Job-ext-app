@@ -851,6 +851,61 @@ const MIGRATIONS = [
       CREATE INDEX idx_aiblocks_run  ON ai_blocks(run_id);
     `);
   },
+
+  // ---- v23: whose application is this? ------------------------------------
+  //
+  // The jobs table has never carried a person. Neither has auto_apply_tasks. Only `qa` does. That
+  // was fine while JAT served one applicant: `profileForSource` maps a SOURCE to a profile, which
+  // is for Pierre's own multiple accounts, not for two different people.
+  //
+  // It stops being fine the moment his dad uses it. Measured 2026-09-05: with a second profile
+  // created, `check_duplicate` told DAD that a job PIERRE had submitted was "already engaged". On
+  // the real ledger that is roughly five thousand jobs, so his dad would be refused almost
+  // everywhere, and the refusal would look exactly like the system working.
+  //
+  // Every row that exists today predates his dad, so the backfill is not a guess: it all belongs to
+  // the default profile. After this, a job is attributed to whoever created it, and the duplicate
+  // check can finally ask "have I applied here" rather than "has anyone".
+  () => {
+    exec('ALTER TABLE jobs ADD COLUMN profile_id TEXT REFERENCES profiles(id) ON DELETE SET NULL;');
+    // profiles has is_default and updated_at. It has NO created_at, and ordering by one that does
+    // not exist throws inside the migration transaction, which takes the whole app down on launch.
+    const def = get('SELECT id FROM profiles WHERE is_default = 1 LIMIT 1')
+      || get('SELECT id FROM profiles ORDER BY rowid LIMIT 1');
+    if (def && def.id) run('UPDATE jobs SET profile_id = ? WHERE profile_id IS NULL', [def.id]);
+    exec('CREATE INDEX IF NOT EXISTS idx_jobs_profile ON jobs(profile_id);');
+  },
+
+  // WHICH JOB DID THE AGENT APPLY TO?
+  //
+  // ai_runs records the session — profile, goal, autonomy, provider, model, steps — and nothing at
+  // all about the job. So there has never been a way to answer "did the AI agent submit this
+  // application, or did the extension?", which is exactly the distinction Pierre asked for: the
+  // Applications list can say Auto, Auto (assisted) or Manual, and every agent submission is
+  // indistinguishable from an extension one.
+  //
+  // Nullable on purpose. A run with no job is legitimate — the sandbox goal, a login run, an
+  // exploratory run — and backfilling the existing rows would be a guess, so they stay NULL and
+  // simply never claim credit for an application.
+  () => {
+    exec('ALTER TABLE ai_runs ADD COLUMN job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL;');
+    exec('CREATE INDEX IF NOT EXISTS idx_airuns_job ON ai_runs(job_id);');
+  },
+
+  // WHAT DID THE AI ACTUALLY DO FOR THIS APPLICATION?
+  //
+  // ai_log records every model call - provider, model, kind, ms, ok - and nothing about which
+  // application it served. So the one question worth asking of an individual application, "which
+  // questions did it answer for this job, with which model, and did any of them fail", could not
+  // be asked at all. The data was there; the join column was not.
+  //
+  // Nullable: plenty of calls legitimately have no job (email triage, a sandbox run), and
+  // backfilling the existing rows would be a guess.
+  () => {
+    exec('ALTER TABLE ai_log ADD COLUMN job_id TEXT;');
+    exec('CREATE INDEX IF NOT EXISTS idx_ailog_job ON ai_log(job_id, ts DESC);');
+  },
+
 ];
 
 // SUCCESS-TRUTH quarantine (shared by the migration above and exported for tests).
@@ -1630,6 +1685,9 @@ function rowToJob(row) {
   if (!row) return null;
   return {
     id: row.id,
+    // Whose application this is (v23). Null on every row created before that migration and on any
+    // row whose caller did not name an owner, which readers treat as the default profile.
+    profileId: row.profile_id || null,
     externalId: row.external_id || null,
     source: row.source || null,
     status: row.status,
@@ -1724,13 +1782,32 @@ function annotateAutoApply(jobs) {
             MAX(CASE WHEN state IN ('done','awaiting_review') THEN 1 ELSE 0 END) AS hasSubmitted,
             MAX(CASE WHEN mode = 'auto' THEN 1 ELSE 0 END) AS hasAutoTask
        FROM auto_apply_tasks WHERE job_id IN (${place}) GROUP BY job_id`, ids)) map[r.job_id] = r;
+  // Did the AI AGENT drive this one? Separate table, separate engine: ai_runs is the agent loop
+  // (it reads the page and decides), auto_apply_tasks is the extension executor (it follows the
+  // recipe). Both end in a submitted application and until now both rendered as "Auto", so there
+  // was no way to tell which engine earned a result — the single most useful thing to know when
+  // judging whether the AI approach is working.
+  const ai = {};
+  for (const r of all(
+    `SELECT job_id, COUNT(*) AS runs,
+            MAX(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS hasDone
+       FROM ai_runs WHERE job_id IN (${place}) GROUP BY job_id`, ids)) ai[r.job_id] = r;
   for (const j of jobs) {
     const m = map[j.id];
+    const a = ai[j.id];
     j.autoApply = !!m || (Array.isArray(j.tags) && j.tags.includes('auto-apply'));
-    // via: 'auto' = the auto pipeline submitted it; 'auto-assisted' = an auto task ran but
-    // the human finished/stepped in to reach submitted; 'manual' = submitted with no auto
-    // task involved; null = not submitted yet.
+    j.aiRuns = a ? a.runs : 0;
+    // via: 'ai' = the agent loop submitted it; 'auto' = the extension executor did;
+    // 'auto-assisted' = an auto task ran but the human finished; 'manual' = submitted with no
+    // machine involved; null = not submitted yet.
+    //
+    // The extension is checked FIRST and wins a tie on purpose. Its `hasSubmitted` is grounded in
+    // a task state the executor only reaches after a verified submit, whereas an ai_run merely
+    // being attached to the job proves the agent looked at it, not that it filed anything. Giving
+    // the weaker signal precedence would let a failed agent run steal credit for an extension
+    // submission, and every AI success number built on top would be inflated.
     if (m && m.hasSubmitted) j.via = 'auto';
+    else if (a && SUBMITTED_PLUS.has(j.status)) j.via = 'ai';
     else if (SUBMITTED_PLUS.has(j.status)) j.via = (m && m.hasAutoTask) ? 'auto-assisted' : 'manual';
     else j.via = null;
   }
@@ -1744,7 +1821,7 @@ function annotateAutoApply(jobs) {
 // description/answers/attachments/fitData uses getJob()/`/jobs/:id` (the FAT single-item path).
 // This is what turns /jobs from a 16MB payload into ~1MB. Pass { full:true } for a lossless dump
 // (exportAll). See the perf audit (v11.82.0).
-const JOB_LEAN_COLS = 'id, external_id, source, status, title, company, location, job_url, '
+const JOB_LEAN_COLS = 'id, profile_id, external_id, source, status, title, company, location, job_url, '
   + 'compensation, work_mode, employment_type, notes, next_action, due_at, needs_review, '
   + 'fit_score, tags, created_at, updated_at, submitted_at';
 
@@ -1882,6 +1959,12 @@ function upsertJob(input, opts = {}) {
     // P3: a job created already-submitted (e.g. a manual apply captured at submit) distills
     // into recipes. Lazy-require avoids a circular load (distiller requires db); best-effort.
     if (incoming.status === 'submitted') { try { require('./distiller').distillJob(id, resolveProfileId(incoming.source)); } catch {} }
+    // WHOSE APPLICATION IS THIS. Set on creation only: an existing row keeps the person who made
+    // it, so a later touch by the other applicant cannot silently reassign their history. A caller
+    // that says nothing leaves it NULL, which the duplicate check reads as the default profile,
+    // preserving today's behaviour for Pierre exactly.
+    const owner = opts.profileId || input.profileId || null;
+    if (owner) { try { run('UPDATE jobs SET profile_id = ? WHERE id = ?', [owner, id]); } catch { /* pre-v23 db */ } }
     return { job: getJob(id), action: 'created', previousStatus: null, statusChanged: true };
   }
 
@@ -2333,7 +2416,19 @@ function qaRecord({ profileId, question, answer, source, fieldType, lineageSourc
 // The questions where a wrong answer is not a wrong answer, it is a false statement of fact about
 // the candidate. Work authorisation, sponsorship, citizenship, clearance. Answer one of these wrong
 // and an offer can be withdrawn after it is signed.
-const HIGH_STAKES_RECALL = /\b(work authoriz|authorized to work|authorised to work|legally (?:authoriz|eligible|entitled)|right to work|eligible to work|sponsor(?:ship)?|visa|h-?1b|work permit|citizen(?:ship)?|permanent resident|green card|security clearance)\b/i;
+// THE TRAILING \b USED TO KILL EVERY PREFIX BRANCH. `\b(work authoriz|...)\b` cannot match
+// "work authorization": the closing boundary needs a non-word character after "authoriz", and the
+// next character is "a". So `work authoriz` and `legally authoriz` were DEAD, and
+// isHighStakesQuestion('Do you have work authorization in the US?') returned false — meaning the
+// autofill bundle would have shipped a SCRAPED answer to it onto a real form. Found 2026-09-05
+// from a live laptop park: "Will you require our assistance with work authorization now or in the
+// future?". "Are you legally authorized to work in Canada?" only ever passed because a DIFFERENT
+// branch, `authorized to work`, happened to match it, which is how a dead branch stays hidden.
+//
+// Same family as the three regexes written with a literal backspace instead of \\b: the pattern did
+// not error, it silently matched nothing. Each stem now carries its own \\w* so prefixes complete,
+// and both spellings (authoriz/authoris) are accepted.
+const HIGH_STAKES_RECALL = /\b(?:work \s*authori[sz]\w*|authori[sz]\w*\s+to\s+work|legally\s+(?:authori[sz]\w*|eligible|entitled)|right\s+to\s+work|eligible\s+to\s+work|sponsor\w*|visa\w*|h-?1b|work\s+permit\w*|citizen\w*|permanent\s+resident\w*|green\s+card|security\s+clearance|lived\s+(?:in|outside)|resided\s+(?:in|outside)|residency\w*|citoyennet\w*|l[\u00e9e]galement\s+autoris\w*|autoris\w*\s+(?:\w+\s+)?[\u00e0a]\s+travailler|parrainage|permis\s+de\s+travail|r[\u00e9e]sidence\s+permanente|habilitation\s+de\s+s[\u00e9e]curit)/i;
 
 // Did a person actually give this answer, or was it scraped off a form?
 function answeredByAHuman(row) {
@@ -2352,7 +2447,44 @@ function answeredByAHuman(row) {
 // Exported so the autofill bundle can apply the same rule. The bundle is the OTHER way an answer
 // reaches a real form: it ships harvested fields to the extension, which matches them locally, with
 // no recall path involved at all.
-function isHighStakesQuestion(q) { return HIGH_STAKES_RECALL.test(String(q || '')); }
+// SELF-IDENTIFICATION IS HIGH STAKES TOO, AND IT WAS NOT IN THE GATE.
+//
+// Found in the live bank 2026-09-05. The rail above refuses to serve a HARVESTED answer to a
+// work-authorisation question, because a value scraped off some other form is not Pierre saying
+// something about himself. Exactly the same argument applies to a protected characteristic, and
+// none of them were covered:
+//
+//     "Do you identify as an Indigenous person in Canada?"     answer "1"     lineage: indeed
+//     "do you identify as a member of the 2slgbtqia community" answer "0"     seen 26 times
+//     "preferred pronouns"                                     answer "He/Him" lineage: indeed
+//
+// None of those came from Pierre. The lineage on each names a job board, not 'user'.
+//
+// MEASURED, because the first reading of this was wrong and worth recording. Only the PRONOUN rows
+// were actually being served: answer-shape.recallAllowed passes "He/Him" for a text question and
+// refuses a bare "1" or "0" for a yes/no one, so the Indigenous and 2SLGBTQIA rows were stopped by
+// the shape gate rather than by any policy. That is luck, not design. Had either form stored "Yes"
+// instead of a radio's raw value, it would have been served. `seen_count` counts times RECORDED on
+// the write path, not times served, so 26 means the question kept being re-captured across four
+// sites, not that the answer went onto 26 forms.
+//
+// The gap this closes is the policy one: a protected characteristic should not depend on a shape
+// check happening to reject the value that was stored.
+//
+// A HUMAN-TYPED self-ID answer is still served, deliberately. If Pierre types his pronouns into
+// the block queue, that is him choosing to disclose, and this rail is not the place to overrule
+// him. Only harvested ones are refused. The AI path refuses to fill these at all, separately, via
+// SELF_ID_RX in ai/guardrails.js; this gate covers the other two ways an answer reaches a form,
+// recall and the autofill bundle that server.js ships to the extension.
+//
+// pronouns? is bounded on purpose: "how do we pronounce your name?" is a real question on four
+// live postings, it is a fact about him, and it must stay answerable.
+const SELF_ID_RECALL = /\b(?:gender\b|gender identity|transgender\b|sexual orientation|lgbtq|2slgbtq|race\b|racial\b|ethnicit\w*|ethnic origin|hispanic|latino|veteran\b|reservist\b|military status|disabilit\w*|disabled\b|visible minorit\w*|employment equity|aboriginal\b|indigenous\b|first nations|m[\u00e9e]tis\b|inuit\b|self[- ]?identif\w*|diversity survey|demographic\w*|pronouns?\b|pronoms?\b|origine ethnique|minorit[\u00e9e] visible|identit[\u00e9e] de genre|orientation sexuelle|autochtone\w*|identification volontaire|genre\b)/i;
+
+function isHighStakesQuestion(q) {
+  const s = String(q || '');
+  return HIGH_STAKES_RECALL.test(s) || SELF_ID_RECALL.test(s);
+}
 
 function recallOk(asked, row, opts) {
   try {
@@ -2368,8 +2500,16 @@ function recallOk(asked, row, opts) {
     // His own typed answer to one of these is trustworthy and is still recalled. Anything else
     // escalates once, and resolving that block records the answer with 'user' lineage, so the
     // question is asked at most one more time.
-    if (HIGH_STAKES_RECALL.test(String(asked || '')) && !answeredByAHuman(row)) {
-      log.info(`recall: refusing a harvested answer to a work-authorisation question — "${String(asked).slice(0, 70)}"`);
+    if (isHighStakesQuestion(asked) && !answeredByAHuman(row)) {
+      log.info(`recall: refusing a harvested answer to a work-authorisation or self-ID question — "${String(asked).slice(0, 70)}"`);
+      return false;
+    }
+    // A START DATE IN THE PAST IS ALWAYS WRONG. Thirteen live rows held one, every one servable,
+    // because the shape gate asks whether a date answers a date question and it does. See
+    // answer-shape.staleStartDate; it is deliberately narrow, so a birth date and a graduation date
+    // are untouched.
+    if (answerShape.staleStartDate(asked, row.answer != null ? row.answer : row.value)) {
+      log.info(`recall: refusing a start date that has already passed — "${String(asked).slice(0, 60)}"`);
       return false;
     }
     return answerShape.recallAllowed(asked, row.question || row.label || '', row.answer != null ? row.answer : row.value, opts && opts.options);
@@ -3522,6 +3662,92 @@ function reconcileDiscovery({ olderThanMinutes = 10 } = {}) {
   return { interrupted, staleClaims };
 }
 
+// AI RUNS THAT DIED WITH THE PROCESS. An ai_runs row is set to 'running' when the agent starts and
+// only ever leaves that state when the agent itself finishes it. If the app is restarted mid-run -
+// a crash, an update, a keeper restart - nothing ever writes the ending, and the row says "running"
+// forever.
+//
+// Measured 2026-09-08 after several app restarts: /ai-apply/performance reported 13 runs, 8 done,
+// 0 failed and 2 STILL RUNNING, hours after the process that owned them had gone. The count is read
+// as live work, so orphans make the agent look permanently busy and quietly misreport the failure
+// rate as better than it is - nothing that never ends is ever counted as a failure.
+//
+// A run older than the cutoff whose process is gone cannot resume, so record what actually happened
+// rather than leaving a row that lies. Same shape as reconcileDiscovery above, deliberately: this is
+// the third table to need it, and they should be recognisably the same repair.
+function reconcileAiRuns({ olderThanMinutes = 30 } = {}) {
+  // NOT clamped to >= 1, matching retryStaleQueue: the parameter means "how old must a run be before
+  // we call it orphaned", so a NEGATIVE value means "no minimum age". That is the only way a test can
+  // reach this path without sleeping a real minute, because started_at is stamped by aiRunCreate and
+  // `started_at < cutoff` is false when both are written in the same instant. Production callers pass
+  // 30 and are unaffected.
+  const cutoff = new Date(Date.now() - (Number(olderThanMinutes) || 0) * 60000).toISOString();
+  return run(`UPDATE ai_runs
+     SET status='failed', ended_at=?,
+         stop_reason=COALESCE(stop_reason,'interrupted'),
+         error=COALESCE(error,'the app stopped while this run was in flight, so it never reported an ending')
+     WHERE status='running' AND started_at < ?`, [now(), cutoff])?.changes || 0;
+}
+
+// A SOURCE THAT IS STILL BEING SEARCHED AND HAS STOPPED RETURNING ANYTHING.
+//
+// This is the failure that hid for six days. LinkedIn discovery produced 12 to 50 jobs a day until
+// 2026-09-02 and exactly zero on every day after, because LinkedIn moved job search to an AI-powered
+// results page and the scraper's selectors stopped matching. It reported `found: 0`, which is
+// EXACTLY what a search legitimately finds when its freshness window is quiet. Nothing anywhere
+// could tell a dead scraper from a slow week, so nobody looked, while the lane kept spending 8
+// searches an hour of the budget that exists to protect an account restricted in August.
+//
+// The two facts together are unambiguous, and neither is on its own: we are still SPENDING searches
+// on this platform, and it has produced NO job for days. A quiet niche still yields the occasional
+// posting; a broken scraper yields precisely none, forever.
+//
+// Reported, never acted on automatically. Disabling a source is a judgement about someone's job
+// search, and the honest move is to say "this looks dead" loudly rather than to switch it off.
+function deadSources({ quietHours = 48 } = {}) {
+  const quietCutoff = new Date(Date.now() - Math.max(1, quietHours) * 3600000).toISOString();
+  const searchWindow = new Date(Date.now() - 24 * 3600000).toISOString();
+  const out = [];
+  let rows = [];
+  try {
+    rows = all(`SELECT platform, COUNT(*) AS searches, MAX(at) AS lastSearch
+                  FROM platform_touches
+                 WHERE kind = 'search' AND at >= ?
+                 GROUP BY platform`, [searchWindow]) || [];
+  } catch { return out; }
+  for (const r of rows) {
+    if (!r.platform || !r.searches) continue;
+    const last = get('SELECT MAX(created_at) AS at FROM jobs WHERE source = ?', [r.platform])?.at || null;
+    if (last && last >= quietCutoff) continue;              // still producing, nothing to say
+    out.push({
+      platform: r.platform,
+      searchesLast24h: r.searches,
+      lastJobAt: last,
+      quietHours: last ? Math.round((Date.now() - Date.parse(last)) / 3600000) : null,
+    });
+  }
+  return out;
+}
+
+// AWAITING_REVIEW ROWS THE PAGE ALREADY REJECTED.
+//
+// awaiting_review means "submitted, but we could not prove it" - the honest maybe. For some rows it
+// is not a maybe at all: the page answered in words, "Your form needs corrections. Missing entry for
+// required field: ...", and the executor filed it as a maybe anyway. That was fixed on 2026-09-08
+// going forward, but the backlog it produced is still sitting in the review queue.
+//
+// Measured that day: 112 rows awaiting review, 34 of them carrying an explicit rejection, every one
+// on an Ashby-hosted form. Those are applications to Supabase, Cohere, Wealthsimple, Vanta, GitLab
+// and others that Pierre believes are pending and which were never submitted at all. Counting them
+// is the difference between a review queue and a pile of false hope.
+function falseMaybes() {
+  try {
+    return get(`SELECT COUNT(*) AS n FROM auto_apply_tasks
+                 WHERE state = 'awaiting_review'
+                   AND (transcript LIKE '%needs corrections%' OR transcript LIKE '%Missing entry for required%')`)?.n || 0;
+  } catch { return 0; }
+}
+
 function pipelineHealth() {
   const staleCutoff = new Date(Date.now() - 8 * 60000).toISOString();
   const lastTaskActivity = get('SELECT MAX(updated_at) AS at FROM auto_apply_tasks')?.at || null;
@@ -3529,7 +3755,7 @@ function pipelineHealth() {
   const staleTasks = get("SELECT COUNT(*) AS n FROM auto_apply_tasks WHERE state IN ('running','scheduled') AND updated_at < ?", [staleCutoff])?.n || 0;
   const invalidWaits = get(`SELECT COUNT(*) AS n FROM auto_apply_tasks WHERE state IN ('awaiting_input','parked')
     AND (pending_questions IS NULL OR TRIM(pending_questions) IN ('','[]','null'))`)?.n || 0;
-  return { discovery: discoveryHealth(), lastTaskActivity, lastSubmission, staleTasks, invalidWaits };
+  return { discovery: discoveryHealth(), lastTaskActivity, lastSubmission, staleTasks, invalidWaits, deadSources: deadSources(), falseMaybes: falseMaybes() };
 }
 
 // ============================================================
@@ -3574,6 +3800,23 @@ function classifyQueueFailure(input = {}) {
   if (input.parkReason === 'resume_required' || input.park_reason === 'resume_required'
       || /r[eé]sum[eé] required|resume required|add a r[eé]sum[eé]|could not find an upload control|select your .{0,20}r[eé]sum[eé]/.test(text)) {
     return mk('resume_required', 'user', 'Résumé needed — add or select one');
+  }
+  // THE SITE REJECTED THE FORM, in words, after the click. Distinct from every bucket around it:
+  // it is not a maybe-submit (awaiting_review), not a site gate (the site is talking to us, not
+  // blocking us), and not a question for the user (nobody asked one). The executor only writes this
+  // when a node carrying a validation complaint APPEARED after the submit click, so it is an answer
+  // from the page rather than an inference.
+  //
+  // 'retry': a re-dispatch re-scans a form the site has just marked invalid, and the fields it
+  // complained about are visibly required on the second pass. Attempts are still capped, so a form
+  // that cannot be satisfied retires normally instead of looping.
+  //
+  // Placed ABOVE missing_info deliberately. The site's own wording is frequently "missing entry for
+  // required field", and the generic branch below would read that as an unanswered question and park
+  // the task for a human — with no question attached for them to answer, which pipelineHealth
+  // already counts as a defect (invalidWaits).
+  if (/the site rejected the submission|submit rejected by the page/.test(text)) {
+    return mk('submit_rejected', 'retry', 'Site rejected the form, retries');
   }
   if (pending.length || state === 'parked' || state === 'awaiting_input' || /missing answer|needs your answer|no confident answer|legal\/eligibility|unanswered question/.test(text)) {
     return mk('missing_info', 'user', 'Needs your answer, then retries');
@@ -4371,9 +4614,24 @@ function queuePatch(id, { state, scheduledAt, lastError, transcriptAppend, attem
     // older extension omits the lastError field. Reading it here makes the dashboard + doctor show
     // "stopped by you" for a deliberate pause instead of the alarming "skipped without a diagnostic".
     const trail = `${transcriptAppend ? JSON.stringify(transcriptAppend) : ''} ${String(cur.transcript || '').slice(-800)}`.toLowerCase();
+    //
+    // AND KEEP A FRAGMENT, BECAUSE THE TRANSCRIPT IS ABOUT TO BE DELETED.
+    //
+    // maintenance.transcriptClearDays is 3: the transcript of every terminal task is nulled after
+    // three days. So a skip that says only "without a diagnostic" is permanently undiagnosable
+    // from that point on. Live 2026-09-06: 59 such tasks, every one with an empty transcript, all
+    // beyond recovery.
+    //
+    // The trail still exists HERE, at the moment the reason is written, and last_error is not
+    // pruned. Carrying 140 characters of it across costs nothing and is the difference between
+    // "we can find out" and "that is gone". An empty trail is itself worth recording: it says the
+    // skip arrived carrying nothing, which points at the reporter rather than the run.
+    const tail = trail.replace(/\s+/g, ' ').trim().slice(-140);
     nextError = /stopped (?:from dashboard|by )|auto-apply (?:stopped|paused)|user[- ]?stop|\bcancell?ed\b/.test(trail)
       ? 'stopped by you (auto-apply was paused)'
-      : 'auto-apply skipped without a diagnostic';
+      : (tail
+        ? `auto-apply skipped without a diagnostic — trail: ${tail}`
+        : 'auto-apply skipped without a diagnostic (and no transcript either)');
   }
   if ((nextState === 'awaiting_input' || nextState === 'parked') && !nextPending.some((q) => q && String(q.question || q.reason || '').trim())) {
     nextState = 'failed';
@@ -4504,6 +4762,41 @@ function jobSourcesFor(jobIds) {
   return out;
 }
 
+// "AI RESCUE" IS NOT A QUESTION, AND IT IS A THIRD OF THE QUEUE.
+//
+// executor.js parks the literal string 'AI rescue' as a last resort, when its AI rescue could not
+// name a field and no required field had an answerable label. That was a deliberate choice: a row
+// the user cannot answer is still a signal that the job needs attention, and dropping it would let
+// the task retry-loop silently. Fair. But measured on the laptop 2026-09-05, 114 of 334 parked
+// tasks carry it, and for 91 of them it is the ONLY parked question. So a third of the needs-you
+// queue was a row Pierre could look at and do nothing about.
+//
+// The information was never actually missing. Every one of those 114 stores a `reason` written by
+// the model, and every one says exactly what is wanted:
+//     'A required field is ungroundable from the provided facts: "how did you hear about this
+//      position?" ... the listed options do not include Indeed.'
+//     "The page has a required driver's license question, but the candidate profile/resume does
+//      not state whether Pierre has a valid driver's licence."
+// The queue just showed the marker instead of the reason.
+//
+// Worse in queueParkedQuestions, which dedupes on the normalized question: 114 different questions
+// collapsed to ONE key, so 113 were invisible and answering the survivor would have written an
+// answer filed under "AI rescue" into the bank.
+//
+// So both read paths present the reason. A quoted question inside it is used verbatim when there
+// is one (10% of them); otherwise the reason prose stands as the question, which is still a thing
+// he can read and act on. Nothing is written back: this is presentation, the stored row is
+// untouched, and the marker survives on the object as `rescueMarker` for anything that needs it.
+const RESCUE_MARKER = 'AI rescue';
+const RESCUE_QUOTED_RX = /["\u201c'`]([^"\u201c\u201d'`]{8,180}\?)["\u201d'`]/;
+function humanizeRescueQuestion(q) {
+  if (!q || String(q.question || '').trim() !== RESCUE_MARKER) return q;
+  const reason = String(q.reason || '').replace(/\s+/g, ' ').trim();
+  if (!reason) return q;                       // nothing to say: leave the marker rather than blank it
+  const m = reason.match(RESCUE_QUOTED_RX);
+  return { ...q, question: (m ? m[1] : reason).trim(), rescueMarker: true };
+}
+
 function queueParkedQuestions() {
   const out = [];
   const seen = new Set();
@@ -4512,7 +4805,8 @@ function queueParkedQuestions() {
   const srcByJob = jobSourcesFor(tasks.map((t) => t.jobId));
   for (const t of tasks) {
     const pid = resolveProfileId(srcByJob[t.jobId]);   // check against THIS job's profile memory
-    for (const q of t.pendingQuestions || []) {
+    for (const raw of t.pendingQuestions || []) {
+      const q = humanizeRescueQuestion(raw);
       if (!q || !q.question) continue;
       if (isJunkQuestionText(q.question)) continue;   // not a question — never ask it (see isJunkQuestionText)
       const key = normalizeQuestion(q.question);
@@ -4541,7 +4835,7 @@ function queueNeedsYou() {
   return rows.map((r) => {
     const tk = rowToTask(r);
     const pid = resolveProfileId(r._src);
-    const questions = (tk.pendingQuestions || []).filter((q) => q && q.question
+    const questions = (tk.pendingQuestions || []).map(humanizeRescueQuestion).filter((q) => q && q.question
       && !isJunkQuestionText(q.question)     // not a question — never put it in the needs-you queue
       && !profileFieldLookup(pid, q.question, cache) && !qaLookup(pid, q.question, cache));
     return {
@@ -4573,6 +4867,29 @@ function queueRetryParked() {
     const stillMissing = pend.filter((q) => q && q.question
       && !isJunkQuestionText(q.question)
       && !profileFieldLookup(pid, q.question, cache) && !qaLookup(pid, q.question, cache));
+    // A PARK THAT RECORDS NO QUESTION CANNOT BE ANSWERED BY ANYBODY.
+    //
+    // Live on the laptop 2026-09-05: 15 tasks parked with a reason reading "needs 1 answer(s)" or
+    // "needs 2 answer(s)" and pending_questions EMPTY. The question list was lost between the
+    // executor detecting it and the park being written. Pierre cannot answer a question nobody
+    // recorded, the agent cannot either, and the rescue above never fires because it requires
+    // pend.length to be non-zero. So they sit in the needs-you queue for ever, looking like work
+    // that is waiting on him.
+    //
+    // The honest recovery is a retry: put it back in the queue so the executor rediscovers what it
+    // actually needs. Bounded by the same rescue counter, so a task that keeps losing its questions
+    // stops after MAX_PARK_RESCUES and stays parked rather than looping.
+    const claimsAnswers = /needs \d+ answer/i.test(String(t.parkReason || ''));
+    if (!pend.length && claimsAnswers) {
+      if ((Number(t.rescueCount) || 0) >= MAX_PARK_RESCUES) continue;
+      run(
+        "UPDATE auto_apply_tasks SET state = 'queued', park_reason = NULL, pending_questions = NULL, rescue_count = rescue_count + 1, updated_at = ? WHERE id = ?",
+        [now(), t.id],
+      );
+      requeued++;
+      continue;
+    }
+
     if (pend.length && stillMissing.length === 0) {
       // BOUNDED. Without this the rescue is a hot loop: requeue clears park_reason,
       // pending_questions AND the failure record, so the attempts cap can never bite, the task
@@ -5074,11 +5391,18 @@ function easyApplyEligible(job) {
 // AI log
 // ============================================================
 function aiLog(entry) {
-  run(`INSERT INTO ai_log (id, ts, provider, model, kind, ms, ok, error, prompt_chars, response_chars)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  run(`INSERT INTO ai_log (id, ts, provider, model, kind, ms, ok, error, prompt_chars, response_chars, job_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [uid('ai'), now(), entry.provider || '', entry.model || '', entry.kind || '',
        entry.ms || 0, entry.ok ? 1 : 0, entry.error || null,
-       entry.promptChars || 0, entry.responseChars || 0]);
+       entry.promptChars || 0, entry.responseChars || 0, entry.jobId || null]);
+}
+
+// Every model call made for one application, newest first. This is the per-application answer to
+// "what did the AI do here" - which questions, which model, how long, and which ones failed.
+function aiLogForJob(jobId, limit = 200) {
+  if (!jobId) return [];
+  return all('SELECT * FROM ai_log WHERE job_id = ? ORDER BY ts DESC LIMIT ?', [String(jobId), limit]);
 }
 function aiLogList(limit = 100) {
   return all('SELECT * FROM ai_log ORDER BY ts DESC LIMIT ?', [limit]);
@@ -5196,6 +5520,37 @@ function aiBlockCounts(profileId = null) {
   return out;
 }
 
+// LINK A RUN TO THE APPLICATION IT SUBMITTED.
+//
+// ai_runs.job_id was added by migration and read by aiPerformance/annotateAutoApply, but nothing
+// ever wrote it, so the AI lane always showed 0 credited (runs.withJob = 0) even when it submitted.
+// Only fills a NULL: a run credits exactly one job and a later call never re-points it.
+function aiRunLinkJob(runId, jobId) {
+  if (!runId || !jobId) return false;
+  if (!get('SELECT id FROM jobs WHERE id = ?', [jobId])) return false;
+  run('UPDATE ai_runs SET job_id = ? WHERE id = ? AND job_id IS NULL', [jobId, runId]);
+  return true;
+}
+
+// Backfill: a finished run with no job that overlaps in time with EXACTLY ONE AI-logged submitted
+// job (tag AI-APPLY) that no other run already claims. Link only - never creates or edits a job,
+// so nothing is double counted. Ambiguous windows stay unlinked.
+function aiRunsBackfillJobLinks() {
+  const runs = all(`SELECT id, started_at, ended_at FROM ai_runs
+                     WHERE job_id IS NULL AND status = 'done' AND ended_at IS NOT NULL`);
+  let linked = 0;
+  for (const r of runs) {
+    const lo = new Date(new Date(r.started_at).getTime() - 60000).toISOString();
+    const hi = new Date(new Date(r.ended_at).getTime() + 120000).toISOString();
+    const cands = all(`SELECT j.id FROM jobs j
+                        WHERE j.status = 'submitted' AND j.tags LIKE '%AI-APPLY%'
+                          AND COALESCE(j.submitted_at, j.created_at) >= ? AND COALESCE(j.submitted_at, j.created_at) <= ?
+                          AND NOT EXISTS (SELECT 1 FROM ai_runs a WHERE a.job_id = j.id)`, [lo, hi]);
+    if (cands.length === 1) { run('UPDATE ai_runs SET job_id = ? WHERE id = ? AND job_id IS NULL', [cands[0].id, r.id]); linked++; }
+  }
+  return linked;
+}
+
 function aiRunGet(runId) { return get('SELECT * FROM ai_runs WHERE id = ?', [runId]); }
 function aiRunSteps(runId, limit = 1000) {
   return all('SELECT * FROM ai_steps WHERE run_id = ? ORDER BY seq ASC LIMIT ?', [runId, limit]);
@@ -5208,6 +5563,105 @@ function aiRunList({ profileId = null, limit = 50 } = {}) {
 function aiUsage() {
   return all(`SELECT provider, COUNT(*) AS calls, SUM(ms) AS total_ms,
               SUM(ok) AS ok_calls FROM ai_log GROUP BY provider`);
+}
+
+// IS THE AI APPROACH ACTUALLY WORKING? — one query set behind one screen.
+//
+// The numbers that answer that were spread across three places and could not be compared:
+// ai_log knows how many model calls happened but not whether an application came out the other
+// end; auto_apply_tasks knows about applications but not which engine drove them; ai_runs knew
+// neither until job_id existed. Worse, the provider totals are LIFETIME and dominated by history,
+// so a chain that has been fixed still reads as broken — the windowed view is the honest one.
+//
+// `days` is a window, not a total, for exactly that reason. Live 2026-09-07: the lifetime numbers
+// said claude succeeded 31% of the time, while the last 24 hours said 100%. Both were true; only
+// the second described the current build.
+function aiPerformance({ days = 7 } = {}) {
+  const cut = new Date(Date.now() - Math.max(1, Number(days) || 7) * 86400000).toISOString();
+
+  // Model calls in the window, split by provider. ok=0 rows are the whole point: a provider that
+  // is being called and always failing is invisible in a success-only count.
+  const providers = all(
+    `SELECT provider, COUNT(*) AS calls, SUM(ok) AS ok_calls, SUM(ms) AS total_ms
+       FROM ai_log WHERE ts >= ? GROUP BY provider ORDER BY calls DESC`, [cut]);
+
+  // What the model was actually asked to do. 'answer-question' is a screening question on a real
+  // form; the rest is scaffolding.
+  const kinds = all(
+    `SELECT COALESCE(kind,'(none)') AS kind, COUNT(*) AS calls, SUM(ok) AS ok_calls
+       FROM ai_log WHERE ts >= ? GROUP BY kind ORDER BY calls DESC LIMIT 12`, [cut]);
+
+  // A FAILURE COUNTER THAT COULD NEVER COUNT A FAILURE.
+  //
+  // This bucketed `status = 'error'`. The agent loop writes exactly three statuses - 'done',
+  // 'failed' and 'stopped' (agent-loop.js) - and 'error' is written nowhere in the codebase. So the
+  // panel reported failed:0 no matter what happened, and 'stopped' was not counted at all.
+  //
+  // Seen live 2026-09-08: total 13, done 8, failed 0, running 2. Eight and two do not make thirteen,
+  // and the three missing runs were the ones worth looking at. Reading it left to right, the agent
+  // had never failed once - while six runs in the same table said 'failed'.
+  //
+  // `other` exists so this cannot happen again quietly: every run lands in exactly one bucket, so a
+  // status added later shows up as an unexplained number instead of vanishing, and the four buckets
+  // are guaranteed to sum to total.
+  const runs = get(
+    `SELECT COUNT(*) AS total,
+            SUM(CASE WHEN status = 'done'    THEN 1 ELSE 0 END) AS done,
+            SUM(CASE WHEN status = 'failed'  THEN 1 ELSE 0 END) AS failed,
+            SUM(CASE WHEN status = 'stopped' THEN 1 ELSE 0 END) AS stopped,
+            SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
+            SUM(CASE WHEN status NOT IN ('done','failed','stopped','running') THEN 1 ELSE 0 END) AS other,
+            SUM(CASE WHEN job_id IS NOT NULL THEN 1 ELSE 0 END) AS withJob
+       FROM ai_runs WHERE started_at >= ?`, [cut]) || {};
+
+  // Applications by engine, using the SAME precedence as annotateAutoApply so the two screens can
+  // never disagree: a verified extension submit outranks a merely-attached agent run.
+  const engine = get(
+    `SELECT
+       SUM(CASE WHEN t.sub = 1 THEN 1 ELSE 0 END)                      AS extension,
+       SUM(CASE WHEN (t.sub IS NULL OR t.sub = 0) AND a.runs > 0 THEN 1 ELSE 0 END) AS agent
+     FROM jobs j
+     LEFT JOIN (SELECT job_id, MAX(CASE WHEN state IN ('done','awaiting_review') THEN 1 ELSE 0 END) AS sub
+                  FROM auto_apply_tasks GROUP BY job_id) t ON t.job_id = j.id
+     LEFT JOIN (SELECT job_id, COUNT(*) AS runs FROM ai_runs
+                 WHERE job_id IS NOT NULL GROUP BY job_id) a ON a.job_id = j.id
+     WHERE j.submitted_at IS NOT NULL AND j.submitted_at >= ?`, [cut]) || {};
+
+  // CAN THIS NUMBER MEAN WHAT IT LOOKS LIKE IT MEANS?
+  //
+  // The `agent` count above joins ai_runs on job_id. That column was added by migration and is read
+  // in three places, and NOTHING has ever written it: aiRunCreate takes no jobId, applyRunner never
+  // sees one, and /ai-apply/start is driven by a free-text goal with no job attached. So the join
+  // matches nothing and `agent` is structurally pinned at 0.
+  //
+  // Read on the dashboard, "extension 56 · agent 0" says the AI agent has achieved nothing in a
+  // week. The data cannot support that claim. It equally fits an agent that submitted plenty whose
+  // runs were never linked to a job, and on 2026-09-08 there were 18 runs and 10 completions in
+  // exactly that state.
+  //
+  // So report the ambiguity next to the number instead of letting the number speak alone. When
+  // unlinkedAgentRuns is non-zero, `agent` is not a measurement of anything. This is the third
+  // metric today that could only ever report one answer; the pattern is a column read by a query
+  // and written by nobody.
+  const unlinkedAgentRuns = get(
+    'SELECT COUNT(*) AS n FROM ai_runs WHERE job_id IS NULL AND started_at >= ?', [cut])?.n || 0;
+
+  return {
+    days: Number(days) || 7,
+    since: cut,
+    providers,
+    kinds,
+    // Every bucket the query computes is passed through. The SQL and this object are the same shape
+    // written twice, and they had already drifted once: the query gained columns and the panel kept
+    // showing the old four, so the new numbers were computed and thrown away. Adding a bucket means
+    // adding it in BOTH places, and ai-performance-buckets.test.mjs fails if they stop summing.
+    runs: {
+      total: runs.total || 0, done: runs.done || 0, failed: runs.failed || 0,
+      stopped: runs.stopped || 0, running: runs.running || 0, other: runs.other || 0,
+      withJob: runs.withJob || 0,
+    },
+    submittedBy: { extension: engine.extension || 0, agent: engine.agent || 0, unlinkedAgentRuns },
+  };
 }
 
 // ============================================================
@@ -6187,6 +6641,7 @@ module.exports = {
   qaRecord, isHighStakesQuestion, qaLookup, qaList, answerMemory, qaDelete, qaSetAnswer, normalizeQuestion, guessLocale,
   answerShape,   // re-exported so callers that already hold `db` can reach the recall gates
   isPlaceholderAnswer, stripPlaceholderAnswers, isJunkQuestionText,
+  humanizeRescueQuestion,
   isMisattributedUrlAnswer, purgeMisattributedUrlAnswers,
   isImplausibleCompany, atsCompanyFromUrl, repairImplausibleCompanies,
   isOpaqueTokenAnswer,
@@ -6203,7 +6658,7 @@ module.exports = {
   extractKeywords, folderList, folderGet, folderAdd, folderTouch, folderDelete, upsertFolderDocument,
   documentByPath, pruneMissingFolderDocs, listFolderEnabled: () => folderList().filter((f) => f.enabled),
   discoveryBatchStart, discoveryBatchGet, discoveryBatchComplete, discoveryBatchList, discoveryRecordJob,
-  discoveryFallbackQueue, discoveryFallbackNext, discoveryFallbackComplete, discoveryHealth, reconcileDiscovery, pipelineHealth,
+  discoveryFallbackQueue, discoveryFallbackNext, discoveryFallbackComplete, discoveryHealth, reconcileDiscovery, reconcileAiRuns, deadSources, falseMaybes, pipelineHealth,
   queueList, queueGet, queueHistory, queueBreakdown, jobUrlsForAtsHarvest, summarizeRun, queueRunSummary, queueLive, queueAdd, queuePatch, queueDelete, queueRunStats, queueParkedQuestions, queueNeedsYou, queueRetryParked, retryStaleQueue, reconcileStaleRunning, reclaimDeadParks, reconcileFalseSubmits, quarantineUntrustworthyDone, recoverRaceLostSubmissions, recoverVerifiedEvidenceFromTranscript, creditRaceLostBacklog, isTrustworthyEvidence, saveIntakeAnswer,
   classifyQueueFailure, taskSiteKey, queueActiveSiteKeys, lastStartBySiteKey,
   setEasyApplyCooldown, easyApplyCooledDown, easyApplySupplyExhausted, easyApplyStatus, easyApplyEligible, easyApplySubmitted24h,
@@ -6211,9 +6666,11 @@ module.exports = {
   triageRecord, triageUnreviewed, triagePendingEscalations, triageCoverage,
   applyTriageVerdicts, triageOrphans, selfEmailAddresses,
   setSignedOut, clearSignedOut, isSignedOut, signedOutStatus, signedOutEligible,
+  aiPerformance,
+  aiLogForJob,
   expireWalledTasks, retireUnanswerableParks,
   aiLog, aiLogList, aiUsage,
-  aiRunCreate, aiStepAppend, aiRunFinish, aiRunGet, aiRunSteps, aiRunList,
+  aiRunCreate, aiStepAppend, aiRunFinish, aiRunLinkJob, aiRunsBackfillJobLinks, aiRunGet, aiRunSteps, aiRunList,
   aiBlockCreate, aiBlockList, aiBlockGet, aiBlockResolve, aiBlockDismiss, aiBlockCounts,
   exportAll, importAll, bulkImportApplications, wipeAllData,
   emailUpsert, emailsForJob, emailSuggestionsForJob, setEmailMatch, listEmails, emailStats, emailCursor, setEmailCursor, jobsForMatching, findJobByThread, gmailStatusFromCategory, reprocessEmails, elevateJobFromEmail, findJobByUrl,

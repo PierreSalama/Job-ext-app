@@ -10,6 +10,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -111,4 +112,46 @@ test('a real application gets the steps a real form needs', () => {
   const src = fs.readFileSync(path.join(root, 'app/src/ai/apply-runner.js'), 'utf8');
   assert.match(src, /const APPLY_STEPS = 55/);
   assert.match(src, /maxSteps: APPLY_STEPS, \.\.\.limits/, 'an explicit caller limit must still win');
+});
+
+test('full auto may only ever be pointed at the fixture', () => {
+  // --auto is the one branch of this system that SENDS an application, and it had never been run at
+  // all, which is its own risk: an untested path that submits. Pointing it at a real posting would
+  // put an application in a real employer's system from a test rig. That is unrecoverable, and not
+  // something anyone should discover by mistyping a flag.
+  const rig = fs.readFileSync(path.join(root, 'tools/apply-e2e.mjs'), 'utf8');
+  assert.match(rig, /if \(FULL_AUTO && !USE_FIXTURE\)/, 'the guard must exist');
+  assert.match(rig, /REFUSED: --auto submits for real/);
+  assert.match(rig, /process\.exit\(2\)/, 'it must actually stop, not warn and continue');
+  // And the flag has to reach the runner, or --auto would silently run in Prepare mode and the
+  // branch would still be untested while looking tested.
+  assert.match(rig, /autonomy: FULL_AUTO \? 'auto' : 'prepare'/);
+});
+
+// Everything above is a regex over a FILE. That is how this rule was guarded for its whole life,
+// and a regex cannot see the one property that actually matters: that the refusal happens BEFORE
+// the rig copies the ledger, launches Chrome, or reaches the agent. Move the guard ten lines down
+// and every assertion above still passes while a test rig starts driving a real employer's form.
+// So actually run it.
+test('BEHAVIOUR: pointing full auto at a real posting refuses and stops dead', () => {
+  const rigPath = path.join(root, 'tools/apply-e2e.mjs');
+  const victim = 'https://job-boards.greenhouse.io/somerealemployer/jobs/123456';
+  let out = '';
+  let code = 0;
+  try {
+    out = execFileSync(process.execPath, [rigPath, '--auto', victim],
+      { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000 });
+  } catch (e) {
+    code = typeof e.status === 'number' ? e.status : -1;
+    out = `${e.stdout || ''}${e.stderr || ''}`;
+  }
+
+  assert.equal(code, 2, 'it must exit 2, not run and not merely warn');
+  assert.match(out, /REFUSED: --auto submits for real/);
+  assert.ok(out.includes(victim), 'it must name the URL it refused, so a typo is obvious');
+
+  // The proof that it stopped EARLY: none of the later stages ever announced themselves.
+  assert.doesNotMatch(out, /fixture employer/, 'it must not fall back to the fixture and run anyway');
+  assert.doesNotMatch(out, /=== transcript ===/, 'the agent must never have started');
+  assert.doesNotMatch(out, /Prepare mode/, 'it must not quietly downgrade to Prepare and run');
 });

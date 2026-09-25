@@ -149,7 +149,8 @@ const fitBadgeHtml = (score) => (score == null || score === '') ? ''
 // exists, 'manual' = reached submitted+ without one, null = not submitted yet.
 const viaBadge = (j) => {
   if (!j) return '';
-  if (j.via === 'auto') return `<span class="via-badge via-auto" title="Submitted by the auto-apply pipeline">⚡ Auto</span>`;
+  if (j.via === 'ai') return `<span class="via-badge via-ai" title="Submitted by the AI agent — it read the page and decided each step">🧠 AI</span>`;
+  if (j.via === 'auto') return `<span class="via-badge via-auto" title="Submitted by the auto-apply pipeline (extension executor)">⚡ Auto</span>`;
   if (j.via === 'auto-assisted') return `<span class="via-badge via-assisted" title="Auto-apply set it up; you finished or corrected it">⚡ Auto (assisted)</span>`;
   if (j.via === 'manual') return `<span class="via-badge via-manual" title="Applied to by hand">✋ Manual</span>`;
   if (j.autoApply) return `<span class="via-badge via-pipeline" title="In the auto-apply pipeline (not submitted yet)">⚡ Pipeline</span>`;
@@ -1440,6 +1441,7 @@ route('/applications', async () => {
   const r = await mergedJobs(q.slice(q.indexOf('?') + 1));
   let rows = r.items || [];
   // Provenance filter (client-side — `via` is derived server-side, not a DB column).
+  if (f.via === 'ai') rows = rows.filter((j) => j.via === 'ai' || j.aiRuns > 0);
   if (f.via === 'auto') rows = rows.filter((j) => j.via === 'auto' || j.autoApply);
   else if (f.via === 'manual') rows = rows.filter((j) => j.via === 'manual' && !j.autoApply);
 
@@ -1563,6 +1565,7 @@ route('/applications', async () => {
       </select>
       <select class="select tb-filter ${f.via !== 'all' ? 'on' : ''}" id="f-via" title="Filter by how it was applied to">
         <option value="all" ${f.via === 'all' ? 'selected' : ''}>Auto &amp; manual</option>
+        <option value="ai" ${f.via === 'ai' ? 'selected' : ''}>🧠 AI agent only</option>
         <option value="auto" ${f.via === 'auto' ? 'selected' : ''}>⚡ Auto-apply only</option>
         <option value="manual" ${f.via === 'manual' ? 'selected' : ''}>✋ Manual only</option>
       </select>
@@ -2063,6 +2066,7 @@ route('/pipeline', async () => {
     const sub = [];
     if (j.source) sub.push(`<span class="kb-source">${esc(j.source)}</span>`);
     if (j.location) sub.push(`<span class="kb-loc">${esc(j.location)}</span>`);
+    if (j.via === 'ai') sub.push('<span class="via-badge via-ai">🧠 AI</span>');
     if (j.via === 'auto') sub.push('<span class="via-badge via-auto">⚡ Auto</span>');
     else if (j.via === 'auto-assisted') sub.push('<span class="via-badge via-assisted">⚡ Auto (assisted)</span>');
     else if (j.via === 'manual') sub.push('<span class="via-badge via-manual">✋ Manual</span>');
@@ -4596,15 +4600,57 @@ function consentGate() {
   return el2;
 }
 
+// "Is the AI approach working?" — the answer, over a WINDOW rather than all time.
+// Lifetime provider totals are dominated by history: on 2026-09-07 they said claude succeeded 31%
+// of the time while the last day said 100%. Both true; only the second describes the current build,
+// so this panel never shows a lifetime number.
+function aiPerfPanel(p) {
+  if (!p || !p.ok) return '';
+  const sub = p.submittedBy || { extension: 0, agent: 0 };
+  const total = (sub.extension || 0) + (sub.agent || 0);
+  const provs = (p.providers || []).filter((x) => x.calls > 0);
+  const answers = (p.kinds || []).find((k) => k.kind === 'answer-question');
+  const pct = (a, b) => (b ? Math.round((a / b) * 100) : 0);
+  return `
+    <section class="card">
+      <div class="card-head"><h2 class="card-title">How it's doing</h2>
+        <span class="muted">last ${esc(p.days)} days &mdash; not all time</span></div>
+      <div class="ai-perf-grid">
+        <div class="ai-perf-stat"><div class="n">${esc(total)}</div><div class="l">applications sent</div></div>
+        <div class="ai-perf-stat"><div class="n">${esc(sub.agent || 0)}</div><div class="l">by the AI agent</div></div>
+        <div class="ai-perf-stat"><div class="n">${esc(sub.extension || 0)}</div><div class="l">by auto-apply</div></div>
+        <div class="ai-perf-stat"><div class="n">${esc(answers ? answers.calls : 0)}</div><div class="l">form questions answered</div></div>
+      </div>
+      ${provs.length ? `
+      <table class="ai-perf-tbl">
+        <thead><tr><th>engine</th><th class="num">asked</th><th class="num">worked</th><th class="num">rate</th><th class="num">avg</th></tr></thead>
+        <tbody>${provs.map((x) => {
+          const rate = pct(x.ok_calls || 0, x.calls || 0);
+          return `<tr>
+            <td>${esc(x.provider)}</td>
+            <td class="num">${esc(x.calls)}</td>
+            <td class="num">${esc(x.ok_calls || 0)}</td>
+            <td class="num ${rate >= 90 ? 'good' : rate >= 50 ? 'mid' : 'bad'}">${rate}%</td>
+            <td class="num">${((x.total_ms || 0) / Math.max(1, x.calls) / 1000).toFixed(1)}s</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>
+      <div class="muted ai-perf-note">A engine at 0% is being called and failing every time &mdash; it costs its full timeout on every question. Reorder it last in Settings.</div>
+      ` : '<div class="muted">No model calls in this window.</div>'}
+    </section>`;
+}
+
 route('/ai-apply', async () => {
   const gate = consentGate();
   if (gate) return gate;
   const pid = aiProfileId();
   const q = pid ? `?profileId=${encodeURIComponent(pid)}` : '';
-  const [st, blocksR, profsR] = await Promise.all([
+  const [st, blocksR, profsR, perf] = await Promise.all([
     api(`/ai-apply/status${q}`).catch(() => null),
     api(`/ai-apply/blocks${q}`).catch(() => ({ items: [], counts: { open: 0, alert: 0 } })),
     api('/ai-apply/profiles').catch(() => ({ items: [] })),
+    // Older nodes have no such route; the panel simply does not render rather than blanking the page.
+    api('/ai-apply/performance?days=7').catch(() => null),
   ]);
   const profiles = profsR?.items || [];
   // An unset selection means "the default profile" — resolve it so the label is never blank.
@@ -4641,6 +4687,8 @@ route('/ai-apply', async () => {
       </div>
       ${anyUsable ? '' : '<div class="ai-warn">No engine can answer right now. Start is disabled until one can.</div>'}
     </section>
+
+    ${aiPerfPanel(perf)}
 
     ${profiles.length ? `
     <section class="card">

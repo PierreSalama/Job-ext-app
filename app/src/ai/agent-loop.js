@@ -157,7 +157,19 @@ function disputeSummary(summary, steps) {
   // alone got the whole run recorded as failed and disputed. Punishing a model for saying plainly
   // that it did NOT do something is the exact opposite of what this check is for, and all it would
   // teach the summary to do is go vague.
-  const DENIED = /\b(?:not|never|no)\s+(?:\w+\s+){0,3}(?:submitted|applied|sent)\b|\b(?:did|was|were|has|have)\s*n(?:o|')?t\s+(?:\w+\s+){0,3}(?:submit|submitted|applied|sent)\b/;
+  // ...AND A DENIAL CAN BE A LIST. Caught live 2026-09-08 on a real Indeed posting: the agent hit
+  // Cloudflare's verification wall, stopped to ask Pierre rather than attempting it, and wrote
+  // "The application was not accessed, filled, or submitted." The gap pattern here was
+  // (?:\w+\s+){0,3}, which cannot cross the COMMAS in "accessed, filled, or " — so the denial went
+  // unrecognised, the bare word "submitted" counted as a claim, and a textbook-correct run was
+  // recorded as failed and disputed. Second time this exact shape has cost a good run.
+  //
+  // The separator now allows commas and list conjunctions, and is still bounded to one clause so a
+  // ...AND THE NEGATOR IS NOT ALWAYS 'not'. Third variant caught live 2026-09-08: the agent
+  // wrote 'no fields were changed and nothing was submitted' and was disputed, because 'nothing'
+  // is not 'no' under a word boundary. Every time this guard has been too narrow it has thrown
+  // away a correct run, so the negator set now covers the words a model actually reaches for.
+  const DENIED = /\b(?:not|never|no|nothing|none|neither)\b(?:[\s,]+(?:or|and|\w+)){0,6}[\s,]+(?:submitted|applied|sent)\b|\b(?:did|was|were|has|have)\s*n[o\u2019']?t\b(?:[\s,]+(?:or|and|\w+)){0,6}[\s,]+(?:submit|submitted|applied|sent)\b/i;
   const claimsSubmitted = /\b(submitted|applied successfully|application (?:was )?sent)\b/.test(s)
     && !DENIED.test(s);
   const reallySubmitted = steps.some((x) => x.tool === 'submit' && x.ok !== false && !x.refused
@@ -174,7 +186,22 @@ function disputeSummary(summary, steps) {
   // "submitted", so a false claim of PARKING walked straight past it. A parked application leaves
   // an awaiting_submit block behind, and that is the fact to test.
   const claimsParked = /\b(hand(?:ed)? (?:it |the .{0,40})?(?:to|over to) the human|parked (?:the |this )?application|ready for (?:the )?human|awaiting (?:the )?human|for (?:final |human )?review)\b/.test(s);
-  const reallyParked = steps.some((x) => x.tool === 'submit' && x.ok !== false && !x.refused
+  // ...AND ask_human PARKS IT TOO, WHICH THIS MISSED.
+  //
+  // The check above was written for the Ritual case, where SUBMIT refused and the model claimed a
+  // handover anyway, so it looked only at submit. But ask_human is the other legitimate way to
+  // park, and it is the RIGHT one for a question nobody can answer: its result reads
+  // "PARKED. Block blk_... raised for the human".
+  //
+  // Live 2026-09-06: an end-to-end run escalated a US work-authorisation question exactly as it
+  // should, raised a needs_answer block, said so honestly, and was disputed twice and then
+  // recorded as FAILED. Correct behaviour, filed as a failure, which is the kind of thing that
+  // quietly poisons every number built on top of it.
+  //
+  // Surfaced by today's work-authorisation fix: parking on a US question used to be rare because
+  // the floor simply answered Yes.
+  const reallyParked = steps.some((x) => (x.tool === 'submit' || x.tool === 'ask_human')
+    && x.ok !== false && !x.refused
     && /Block blk_/i.test(String(x.result || '')));
   if (claimsParked && !reallyParked) {
     problems.push('the summary says the application was handed to the human, but no submit step raised a block, so nothing was handed over.');
@@ -191,6 +218,52 @@ function disputeSummary(summary, steps) {
 
 // Models wrap JSON in prose or a fence no matter how firmly you ask. Recover instead of failing the
 // run: a parse failure is fed back as an observation so the model can correct itself.
+// THE ONE FAILURE THAT IS ALWAYS RECOVERABLE.
+//
+// Every recorded unparsed reply is the same thing: a complete, well formed action whose bodyHtml
+// contains a quoted phrase the model forgot to escape. Nothing else is wrong with it. Regenerating
+// a 4,000-character resume to recover one missing backslash costs a step and usually reproduces
+// the same phrase, because the phrase comes from his own material.
+//
+// So repair it, narrowly. JSON.parse reports the position of the character AFTER the quote that
+// ended the string early, verified against the real failures: at position 63 the string holds
+// [", n], so the quote to escape is at at-1. Insert one backslash there and re-parse.
+//
+// It only ever inserts a backslash, only at the exact character the parser objected to, and only
+// when that character is a double quote. Anything else and it gives up, so a genuinely malformed
+// reply is still rejected rather than mangled into something that parses.
+function repairUnescapedQuotes(text, maxFixes = 40) {
+  let s = String(text == null ? '' : text);
+  for (let i = 0; i < maxFixes; i++) {
+    try { JSON.parse(s); return s; }
+    catch (e) {
+      const m = /position (\d+)/.exec(String(e && e.message));
+      if (!m) return null;
+      const at = Number(m[1]);
+      // The reported position is the first character the parser could not use, and JSON skips
+      // whitespace before complaining. So the quote that ended the string early is at at-1 only
+      // when nothing separates them: the real sample reads [tests" gate], where the position
+      // lands on the g and at-1 is a space. Walk back over the whitespace to find the quote.
+      let j = at - 1;
+      while (j >= 0 && /\s/.test(s[j])) j--;
+      if (j < 0 || s[j] !== '"') return null;
+      s = s.slice(0, j) + '\\"' + s.slice(j + 1);
+    }
+  }
+  return null;
+}
+// One reading of a parsed object, used by the normal path and the repair path both. Two copies of
+// this would drift, and a repaired reply that behaved differently from an identical clean one
+// would be the worst kind of bug to chase.
+function toAction(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+  if (obj.done === true) return { done: true, thought: str(obj.thought), summary: str(obj.summary) };
+  if (typeof obj.tool === 'string' && obj.tool) {
+    const args = obj.args && typeof obj.args === 'object' && !Array.isArray(obj.args) ? obj.args : {};
+    return { done: false, thought: str(obj.thought), tool: obj.tool, args };
+  }
+  return null;
+}
 function parseAction(text) {
   const raw = String(text == null ? '' : text).trim();
   if (!raw) return { error: 'empty reply' };
@@ -202,17 +275,58 @@ function parseAction(text) {
   const last = raw.lastIndexOf('}');
   if (first !== -1 && last > first) candidates.push(raw.slice(first, last + 1));
 
+  // WHY IT WOULD NOT PARSE, NOT JUST THAT IT WOULD NOT.
+  //
+  // `(unparsed)` is the single commonest step in the recorded runs, 16 of 219 on 2026-09-05, and
+  // this function threw the reason away: every failure came back as "reply was not a single JSON
+  // action object", with no position and no offending text. The model then had to find one bad
+  // character in a 4,000-character document by guessing, so it regenerated the whole resume and
+  // reproduced the same mistake.
+  //
+  // Diagnosed 2026-09-06 from the replies this loop now keeps. BOTH failures across two end-to-end
+  // runs were write_resume calls, complete and well formed except for a quoted phrase inside
+  // bodyHtml that was never escaped:
+  //
+  //     an AST-enforced "new functions need tests" gate
+  //
+  // The same phrase both times, because it comes from his own material, so it recurs on every
+  // resume that mentions it. Handing back the position and the surrounding text turns a blind
+  // regeneration into a one-character correction.
+  let worst = null;   // the candidate that got FURTHEST before failing is the most informative one
   for (const c of candidates) {
     let obj;
-    try { obj = JSON.parse(c); } catch { continue; }
+    try { obj = JSON.parse(c); }
+    catch (e) {
+      const m = /position (\d+)/.exec(String(e && e.message));
+      const at = m ? Number(m[1]) : -1;
+      if (at >= 0 && (!worst || at > worst.at)) {
+        worst = { at, near: c.slice(Math.max(0, at - 60), at + 30).replace(/\s+/g, ' ') };
+      }
+      continue;
+    }
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) continue;
-    if (obj.done === true) {
-      return { action: { done: true, thought: str(obj.thought), summary: str(obj.summary) } };
-    }
-    if (typeof obj.tool === 'string' && obj.tool) {
-      const args = obj.args && typeof obj.args === 'object' && !Array.isArray(obj.args) ? obj.args : {};
-      return { action: { done: false, thought: str(obj.thought), tool: obj.tool, args } };
-    }
+    const act = toAction(obj);
+    if (act) return { action: act };
+  }
+  // Narrow repair, before reporting a failure the model would have to fix blind.
+  for (const c of candidates) {
+    const repaired = repairUnescapedQuotes(c);
+    if (!repaired) continue;
+    let obj;
+    try { obj = JSON.parse(repaired); } catch { continue; }
+    const act = toAction(obj);
+    // `repaired` is returned so the caller can say so out loud. A silent repair would hide the
+    // single commonest failure in the system behind a step that looks perfectly ordinary.
+    if (act) return { action: act, repaired: true };
+  }
+
+  if (worst) {
+    return {
+      error: `invalid JSON at position ${worst.at}, right here: ...${worst.near}... `
+        + 'That is almost always a double quote inside a string value that was not escaped. Inside '
+        + 'bodyHtml, and inside every other value, a double quote must be written backslash-quote, '
+        + 'or write the HTML with single quotes instead.',
+    };
   }
   return { error: 'reply was not a single JSON action object' };
 }
@@ -297,10 +411,23 @@ async function runAgent(opts = {}) {
       };
 
       const parsed = parseAction(text);
+      if (parsed.repaired) {
+        // Said out loud on purpose. The repair is narrow and safe, but a reply that needed fixing
+        // is still the model getting its own output format wrong, and burying that would hide the
+        // commonest failure in the system behind a step that reads as perfectly ordinary.
+        log.warn('reply had an unescaped quote in a string value; repaired it rather than burning a step');
+      }
       if (parsed.error) {
         // Feed the failure back rather than dying. The model usually corrects on the next turn.
         const step = {
-          seq: seq++, thought: '', tool: '(unparsed)', args: {}, ok: false, refused: false,
+          // KEEP THE REPLY THAT WOULD NOT PARSE. `(unparsed)` is the single commonest step in the
+          // recorded runs, 16 of 219 on 2026-09-05, and it stored nothing but its own complaint,
+          // so there was no way to tell WHY. Note the parser already tolerates a markdown fence,
+          // so that is NOT the cause; without the text the biggest waste cannot be diagnosed.
+          seq: seq++, thought: '', tool: '(unparsed)',
+          // 700 was too short: the replies that fail are write_resume calls carrying a whole HTML
+          // document, around 4,000 characters, and the invalid part can be anywhere in it.
+          args: { rejectedReply: clip(String(text || ''), 5000) }, ok: false, refused: false,
           error: `${parsed.error}. Reply with ONE JSON object, nothing else.`,
           result: null, ...meta,
         };
@@ -356,7 +483,12 @@ async function runAgent(opts = {}) {
           // gets the run finished, and it happens exactly once so a stubborn model still ends.
           challengedOnce = true;
           const step = {
-            seq: seq++, thought: action.thought, tool: '(done-challenged)', args: {},
+            // KEEP THE SUMMARY THAT WAS REJECTED. Without it nobody can tell afterwards whether a
+            // challenge was a true catch or a false positive: the step stored `args: {}`, so the
+            // only record of what the model actually claimed was gone. Seen 2026-09-05 trying to
+            // audit a challenge on a Prepare-mode run and having nothing to audit.
+            seq: seq++, thought: action.thought, tool: '(done-challenged)',
+            args: { rejectedSummary: clip(String(action.summary || ''), 600) },
             ok: false, refused: false, result: null,
             error: `That is not what happened. ${disputed} Look at the record above: if the work is `
               + 'genuinely unfinished, take the next action. If it is finished, say done again with an '

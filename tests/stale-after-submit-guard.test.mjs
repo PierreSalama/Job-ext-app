@@ -19,7 +19,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import os from 'node:os';
 
+const require = createRequire(import.meta.url);
 const here = path.dirname(fileURLToPath(import.meta.url));
 const db = fs.readFileSync(path.join(here, '..', 'app', 'src', 'db.js'), 'utf8');
 const RX = new RegExp(db.match(/const CLICKED_FINAL_SUBMIT_RX = \/(.+)\/i;/)[1], 'i');
@@ -73,4 +76,47 @@ test('it never CLAIMS the job was submitted — only that it needs confirming', 
   assert.doesNotMatch(fn, /state='done'/,
     'marking it done would violate the verified-evidence rule and inflate the ledger');
   assert.match(fn, /confirm whether this went through/i, 'the reason must say what is uncertain');
+});
+
+// Everything above works on db.js as TEXT: RX is parsed out of the source, and `route` mirrors the
+// reconciler's decision rather than making it. So nothing above would notice the reconciler
+// selecting the transcript but never consulting the guard, or routing a possible-submit to 'failed'
+// and re-applying to an employer Pierre has already applied to. reconcileStaleRunning is exported
+// and its own comment says negative minutes exist so a test can drive it. So drive it.
+test('BEHAVIOUR: the reconciler really routes a possible-submit to review, and a dead run to retry', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jat-stale-'));
+  const ledger = require(path.join(here, '..', 'app', 'src', 'db.js'));
+  ledger.open(dir);
+  try {
+    const mk = (n, state, note) => {
+      // Distinct EMPLOYERS, not just distinct paths: upsertJob deduplicates on a normalised
+      // URL key, so three greenhouse.io/acme/jobs/N urls collapse into one job and one task.
+      const url = `https://job-boards.greenhouse.io/acme${n}/jobs/${n}`;
+      const job = ledger.upsertJob({ externalId: url, title: 'Dev', company: `Acme ${n}`, source: 'greenhouse', status: 'started', jobUrl: url }).job;
+      const t = ledger.queueAdd(job.id, { mode: 'auto' });
+      ledger.queuePatch(t.id, { state, transcriptAppend: { note } });
+      return t.id;
+    };
+
+    // The live 2026-08-09 transcript, verbatim from the header of this file.
+    const clicked = mk(1, 'running', 'trace:button isFinalSubmit("Submit application")=true [ats-pack hint] mode=auto');
+    const died = mk(2, 'running', 'opened apply page, filled three fields');
+    const neverRan = mk(3, 'scheduled', 'scheduled (mode=auto)');
+
+    // Negative minutes means "no minimum idle time", which is what makes this runnable at all.
+    ledger.reconcileStaleRunning({ olderThanMinutes: -1, scheduledOlderThanMinutes: -1 });
+
+    const stateOf = (id) => ledger.queueList({}).find((t) => t.id === id)?.state;
+
+    assert.equal(stateOf(clicked), 'awaiting_review',
+      'THE POINT: a run that may have submitted must be handed over for confirmation, never retried');
+    assert.notEqual(stateOf(clicked), 'done',
+      'and must never be CLAIMED as submitted — that would inflate the ledger on no evidence');
+    assert.equal(stateOf(died), 'failed', 'a run with no submit marker still retries as before');
+    assert.equal(stateOf(neverRan), 'queued',
+      'a claim the executor never picked up goes back to the queue, not to failed');
+  } finally {
+    try { ledger.close(); } catch { /* already closed */ }
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* temp */ }
+  }
 });

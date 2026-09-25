@@ -20,7 +20,7 @@
 import * as api from './lib/api.js';
 import { computeIdleGate, clampIdleThreshold } from './lib/idle-gate.js';
 import { isJobPageUrl } from './lib/jobpage.js';
-import { HOST_BREAKER_COOLDOWN_MS, HOST_BREAKER_FORGET_MS, hostOfUrl, shouldDispatchHost, trippedEntry, registrableDomain, shouldForget, backoffMs } from './lib/host-breaker.js';
+import { HOST_BREAKER_COOLDOWN_MS, HOST_BREAKER_FORGET_MS, hostOfUrl, shouldDispatchHost, trippedEntry, behavedEntry, registrableDomain, shouldForget, backoffMs } from './lib/host-breaker.js';
 import { focusArbiterDecision } from './lib/focus-arbiter.js';
 import { pickApplyWindowBounds } from './lib/window-place.js';
 import { buildSearchUrl } from './lib/search-url.js';
@@ -195,12 +195,26 @@ chrome.alarms.create('jat11-aa-reaper', { periodInMinutes: 2 });   // close stal
 
 chrome.alarms.onAlarm.addListener(async (a) => {
   if (a.name === 'jat11-flush') {
-    const h = await api.health();
-    if (h?.ok && await api.isPaired()) await api.flushQueue();
+    // EVERY STEP IS ISOLATED, because this listener carries the app's only channel for commanding
+    // the extension and one throw used to silence all of it.
+    //
+    // The body ran flushQueue() unguarded, ahead of the command handlers. The listener is an async
+    // arrow with no try/catch, so a rejection there skipped the reload request, the clear-breaker
+    // request and the badge, and surfaced as nothing at all - not a log line, not a failed health
+    // probe. Worse, it looked healthy from the app: /health is ALSO called by pump() every minute,
+    // so extLink.seenAt kept ticking and the dashboard kept saying connected. I spent a while today
+    // reading that freshness as proof this alarm was running. It was not proof of anything.
+    //
+    // Measured 2026-09-08: a clear-breaker request sat armed and re-offered on /health for eight
+    // minutes while the node stayed idle, with the handler correctly installed and the command
+    // correctly advertised.
+    const h = await api.health().catch(() => null);
+    try { if (h?.ok && await api.isPaired()) await api.flushQueue(); } catch (e) { console.warn('[jat11] flushQueue failed', e); }
     // The app can ask this extension to reload itself; the request rides the health probe it
     // already makes every minute. NEVER reloads mid-application — see handleExtReload.
-    if (h?.extReload) await handleExtReload(h.extReload).catch(() => {});
-    await paintBadge();
+    if (h?.extReload) await handleExtReload(h.extReload).catch((e) => console.warn('[jat11] extReload failed', e));
+    if (h?.extClearBreaker) await handleClearBreaker(h.extClearBreaker).catch((e) => console.warn('[jat11] clearBreaker failed', e));
+    await paintBadge().catch(() => {});
   }
   if (a.name === 'jat11-autoapply') {
     // Top up the apply pool (serial self-drives between ticks; this is the backstop
@@ -726,6 +740,21 @@ async function tripHostBreaker(host, kind, now = Date.now()) {
   // wall is paused for hours, and a log line claiming "~20 min" would hide exactly that.
   const mins = Math.round(backoffMs(map[h].hits) / 60000);
   console.log(`[jat11] host breaker TRIPPED (persisted): ${h} (bot-challenge: ${kind || 'unknown'}) hit #${map[h].hits} — pausing dispatch ~${mins} min`);
+}
+
+// The other half of the breaker, which was missing: a host that just ACCEPTED an application has
+// demonstrably stopped walling us, so its consecutive-hit count must go back to zero. Without this
+// the count only ever climbed and the backoff priced a mostly-working host like a permanently
+// hostile one — see behavedEntry() in ./lib/host-breaker.js for the measurement.
+async function noteHostBehaved(host) {
+  const h = registrableDomain(host);
+  if (!h) return;
+  const map = await loadHostBreaker();
+  const prev = map[h];
+  if (!prev) return;                       // nothing recorded — nothing to reset
+  if (behavedEntry() === null) delete map[h];
+  await saveHostBreaker(map);
+  console.log(`[jat11] host breaker RESET: ${h} accepted an application (was hit #${prev.hits || 1}) — the next wall starts from the base cooldown`);
 }
 
 // Read the persisted breaker, forgetting only hosts that have been QUIET for the forget window.
@@ -1359,6 +1388,43 @@ async function extReloadInFlightCount() {
   return 1;   // cannot tell → treat as busy and defer
 }
 
+// FORGET THE WALLS, on request from the app.
+//
+// The bot-challenge breaker lives in this extension's own storage, so nothing outside can reach it.
+// On 2026-09-08 that became a deadlock: indeed.com was held by an escalated wall-count, the entire
+// 42-job queue was on indeed.com, and the rule that clears the count only fires when a run reaches
+// a form - which the wall prevents. Meanwhile a run HAD reached that site's form an hour earlier
+// without a challenge, so the breaker was holding on evidence already known to be stale.
+//
+// Clearing is safe in the only direction that matters. If the host really is still walling us, the
+// next job meets the wall, trips the breaker again, and we are exactly where we started, having
+// spent one page load. If it is not, the node goes back to work immediately.
+//
+// Idempotent on the token, like the reload command: /health re-offers it until it is acknowledged.
+const CLEAR_BREAKER_ACTED_KEY = 'jat11.clearBreakerActed';
+
+async function handleClearBreaker({ token } = {}) {
+  if (!token) return;
+  let acted = [];
+  try { acted = (await chrome.storage.local.get(CLEAR_BREAKER_ACTED_KEY))[CLEAR_BREAKER_ACTED_KEY] || []; } catch {}
+  if (acted.includes(token)) return;                     // already handled — /health just repeats it
+
+  const map = await loadHostBreaker();
+  const hosts = Object.keys(map);
+  await saveHostBreaker({});
+  console.log(`[jat11] host breaker CLEARED on request: ${hosts.length ? hosts.join(', ') : '(nothing was held)'}`);
+
+  try {
+    await chrome.storage.local.set({ [CLEAR_BREAKER_ACTED_KEY]: [...acted, token].slice(-20) });
+  } catch {}
+  try {
+    await api.call('POST', '/ext/clear-breaker-ack', { token, cleared: hosts.length, detail: hosts.join(',') }, 5000);
+  } catch {}
+  // Ask for work straight away rather than waiting for the next alarm tick: the whole point of the
+  // request was that the node is idle and should not be.
+  try { await pump(true); } catch {}
+}
+
 async function ackExtReload(token, state, detail) {
   try { await api.call('POST', '/ext/reload-ack', { token, state, detail: detail || '' }, 5000); } catch {}
 }
@@ -1957,6 +2023,25 @@ async function launchOne(task, context) {
     // the dashboard, NOT in the tab, so leaving them open just piled tabs to 90+. Only
     // awaiting_review (review-mode: the user manually clicks submit in that tab) stays
     // open — and the reaper still closes it after the max age as a backstop.
+    // WE GOT THROUGH: clear this host's consecutive-wall count.
+    //
+    // The first version of this required finalState === 'done', reasoning that only a completed
+    // submission proves a site is behaving. That was too strict, and it showed up within the hour.
+    //
+    // Live 2026-09-08: indeed.com was walled, its cooldown lapsed, one job ran and reached the form
+    // and stopped on a question we could not answer ('skipped', missing_info). The site had served
+    // the application perfectly well - and because that was not a 'done', the hit count stayed put.
+    // The node went straight back to being walled on the only host its whole queue was on, with the
+    // breaker still pricing the next wall from an escalated count. A reset that can only fire on a
+    // submit can never fire on a host that is blocking submits.
+    //
+    // Reaching the form is the honest test. everHadForm means the detector latched onto a real
+    // application form on this host, which is direct proof it served us rather than walled us. The
+    // one thing that must NOT reset is a run that ended BECAUSE of a challenge, hence the parkReason
+    // guard - otherwise the breaker would clear itself on the very evidence that tripped it.
+    if (result.everHadForm === true && result.parkReason !== 'bot_challenge') {
+      try { await noteHostBehaved(hostOfUrl(url)); } catch { /* never fail an application over bookkeeping */ }
+    }
     if (['done', 'skipped', 'failed', 'parked', 'awaiting_input'].includes(finalState)) {
       // reuse (serial): KEEP the warm tab — the next job navigates it, preserving the Cloudflare
       // session so a passed check stays cleared. Only close it on Stop (closeAutoApplyTabs) or when
@@ -1994,6 +2079,19 @@ async function pump(force = false) {
   if (!(await api.isPaired())) return { dispatched: false, reason: 'not paired' };
   const h = await api.health();
   if (!h?.ok) return { dispatched: false, reason: 'app offline' };
+  // COMMANDS RIDE THE ALARM THAT DEMONSTRABLY RUNS.
+  //
+  // These are also handled by the jat11-flush alarm, and handling them twice is free because both
+  // are idempotent on their token. They are repeated here because on 2026-09-08 a clear-breaker
+  // request sat armed and re-offered on /health for over ten minutes while the extension was
+  // connected, the handler was installed, the command was being advertised, and this pump was
+  // provably running once a minute - visible in the app log as a /queue/next ask on every tick.
+  //
+  // I could not prove the flush alarm was firing at all, and two attempts to explain its silence
+  // were wrong. The pump's liveness, by contrast, is written in the server log every minute. A
+  // command channel belongs on the heartbeat you can see, not the one you assume.
+  if (h.extReload) await handleExtReload(h.extReload).catch((e) => console.warn('[jat11] extReload failed', e));
+  if (h.extClearBreaker) await handleClearBreaker(h.extClearBreaker).catch((e) => console.warn('[jat11] clearBreaker failed', e));
   // IDLE GATE: when "only when idle" is on and the user is active (input) or media is
   // playing, don't START new applies. A manual "Apply next now" (force) always bypasses.
   // In-flight tasks keep running; the idle/audible listeners re-pump when the user goes away.
@@ -2459,7 +2557,11 @@ async function discoverTick(force = false) {
     await waitTabComplete(tab.id, 30000);
     await new Promise((r2) => setTimeout(r2, 2000));
     try {
-      resp = await chrome.tabs.sendMessage(tab.id, { type: 'jat11.discover-search', source: board, max: aa.discovery.perRunLimit || 8, easyApplyOnly: aa.easyApplyOnly !== false }, { frameId: 0 });
+      // WAIT FOR THE CONTENT SCRIPT, injecting it if it never attached. A bare sendMessage failed
+      // with "Receiving end does not exist" whenever Indeed was still on a Cloudflare interstitial or
+      // redirect at the 2s mark, and every such tick was logged as "could not reach the search page".
+      // sendTaskWhenReady injects the loader once and retries until the listener registers.
+      resp = await sendTaskWhenReady(tab.id, { type: 'jat11.discover-search', source: board, max: aa.discovery.perRunLimit || 8, easyApplyOnly: aa.easyApplyOnly !== false }, 25000);
     } catch (e) {
       resp = { ok: false, error: String(e?.message || e), jobs: [], found: 0, note: 'could not reach the search page (content script not ready?)' };
     }

@@ -17,8 +17,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import os from 'node:os';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
 const src = fs.readFileSync(path.join(here, '..', 'app', 'src', 'db.js'), 'utf8');
 const fn = src.slice(src.indexOf('function easyApplyCooledDown'), src.indexOf('function easyApplyStatus'));
 
@@ -37,6 +40,47 @@ test('the blackout is checked BEFORE the early-reset heuristic', () => {
     'the blackout must short-circuit first — otherwise the per-node count still wins');
   assert.match(fn, /EARLY_RESET_BLACKOUT_MS/, 'the window must be a named constant');
   assert.match(fn, /return true;/, 'inside the blackout the node must report COOLED DOWN');
+});
+
+// THE LIVE CASE, DRIVEN THROUGH THE REAL FUNCTION.
+//
+// Everything else in this file either greps db.js or runs the local `cooled` copy below. A copy
+// agrees with itself by construction: rewrite easyApplyCooledDown any way you like and the copy
+// keeps returning what it always did. The rule it guards is the one that stopped two nodes looping
+// refused requests at a LinkedIn account already warned for automated access, so it is worth
+// driving the real thing.
+test('BEHAVIOUR: the 2026-08-08 case — a real refusal outranks the local count', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jat-eacap-'));
+  const db = require(path.join(here, '..', 'app', 'src', 'db.js'));
+  db.open(dir);
+  try {
+    // 19 Easy-Apply submissions from THIS node inside the rolling window (the laptop's number).
+    for (let i = 0; i < 19; i++) {
+      const url = `https://www.linkedin.com/jobs/view/880000${i}/`;
+      const job = db.upsertJob({ externalId: url, title: 'Dev ' + i, company: 'Acme', source: 'linkedin', status: 'submitted', jobUrl: url }).job;
+      const t = db.queueAdd(job.id, { mode: 'auto' });
+      db.queuePatch(t.id, { state: 'done', applyRoute: 'easy-apply' });
+    }
+    assert.equal(db.easyApplySubmitted24h(), 19, 'precondition: this node counts 19');
+
+    // LinkedIn refuses. The account limit observed across nodes is 40, so margin = 4 and the
+    // early-reset heuristic evaluates 19 < 36 → it WOULD have said "cap is free".
+    db.setEasyApplyCooldown({ hours: 24 });
+    db.kvSet('easyApplyObservedLimit', 40);
+    assert.ok(19 < 40 - Math.max(2, Math.round(40 * 0.1)), 'precondition: the old heuristic would resume');
+
+    assert.equal(db.easyApplyCooledDown(), true,
+      'THE BUG: an explicit refusal must win over the partial per-node view, or both nodes dispatch into an enforced cap');
+
+    // Once the blackout has passed, fast recovery must still work — the fix must not pin the
+    // cooldown on for the full 24 hours.
+    db.kvSet('easyApplyLimitSeenAt', Date.now() - (61 * 60 * 1000));
+    assert.equal(db.easyApplyCooledDown(), false,
+      'after the blackout the early reset resumes, so a freed-up cap is noticed quickly');
+  } finally {
+    try { db.close(); } catch { /* already closed */ }
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* temp */ }
+  }
 });
 
 // The decision logic itself, so intent is pinned independently of the source text.

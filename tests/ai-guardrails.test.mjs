@@ -107,6 +107,110 @@ test('a non-salary field with a number in it is not mistaken for pay', async () 
   assert.equal(await p('fill', { ref: 'n', text: '4021' }), null);
 });
 
+// THE MONEY GUARD USED TO FAIL OPEN WHEN IT COULD NOT READ THE LABEL.
+//
+// labelFor wraps describeRef and labelContext in .catch, so a detached node or a CDP hiccup
+// produced an EMPTY label — indistinguishable from a field that genuinely is not about pay. The
+// salary check keys on the label, so it silently did nothing and the agent was free to type a
+// number below his floor. Found 2026-09-05 while checking whether the floor protects the AI Apply
+// path: it does, but only while the page answers.
+//
+// The fix distinguishes "not a salary field" from "we could not tell". lowestSalaryIn only accepts
+// 4-7 digit numbers between 20,000 and 1,000,000, so years, dates, counts and IDs are untouched.
+function blindPage() {
+  return {
+    isPasswordRef: async () => false,
+    describeRef: async () => { throw new Error('detached node'); },
+    labelContext: async () => { throw new Error('detached node'); },
+  };
+}
+
+test('an unreadable label does not disable the salary floor', async () => {
+  const p = g.makePolicy({ page: () => blindPage(), salaryFloor: 90000 });
+  const refusal = await p('fill', { ref: 'x', text: '85000' });
+  assert.ok(refusal, 'a below-floor number must still be refused when the label cannot be read');
+  assert.match(refusal, /below his floor/);
+});
+
+test('...and it still lets his real ask through', async () => {
+  const p = g.makePolicy({ page: () => blindPage(), salaryFloor: 90000 });
+  assert.equal(await p('fill', { ref: 'x', text: 'CAD 100,000-110,000. Open to discussion.' }), null);
+});
+
+test('...and a blind page never turns ordinary numbers into salary refusals', async () => {
+  const p = g.makePolicy({ page: () => blindPage(), salaryFloor: 90000 });
+  for (const text of ['3', '0', '2026', '647-963-7745', '1']) {
+    assert.equal(await p('fill', { ref: 'x', text }), null, `${text} is not money`);
+  }
+});
+
+test('a READABLE label that is not about pay still allows a big number', async () => {
+  // The fallback must only apply when the label is unknown. "How many users did your system serve?"
+  // is a legitimate question whose answer can look like a salary.
+  const p = policyWith({ u: { label: 'How many users did your system serve?' } }, { salaryFloor: 90000 });
+  assert.equal(await p('fill', { ref: 'u', text: '50000' }), null);
+});
+
+// THE LIST WAS WRITTEN FOR US FORMS. It named hispanic, latino, veteran and EEO, and none of the
+// groups the Canadian Employment Equity Act names. Measured 2026-09-05: "Do you identify as a
+// member of a visible minority?" was NOT caught, and neither was any French phrasing, on a search
+// whose second location priority is Montreal. Answering one of these on his behalf is a standing
+// instruction never to do it.
+test('Canadian and French self-identification questions are recognised', () => {
+  for (const q of [
+    'Do you identify as a member of a visible minority?',
+    'Are you an Aboriginal person?',
+    'Do you identify as Indigenous?',
+    'Employment Equity self-declaration',
+    'Quelle est votre origine ethnique?',
+    'Vous identifiez-vous comme une personne handicapée?',
+    'Identification volontaire (facultatif)',
+    'Êtes-vous membre d’une minorité visible?',
+    'Quel est votre genre?',
+    'Auto-identification volontaire',
+    'Êtes-vous autochtone?',
+  ]) assert.equal(g.SELF_ID_RX.test(q), true, `must be left blank: ${q}`);
+});
+
+test('and an ordinary question is not mistaken for one', () => {
+  // Over-matching here means skipping a field he needed answered, so the line matters both ways.
+  for (const q of [
+    'What is your phone number?',
+    'Quelle est votre ville?',
+    'What are your salary expectations?',
+    'Are you legally authorized to work in Canada?',
+    'Location (City)',
+    'How many years of React experience?',
+  ]) assert.equal(g.SELF_ID_RX.test(q), false, `must stay answerable: ${q}`);
+});
+
+// PRONOUNS. Not found by reading the list, found in the live parked queue: three tasks on the
+// laptop were stranded on "Preferred pronouns", "Pronouns *" and Docebo's opt-in blurb, and ten
+// distinct pronoun fields sit in the answer bank. Nothing on file says what his pronouns are, so
+// there is no source to fill one from. Left blank it is, and the application goes through.
+test('a pronouns field is a voluntary disclosure and is left blank', () => {
+  for (const q of [
+    'Preferred pronouns',
+    'Pronouns *',
+    'What are your pronouns? (optional)',
+    'Please tell us your pronouns',
+    'Let Docebo know what pronouns you use so that we can address you correctly.',
+    'Quels sont vos pronoms?',
+  ]) assert.equal(g.SELF_ID_RX.test(q), true, `must be left blank: ${q}`);
+});
+
+// The boundary in pronouns? is load-bearing, and this is the assertion that says so. Four live
+// postings ask how to say his name. That is a fact about him, he has a source for it, and swallowing
+// it as self-ID would leave a field blank that he wanted answered.
+test('asking how to PRONOUNCE his name is not a self-identification question', () => {
+  for (const q of [
+    'How do we pronounce your name?',
+    'Name pronunciation',
+    'Name pronunciation (optional)',
+    "It's important for us to know how to pronounce everyone's names. How would we pronounce your name?",
+  ]) assert.equal(g.SELF_ID_RX.test(q), false, `must stay answerable: ${q}`);
+});
+
 test('lowestSalaryIn ignores things that are not money', () => {
   assert.equal(g.lowestSalaryIn('CAD 100,000 - 110,000'), 100000);
   assert.equal(g.lowestSalaryIn('2 years 8 months'), null, 'a duration is not a salary');

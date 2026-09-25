@@ -16,6 +16,7 @@
 // must not pay for (or grant) on every call. Auth still resolves via CODEX_HOME.
 
 const { spawn, spawnSync } = require('child_process');
+const { toStrictSchema } = require('./strict-schema');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -220,8 +221,12 @@ async function generateOnce({ prompt, system, schema, model, timeoutMs = 120000 
   if (model) args.push('-m', model);
   let schemaFile = null;
   if (schema) {
+    // OpenAI strict mode rejects an otherwise-valid JSON Schema that does not declare
+    // additionalProperties:false on every object and list every property as required. Measured
+    // 2026-09-08: every structured call to Codex failed on exactly this, and since Codex is first
+    // in the chain it burned 9-31s on each one before falling through. See strict-schema.js.
     schemaFile = path.join(work, 'schema.json');
-    fs.writeFileSync(schemaFile, JSON.stringify(schema));
+    fs.writeFileSync(schemaFile, JSON.stringify(toStrictSchema(schema)));
     args.push('--output-schema', schemaFile);
   }
 

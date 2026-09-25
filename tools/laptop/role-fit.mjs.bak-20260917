@@ -1,0 +1,196 @@
+// IS THIS ACTUALLY A JOB PIERRE SHOULD BE APPLYING TO?
+//
+// Measured on the live queue, 2026-09-08. 39 tasks waiting, every one of them from Indeed, and this
+// is what they were:
+//
+//     9  structural / civil / mechanical / electrical engineer
+//     4  CNC programmer, machinist, boring mill operator
+//     5  manufacturing, production, digital-manufacturing engineering
+//     4  Java backend
+//    ~7  other non-fit
+//    ~10 actual software roles in his stack
+//
+// Real titles in that pile: "CNC Boring Mill Operator/ Programmer", "Structural Engineer" (four
+// times), "Civil Engineer P.Eng", "Co-Op Electrical Engineer", "PROGRAMMEUR ROBOTIQUE". The word
+// "engineer" is doing enormous damage to this queue, because Indeed's search cannot tell a software
+// engineer from a structural one and neither could anything downstream of it.
+//
+// That is how 1,258 applications produce four interviews. Applying harder is not the fix; applying
+// to the right quarter of them is. So this is the gate the AI lane runs every candidate through
+// before it spends a Codex run and Pierre's name on it.
+//
+// THE RULE: a title must match something in ALLOW and nothing in DENY. Deny always wins, because
+// the cost of the two mistakes is not symmetric — skipping a good job costs one application out of
+// a queue that refills, while applying to a CNC machinist role costs credibility that does not.
+//
+// Everything here is a title heuristic. It is deliberately readable and deliberately tunable: when
+// it gets one wrong, edit the list, run `node role-fit.mjs --self-test`, and move on.
+
+// ---------------------------------------------------------------------------------------------
+// DENY — checked first, and one hit is enough.
+// ---------------------------------------------------------------------------------------------
+export const DENY = [
+  // Physical / trades engineering. The single biggest source of noise in the live queue.
+  [/\bcnc\b/i, 'CNC / machining'],
+  [/\bmachinist\b/i, 'CNC / machining'],
+  [/boring mill/i, 'CNC / machining'],
+  [/\bmillwork\b/i, 'CNC / machining'],
+  [/\bwelder\b|\bfabricator\b|\bmachine operator\b/i, 'trades'],
+  [/\bstructural\b/i, 'structural engineering'],
+  [/\bcivil\b/i, 'civil engineering'],
+  [/\bmechanical\b/i, 'mechanical engineering'],
+  [/\belectrical\b|\belectronic(s)?\b/i, 'electrical engineering'],
+  [/\bp\.?eng\b/i, 'licensed P.Eng role'],
+  [/\bhvac\b|\bplumbing\b|\bpiping\b/i, 'building trades'],
+  [/\bmanufacturing\b|\bproduction engineer\b|\bprocess engineer\b/i, 'manufacturing'],
+  [/\bquality (engineer|technician|inspector)\b/i, 'QA hardware / inspection'],
+  [/\bfield service\b|\bmaintenance technician\b/i, 'field service'],
+  [/\bcontrols? engineer\b|\bautomation technician\b|\bplc\b/i, 'industrial controls'],
+  [/robotique|\brobotics? (programmer|technician)\b/i, 'robotics / industrial programming'],
+  [/\bchemical\b|\bmining\b|\bgeotechnical\b|\benvironmental engineer\b/i, 'other engineering discipline'],
+  [/\bdrafter\b|\bcad technician\b|\bsolidworks designer\b/i, 'drafting'],
+  // CHIP AND HARDWARE DESIGN. Leaked through on 2026-09-11: two Tenstorrent roles, "Physical Design
+  // Engineer, AI Accelerator IP" and "Physical Design Methodology Engineer, AI HW IP", both reached
+  // the queue and each burned a nine-minute agent run. They matched the ALLOW pattern for
+  // "engineer, ai" while being silicon jobs.
+  [/\bphysical design\b|\brtl\b|\basic\b|\bfpga\b|\bsilicon\b|\bverilog\b|\bvhdl\b|\bsemiconductor\b/i, 'chip / hardware design'],
+  [/\b(hw|hardware) ip\b|\baccelerator ip\b|\bdesign verification\b|\bsignal integrity\b|\btape ?out\b/i, 'chip / hardware design'],
+  [/\bfirmware engineer\b|\bboard design\b|\bpcb\b/i, 'hardware'],
+
+  // Software-adjacent but not the job. These read as developer roles and are not.
+  [/\bsupport engineer\b|\btechnical support\b|\bhelp ?desk\b|\bservice desk\b/i, 'support, not development'],
+  [/\bsales engineer\b|\bsolutions? consultant\b|\bpre-?sales\b/i, 'sales'],
+  [/\bbusiness develop(er|ment)\b/i, 'sales wearing a developer title'],
+  [/\bbusiness analyst\b|\bscrum master\b|\bproject manager\b|\bproduct manager\b/i, 'not an engineering seat'],
+  [/\bd365\b|dynamics \(f&o\)|dynamics 365/i, 'Dynamics / ERP consulting'],
+  [/\bsalesforce\b|\bservicenow\b|\bsap\b|\bworkday\b/i, 'enterprise platform specialist'],
+  [/\bqa (analyst|tester)\b|\bmanual tester\b/i, 'manual QA'],
+
+  // Wrong level. He has three years: not a student, not a principal.
+  // `internship\b` missed "Internships" (plural) — Wealthsimple's "Software Development and Data
+  // Science Internships (Winter 2027)" walked straight through the gate on 2026-09-08.
+  [/\bintern(s|ship|ships)?\b|\bco-?op\b|\bstudent\b|\bnew grad\b|\bgraduate program\b/i, 'student / intern level'],
+  // ONLY the accented spelling. His app's own exclusion list already catches English "senior", and
+  // duplicating that policy here would hide it in two places. What it does NOT catch is "sénior",
+  // which is how every Québec posting writes it — five osedea roles reached the queue that way.
+  [/\bsénior\b/i, 'senior (French spelling, which his exclusion list misses)'],
+  [/\bprincipal\b|\bstaff engineer\b|\bdistinguished\b|\barchitect\b/i, 'above his level'],
+  [/\bdirector\b|\bhead of\b|\bvp\b|\bvice president\b|\bmanager,? (engineering|software)\b/i, 'management'],
+];
+
+// ---------------------------------------------------------------------------------------------
+// ALLOW — at least one must match.
+// ---------------------------------------------------------------------------------------------
+export const ALLOW = [
+  // "engineering" as well as "engineer": the live queue held "Specialist - Software Engineering",
+  // a real software seat that the narrower pattern threw away.
+  /\bsoftware (engineer|engineering|developer|development|dev)\b/i,
+  /\bd[ée]veloppeu(r|se)/i,
+  /\blogiciel\b/i,                    // French for software: "Ingénieur·e logiciel", "Développeur logiciel"
+  /\bfull[- ]?stack\b/i,
+  /\bfront[- ]?end\b|\bback[- ]?end\b/i,
+  /\bweb developer\b|\bweb engineer\b/i,
+  // Safe to be this broad: DENY runs first, so every trade, support and sales title carrying the
+  // word "developer" has already been removed before this is reached.
+  /\bdeveloper\b/i,
+  /\bapplication (developer|engineer)\b/i,
+  /\bplatform engineer\b|\bproduct engineer\b/i,
+  /\bmobile developer\b|\bios developer\b|\bandroid developer\b/i,
+  /\bdevops\b|\bsite reliability\b|\bsre\b|\binfrastructure (developer|engineer)\b/i,
+  /\bdata engineer\b|\bml engineer\b|\bmachine learning engineer\b/i,
+  /\breact\b|\bnode(\.?js)?\b|\btypescript\b|\bjavascript\b|\bpython\b|\brust\b|\b\.net\b|\bc#\b/i,
+  /\bjava\b/i,                       // not his stack, but the right profession and often a real fit
+  /\bprogrammer analyst\b|\bsoftware development\b/i,
+  // Rejected on 11 September and all four were genuine fits. "AI Engineer (Agentic Workflows)" is
+  // about as close to what he actually builds as a title gets, and he already has a live Forward
+  // Deployed Engineer application at Okta. A bare `programmer` is safe here because every trade use
+  // of the word (CNC, robotics, machinist) is caught by DENY before ALLOW is reached.
+  /\bai engineer\b|\bagentic\b/i,
+  /\bforward deployed engineer\b/i,
+  /\bprogrammer\b/i,
+  /\bapplication security engineer\b|\bsecurity engineer\b/i,
+  /\bengineer,? (frontend|backend|growth|platform|product|infrastructure|data|ai)\b/i,
+];
+
+/**
+ * Decide whether a posting is worth an application.
+ * Returns { fit, reason } — reason always says WHY, so a skip is never silent.
+ */
+export function classify(job = {}) {
+  const title = String(job.title || '').replace(/\s+/g, ' ').trim();
+  if (!title) return { fit: false, reason: 'no title' };
+
+  for (const [rx, why] of DENY) {
+    if (rx.test(title)) return { fit: false, reason: why };
+  }
+  const hit = ALLOW.find((rx) => rx.test(title));
+  if (!hit) return { fit: false, reason: 'no software signal in the title' };
+  return { fit: true, reason: 'software role' };
+}
+
+// ---------------------------------------------------------------------------------------------
+// SELF TEST — every case below is a real title taken off the live queue on 2026-09-08, plus the
+// roles he has actually interviewed for. Run: node role-fit.mjs --self-test
+// ---------------------------------------------------------------------------------------------
+const CASES = [
+  // must be REJECTED — all seen in the live queue
+  ['CNC Programmer', false], ['CNC Machinist / Programmer', false],
+  ['CNC Boring Mill Operator/ Programmer', false],
+  ['CNC Programmer - MILLWORK (Mozaik Proficiency)', false],
+  ['Structural Engineer', false], ['Intermediate Structural Engineer', false],
+  ['Civil Engineer P.Eng', false], ['Co-Op Electrical Engineer', false],
+  ['Junior Electrical Systems Engineer', false],
+  ['Mechanical Engineer - Product Development Engineer', false],
+  ['Intermediate Electrical/Controls Engineer', false],
+  ['Electronic Technician - Software Engineer', false],
+  ['Digital Manufacturing Engineer', false], ['Production Engineer', false],
+  ['Enterprise Support Engineer I', false],
+  ['PROGRAMMEUR ROBOTIQUE', false],
+  ['Platform Engineer, Dynamics (F&O)', false],
+  ['Hatch Structural Engineer', false],
+
+  // must be ACCEPTED — also from the live queue, plus his real target roles
+  ['Product Engineer', true], ['Front End Developer', true],
+  ['Software Developer (2026-035)', true], ['Software Engineer - Full Stack', true],
+  ['AI - Full Stack Engineer', true], ['Software Engineer', true],
+  ['Software Engineer, Products', true],
+  ['Software Engineer - Internal Tools & IT Infrastructure', true],
+  ['Java/NodeJS Software Developer', true], ['Java Backend Developer', true],
+  ['Application Support Developer', true],
+  // The hole that broadening ALLOW to a bare `developer` opened, pinned shut.
+  ['Business Developer', false], ['Business Development Representative', false],
+  ['Développeur logiciel junior', true],
+  ['Intermediate Full-Stack Developer', true],       // the Method role
+  ['Software Engineer, Growth', true],
+  ['Specialist - Software Engineering', true],   // was thrown away by `software engineer\b`
+  // Both reached the live queue on 2026-09-11 and burned an agent run each.
+  ['Physical Design Engineer, AI Accelerator IP', false],
+  ['Physical Design Methodology Engineer, AI HW IP', false],
+  ['RTL Design Engineer', false], ['FPGA Engineer', false],
+  ['Software Engineer, AI Platform', true],      // the genuine "engineer, ai" case must still pass
+  // Wrongly rejected on 11 September, all four real fits.
+  ['AI Engineer (Agentic Workflows)', true],
+  ['Forward Deployed Engineer (Healthcare Integrations)', true],
+  ['Specialist Programmer', true],
+  ['Application Security Engineer II', true],
+  // And the trade uses of the same words must STILL be rejected.
+  ['CNC Programmer', false], ['PROGRAMMEUR ROBOTIQUE', false],
+  // Both reached the live queue on 2026-09-08 and should not have.
+  ['Software Development and Data Science Internships (Winter 2027)', false],
+  ['Développeur·euse logiciel sénior, DevOps et infrastructure', false],
+  ['Développeur·euse sénior de logiciel', false],
+  ['Ingénieur·e logiciel', true],                // the non-senior French one is a genuine fit
+  ['Senior Software Engineer, GPU Infrastructure', true],
+];
+
+if (process.argv[1] && process.argv[1].endsWith('role-fit.mjs') && process.argv.includes('--self-test')) {
+  let bad = 0;
+  for (const [title, want] of CASES) {
+    const got = classify({ title });
+    const ok = got.fit === want;
+    if (!ok) bad++;
+    console.log(`${ok ? 'ok  ' : 'FAIL'}  ${want ? 'accept' : 'reject'}  ${title.padEnd(52)} ${got.reason}`);
+  }
+  console.log(`\n${CASES.length - bad}/${CASES.length} passed`);
+  process.exit(bad ? 1 : 0);
+}

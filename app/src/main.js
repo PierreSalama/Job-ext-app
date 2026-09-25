@@ -975,6 +975,11 @@ app.whenReady().then(async () => {
     const fixed = db.reconcileFalseSubmits();
     if (fixed) log.info(`reverted ${fixed} false auto-apply submit(s) → started`);
   } catch (e) { log.warn('reconcileFalseSubmits failed', e); }
+  // Credit finished AI runs to the AI-logged application they produced (link only, unambiguous).
+  try {
+    const linked = db.aiRunsBackfillJobLinks();
+    if (linked) log.info(`linked ${linked} AI run(s) to their submitted job`);
+  } catch (e) { log.warn('aiRunsBackfillJobLinks failed', e); }
   // Free any pool slots held by tasks stuck 'running'/'scheduled' from a previous run.
   try {
     const unstuck = db.reconcileStaleRunning({ olderThanMinutes: 8 });
@@ -984,6 +989,10 @@ app.whenReady().then(async () => {
     const discoveryRepair = db.reconcileDiscovery({ olderThanMinutes: 10 });
     if (discoveryRepair.interrupted || discoveryRepair.staleClaims) log.info(`reconciled discovery: ${discoveryRepair.interrupted} interrupted, ${discoveryRepair.staleClaims} stale fallback claim(s)`);
   } catch (e) { log.warn('reconcileDiscovery failed', e); }
+  try {
+    const orphanRuns = db.reconcileAiRuns({ olderThanMinutes: 30 });
+    if (orphanRuns) log.info(`reconciled ${orphanRuns} ai run(s) that died with a previous process → failed`);
+  } catch (e) { log.warn('reconcileAiRuns failed', e); }
 
   const port = effectivePort();
   discoveryService = createDiscoveryService({

@@ -66,8 +66,12 @@ test('a non-document, non-image type (zip, exe) is refused too', () => {
 });
 
 test('the executor consults the guard and refuses rather than proceeding', () => {
-  // executor.js cannot be imported under node (it is a browser content-script entry), so the
-  // wiring is asserted on its source — the guard itself is behaviourally tested above.
+  // NOT because executor.js is unimportable — it imports cleanly under node and exports
+  // SEND_TIMEOUT_MS and run. Checked 2026-09-05, because that claim used to sit here and was being
+  // used to justify source-text assertions. The real reason is narrower: tryAttachResume is at
+  // module scope but is not exported, and it drives the DOM, so calling it needs an export plus a
+  // jsdom harness. The guard it consults IS behaviourally tested above; what is asserted here is
+  // only the wiring and the ORDERING, which is a genuine property of the source.
   const src = fs.readFileSync(path.join(here, '..', 'extension', 'content', 'executor.js'), 'utf8');
   const fn = src.slice(src.indexOf('async function tryAttachResume'), src.indexOf('// ---- RESUME PAGE'));
   assert.ok(fn.length, 'tryAttachResume must exist');

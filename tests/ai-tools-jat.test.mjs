@@ -335,11 +335,29 @@ const fitTool = () => {
   return mk({}).tools.find((t) => t.name === 'check_fit');
 };
 
-test('a role he can do scores far above one he cannot', () => {
+test('a role he can do reads differently from one he cannot', () => {
+  // RELATIVE, not absolute. A fixture database holds a two-line résumé, so every posting reads as
+  // "little overlap" there. The band a posting lands in depends on the résumé; the ORDER does not.
   const t = fitTool();
-  const good = Number(/score (\d+)/.exec(t.run({ title: 'Software Developer, Platform', description: PLATFORM }))[1]);
-  const bad = Number(/score (\d+)/.exec(t.run({ title: 'Senior Process Engineer', description: CHEMICAL }))[1]);
-  assert.ok(good > bad * 2, `expected a clear gap, got ${good} vs ${bad}`);
+  const BANDS = ['little overlap', 'some overlap', 'a lot of overlap'];
+  const band = (said) => BANDS.findIndex((b) => said.startsWith(b));
+  const good = band(t.run({ title: 'Software Developer, Platform', description: PLATFORM }));
+  const bad = band(t.run({ title: 'Senior Process Engineer', description: CHEMICAL }));
+  assert.ok(good >= 0 && bad >= 0, 'both must report a band');
+  assert.ok(good >= bad, `the platform role must not read as less of a fit than the chemical one`);
+  // And the lists, which are the part that carries information, must separate them properly.
+  assert.match(t.run({ title: 'Senior Process Engineer', description: CHEMICAL }), /hazop|distillation|aspen/i);
+});
+
+test('it reports no number, because a number gets ranked', () => {
+  // It used to say "overlap score 67/100". The number is dominated by how long a posting is and how
+  // many technologies it names, so ranking real Canadian postings by it put "Enterprise Core Sales
+  // Engineer" at 91 and an AI Architect role at 100. Calling it crude in the same breath did not
+  // stop it being used as a ranking, by me, within the hour.
+  const said = fitTool().run({ title: 'x', description: PLATFORM });
+  assert.doesNotMatch(said, /[0-9]+ *\/ *100/, 'no score out of 100');
+  // Not a blanket ban on the word: a posting's own vocabulary can contain it. The number is the problem.
+  assert.match(said, /judged on words alone and easily wrong/);
 });
 
 test('it names the gap and forbids writing it onto the résumé', () => {
@@ -349,9 +367,8 @@ test('it names the gap and forbids writing it onto the résumé', () => {
   assert.match(said, /Do NOT put anything from that list on the résumé/);
 });
 
-test('the score is labelled as a signal, not a verdict', () => {
-  // A number that looks authoritative is worse than no number. The judgement is the agent's.
-  assert.match(fitTool().run({ title: 'x', description: PLATFORM }), /crude token overlap, not a verdict/);
+test('the reading is labelled as fallible, because the judgement belongs to the agent', () => {
+  assert.match(fitTool().run({ title: 'x', description: PLATFORM }), /easily wrong/);
 });
 
 test('punctuation and filler are stripped, real tokens are not', () => {

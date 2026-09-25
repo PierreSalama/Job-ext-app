@@ -100,9 +100,23 @@ test('the tool belt drives a real form', { skip: chromePath ? false : 'no Chrome
   <input id="degree" role="combobox" aria-autocomplete="list" aria-controls="degreelist" autocomplete="off" aria-label="Degree" />
   <ul id="degreelist" role="listbox" style="display:none"></ul>
   <p id="chosen">none</p>
+  <!-- Ashby and Lever both render consent boxes as a STYLED control whose real input is visually
+       hidden. Recon on 2026-09-05: Ashby had 2 hidden checkboxes, Lever had 18 checkboxes and 11
+       radios. Clicking the input itself lands nowhere because it has no box. -->
+  <label for="consent" id="consentlabel">I agree to the terms</label>
+  <input type="checkbox" id="consent" aria-label="I agree to the terms"
+         style="position:absolute;opacity:0;width:0;height:0" />
+  <fieldset id="startgroup"><legend>When can you start?</legend>
+    <label><input type="radio" name="startdate" value="now" aria-label="Immediately" /> Immediately</label>
+    <label><input type="radio" name="startdate" value="2w" aria-label="Two weeks" /> Two weeks</label>
+  </fieldset>
+  <p id="consentstate">unchecked</p>
   <button id="go" type="button" onclick="document.getElementById('out').textContent='CLICKED'">Continue</button>
   <p id="out">waiting</p>
   <script>window.__blur = 0; document.getElementById('phone').addEventListener('blur', () => window.__blur++);
+  document.getElementById('consent').addEventListener('change', function () {
+    document.getElementById('consentstate').textContent = this.checked ? 'checked' : 'unchecked';
+  });
   document.getElementById('src').addEventListener('change', function () {
     document.getElementById('saw').textContent = 'change:' + this.value;
   });
@@ -211,6 +225,26 @@ test('the tool belt drives a real form', { skip: chromePath ? false : 'no Chrome
           'nothing may have been typed');
       });
 
+      // THE FAIL-CLOSED PROPERTY, WHICH ANOTHER FILE DEPENDS ON.
+      //
+      // guardrails.js swallows an error from its own isPasswordRef check with the comment "if the
+      // ref cannot be identified the tool's own guard handles it". That is only true if THIS guard
+      // refuses on an unidentifiable ref rather than assuming it is safe. Nothing asserted it.
+      //
+      // Checked 2026-09-05 after finding the salary guard in the SAME file failing open in exactly
+      // this situation: an unreadable element silently disabled the rule. The password guard gets
+      // it right; this pins it so it stays right.
+      await t.test('fill refuses a ref it cannot identify, rather than assuming it is safe', async () => {
+        await belt.page().readTree();
+        // A ref that was NEVER ISSUED. Removing a real node is not enough — isPasswordRef still
+        // answers for a detached one, which is how the first version of this test passed even with
+        // the guard deliberately broken.
+        const r = await call('fill', { ref: 'ref_q9999999', text: 'hunter2' });
+        assert.ok(r.refused, 'an unidentifiable ref must be REFUSED, never typed into');
+        assert.match(r.refused, /could not identify/,
+          'and refused for the RIGHT reason — this is the property guardrails.js relies on');
+      });
+
       await t.test('choose_option drives a real dropdown, and the page sees it', async () => {
         // `fill` types text, and typing into a <select> does nothing at all, silently. Every real
         // Greenhouse form has several: country, phone country, "how did you hear about us". The
@@ -315,6 +349,24 @@ test('the tool belt drives a real form', { skip: chromePath ? false : 'no Chrome
         assert.match(said, /cover_letter/);
         assert.match(said, /FIRST one/);
         assert.match(said, /#cover_letter/, 'and it must suggest how to name the other one');
+      });
+
+      await t.test('a checkbox whose input is visually hidden can still be ticked', async () => {
+        // Ashby and Lever render consent boxes as a styled control with the real input hidden.
+        // click() dispatches a mouse event at the element's box centre, and a hidden input has no
+        // usable box, so the click lands nowhere and the box stays unticked in silence.
+        const ref = (await call('query_ref', { selector: '#consent' })).result.match(/ref_\w+/)[0];
+        const said = (await call('click', { ref })).result;
+        assert.match((await call('page_text', {})).result, /(^|\s)checked(\s|$)/,
+          `the checkbox must actually be ticked, got: ${said}`);
+        // And the agent is told HOW it was clicked, so a label click is never invisible to it.
+        assert.match(said, /via its label "I agree to the terms"/);
+      });
+
+      await t.test('a radio in a normal fieldset still works', async () => {
+        // The ordinary case must keep working: this is only about hidden inputs.
+        const ref = (await call('query_ref', { selector: 'input[value="2w"]' })).result.match(/ref_\w+/)[0];
+        assert.match((await call('click', { ref })).result, /clicked/);
       });
 
       await t.test('an unambiguous selector names what it found', async () => {
@@ -422,4 +474,14 @@ test('the belt reads a live Greenhouse form', {
   } finally {
     await belt.close();
   }
+});
+
+test('a control with neither a box nor a label is refused, not silently missed', () => {
+  // The failure this fix exists to prevent is a REQUIRED consent box that never ticks and says
+  // nothing. With no label either, that must surface as an error the agent can act on rather than
+  // a click reporting success.
+  const src = fs.readFileSync(path.join(root, 'app/src/browser/cdp.js'), 'utf8');
+  assert.match(src, /no clickable label, so it cannot be clicked/);
+  assert.match(src, /if \(r\.width > 0 && r\.height > 0\) return null;/,
+    'a control that HAS a box must still be clicked normally');
 });
