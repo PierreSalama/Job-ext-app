@@ -18,7 +18,7 @@ const { APPLY_RULES } = require(path.join(root, 'app/src/ai/apply-runner.js'));
 
 test('the rules cover every line Pierre has actually drawn', () => {
   for (const [what, re] of [
-    ['no duplicates, on any machine', /twice, on any machine/],
+    ['no duplicate postings, on any machine', /SAME POSTING twice, on any/],
     ['never invent experience', /Never invent experience/],
     ['tailor wording, not facts', /wording only, never in facts/i],
     ['cover letter only on request', /ONLY if the form or the posting asks/],

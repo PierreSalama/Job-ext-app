@@ -111,7 +111,7 @@ test('THE JOBBER BUG: a different display name is still caught by the slug', asy
   const r = await call('check_duplicate', {
     url: 'https://job-boards.greenhouse.io/autotrader/jobs/999',
     company: 'AutoTrader.ca / Dealer Solutions',   // the name the scraper stored elsewhere
-    title: 'Full Stack Developer',
+    title: 'Software Engineer',                    // same role: a different role is not a duplicate (25 Sep)
   });
   assert.match(r.result, /^DUPLICATE/);
   assert.match(r.result, /matched on slug "autotrader"/);
@@ -122,9 +122,20 @@ test('THE OTHER HALF: every terminal status counts as engaged, not just "applied
     db.upsertJob({
       company: slug, title: 'Dev', jobUrl: `https://jobs.lever.co/${slug}/x`, status,
     }, { source: 'manual', manual: true });
-    const r = await call('check_duplicate', { url: `https://jobs.lever.co/${slug}/y`, company: slug, title: 'Other Role' });
+    const r = await call('check_duplicate', { url: `https://jobs.lever.co/${slug}/y`, company: slug, title: 'Dev' });
     assert.match(r.result, /^DUPLICATE/, `status "${status}" must count as already engaged`);
   }
+});
+
+test('A DIFFERENT ROLE at a known employer is not a duplicate (25 Sep rule)', async () => {
+  // 17 Sep: 15 agent runs in a row refused on a DIFFERENT role at the same company. Only the same
+  // role, or the same posting url, is a refusal now.
+  db.upsertJob({ company: 'roleco', title: 'Backend Developer', jobUrl: 'https://jobs.lever.co/roleco/a', status: 'submitted' }, { source: 'manual', manual: true });
+  const other = await call('check_duplicate', { url: 'https://jobs.lever.co/roleco/b', company: 'roleco', title: 'Data Analyst' });
+  assert.match(other.result, /^KNOWN EMPLOYER, DIFFERENT ROLE/);
+  assert.match(other.result, /not a duplicate/);
+  const same = await call('check_duplicate', { url: 'https://jobs.lever.co/roleco/c', company: 'roleco', title: 'Backend Developer' });
+  assert.match(same.result, /^DUPLICATE/);
 });
 
 test('FOUND BY E2E: a check that could not run is NOT reported as fresh', async () => {

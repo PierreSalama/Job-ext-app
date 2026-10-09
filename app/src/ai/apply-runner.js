@@ -137,7 +137,8 @@ function getActive(profileId) { return publicView(active.get(profileId || '')); 
 // goal string because a goal string is something a person retypes and quietly drops half of.
 const APPLY_RULES = [
   'House rules for every application:',
-  '- Check for a duplicate BEFORE writing anything. Never apply to an employer twice, on any machine.',
+  '- Check for a duplicate BEFORE writing anything. Never apply to the SAME POSTING twice, on any',
+  '  machine. A different role at an employer already applied to is NOT a duplicate - apply to it.',
   '- Never invent experience. Every claim traces to the stored profile or a previous answer. If the',
   '  posting wants something the candidate does not have, leave it out or say so plainly.',
   '- check_fit before writing anything. If the posting requires something he has no record of,',

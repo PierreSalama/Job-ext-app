@@ -133,10 +133,21 @@ const line = (j) => `${j.company || '?'} — ${j.title || '?'} [${j.status}] ${j
 // One wording for a duplicate wherever it was found, so a hit on another machine reads exactly as
 // seriously as a hit on this one.
 function sayDuplicate(dup, where) {
-  return `DUPLICATE — already engaged on ${where}: ${dup.company} / ${dup.title} [${dup.status}]`
-    + `, matched on ${dup.matchedOn}${dup.slug ? ` "${dup.slug}"` : ''}`
-    + `${dup.sameRole ? ' (the same role)' : ` (${dup.count} row(s) for this employer)`}`
-    + '. Do not apply again. Pick a different employer.';
+  // A SECOND ROLE AT THE SAME EMPLOYER IS NOT A DUPLICATE. On 17 Sep every one of the last 15
+  // agent runs opened the posting, called check_duplicate, and refused on the strength of a
+  // DIFFERENT role at that company: 15 runs, 15 model calls, two minutes each, zero applications.
+  // duplicateOf already computes sameRole, and the keeper and ai-lane-selfcheck both treat
+  // sameRole or a url match as the real duplicate test. Only a true repeat is a refusal.
+  const real = dup.sameRole || String(dup.matchedOn) === 'url';
+  if (!real) {
+    return `KNOWN EMPLOYER, DIFFERENT ROLE - ${dup.company} / ${dup.title} [${dup.status}] on ${where}`
+      + `, matched on ${dup.matchedOn}${dup.slug ? ` "${dup.slug}"` : ''}`
+      + ` (${dup.count} row(s) for this employer)`
+      + '. This posting is NOT one of them, so it is not a duplicate. Carry on and apply.';
+  }
+  return `DUPLICATE - already engaged on ${where}: ${dup.company} / ${dup.title} [${dup.status}]`
+    + `, matched on ${dup.matchedOn}${dup.slug ? ` "${dup.slug}"` : ''} (the same role)`
+    + '. Do not apply again. Pick a different posting.';
 }
 
 // Ask every peer node the same question this machine just asked itself. A node that errors is

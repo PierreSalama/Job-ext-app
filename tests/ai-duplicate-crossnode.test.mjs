@@ -144,7 +144,8 @@ test('a peer on an older build is asked a question it CAN answer', async () => {
 // wrong do harm: a false duplicate quietly stops Pierre applying to a job Dad went for, and a false
 // all-clear is the double application the whole mechanism exists to prevent.
 // ---------------------------------------------------------------------------
-const answersYes = async () => [{ company: 'Zip', title: 'Backend', status: 'submitted' }];
+// Same role as ZIP: since the 25 Sep rule only a true repeat (same role or same url) is a DUPLICATE.
+const answersYes = async () => [{ company: 'Zip', title: 'Software Engineer, Backend', status: 'submitted' }];
 
 test("another applicant's ledger is never consulted", async () => {
   const dad = { nodes: async () => [{ name: 'Dad', baseUrl: 'http://dad' }], engaged: answersYes };
@@ -189,7 +190,7 @@ test('the runner marks a node that points back at this machine', () => {
 const askAs = (profileId, company, n) => {
   const { makeJatTools: mk } = require(path.join(root, 'app/src/ai/tools/jat.js'));
   return mk({ profileId }).tools.find((t) => t.name === 'check_duplicate')
-    .run({ url: `https://job-boards.greenhouse.io/${company}/${n}`, company, title: 'Engineer' });
+    .run({ url: `https://job-boards.greenhouse.io/${company}/${n}`, company, title: 'Dev' });   // same role as the stored rows
 };
 
 test('a second applicant does not inherit the first one\'s history', async () => {

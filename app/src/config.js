@@ -79,6 +79,15 @@ const DEFAULTS = {
       cliModel: '',                 // '' = the CLI's default model; or e.g. 'claude-sonnet-4-6'
       apiKey: '',                   // Anthropic API key (alternative / fallback)
       model: 'claude-sonnet-5',
+      // API-key path only. effort: '' (model default) | 'low' | 'medium' | 'high' -> output_config.effort.
+      // thinking: '' (model default) | 'disabled'. strictModel: true -> `model` above is the ONLY
+      // model the API path will call, per-call overrides ignored (cheap Haiku on API credits).
+      effort: '',
+      thinking: '',
+      strictModel: false,
+      // apiFirst: true -> the API key is tried BEFORE the subscription CLI, and claude-cli answers
+      // whenever the API call fails (auth, 429, out of credit, network). false = CLI first (old order).
+      apiFirst: false,
       timeoutMs: 120000,
     },
 

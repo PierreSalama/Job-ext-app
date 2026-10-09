@@ -93,18 +93,26 @@ function buildAttempts(s, { prose, modelOverride, providerOverride }) {
       });
     } else if (key === 'claude') {
       const cfg = s.claude || {};
+      const pair = [];
       // SUBSCRIPTION via the official Claude CLI (subprocess) FIRST — identical secure pattern to
       // chatgpt→codex: the CLI owns its own credentials + refresh in ~/.claude; we never read,
       // store, or hardcode the token. Default ON; flip cfg.useSubscription=false to use only the key.
       if (cfg.useSubscription !== false) {
         const model = modelOverride || cfg.cliModel || null;   // null → CLI's own default model
-        attempts.push({ name: 'claude-cli', model: model || 'cli-default', run: (a) => claudeCli.generate({ ...a, model, timeoutMs: cfg.timeoutMs }) });
+        pair.push({ name: 'claude-cli', model: model || 'cli-default', run: (a) => claudeCli.generate({ ...a, model, timeoutMs: cfg.timeoutMs }) });
       }
       // API-key fallback (Anthropic direct) when a key is set.
       if (cfg.apiKey) {
-        const model = modelOverride || cfg.model || 'claude-sonnet-4-6';
-        attempts.push({ name: 'claude', model, run: (a) => anthropic.generate({ ...a, model, cfg }) });
+        // strictModel: the API key bills per token, so a pinned cfg.model (Haiku, on Pierre's
+        // credits) is never displaced by a per-call override such as the email pipeline's 'sonnet'.
+        const model = (cfg.strictModel ? '' : modelOverride) || cfg.model || 'claude-sonnet-4-6';
+        const api = { name: 'claude', model, run: (a) => anthropic.generate({ ...a, model, cfg }) };
+        // apiFirst (2026-10-09, Pierre): the API key is PRIMARY and the subscription CLI is the
+        // FALLBACK. run() moves to the next attempt on ANY throw, so an auth failure, a 429, an
+        // out-of-credit 400 or a network error on the API is answered by claude-cli on that same call.
+        if (cfg.apiFirst) pair.unshift(api); else pair.push(api);
       }
+      attempts.push(...pair);
     } else if (key === 'chatgpt') {
       const cfg = bridgeChatgpt(s);
       // The two chatgpt backends need OPPOSITE defaults, so they must not share one `model`.
@@ -190,7 +198,7 @@ function remoteCoolingDown(nowMs = Date.now()) {
 const HARD_FAIL = new Set([
   'CLAUDE_AUTH', 'CLAUDE_MISSING', 'CLAUDE_RESULT_ERR',
   'CODEX_AUTH', 'CODEX_MISSING',
-  'ANTHROPIC_AUTH', 'ANTHROPIC_NOKEY',
+  'ANTHROPIC_AUTH', 'ANTHROPIC_NOKEY', 'ANTHROPIC_CREDIT',
   'OPENAI_AUTH', 'OPENAI_NOKEY',
   'REMOTE_AUTH', 'REMOTE_NO_URL', 'REMOTE_SELF', 'REMOTE_LOOP', 'REMOTE_OFF',
 ]);
